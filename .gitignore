@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.*
+coverage/
+
+# Eval run outputs — results are additive and live in a store the harness
+# manages. Never commit raw provider replies (they can be large and may echo
+# brief text under NDA).
+results/
+.tmp/
