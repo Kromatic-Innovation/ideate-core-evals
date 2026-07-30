@@ -1,6 +1,16 @@
 # ideate-core — Comparative Ideation Study (eval spec v0.1)
 
-**Status:** pre-registration draft. Nothing has been run. Numbers below are cost *projections*, not measurements.
+> ## 🔒 Pre-registration
+>
+> **This document is a pre-registration: it states the hypotheses, metrics, and analysis plan BEFORE any data is collected.** That is what makes a confirmatory result meaningful rather than a story fitted to whatever the data happened to show.
+>
+> Its credibility rests on being verifiably prior. This repository is public and the git history is the timestamp — the commit that introduced this file predates every result in `REPORT.md`, and anyone can check that.
+>
+> **Amendment rule.** Changes to §6 (hypotheses and analysis plan) after data collection begins are *amendments*, not edits. They must be added as a dated appendix that states what changed and why, never applied in place. A silently rewritten analysis plan is not a pre-registration.
+>
+> Nothing has been run. Every number below is a projection.
+
+**Status:** pre-registration draft.
 **Date:** 2026-07-30 · **Target SHA:** ideate-core `develop` @ `920c086` + fix A1 (see Blockers)
 
 ---
