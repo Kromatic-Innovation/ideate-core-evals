@@ -1,7 +1,7 @@
 {
   "name": "ideate-core-evals",
   "version": "0.0.1",
-  "description": "Comparative ideation study for ideate-core \u2014 which model configuration produces the most usefully diverse idea pool per dollar.",
+  "description": "Comparative ideation study for ideate-core — which model configuration produces the most usefully diverse idea pool per dollar.",
   "type": "module",
   "scripts": {
     "test": "node --test"
@@ -14,5 +14,8 @@
     "type": "git",
     "url": "git+https://github.com/Kromatic-Innovation/ideate-core-evals.git"
   },
-  "author": "Kromatic Innovation (https://www.kromatic.com/)"
+  "author": "Kromatic Innovation (https://www.kromatic.com/)",
+  "devDependencies": {
+    "@huggingface/transformers": "^4.2.0"
+  }
 }
