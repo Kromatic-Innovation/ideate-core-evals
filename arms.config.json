@@ -1,0 +1,125 @@
+{
+  "_comment": "arms.config.json — arm -> model configuration (issue #5, pre-registration §3.1). Config, not code: the runner (evals/harness/runner.mjs) READS this file; it never hardcodes a model ID. Panel size is fixed at 5 agents / ideasPerAgent: 6 / maxRounds: 2 for every panel arm (A is the one exception - a single solo call, no panel) so the ONLY thing varying between arms is model assignment, per the pre-registration's design intent ('the only thing varying is model assignment').",
+  "_modelIdSource": "Model IDs verified against the claude-api skill (cached 2026-06-24) and docs/PREREGISTRATION.md §8.1 rate table: claude-opus-5, claude-sonnet-5, claude-haiku-4-5. OpenAI model IDs are placeholders pending the OpenAI adapter (§8.1 flags OpenAI rates as 'aggregator sites, not openai.com -- must verify before running'); openaiModelId marks them explicitly as UNVERIFIED so nothing downstream mistakes a placeholder for a priced, confirmed identifier.",
+  "panel": {
+    "size": 5,
+    "ideasPerAgent": 6,
+    "maxRounds": 2
+  },
+  "arms": {
+    "A": {
+      "label": "Solo baseline",
+      "purpose": "The control that can falsify the product -- single call, no panel, no rounds. Matched on total ideas requested (5 x 6 = 30).",
+      "mode": "solo",
+      "personaDisabled": false,
+      "totalIdeasRequested": 30,
+      "slots": [
+        { "persona": "solo", "model": "claude-sonnet-5" }
+      ]
+    },
+    "B": {
+      "label": "Homogeneous Haiku 4.5",
+      "purpose": "Cheap floor; tests NoveltyBench inverse-scaling (H4)",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_2", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_3", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_4", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_5", "model": "claude-haiku-4-5" }
+      ]
+    },
+    "C": {
+      "label": "Homogeneous Sonnet 5",
+      "purpose": "Mid tier",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "claude-sonnet-5" },
+        { "persona": "proposer_2", "model": "claude-sonnet-5" },
+        { "persona": "proposer_3", "model": "claude-sonnet-5" },
+        { "persona": "proposer_4", "model": "claude-sonnet-5" },
+        { "persona": "proposer_5", "model": "claude-sonnet-5" }
+      ]
+    },
+    "D": {
+      "label": "Homogeneous Opus 5",
+      "purpose": "Expensive ceiling",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "claude-opus-5" },
+        { "persona": "proposer_2", "model": "claude-opus-5" },
+        { "persona": "proposer_3", "model": "claude-opus-5" },
+        { "persona": "proposer_4", "model": "claude-opus-5" },
+        { "persona": "proposer_5", "model": "claude-opus-5" }
+      ]
+    },
+    "E": {
+      "label": "Anthropic tiered mix",
+      "purpose": "The 'combination' hypothesis (H2): does heterogeneity buy diversity cheaply? 2xHaiku, 2xSonnet, 1xOpus.",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_2", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_3", "model": "claude-sonnet-5" },
+        { "persona": "proposer_4", "model": "claude-sonnet-5" },
+        { "persona": "proposer_5", "model": "claude-opus-5" }
+      ]
+    },
+    "F": {
+      "label": "Anthropic inverted mix",
+      "purpose": "Separates heterogeneity from average capability: E and F differ in tier mix at similar spread. 2xOpus, 3xHaiku.",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "claude-opus-5" },
+        { "persona": "proposer_2", "model": "claude-opus-5" },
+        { "persona": "proposer_3", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_4", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_5", "model": "claude-haiku-4-5" }
+      ]
+    },
+    "G": {
+      "label": "Cross-provider mix",
+      "purpose": "The cross-provider claim (H3). 3xAnthropic (H/S/O), 2xOpenAI.",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_2", "model": "claude-sonnet-5" },
+        { "persona": "proposer_3", "model": "claude-opus-5" },
+        { "persona": "proposer_4", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
+        { "persona": "proposer_5", "model": "openai-large-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" }
+      ]
+    },
+    "H": {
+      "label": "Homogeneous OpenAI",
+      "purpose": "Control for G -- isolates 'cross-provider' from 'OpenAI is just different'.",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
+        { "persona": "proposer_2", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
+        { "persona": "proposer_3", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
+        { "persona": "proposer_4", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
+        { "persona": "proposer_5", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" }
+      ]
+    },
+    "A'": {
+      "label": "Ablation: persona-disabled panel",
+      "purpose": "Cheap, high-value ablation. Panel of 5 identical models with IDENTICAL personas (persona lever disabled). Isolates how much of the panel's benefit is persona engineering vs. merely sampling 5 times.",
+      "mode": "panel",
+      "personaDisabled": true,
+      "slots": [
+        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
+        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" }
+      ]
+    }
+  }
+}
