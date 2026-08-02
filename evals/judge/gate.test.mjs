@@ -1,18 +1,26 @@
-// Tests for the ρ validation gate (issue #4, AC7/AC8/AC10): fails closed,
-// lives as a store record, and judge calls are metered like any other cell.
+// Tests for the judge validation gate (issue #4, AC7/AC8/AC10; re-scoped by
+// #24): the gate now reads Si et al.'s split-half top/bottom-25% BALANCED
+// ACCURACY floored at 56.1%, fails closed, lives as a store record, retains
+// spearmanRho as a descriptive statistic, and refuses below a minimum n.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeTempStore } from "../../lib/store.mjs";
 import {
   spearmanRho,
+  balancedAccuracyTopBottom,
+  balancedAccuracySplitHalf,
   validateJudge,
+  resolveAccuracyFloor,
   validationKey,
   recordValidation,
   attachIdeaLevelScores,
   meterJudgeCall,
+  SI_ET_AL_BALANCED_ACCURACY_FLOOR,
+  MIN_IDEAS_N,
+  CONSTRUCTION_ID,
 } from "./gate.mjs";
 
-// ── spearmanRho ──────────────────────────────────────────────────────────────
+// ── spearmanRho (retained, descriptive) ──────────────────────────────────────
 
 test("spearmanRho: perfect positive correlation is 1", () => {
   assert.equal(spearmanRho([1, 2, 3, 4, 5], [10, 20, 30, 40, 50]), 1);
@@ -23,8 +31,6 @@ test("spearmanRho: perfect anti-correlation is -1", () => {
 });
 
 test("spearmanRho: handles tied ranks via average-rank convention", () => {
-  // a has a tie at positions 2,3 (both value 5); Spearman with average ranks
-  // should still report a strong positive correlation, not throw or NaN.
   const rho = spearmanRho([1, 5, 5, 8], [1, 6, 5, 9]);
   assert.ok(rho > 0.9, `expected strong positive correlation with ties, got ${rho}`);
 });
@@ -38,62 +44,179 @@ test("spearmanRho throws when an input has zero rank variance (all tied)", () =>
   assert.throws(() => spearmanRho([5, 5, 5], [1, 2, 3]), /zero variance/);
 });
 
-// ── AC7: validateJudge — perfect / anti-correlated / just-below-floor ──────
+// ── #24 AC1: the balanced-accuracy construction, against a HAND-WORKED oracle ──
 
-const FLOOR_CONFIG = { judge: { rhoFloor: 0.4 } };
-
-test("AC7 — perfect correlation (rho=1) passes against floor 0.4", () => {
-  const judgeScores = [1, 2, 3, 4, 5, 6, 7, 8];
-  const expertScores = [10, 20, 30, 40, 50, 60, 70, 80];
-  const { rho, floor, verdict } = validateJudge({ judgeScores, expertScores, config: FLOOR_CONFIG });
-  assert.equal(rho, 1);
-  assert.equal(floor, 0.4);
-  assert.equal(verdict, "pass");
+test("balancedAccuracyTopBottom — hand-worked example (expected value derived by hand)", () => {
+  // n=8 ideas, quantile 0.25 -> k = floor(8*0.25) = 2 ideas per side.
+  //
+  // referenceScores (idea 0..7):  [1, 2, 3, 4, 5, 6, 7, 8]
+  //   ascending order of indices: 0,1,2,3,4,5,6,7
+  //   NEGATIVES (bottom 2) = ideas {0, 1};  POSITIVES (top 2) = ideas {6, 7}
+  //   labelled set = {0, 1, 6, 7}; ideas 2..5 are discarded.
+  //
+  // evaluatorScores:              [9, 1, _, _, _, _, 2, 10]  (middle irrelevant)
+  //   labelled evaluator scores:  idea0=9, idea1=1, idea6=2, idea7=10
+  //   rank the 4 labelled by evaluator asc: idea1(1), idea6(2), idea0(9), idea7(10)
+  //   predicted NEGATIVE = bottom 2 = {1, 6};  predicted POSITIVE = top 2 = {0, 7}
+  //
+  //   POSITIVES {6,7} vs predicted-positive {0,7}: TP = {7}             -> sensitivity 1/2
+  //   NEGATIVES {0,1} vs predicted-negative {1,6}: TN = {1}             -> specificity 1/2
+  //   balanced accuracy = (1/2 + 1/2) / 2 = 0.5
+  const referenceScores = [1, 2, 3, 4, 5, 6, 7, 8];
+  const evaluatorScores = [9, 1, 5, 5, 5, 5, 2, 10];
+  const r = balancedAccuracyTopBottom({ referenceScores, evaluatorScores });
+  assert.equal(r.k, 2);
+  assert.equal(r.n, 8);
+  assert.equal(r.sensitivity, 0.5);
+  assert.equal(r.specificity, 0.5);
+  assert.equal(r.accuracy, 0.5);
 });
 
-test("AC7 — anti-correlated (rho=-1) drops", () => {
-  const judgeScores = [1, 2, 3, 4, 5, 6, 7, 8];
-  const expertScores = [80, 70, 60, 50, 40, 30, 20, 10];
-  const { rho, verdict } = validateJudge({ judgeScores, expertScores, config: FLOOR_CONFIG });
-  assert.equal(rho, -1);
-  assert.equal(verdict, "drop");
+test("balancedAccuracyTopBottom — perfect agreement is 1.0, perfect disagreement is 0.0", () => {
+  const reference = [1, 2, 3, 4, 5, 6, 7, 8];
+  const agree = balancedAccuracyTopBottom({ referenceScores: reference, evaluatorScores: [1, 2, 3, 4, 5, 6, 7, 8] });
+  assert.equal(agree.accuracy, 1);
+  // reverse the evaluator: the reference top-2 become the evaluator's bottom-2
+  const disagree = balancedAccuracyTopBottom({ referenceScores: reference, evaluatorScores: [8, 7, 6, 5, 4, 3, 2, 1] });
+  assert.equal(disagree.accuracy, 0);
 });
 
-test("AC7 — just-below-floor rho drops", () => {
-  // Constructed so rho lands just under 0.4: mostly concordant ranking with
-  // one large inversion to pull it down.
-  const judgeScores = [1, 2, 3, 4, 5, 6, 7, 8];
-  const expertScores = [8, 7, 3, 4, 5, 6, 2, 1];
-  const { rho, verdict } = validateJudge({ judgeScores, expertScores, config: FLOOR_CONFIG });
-  assert.ok(rho < 0.4, `test fixture must produce rho < 0.4, got ${rho}`);
-  assert.equal(verdict, "drop");
+test("balancedAccuracyTopBottom — validates inputs and quantile", () => {
+  assert.throws(() => balancedAccuracyTopBottom({ referenceScores: [1, 2], evaluatorScores: [1] }), /equal length/);
+  assert.throws(() => balancedAccuracyTopBottom({ referenceScores: [1, 2, 3, 4], evaluatorScores: [1, 2, 3, 4], quantile: 0.9 }), /quantile must be in/);
+  // n=2, quantile 0.25 -> k=0 -> cannot split
+  assert.throws(() => balancedAccuracyTopBottom({ referenceScores: [1, 2], evaluatorScores: [1, 2] }), /cannot form a top\/bottom split/);
 });
 
-test("AC7 — validateJudge throws if the floor is unset (delegates to resolveRhoFloor)", () => {
+// ── #24: the gate reads accuracy, floored at 56.1%; rho is retained descriptive ──
+
+// Build aligned expert/judge arrays whose balanced accuracy is exactly
+// correctPos/k (see the derivation in the test below).
+function makeAligned({ n, correctPos, quantile = 0.25 }) {
+  const k = Math.floor(n * quantile);
+  const expert = Array.from({ length: n }, (_, i) => i); // positives = top-k indices, negatives = bottom-k
+  const judge = new Array(n).fill(500); // middle band; discarded middle ideas keep it
+  const positives = [];
+  const negatives = [];
+  for (let i = 0; i < n; i++) {
+    if (i >= n - k) positives.push(i);
+    else if (i < k) negatives.push(i);
+  }
+  // correctPos true positives ranked highest; the rest ranked lowest.
+  positives.forEach((idx, j) => { judge[idx] = j < correctPos ? 1000 + j : 0 + j; });
+  // all negatives in the middle band so exactly (k-correctPos) of them fill the
+  // remaining predicted-positive slots.
+  negatives.forEach((idx, j) => { judge[idx] = 500 + j; });
+  return { expert, judge, k };
+}
+
+test("#24 — validateJudge reads balanced accuracy (correctPos/k), not rho; verdict against the 56.1% floor", () => {
+  // n=24, k=6. Balanced accuracy in this balanced 2k construction = correctPos/k.
+  const passCase = makeAligned({ n: 24, correctPos: 4 }); // 4/6 = 0.6667 >= 0.561 -> pass
+  const rPass = validateJudge({ judgeScores: passCase.judge, expertScores: passCase.expert });
+  assert.equal(rPass.metric, "balanced-accuracy");
+  assert.equal(rPass.construction, CONSTRUCTION_ID);
+  assert.equal(rPass.n, 24);
+  assert.ok(Math.abs(rPass.accuracy - 4 / 6) < 1e-9, `expected 4/6, got ${rPass.accuracy}`);
+  assert.equal(rPass.floor, SI_ET_AL_BALANCED_ACCURACY_FLOOR);
+  assert.equal(rPass.verdict, "pass");
+  assert.equal(typeof rPass.rho, "number"); // rho retained as a descriptive statistic
+
+  const dropCase = makeAligned({ n: 24, correctPos: 3 }); // 3/6 = 0.5 < 0.561 -> drop
+  const rDrop = validateJudge({ judgeScores: dropCase.judge, expertScores: dropCase.expert });
+  assert.ok(Math.abs(rDrop.accuracy - 0.5) < 1e-9, `expected 0.5, got ${rDrop.accuracy}`);
+  assert.equal(rDrop.verdict, "drop");
+});
+
+test("#24 — perfect judge passes, anti-correlated judge drops; rho tracks alongside", () => {
+  const expert = Array.from({ length: 24 }, (_, i) => i);
+  const perfect = validateJudge({ judgeScores: expert.slice(), expertScores: expert });
+  assert.equal(perfect.accuracy, 1);
+  assert.equal(perfect.verdict, "pass");
+  assert.equal(perfect.rho, 1);
+
+  const anti = validateJudge({ judgeScores: expert.slice().reverse(), expertScores: expert });
+  assert.equal(anti.accuracy, 0);
+  assert.equal(anti.verdict, "drop");
+  assert.equal(anti.rho, -1);
+});
+
+test("#24 — validateJudge REFUSES below the stated minimum n", () => {
+  const n = MIN_IDEAS_N - 1;
+  const expert = Array.from({ length: n }, (_, i) => i);
   assert.throws(
-    () => validateJudge({ judgeScores: [1, 2, 3], expertScores: [1, 2, 3], config: {} }),
-    /no rho floor is registered/,
+    () => validateJudge({ judgeScores: expert.slice(), expertScores: expert }),
+    new RegExp(`below the minimum ${MIN_IDEAS_N}`),
   );
+  // exactly at the minimum is allowed
+  const atMin = Array.from({ length: MIN_IDEAS_N }, (_, i) => i);
+  assert.doesNotThrow(() => validateJudge({ judgeScores: atMin.slice(), expertScores: atMin }));
 });
 
-test("AC7 — a drop is recorded with idea_level_metrics: 'dropped' via recordValidation + attach", (t) => {
+test("#24 — the floor constant is 0.561 and is the default; config may override", () => {
+  assert.equal(SI_ET_AL_BALANCED_ACCURACY_FLOOR, 0.561);
+  assert.equal(resolveAccuracyFloor(undefined), 0.561);
+  assert.equal(resolveAccuracyFloor({}), 0.561);
+  assert.equal(resolveAccuracyFloor({ judge: { accuracyFloor: 0.66 } }), 0.66);
+  assert.throws(() => resolveAccuracyFloor({ judge: { accuracyFloor: "0.66" } }), /must be a finite number/);
+});
+
+// ── #24: the human-human split-half construction that produces the floor ──────
+
+test("balancedAccuracySplitHalf — reproducible from a seed, reports a distribution", () => {
+  // Synthetic reviews with a clean signal: idea i's reviews all cluster near i,
+  // so a within-idea split should agree strongly and balanced accuracy is high.
+  // This is a HERMETIC exercise of the construction (no real payload); the real
+  // 56.1% reproduction against Si et al.'s reviews is the #16 real-data run.
+  const ideaReviews = Array.from({ length: 40 }, (_, i) => [i, i + 0.1, i - 0.1, i + 0.2]);
+  const a = balancedAccuracySplitHalf({ ideaReviews, splits: 25, seed: 7 });
+  const b = balancedAccuracySplitHalf({ ideaReviews, splits: 25, seed: 7 });
+  assert.deepEqual(a.values, b.values, "same seed must reproduce the same draws (state the seed, do not tune)");
+  assert.equal(a.values.length, 25);
+  assert.equal(a.n, 40);
+  assert.ok(a.mean > 0.9, `a clean within-idea signal should agree strongly, got mean ${a.mean}`);
+});
+
+test("balancedAccuracySplitHalf — refuses below MIN_IDEAS_N and on ideas with <2 reviews", () => {
+  const tooFew = Array.from({ length: MIN_IDEAS_N - 1 }, () => [1, 2]);
+  assert.throws(() => balancedAccuracySplitHalf({ ideaReviews: tooFew }), new RegExp(`below the minimum ${MIN_IDEAS_N}`));
+  const singleReview = Array.from({ length: MIN_IDEAS_N }, (_, i) => (i === 0 ? [1] : [1, 2]));
+  assert.throws(() => balancedAccuracySplitHalf({ ideaReviews: singleReview }), /fewer than 2 reviews/);
+});
+
+// ── #24: the widened validation record ────────────────────────────────────────
+
+test("#24 — recordValidation stores the widened { metric, construction, n, accuracy, floor, verdict, rho }", () => {
   const store = makeTempStore("judge-gate-test-");
-  const judgeHash = "judgehashabc1";
-  const { rho, floor, verdict } = validateJudge({
-    judgeScores: [1, 2, 3, 4, 5],
-    expertScores: [5, 4, 3, 2, 1],
-    config: FLOOR_CONFIG,
+  const judgeHash = "judgehashwide";
+  recordValidation(store, {
+    judgeHash, sliceId: "sliceW",
+    metric: "balanced-accuracy", construction: CONSTRUCTION_ID,
+    n: 147, accuracy: 0.62, floor: SI_ET_AL_BALANCED_ACCURACY_FLOOR, verdict: "pass", rho: 0.41,
   });
-  assert.equal(verdict, "drop");
-  recordValidation(store, { judgeHash, sliceId: "sliceA", rho, floor, verdict });
-
-  const result = attachIdeaLevelScores({ store, judgeHash, pools: [{ poolKey: "p1" }], ideaLevelScores: [{ idea: "x", score: 9 }] });
-  assert.equal(result.idea_level_metrics, "dropped");
-  assert.deepEqual(result.pools, [{ poolKey: "p1" }]);
-  assert.ok(!result.ideas, "idea-level scores must never be attached on a drop");
+  const stored = store.get(validationKey({ judgeHash, sliceId: "sliceW" }));
+  assert.deepEqual(stored.result, {
+    kind: "judge-validation",
+    metric: "balanced-accuracy",
+    construction: CONSTRUCTION_ID,
+    n: 147,
+    accuracy: 0.62,
+    floor: 0.561,
+    verdict: "pass",
+    rho: 0.41,
+  });
 });
 
-// ── AC8: fails closed ────────────────────────────────────────────────────────
+test("recordValidation requires a store, a valid verdict, a finite accuracy, and a positive-integer n", () => {
+  const store = makeTempStore("judge-gate-test-");
+  const base = { judgeHash: "x", sliceId: "y", accuracy: 0.6, floor: 0.561, verdict: "pass", n: 30, rho: 0.3 };
+  assert.throws(() => recordValidation(undefined, base), /store is required/);
+  assert.throws(() => recordValidation(store, { ...base, verdict: "maybe" }), /verdict must be/);
+  assert.throws(() => recordValidation(store, { ...base, accuracy: "high" }), /accuracy must be a finite number/);
+  assert.throws(() => recordValidation(store, { ...base, n: 0 }), /n must be a positive integer/);
+});
+
+// ── AC8: fails closed (unchanged behavior, new record shape) ──────────────────
 
 test("AC8 — attachIdeaLevelScores THROWS with no validation record at all", () => {
   const store = makeTempStore("judge-gate-test-");
@@ -106,7 +229,7 @@ test("AC8 — attachIdeaLevelScores THROWS with no validation record at all", ()
 test("AC8 — a recorded FAILING validation forces pool-level-only output", () => {
   const store = makeTempStore("judge-gate-test-");
   const judgeHash = "judgehashdrop";
-  recordValidation(store, { judgeHash, sliceId: "sliceB", rho: -0.2, floor: 0.4, verdict: "drop" });
+  recordValidation(store, { judgeHash, sliceId: "sliceB", accuracy: 0.5, floor: 0.561, verdict: "drop", n: 147, rho: -0.2 });
 
   const result = attachIdeaLevelScores({
     store,
@@ -122,7 +245,7 @@ test("AC8 — a recorded FAILING validation forces pool-level-only output", () =
 test("AC8 — a recorded PASSING validation attaches idea-level scores", () => {
   const store = makeTempStore("judge-gate-test-");
   const judgeHash = "judgehashpass";
-  recordValidation(store, { judgeHash, sliceId: "sliceC", rho: 0.85, floor: 0.4, verdict: "pass" });
+  recordValidation(store, { judgeHash, sliceId: "sliceC", accuracy: 0.7, floor: 0.561, verdict: "pass", n: 147, rho: 0.5 });
 
   const ideaLevelScores = [{ idea: "z", originality: 9, feasibility: 3 }];
   const result = attachIdeaLevelScores({ store, judgeHash, pools: [{ poolKey: "p1" }], ideaLevelScores });
@@ -135,12 +258,6 @@ test("validationKey is reserved and cannot collide with a real cellKey shape", (
   const key = validationKey({ judgeHash: "abc123", sliceId: "sliceA" });
   assert.equal(key, "judge-validation|judge=abc123|slice=sliceA");
   assert.ok(!key.startsWith("arm="), "validation keys must never look like a real cell key");
-});
-
-test("recordValidation requires a store and a valid verdict", () => {
-  const store = makeTempStore("judge-gate-test-");
-  assert.throws(() => recordValidation(undefined, { judgeHash: "x", sliceId: "y", rho: 1, floor: 0.4, verdict: "pass" }), /store is required/);
-  assert.throws(() => recordValidation(store, { judgeHash: "x", sliceId: "y", rho: 1, floor: 0.4, verdict: "maybe" }), /verdict must be/);
 });
 
 // ── AC10: judge calls are metered through lib/accounting.mjs and land in the store ──

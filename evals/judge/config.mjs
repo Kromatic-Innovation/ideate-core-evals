@@ -1,5 +1,14 @@
 // config.mjs — the ρ floor is read from config, never baked in (issue #4, AC9).
 //
+// ── #24 rescope note ────────────────────────────────────────────────────────
+// The GATE no longer reads a ρ floor: #24 replaced the (uninstantiable)
+// Spearman-ρ gate with Si et al.'s split-half top/bottom-25% balanced-accuracy
+// construction, floored at their reported 56.1%. That floor is a REGISTERED
+// constant living with the gate (SI_ET_AL_BALANCED_ACCURACY_FLOOR /
+// resolveAccuracyFloor in gate.mjs). `spearmanRho` is retained as a descriptive
+// statistic, and `resolveRhoFloor` below is kept for anyone who wants to
+// threshold that descriptive ρ explicitly — it is no longer on the gate path.
+//
 // ── Why there is no default number here ─────────────────────────────────────
 // docs/PREREGISTRATION.md §5.1 pins the floor to "the human-human inter-rater
 // agreement Si et al. themselves report — confirm their reported figure and

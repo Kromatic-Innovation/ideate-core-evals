@@ -1,18 +1,36 @@
-// gate.mjs — the ρ validation gate: fails closed, and lives in the store as a
-// RECORD, not a runtime flag (issue #4, AC7/AC8/AC10).
+// gate.mjs — the judge validation gate: fails closed, and lives in the store as
+// a RECORD, not a runtime flag (issue #4, AC7/AC8/AC10; re-scoped by #24).
 //
-// ── Why a store record, not a flag ──────────────────────────────────────────
-// docs/PREREGISTRATION.md §5's rule — "you cannot measure with an uncalibrated
-// instrument" — has to be ENFORCED, not just documented, or an unvalidated
-// judge could sit in the tree looking ready (exactly the anti-pattern the
-// issue's kickback/re-scope discussion names). A runtime flag (e.g. an env
-// var or an in-memory boolean some caller sets) can't be constructed by a
-// test without also faking the code path that would set it, and it vanishes
-// between process runs. A STORE RECORD (via the same `lib/store.mjs`
-// ResultsStore every other cell goes through) makes "has this judge been
-// validated, and did it pass" a durable, replayable, test-constructible fact:
-// a test can `store.put()` a validation record directly and assert the
-// scoring path honors (or refuses to honor) it, with no special-cased mock.
+// ── What the gate measures (re-scoped, #24) ─────────────────────────────────
+// docs/PREREGISTRATION.md §5.1 originally registered a **Spearman ρ ≥ 0.4**
+// gate, "in the neighborhood of the human-human inter-rater agreement Si et al.
+// themselves report — confirm their reported figure and set the floor to it."
+// Verified against the paper on 2026-08-02 (#24): Si et al. do **not** report a
+// human-human Spearman ρ, and footnote 11 explicitly rejects correlation-style
+// agreement metrics for their data. The number the ρ gate reached for does not
+// exist, so the gate cannot be instantiated as registered.
+//
+// The registered decision (recorded on #16, tracked into the pre-registration by
+// #23) replaces the metric with Si et al.'s OWN: the split-half top/bottom-25%
+// **balanced accuracy** construction of Lu et al. (2024), floored at Si et al.'s
+// reported human-human figure, **56.1%** (SI_ET_AL_BALANCED_ACCURACY_FLOOR
+// below). `spearmanRho` is **retained** — still computed and stored alongside
+// the gate result as a descriptive statistic — it is simply no longer what the
+// gate reads.
+//
+// ── The construction (Si et al. 2024, Section 5 / Table 11) ─────────────────
+//   1. Rank the ideas by a REFERENCE signal (for the gate: the expert-consensus
+//      score per idea; for the human-human floor: one random half of each
+//      idea's reviews).
+//   2. Take the top `quantile` and bottom `quantile` of ideas as the positive
+//      and negative classes (default 25% each; the middle 50% is discarded —
+//      too near the boundary to make a clean top/bottom decision).
+//   3. Have an EVALUATOR signal (for the gate: our judge's score; for the floor:
+//      the held-out other half of reviews) rank those same 2k labelled ideas,
+//      and predict its own top-k as positive / bottom-k as negative.
+//   4. Balanced accuracy = (sensitivity + specificity) / 2 over that 2k set.
+// It is NOT a rank correlation rescaled to look like an accuracy — it is the
+// genuine top/bottom-quartile balanced-accuracy metric.
 //
 // ── The validation record's key and shape ───────────────────────────────────
 // Key: `judge-validation|judge=${judgeHash}|slice=${sliceId}` — reserved,
@@ -20,25 +38,71 @@
 // key shape (lib/manifest.mjs's cellKey), and scoped per judge-prompt-version
 // (judgeHash) and per validation slice (sliceId identifies WHICH held-out
 // expert-scored slice validated this judge — e.g. a Si et al. subset id).
-// Record shape, matching ResultsStore.put()'s required fields exactly:
-//   result          = { kind: "judge-validation", rho, floor, verdict }
+// Record shape (#24 widened it from `{ rho, floor, verdict }` so a reader can
+// confirm WHICH computation produced the verdict):
+//   result = { kind: "judge-validation", metric, construction, n, accuracy,
+//              floor, verdict, rho }
+//     metric        = "balanced-accuracy" (the gate metric)
+//     construction  = human-readable id of the exact split (see CONSTRUCTION_ID)
+//     n             = number of ideas the accuracy was computed over
+//     accuracy      = the balanced accuracy the gate read
+//     floor         = the registered floor (SI_ET_AL_BALANCED_ACCURACY_FLOOR)
+//     verdict       = "pass" (accuracy >= floor) | "drop"
+//     rho           = Spearman ρ, retained as a descriptive statistic only
 //   resolvedModels  = { judge: <judgeModelId or "mixed"> }
 //   accounting      = { state: "completed" }
 //   costRows        = []  (a validation record's OWN accounting is separate
 //                          from the token cost of the calls that produced the
-//                          rho estimate; see meterJudgeCall for how the judge
-//                          calls THEMSELVES are metered)
+//                          judge scores; see meterJudgeCall)
 //
 // ── Fails closed: three-way disposition in attachIdeaLevelScores ────────────
 //   1. no validation record for this judgeHash at all       -> THROW
-//   2. a record exists, verdict "drop" (rho < floor)        -> pool-level only
-//   3. a record exists, verdict "pass" (rho >= floor)        -> attach idea-level
+//   2. a record exists, verdict "drop" (accuracy < floor)   -> pool-level only
+//   3. a record exists, verdict "pass" (accuracy >= floor)  -> attach idea-level
 // "Fails closed" means the ABSENCE of a record is treated exactly like a
 // KNOWN failure for the purpose of withholding idea-level scores — never
 // like an implicit pass.
 
-import { resolveRhoFloor } from "./config.mjs";
 import { costRow } from "../../lib/accounting.mjs";
+
+/**
+ * Si et al. 2024's reported human-human balanced accuracy — the floor this gate
+ * is registered at.
+ *
+ * 56.1% = the split-half top/bottom-25% balanced accuracy between Si et al.'s
+ * own expert reviewers (Si, Yang & Hashimoto 2024, "Can LLMs Generate Novel
+ * Research Ideas?", arXiv:2409.04109, Section 5 / Table 11 — the "Si et al.
+ * expert reviewers (human-human)" row). It is the human agreement ceiling for
+ * this task: an LLM judge that clears it tracks humans at least as well as
+ * humans track each other on the very metric the paper uses.
+ *
+ * This value is REGISTERED (not recomputed here): reproducing it from Si et
+ * al.'s released reviews is the human-gated real-data run (#16) — see
+ * balancedAccuracySplitHalf and docs/fetching-si-et-al.md. If that reproduction
+ * fails, this constant is revisited (#16), not silently kept.
+ */
+export const SI_ET_AL_BALANCED_ACCURACY_FLOOR = 0.561;
+
+/**
+ * Minimum number of ideas the gate will compute a balanced accuracy over.
+ *
+ * The metric splits ideas into a top and a bottom `quantile` (25% each). Below
+ * some n, each side holds so few ideas that a single idea's classification
+ * swings the reported accuracy by an unacceptable amount, and "top/bottom 25%"
+ * stops being a meaningful split. We require at least 20 ideas — at the default
+ * 0.25 quantile that is 5 ideas per side, so no single idea can move balanced
+ * accuracy by more than 10 points. The study's real validation slice carries
+ * 147 ideas (37 per side; comment on #24), comfortably above this floor; the
+ * minimum exists only to REFUSE a degenerate tiny slice loudly rather than
+ * emit a number computed on too few ideas to trust.
+ */
+export const MIN_IDEAS_N = 20;
+
+/** Default top/bottom quantile for the classes (Si et al. use 25%). */
+export const DEFAULT_QUANTILE = 0.25;
+
+/** Human-readable id of the exact construction, carried in the record. */
+export const CONSTRUCTION_ID = "si-et-al-2024/split-half-top-bottom-25pct-balanced-accuracy";
 
 /**
  * Rank an array of numbers, assigning TIED values the AVERAGE of the ranks
@@ -65,6 +129,9 @@ function rankWithTies(values) {
 /**
  * Spearman rank correlation between two equal-length numeric arrays: rank
  * both (average ranks for ties), then Pearson correlation on the ranks.
+ *
+ * Retained (#24) as a DESCRIPTIVE statistic reported alongside the gate — it is
+ * no longer what the gate reads.
  *
  * @param {number[]} a
  * @param {number[]} b
@@ -97,20 +164,214 @@ export function spearmanRho(a, b) {
 }
 
 /**
- * Compute the ρ gate's verdict for one judge, over one validation slice.
- * Reads the floor via resolveRhoFloor(config) — throws if unset (AC9).
+ * Order indices of `scores` by value ASCENDING, breaking ties by index
+ * ascending so the ordering — and therefore the top/bottom membership — is
+ * deterministic and hand-reproducible regardless of the input's original order.
+ */
+function orderByScoreAsc(scores) {
+  return scores
+    .map((v, i) => ({ v, i }))
+    .sort((a, b) => (a.v - b.v) || (a.i - b.i))
+    .map((x) => x.i);
+}
+
+/**
+ * The shared metric: split-half top/bottom-`quantile` balanced accuracy.
+ *
+ * `referenceScores` and `evaluatorScores` are aligned per-idea signals (same
+ * length, same idea order). The reference defines the ground-truth top/bottom
+ * classes; the evaluator predicts them.
+ *
+ *   k          = floor(n * quantile) ideas per side
+ *   positives  = the k ideas with the HIGHEST reference score (top quantile)
+ *   negatives  = the k ideas with the LOWEST reference score (bottom quantile)
+ *   the middle n - 2k ideas are discarded (not scored)
+ *   prediction = rank the 2k labelled ideas by EVALUATOR score; the evaluator's
+ *                own top-k are predicted positive, bottom-k predicted negative
+ *   balanced accuracy = (TP/k + TN/k) / 2, i.e. (sensitivity + specificity)/2
  *
  * @param {object} o
- *   @param {number[]} o.judgeScores    judge's scores/ranking basis for the slice
- *   @param {number[]} o.expertScores   Si et al. expert scores/ranking basis, same order
- *   @param {object} o.config           passed through to resolveRhoFloor
- * @returns {{rho: number, floor: number, verdict: "pass"|"drop"}}
+ *   @param {number[]} o.referenceScores  per-idea reference (ground-truth) score
+ *   @param {number[]} o.evaluatorScores  per-idea evaluator (predictor) score
+ *   @param {number}   [o.quantile]       top/bottom fraction (default 0.25)
+ * @returns {{ accuracy: number, k: number, n: number, sensitivity: number, specificity: number }}
+ */
+export function balancedAccuracyTopBottom({ referenceScores, evaluatorScores, quantile = DEFAULT_QUANTILE }) {
+  if (!Array.isArray(referenceScores) || !Array.isArray(evaluatorScores)) {
+    throw new Error("balancedAccuracyTopBottom: referenceScores and evaluatorScores must be arrays");
+  }
+  if (referenceScores.length !== evaluatorScores.length) {
+    throw new Error("balancedAccuracyTopBottom: referenceScores and evaluatorScores must be equal length (aligned per idea)");
+  }
+  if (!(quantile > 0 && quantile <= 0.5)) {
+    throw new Error(`balancedAccuracyTopBottom: quantile must be in (0, 0.5], got ${quantile}`);
+  }
+  const n = referenceScores.length;
+  const k = Math.floor(n * quantile);
+  if (k < 1) {
+    throw new Error(
+      `balancedAccuracyTopBottom: quantile ${quantile} of n=${n} rounds to 0 ideas per side — ` +
+        "cannot form a top/bottom split",
+    );
+  }
+  const refOrder = orderByScoreAsc(referenceScores);
+  const negatives = new Set(refOrder.slice(0, k)); // lowest-k reference scores
+  const positives = new Set(refOrder.slice(n - k)); // highest-k reference scores
+
+  // The labelled set is exactly positives ∪ negatives (disjoint: 2k <= n since
+  // quantile <= 0.5). Rank ONLY those ideas by evaluator score; predict the
+  // evaluator's own top-k positive, bottom-k negative.
+  const labelled = [...negatives, ...positives];
+  const labelledByEval = labelled
+    .map((idx) => ({ idx, v: evaluatorScores[idx] }))
+    .sort((a, b) => (a.v - b.v) || (a.idx - b.idx));
+  const predNegative = new Set(labelledByEval.slice(0, k).map((x) => x.idx));
+  const predPositive = new Set(labelledByEval.slice(k).map((x) => x.idx));
+
+  let tp = 0, tn = 0;
+  for (const idx of positives) if (predPositive.has(idx)) tp++;
+  for (const idx of negatives) if (predNegative.has(idx)) tn++;
+  const sensitivity = tp / k;
+  const specificity = tn / k;
+  return { accuracy: (sensitivity + specificity) / 2, k, n, sensitivity, specificity };
+}
+
+/** Deterministic PRNG (mulberry32) so the split-half derivation is
+ *  reproducible from a seed — required for hermetic tests and for stating the
+ *  seed of any reported number rather than reporting a single lucky draw. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** In-place Fisher–Yates shuffle of `arr` using `rand` (returns arr). */
+function shuffleInPlace(arr, rand) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+/**
+ * The human-human construction that PRODUCES the 56.1% floor: randomly split
+ * each idea's reviews into two halves, aggregate each half to a per-idea mean,
+ * and measure balanced accuracy of one half predicting the other's top/bottom
+ * classes. Because the split is random, repeat it `splits` times and report the
+ * DISTRIBUTION (mean + all draws), not a single lucky number.
+ *
+ * This is the load-bearing reproduction of Si et al.'s figure. Reproducing
+ * 56.1% requires their real released reviews (data/si-et-al/, gitignored, #16) —
+ * this function is exercised hermetically here on a synthetic fixture with a
+ * known answer, and against the real reviews only in the #16 real-data run.
+ *
+ * @param {object} o
+ *   @param {number[][]} o.ideaReviews  per-idea array of expert review scores
+ *     (each idea needs >= 2 reviews so it can be split into two non-empty halves)
+ *   @param {number}   [o.quantile]     top/bottom fraction (default 0.25)
+ *   @param {number}   [o.splits]       number of random half-splits (default 100)
+ *   @param {number}   [o.seed]         PRNG seed (default 1) — state it, don't tune it
+ * @returns {{ mean: number, values: number[], splits: number, n: number, quantile: number, seed: number }}
+ */
+export function balancedAccuracySplitHalf({ ideaReviews, quantile = DEFAULT_QUANTILE, splits = 100, seed = 1 }) {
+  if (!Array.isArray(ideaReviews)) {
+    throw new Error("balancedAccuracySplitHalf: ideaReviews must be an array of per-idea review-score arrays");
+  }
+  const n = ideaReviews.length;
+  if (n < MIN_IDEAS_N) {
+    throw new Error(
+      `balancedAccuracySplitHalf: n=${n} ideas is below the minimum ${MIN_IDEAS_N} — refusing to compute a ` +
+        "top/bottom split on too few ideas (see MIN_IDEAS_N).",
+    );
+  }
+  for (let i = 0; i < n; i++) {
+    if (!Array.isArray(ideaReviews[i]) || ideaReviews[i].length < 2) {
+      throw new Error(
+        `balancedAccuracySplitHalf: idea at index ${i} has fewer than 2 reviews — cannot split into two ` +
+          "non-empty halves (Si et al.'s construction splits the reviewers of each idea).",
+      );
+    }
+  }
+  const rand = mulberry32(seed);
+  const values = [];
+  for (let s = 0; s < splits; s++) {
+    const refMeans = new Array(n);
+    const evalMeans = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const reviews = ideaReviews[i].slice();
+      shuffleInPlace(reviews, rand);
+      const half = Math.floor(reviews.length / 2);
+      const refHalf = reviews.slice(0, half);
+      const evalHalf = reviews.slice(half);
+      refMeans[i] = refHalf.reduce((a, b) => a + b, 0) / refHalf.length;
+      evalMeans[i] = evalHalf.reduce((a, b) => a + b, 0) / evalHalf.length;
+    }
+    const { accuracy } = balancedAccuracyTopBottom({ referenceScores: refMeans, evaluatorScores: evalMeans, quantile });
+    values.push(accuracy);
+  }
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  return { mean, values, splits, n, quantile, seed };
+}
+
+/**
+ * Compute the judge gate's verdict for one judge, over one validation slice.
+ *
+ * The gate reads the split-half top/bottom-25% BALANCED ACCURACY of the judge
+ * against the expert-consensus ranking, and compares it to the registered floor
+ * (SI_ET_AL_BALANCED_ACCURACY_FLOOR, overridable via config.judge.accuracyFloor).
+ * `spearmanRho` is retained and returned as a descriptive statistic only.
+ *
+ * Refuses (throws) below MIN_IDEAS_N rather than reporting a number computed on
+ * too few ideas.
+ *
+ * @param {object} o
+ *   @param {number[]} o.judgeScores    judge's per-idea score, same idea order as expertScores
+ *   @param {number[]} o.expertScores   Si et al. expert-consensus per-idea score
+ *   @param {object}   [o.config]       config.judge.accuracyFloor overrides the floor; config.judge.quantile the quantile
+ * @returns {{ metric: string, construction: string, n: number, accuracy: number, floor: number, verdict: "pass"|"drop", rho: number }}
  */
 export function validateJudge({ judgeScores, expertScores, config }) {
-  const floor = resolveRhoFloor(config);
+  if (!Array.isArray(judgeScores) || !Array.isArray(expertScores)) {
+    throw new Error("validateJudge: judgeScores and expertScores must be arrays");
+  }
+  if (judgeScores.length !== expertScores.length) {
+    throw new Error("validateJudge: judgeScores and expertScores must be equal length (aligned per idea)");
+  }
+  const n = judgeScores.length;
+  if (n < MIN_IDEAS_N) {
+    throw new Error(
+      `validateJudge: n=${n} ideas is below the minimum ${MIN_IDEAS_N} — refusing to compute a top/bottom ` +
+        "balanced accuracy on too few ideas (see MIN_IDEAS_N). Widen the validation slice.",
+    );
+  }
+  const quantile = config && config.judge && typeof config.judge.quantile === "number" ? config.judge.quantile : DEFAULT_QUANTILE;
+  const floor = resolveAccuracyFloor(config);
+  const { accuracy } = balancedAccuracyTopBottom({ referenceScores: expertScores, evaluatorScores: judgeScores, quantile });
   const rho = spearmanRho(judgeScores, expertScores);
-  const verdict = rho >= floor ? "pass" : "drop";
-  return { rho, floor, verdict };
+  const verdict = accuracy >= floor ? "pass" : "drop";
+  return { metric: "balanced-accuracy", construction: CONSTRUCTION_ID, n, accuracy, floor, verdict, rho };
+}
+
+/**
+ * Resolve the balanced-accuracy floor. Unlike the (now descriptive-only) ρ
+ * floor, this floor IS registered — Si et al.'s reported 56.1% — so the
+ * default is the registered constant, and config may override it only with an
+ * explicit finite number.
+ */
+export function resolveAccuracyFloor(config) {
+  const override = config && config.judge ? config.judge.accuracyFloor : undefined;
+  if (override === undefined) return SI_ET_AL_BALANCED_ACCURACY_FLOOR;
+  if (typeof override !== "number" || !Number.isFinite(override)) {
+    throw new Error(
+      `resolveAccuracyFloor: config.judge.accuracyFloor must be a finite number when set, got ${JSON.stringify(override)}`,
+    );
+  }
+  return override;
 }
 
 /** Reserved, namespaced key for a judge-validation record — never collides
@@ -124,23 +385,33 @@ export function validationKey({ judgeHash, sliceId }) {
 
 /**
  * Write a judge-validation record into the store. This IS the gate: nothing
- * about "is this judge validated" exists anywhere else in memory or in
- * config — only what has been put() here.
+ * about "is this judge validated" exists anywhere else in memory or in config —
+ * only what has been put() here. The record body (#24) carries the full
+ * computation so a reader can confirm which metric produced the verdict.
  *
  * @param {object} store  a lib/store.mjs ResultsStore
  * @param {object} o
  *   @param {string} o.judgeHash
  *   @param {string} o.sliceId
- *   @param {number} o.rho
+ *   @param {number} o.accuracy   the balanced accuracy the gate read
  *   @param {number} o.floor
  *   @param {"pass"|"drop"} o.verdict
- *   @param {string} [o.judgeModel]  the judge model id, or omit/pass "mixed"
- *     when the validated judge spans multiple models (cross-judge matrix).
+ *   @param {number} o.n          number of ideas the accuracy was computed over
+ *   @param {number} o.rho        Spearman ρ, retained as a descriptive statistic
+ *   @param {string} [o.metric]        default "balanced-accuracy"
+ *   @param {string} [o.construction]  default CONSTRUCTION_ID
+ *   @param {string} [o.judgeModel]    judge model id, or "mixed" (default)
  */
-export function recordValidation(store, { judgeHash, sliceId, rho, floor, verdict, judgeModel = "mixed" }) {
+export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, verdict, n, rho, metric = "balanced-accuracy", construction = CONSTRUCTION_ID, judgeModel = "mixed" }) {
   if (!store) throw new Error("recordValidation: store is required");
   if (verdict !== "pass" && verdict !== "drop") {
     throw new Error(`recordValidation: verdict must be "pass" or "drop", got ${JSON.stringify(verdict)}`);
+  }
+  if (typeof accuracy !== "number" || !Number.isFinite(accuracy)) {
+    throw new Error("recordValidation: accuracy must be a finite number (the balanced accuracy the gate read)");
+  }
+  if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
+    throw new Error("recordValidation: n must be a positive integer (the idea count the accuracy was computed over)");
   }
   const key = validationKey({ judgeHash, sliceId });
   return store.put({
@@ -149,7 +420,7 @@ export function recordValidation(store, { judgeHash, sliceId, rho, floor, verdic
     briefId: sliceId,
     replicate: 0,
     cfg: judgeHash,
-    result: { kind: "judge-validation", rho, floor, verdict },
+    result: { kind: "judge-validation", metric, construction, n, accuracy, floor, verdict, rho },
     resolvedModels: { judge: judgeModel },
     accounting: { state: "completed" },
     costRows: [],
@@ -157,16 +428,9 @@ export function recordValidation(store, { judgeHash, sliceId, rho, floor, verdic
 }
 
 /**
- * Look up every validation record for `judgeHash` via the store's INDEX only
- * (store.list() — never reads a body just to answer "is there a passing
- * record"). Returns the parsed { rho, floor, verdict } bodies... actually
- * verdict/rho/floor are NOT in the index (list() only returns index
- * metadata: key/state/armId/briefId/replicate/cfg/storedAt — see
- * lib/store.mjs), so this reads the matching bodies via store.get(), but
- * only for entries whose key already matches the judge-validation namespace
- * for this judgeHash — i.e. it still never scans/reads unrelated cells'
- * bodies, it just isn't index-only for the (small, O(1)-per-judge) set of
- * validation records themselves.
+ * Look up every validation record for `judgeHash`. Reads only the bodies whose
+ * key already matches the judge-validation namespace for this judgeHash — it
+ * never scans/reads unrelated cells' bodies.
  */
 function findValidationRecords(store, judgeHash) {
   const prefix = `judge-validation|judge=${judgeHash}|`;
@@ -181,10 +445,10 @@ function findValidationRecords(store, judgeHash) {
  *   - no validation record for judgeHash at all           -> throws
  *   - a record exists with verdict "drop"                 -> pool-level only
  *   - a record exists with verdict "pass"                 -> idea-level attached
- * If multiple validation records exist for this judgeHash (e.g. across
- * multiple slices), ANY passing record is sufficient to attach — the study
- * only needs one confirmed calibration to trust the instrument; a dropped
- * record from a DIFFERENT slice does not retroactively invalidate a pass.
+ * If multiple validation records exist for this judgeHash (e.g. across multiple
+ * slices), ANY passing record is sufficient to attach — the study only needs one
+ * confirmed calibration to trust the instrument; a dropped record from a
+ * DIFFERENT slice does not retroactively invalidate a pass.
  *
  * @param {object} o
  *   @param {object} o.store         lib/store.mjs ResultsStore
@@ -208,10 +472,10 @@ export function attachIdeaLevelScores({ store, judgeHash, pools, ideaLevelScores
 
   const passing = records.find((r) => r.result && r.result.verdict === "pass");
   if (!passing) {
-    // Every record on file for this judge is a "drop" — pool-level-only
-    // output, idea-level metrics explicitly marked dropped rather than just
-    // omitted (so a downstream report can distinguish "we chose not to
-    // compute this" from "this field is simply absent").
+    // Every record on file for this judge is a "drop" — pool-level-only output,
+    // idea-level metrics explicitly marked dropped rather than just omitted (so
+    // a downstream report can distinguish "we chose not to compute this" from
+    // "this field is simply absent").
     return { idea_level_metrics: "dropped", pools };
   }
 
