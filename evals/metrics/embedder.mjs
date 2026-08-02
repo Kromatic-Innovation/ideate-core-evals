@@ -108,6 +108,23 @@ export function fixtureEmbedder(fixtures) {
  * rather than trusting response order to match request order, since nothing
  * in Voyage's docs guarantees that and every function in this directory
  * (clustering.mjs, diversity.mjs) assumes strict input-order correspondence.
+ *
+ * ── Transient-failure retry (429 / 5xx), bounded ────────────────────────────
+ * A rate-limit (`429`) or server (`5xx`) response is the ONE class of error
+ * that is expected to be retried — failing closed on it kills a whole run,
+ * re-spending every chunk already paid for before the failing one (see issue
+ * #31). Each chunk's POST is therefore retried up to `maxRetries` times with
+ * bounded exponential backoff (`baseDelayMs * 2**attempt`, capped at
+ * `maxDelayMs`), honoring a `retry-after` response header when present (parsed
+ * as either delta-seconds or an HTTP-date, still capped at `maxDelayMs` so a
+ * hostile/huge header can't hang a run). Every OTHER non-2xx — any non-429
+ * `4xx` (a bad key, a malformed request) — fails IMMEDIATELY with the same
+ * loud error as before: those are not transient and must not be retried. Retry
+ * happens INSIDE the chunk loop, before a chunk's vectors are written to their
+ * output slots, so the `results = new Array(texts.length)` preallocation
+ * invariant is untouched — a retried chunk still lands in exactly its slots.
+ * `sleepImpl` is injected (default: a real `setTimeout` promise) purely so
+ * tests can drive the retry path with a no-op sleep and never actually wait.
  * Every returned vector is L2-normalized defensively — Voyage returns unit
  * vectors by default, but re-normalizing here costs nothing and removes an
  * entire class of "was this actually unit-length" doubt from every
@@ -137,9 +154,28 @@ export function fixtureEmbedder(fixtures) {
  * @param {string} [opts.inputType]  optional Voyage `input_type` ("query" |
  *   "document") — omitted from the request body entirely when not supplied,
  *   matching Voyage's own "omit for symmetric use" default behavior.
+ * @param {number} [opts.maxRetries]  max RETRIES (not total attempts) for a
+ *   transient 429/5xx chunk POST, default 5. `0` disables retry entirely.
+ * @param {number} [opts.baseDelayMs]  base backoff, default 500ms — the delay
+ *   before the first retry; doubles each subsequent attempt.
+ * @param {number} [opts.maxDelayMs]  backoff cap, default 30000ms — also caps
+ *   any `retry-after` the server sends, so a huge header can't hang a run.
+ * @param {(ms: number) => Promise<void>} [opts.sleepImpl]  injected sleep,
+ *   default a real setTimeout promise — the seam that lets tests exercise the
+ *   retry/backoff path with a no-op sleep, never actually waiting.
  */
 export function voyageEmbedder(opts = {}) {
-  const { apiKey, fetchImpl = globalThis.fetch, model = "voyage-4-lite", batchSize = 128, inputType } = opts;
+  const {
+    apiKey,
+    fetchImpl = globalThis.fetch,
+    model = "voyage-4-lite",
+    batchSize = 128,
+    inputType,
+    maxRetries = 5,
+    baseDelayMs = 500,
+    maxDelayMs = 30000,
+    sleepImpl = defaultSleep,
+  } = opts;
 
   const embedder = {
     modelId: model,
@@ -170,18 +206,34 @@ export function voyageEmbedder(opts = {}) {
           ...(inputType ? { input_type: inputType } : {}),
         };
 
-        const res = await fetchImpl("https://api.voyageai.com/v1/embeddings", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(body),
-        });
+        // Retry a transient 429/5xx with bounded exponential backoff; any
+        // other non-2xx (a non-429 4xx: bad key, malformed request) fails
+        // immediately with the loud, unchanged error message. See the
+        // function header for why this lives inside the chunk loop.
+        let res;
+        for (let attempt = 0; ; attempt++) {
+          res = await fetchImpl("https://api.voyageai.com/v1/embeddings", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify(body),
+          });
 
-        if (!res.ok) {
-          const text = await res.text().catch(() => "<unreadable body>");
-          throw new Error(`voyageEmbedder.embed: Voyage API returned ${res.status} ${res.statusText}: ${text}`);
+          if (res.ok) break;
+
+          const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
+          if (!retryable || attempt >= maxRetries) {
+            const text = await res.text().catch(() => "<unreadable body>");
+            throw new Error(`voyageEmbedder.embed: Voyage API returned ${res.status} ${res.statusText}: ${text}`);
+          }
+
+          // Honor `retry-after` when the server sent one, else exponential
+          // backoff; either way capped at maxDelayMs so a run can't hang.
+          const retryAfterMs = parseRetryAfterMs(res);
+          const backoffMs = retryAfterMs != null ? retryAfterMs : baseDelayMs * 2 ** attempt;
+          await sleepImpl(Math.min(maxDelayMs, backoffMs));
         }
 
         const payload = await res.json();
@@ -213,6 +265,55 @@ export function voyageEmbedder(opts = {}) {
   };
 
   return embedder;
+}
+
+/** The default backoff sleep: a real setTimeout promise. Injected via
+ * `sleepImpl` so tests drive the retry path without ever actually waiting. */
+function defaultSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Read a `retry-after` header off a fetch Response and return it in
+ * milliseconds, or `null` when the header is absent/unparseable (caller then
+ * falls back to exponential backoff). Handles both header container shapes —
+ * a real `Headers` object (`.get`) and a plain object (the fake fetches tests
+ * inject) — and both RFC-7231 forms: delta-seconds (e.g. `"2"`) and an
+ * HTTP-date (e.g. `"Wed, 21 Oct 2026 07:28:00 GMT"`). A negative/NaN result is
+ * treated as absent so a stale date can't produce a negative delay.
+ *
+ * @param {{ headers?: unknown }} res
+ * @returns {number | null}
+ */
+function parseRetryAfterMs(res) {
+  const headers = res && res.headers;
+  if (!headers) return null;
+
+  let raw = null;
+  if (typeof headers.get === "function") {
+    raw = headers.get("retry-after");
+  } else if (typeof headers === "object") {
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "retry-after") {
+        raw = headers[key];
+        break;
+      }
+    }
+  }
+  if (raw == null || raw === "") return null;
+
+  const asSeconds = Number(raw);
+  if (Number.isFinite(asSeconds)) {
+    return asSeconds >= 0 ? asSeconds * 1000 : null;
+  }
+
+  const asDateMs = Date.parse(raw);
+  if (Number.isFinite(asDateMs)) {
+    const deltaMs = asDateMs - Date.now();
+    return deltaMs > 0 ? deltaMs : null;
+  }
+
+  return null;
 }
 
 /**

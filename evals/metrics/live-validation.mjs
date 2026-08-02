@@ -38,6 +38,65 @@ function fmt(n) {
   return Number.isFinite(n) ? n.toFixed(4) : String(n);
 }
 
+/**
+ * Pure random-pool reporter — the single source of truth for both what the
+ * random-pool control PRINTS and whether it FAILS the run. It calls
+ * validation.mjs's `randomPoolVerdict` and turns that verdict into console
+ * lines plus a run-fail flag, so the caller no longer re-derives `ok` at two
+ * separate sites (once for the distinct_k half, once for the diversity-floor
+ * half). Extracting it makes the shipped gating rule reachable from a hermetic
+ * test WITHOUT a live embedder: previously `live-validation.mjs` was
+ * unimportable (its module-scope `main()` fired a billed run on import), so its
+ * gating had zero coverage and the tested `verdict.failed` was dead — the two
+ * could drift silently. Now `failed` here IS `verdict.failed`, which
+ * validation.test.mjs asserts, so the tested rule is the shipped rule.
+ *
+ * @param {{ distinctK: number, diversity: number, poolSize: number, datHigh: number, orderingHolds: boolean }} args
+ * @returns {{ lines: Array<{ level: "log" | "error", text: string }>, verdict: ReturnType<typeof randomPoolVerdict>, failed: boolean }}
+ */
+export function renderRandomPoolReport({ distinctK, diversity, poolSize, datHigh, orderingHolds }) {
+  const verdict = randomPoolVerdict({ distinctK, diversity, poolSize, datHigh, orderingHolds });
+  const lines = [];
+
+  if (verdict.distinctKPass) {
+    lines.push({
+      level: "log",
+      text: `  PASS: random pool stays overwhelmingly distinct (distinct_k >= ${Math.ceil(poolSize * 0.9)} of ${poolSize})`,
+    });
+  } else {
+    lines.push({
+      level: "error",
+      text:
+        `  FAIL: random pool did not stay distinct enough (want distinct_k >= 90% of pool, got ${distinctK}). ` +
+        "Reported honestly, not worked around.",
+    });
+  }
+
+  if (verdict.floorVerdict === "inconclusive") {
+    lines.push({
+      level: "log",
+      text:
+        `  INCONCLUSIVE: diversity=${fmt(diversity)} is printed but not judged against the live DAT-high ` +
+        `floor of ${fmt(datHigh)} -- the floor is uncalibrated because the DAT ordering did not hold on this embedder ` +
+        "(see the DAT replication FAIL above).",
+    });
+  } else if (verdict.floorVerdict === "pass") {
+    lines.push({ level: "log", text: `  PASS: random pool diversity clears the live DAT-high diversity floor of ${fmt(datHigh)}` });
+  } else {
+    lines.push({
+      level: "error",
+      text:
+        `  FAIL: random pool diversity (${fmt(diversity)}) did not clear the live DAT-high floor of ` +
+        `${fmt(datHigh)}. Reported honestly, not worked around.`,
+    });
+  }
+
+  // The run-fail decision IS verdict.failed — the caller consumes this rather
+  // than re-deriving the rule inline, so the rule validation.test.mjs asserts
+  // is exactly the rule the live script gates on.
+  return { lines, verdict, failed: verdict.failed };
+}
+
 async function main() {
   const apiKey = process.env.VOYAGE_API_KEY;
   if (!apiKey) {
@@ -115,39 +174,22 @@ async function main() {
   // against it would mislead in either direction -- report INCONCLUSIVE
   // instead and let the DAT-ordering failure above be the thing that fails
   // the run.
-  const verdict = randomPoolVerdict({
+  // The random-pool control's printing AND its run-fail decision both come
+  // from the one pure reporter (renderRandomPoolReport -> randomPoolVerdict),
+  // so the run-failing rule is exactly the one validation.test.mjs asserts and
+  // the caller no longer re-derives `ok` at two separate sites.
+  const report = renderRandomPoolReport({
     distinctK: controls.random.distinctK,
     diversity: controls.random.diversity,
     poolSize: RANDOM_TEXT_POOL.length,
     datHigh: dat.high,
     orderingHolds: dat.orderingHolds,
   });
-
-  if (verdict.distinctKPass) {
-    console.log(`  PASS: random pool stays overwhelmingly distinct (distinct_k >= ${Math.ceil(RANDOM_TEXT_POOL.length * 0.9)} of ${RANDOM_TEXT_POOL.length})`);
-  } else {
-    console.error(
-      `  FAIL: random pool did not stay distinct enough (want distinct_k >= 90% of pool, got ${controls.random.distinctK}). ` +
-        "Reported honestly, not worked around.",
-    );
-    ok = false;
+  for (const line of report.lines) {
+    if (line.level === "error") console.error(line.text);
+    else console.log(line.text);
   }
-
-  if (verdict.floorVerdict === "inconclusive") {
-    console.log(
-      `  INCONCLUSIVE: diversity=${fmt(controls.random.diversity)} is printed but not judged against the live DAT-high ` +
-        `floor of ${fmt(dat.high)} -- the floor is uncalibrated because the DAT ordering did not hold on this embedder ` +
-        "(see the DAT replication FAIL above).",
-    );
-  } else if (verdict.floorVerdict === "pass") {
-    console.log(`  PASS: random pool diversity clears the live DAT-high diversity floor of ${fmt(dat.high)}`);
-  } else {
-    console.error(
-      `  FAIL: random pool diversity (${fmt(controls.random.diversity)}) did not clear the live DAT-high floor of ` +
-        `${fmt(dat.high)}. Reported honestly, not worked around.`,
-    );
-    ok = false;
-  }
+  if (report.failed) ok = false;
 
   console.log(`\n[live-validation] usage: ${embedder.usage.total_tokens} total_tokens`);
   console.log(`[live-validation] ${ok ? "ALL CHECKS PASSED" : "ONE OR MORE CHECKS FAILED"}`);
@@ -155,7 +197,15 @@ async function main() {
   if (!ok) process.exitCode = 1;
 }
 
-main().catch((err) => {
-  console.error("[live-validation] failed:", err.stack || err.message);
-  process.exitCode = 1;
-});
+// Only auto-run when this file is the actual entry point
+// (`node evals/metrics/live-validation.mjs`), never when it is imported for its
+// exports (e.g. renderRandomPoolReport from live-validation.test.mjs). Without
+// this guard — matching evals/run.mjs's own guard — importing this module in a
+// test would immediately fire main(), which makes real, billed Voyage API calls
+// and would violate the repo's no-network-in-tests invariant.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    console.error("[live-validation] failed:", err.stack || err.message);
+    process.exitCode = 1;
+  });
+}
