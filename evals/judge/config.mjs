@@ -78,6 +78,28 @@ export const JUDGE_VALIDATION_MAPPING = Object.freeze({
   expertColumn: SI_ET_AL_EXPERT_SCORE_FIELD,
 });
 
+/**
+ * The research brief the judge scores the Si et al. slice ideas AGAINST during
+ * validation (issue #36). The judge's scoring prompt requires a non-empty
+ * `RESEARCH BRIEF` (score.mjs `buildJudgeScoringPrompt`), but the expert-score
+ * slice carries idea text only — no per-idea brief — so validation supplies one
+ * shared brief describing the Si et al. research-ideation task.
+ *
+ * NOTE (reversible default, #36 / self-heal aperture #250): this wording is a
+ * safe, reversible default — it lives in one named constant, changing it changes
+ * nothing irreversible, and it only takes effect when the REAL validation is run
+ * (issue #16, operator + live judge key). The #16 operator should confirm or
+ * override it (`runJudgeValidation({ briefText })`), and consider whether the
+ * study's per-topic briefs should be used instead of one shared brief. Recorded
+ * so the choice is visible rather than hidden at a call site.
+ */
+export const SI_ET_AL_VALIDATION_BRIEF =
+  "Propose a novel, expert-level research idea in natural language processing. " +
+  "This is the research-ideation task underlying the Si et al. 2024 expert-review " +
+  "study (arXiv:2409.04109): ideas span prompting-related NLP topics — bias, coding, " +
+  "safety, multilingual, factuality, math, and uncertainty — and are judged as " +
+  "standalone research proposals.";
+
 // ── #36: registered LLM-evaluator comparators (Si et al. Table 11) ──
 // Both are balanced accuracy on Si et al.'s OWN split-half top/bottom-25%
 // construction, so our judge's number is directly comparable. Registered before

@@ -31,7 +31,7 @@ import { validateJudge, recordValidation } from "./gate.mjs";
 import { judgeScoresForAxis, computeJudgeHash } from "./score.mjs";
 import { assertAxesNotCollapsed } from "./prompt.mjs";
 import { providerOf } from "./matrix.mjs";
-import { JUDGE_VALIDATION_AXIS, SI_ET_AL_EXPERT_SCORE_FIELD } from "./config.mjs";
+import { JUDGE_VALIDATION_AXIS, SI_ET_AL_EXPERT_SCORE_FIELD, SI_ET_AL_VALIDATION_BRIEF } from "./config.mjs";
 
 /** Mean of an idea's expert review scores (its expert consensus for the column).
  *  This is a per-idea aggregate over REVIEWS of one column — not an axis average. */
@@ -67,6 +67,10 @@ export function judgeValidationSliceId({ axis, expertScoreField }) {
  *   @param {string}  [o.axis]         judge axis (default JUDGE_VALIDATION_AXIS = "originality")
  *   @param {string}  [o.expertScoreField]  expert column (default SI_ET_AL_EXPERT_SCORE_FIELD = "overall_score")
  *   @param {string}  [o.sliceRoot]    slice root (default data/si-et-al via readSiEtAlSlice)
+ *   @param {string}  [o.briefText]    the research brief the judge scores against
+ *     (default SI_ET_AL_VALIDATION_BRIEF — the judge scoring prompt requires a
+ *     non-empty brief; the slice carries no per-idea brief, so one shared brief
+ *     is supplied). A reversible default (#36 / #250) — the #16 operator may override.
  *   @param {object}  [o.config]       forwarded to validateJudge (accuracyFloor/quantile overrides)
  *   @param {number}  [o.seed]         judge presentation seed (default 1)
  *   @param {"batch"|"single"} [o.mode]  default "batch"
@@ -81,6 +85,7 @@ export async function runJudgeValidation({
   axis = JUDGE_VALIDATION_AXIS,
   expertScoreField = SI_ET_AL_EXPERT_SCORE_FIELD,
   sliceRoot,
+  briefText = SI_ET_AL_VALIDATION_BRIEF,
   config,
   seed = 1,
   mode = "batch",
@@ -98,8 +103,14 @@ export async function runJudgeValidation({
   // 2. Text-only judge inputs, in slice.ideas order (the leakage boundary).
   const pool = sliceToJudgePool(slice);
 
-  // 3. Judge scores the pool.
-  const resp = await judgeProvider.score({ candidates: pool }, { judgeModel, mode, seed, timestamp });
+  // 3. Judge scores the pool. The real judge scoring prompt requires a non-empty
+  //    RESEARCH BRIEF (score.mjs buildJudgeScoringPrompt), and the slice carries
+  //    no per-idea brief, so the shared validation brief is threaded here — the
+  //    payload shape (`{ briefText, candidates }`) matches assembleJudgePayload's.
+  if (typeof briefText !== "string" || briefText.length === 0) {
+    throw new Error("runJudgeValidation: briefText must be a non-empty string (the research brief the judge scores against)");
+  }
+  const resp = await judgeProvider.score({ briefText, candidates: pool }, { judgeModel, mode, seed, timestamp });
   if (!resp || resp.terminalState !== "completed") {
     const detail = resp ? (resp.detail || resp.failureKind || resp.terminalState) : "no response";
     throw new Error(

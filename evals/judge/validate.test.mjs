@@ -197,6 +197,40 @@ test("runJudgeValidation — a score/idea count mismatch throws rather than vali
   );
 });
 
+test("runJudgeValidation — supplies the non-empty RESEARCH BRIEF the real judge requires (regression: #36 Seer CRITICAL)", async () => {
+  const root = tmpRoot("brief");
+  writeValidationFixture(root);
+  const store = makeTempStore("judge-validate-brief-");
+  // Enforce the real AnthropicJudgeProvider contract: the payload MUST carry a
+  // non-empty briefText, or buildJudgeScoringPrompt throws. (MockJudgeProvider
+  // ignores briefText, which is exactly why it missed this — hence this stub.)
+  let seenBrief = null;
+  const provider = {
+    async score(payload, { judgeModel }) {
+      if (typeof payload.briefText !== "string" || payload.briefText.length === 0) {
+        throw new Error("stub judge: payload.briefText must be a non-empty string");
+      }
+      seenBrief = payload.briefText;
+      const scores = payload.candidates.map((_c, index) => ({
+        originality: EXPERT_BY_INDEX[index],
+        feasibility: 4,
+        fluency: (index % 7) + 1,
+        flexibility: (index % 5) + 2,
+      }));
+      return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
+    },
+  };
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  assert.equal(out.verdict, "pass");
+  assert.ok(seenBrief && seenBrief.length > 0, "the judge must receive a non-empty research brief");
+
+  // An explicitly empty briefText is rejected rather than sent to the judge.
+  await assert.rejects(
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, briefText: "" }),
+    /briefText must be a non-empty string/,
+  );
+});
+
 test("runJudgeValidation — validates its arguments", async () => {
   const store = makeTempStore("judge-validate-args-");
   const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
