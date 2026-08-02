@@ -1,8 +1,21 @@
-// integration.test.mjs — AC5: an integration test with the mock provider
-// covering the FULL path: plan -> (per cell) generate -> account -> store ->
-// reconcile. This is the one test that exercises every module the runner
-// composes end-to-end, rather than isolating one behavior at a time (that's
-// runner.test.mjs's job). Hermetic: temp store dir, mock provider, no network.
+// integration.test.mjs — an integration test with the mock provider covering
+// the GENERATION path end-to-end: plan -> (per cell) generate -> account ->
+// store -> reconcile, plus a composition-root wiring test for the JUDGE seam
+// (pool -> judge scores -> store).
+//
+// ── What this crosses, stated honestly (issue #25) ──────────────────────────
+// This was originally headed "covering the FULL path", but it does not cross
+// every seam of the study and that header over-advertised its coverage. The
+// seams it ACTUALLY crosses:
+//   - GENERATION: plan -> generate (MockProvider) -> account -> store ->
+//     reconcile, including a mixed-tier arm, a forced failure, resume/reuse.
+//   - JUDGE: a generated pool -> judge scores in the store, via the live
+//     scoring composition root runJudgeMatrix (#21), driven by a MockJudgeProvider.
+// The seams it does NOT cross: the EMBED seam (distinct_k/diversity/collapse —
+// exercised in evals/metrics/*.test.mjs against fixtureEmbedder), and any LIVE
+// provider/judge/embedder call (all doubled here). evals/capabilities.json +
+// evals/capabilities.test.mjs are the authoritative ledger of which seams are
+// live | stub | absent. Hermetic: temp store dir, mock provider/judge, no network.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -15,6 +28,7 @@ import { configHash, cellKey } from "../../lib/manifest.mjs";
 import { runSpec } from "./runner.mjs";
 import { MockProvider } from "./provider.mjs";
 import { operationalSummary } from "../metrics/operational.mjs";
+import { runJudgeMatrix, MockJudgeProvider, judgeScoresKey } from "../judge/score.mjs";
 
 function tempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "ideate-integration-test-"));
@@ -143,4 +157,52 @@ test("full path: plan -> generate -> account -> store -> reconcile, including a 
   // are todo.
   assert.equal(resumedSummary.planned, 18);
   assert.equal(provider2.calls.length, 6, "only the newly-added replicate's cells hit the provider");
+});
+
+// Composition-root wiring test for the JUDGE seam (issue #25). Before #21 there
+// was no pool -> scores path to wire at all (gate.mjs took judgeScores as an
+// input array); now runJudgeMatrix is that composition root. This proves a
+// generated pool actually flows through it to per-axis scores in the store,
+// driven by a hermetic MockJudgeProvider — the seam the "FULL path" header used
+// to imply but never crossed.
+test("composition root: a generated pool -> judge scores in the store, via runJudgeMatrix (judge seam, #21)", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+
+  // A pool as it comes off a generation run (candidates carry identity fields;
+  // runJudgeMatrix de-identifies them before the judge sees them). Arm B is
+  // all-Haiku, so a Sonnet Anthropic judge and an OpenAI judge are both distinct.
+  const armB = { id: "B", ...ARMS_CONFIG.arms.B };
+  const poolKey = cellKey({ armId: "B", briefId: "biz-01", replicate: 0, cfg: CFG_HASH });
+  const pools = [
+    {
+      poolKey,
+      arm: armB,
+      briefText: "Design a low-cost coral reef health monitoring approach.",
+      candidates: [
+        { text: "a solar buoy with a camera", model: "claude-haiku-4-5", persona: "proposer_1" },
+        { text: "trained-dolphin acoustic survey", model: "claude-haiku-4-5", persona: "proposer_2" },
+      ],
+    },
+  ];
+
+  const { rows, results, deferred } = await runJudgeMatrix({
+    pools,
+    judgeModels: { anthropic: ["claude-sonnet-5"], openai: ["gpt-5.6-terra"] },
+    providers: { anthropic: new MockJudgeProvider(), openai: new MockJudgeProvider() },
+    store,
+    seed: 3,
+    timestamp: "2026-08-02T00:00:00Z",
+  });
+
+  assert.equal(rows.length, 2, "the cross-judge matrix schedules both legs for the pool");
+  assert.equal(deferred.length, 0, "both judge providers were wired, so nothing is deferred");
+  assert.equal(results.filter((r) => r.state === "completed").length, 2);
+
+  // The pool's per-axis scores actually landed in the store under BOTH judges,
+  // with novelty (originality) and feasibility as distinct fields.
+  const anthRec = store.get(judgeScoresKey({ poolKey, judgeModel: "claude-sonnet-5" }));
+  assert.equal(anthRec.result.kind, "judge-scores");
+  assert.equal(anthRec.result.scores.length, 2);
+  assert.ok(anthRec.result.scores.every((s) => typeof s.originality === "number" && typeof s.feasibility === "number"));
+  assert.ok(store.has(judgeScoresKey({ poolKey, judgeModel: "gpt-5.6-terra" })));
 });
