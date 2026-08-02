@@ -11,7 +11,8 @@
 > Nothing has been run. Every number below is a projection.
 
 **Status:** pre-registration draft.
-**Date:** 2026-07-30 · **Target SHA:** ideate-core `develop` @ `920c086` + fix A1 (see Blockers)
+**Date:** 2026-07-30 · **Target engine:** ideate-core `@0.4.0` (npm, published 2026-08-02) — pinned.
+> *Amended 2026-08-02 ([Appendix A](#appendix-a--amendments-dated-2026-08-02), item 1). Was: `Target SHA: ideate-core develop @ 920c086 + fix A1`. That SHA predates the remediation; `ideate-core@0.4.0` contains the fixes for **both** registered blockers (B1, B2). The runtime `engineSha` in the manifest is now the resolved package version (`ideate-core@0.4.0`) rather than the `"unpinned"` literal `evals/run.mjs` originally shipped.*
 
 ---
 
@@ -36,11 +37,11 @@ The app takes an arbitrary user brief, so we cannot eval "the prompt." We hold t
 
 | # | Blocker | Why it invalidates the study |
 |---|---|---|
-| B1 | **Audit finding IC-01** (duplicate candidate IDs when agents share a persona) | Mixed-tier arms (E, F, G) assign the same persona to different models. At this SHA that collides IDs and **silently deletes candidates downstream** (verified: 7 in → 5 out). Every diversity metric would be computed on a silently truncated pool, biased *against* the mixed arms — i.e. it would fake a result. Fix = the verified one-liner in the audit (`ctx.temperature` → `ctx.agentId`). |
-| B2 | **`temperature` is rejected by current frontier models** | Opus 5, Sonnet 5, Opus 4.8/4.7 and Fable 5 return **HTTP 400** if `temperature` is sent. `DEFAULT_PERSONAS` sets `temperature: 0.4…1.0` and `safeComplete` forwards it. Haiku 4.5 still accepts it. So a mixed haiku/sonnet/opus panel **400s on 3 of 5 agents** unless the adapter strips the parameter per-model. See §3.3. |
-| B3 | **No token accounting in ideate-core** | The cost ledger (§7) needs per-call token counts. The engine currently discards the provider's `usage` object entirely. The adapter must capture it (no core change required — the adapter owns the client). |
+| B1 | **Audit finding IC-01** (duplicate candidate IDs when agents share a persona) | Mixed-tier arms (E, F, G) assign the same persona to different models. At the original SHA that collides IDs and **silently deletes candidates downstream** (verified: 7 in → 5 out). Every diversity metric would be computed on a silently truncated pool, biased *against* the mixed arms — i.e. it would fake a result. Fix = the verified one-liner in the audit (`ctx.temperature` → `ctx.agentId`). **✅ CLOSED — `ideate-core#87`, 2026-07-31; shipped in `ideate-core@0.4.0`** (Appendix A, item 2). |
+| B2 | **`temperature` is rejected by current frontier models** | Opus 5, Sonnet 5, Opus 4.8/4.7 and Fable 5 return **HTTP 400** if `temperature` is sent. `DEFAULT_PERSONAS` sets `temperature: 0.4…1.0` and `safeComplete` forwards it. Haiku 4.5 still accepts it. So a mixed haiku/sonnet/opus panel **400s on 3 of 5 agents** unless the adapter strips the parameter per-model. See §3.3. **✅ CLOSED — `ideate-core#89`, 2026-07-31; `ideate-core@0.4.0` exports the strip-and-warn helper at `ideate-core/integrations/sampling-params`** (Appendix A, item 2). |
+| B3 | **No token accounting in ideate-core** | The cost ledger (§7) needs per-call token counts. The engine currently discards the provider's `usage` object entirely. The adapter must capture it (no core change required — the adapter owns the client). **⏳ Still OPEN — correctly homed in the adapter: closes when the generation adapter captures `usage`** (Appendix A, item 2). |
 
-B2 is also a **finding about the library**, not just the eval: ideate-core documents temperature as a per-agent diversity lever, and that lever is now unavailable on most current Anthropic models. Persona is the only surviving structural lever — which happens to be what the literature says is stronger anyway (Wang et al. 2023), but the docs should say "unavailable on current frontier models," not present it as a live knob.
+B2 is also a **finding about the library**, not just the eval: ideate-core documents temperature as a per-agent diversity lever, and that lever is now unavailable on most current Anthropic models. Persona is the only surviving structural lever — which happens to be what the literature says is stronger anyway (Wang et al. 2023), but the docs should say "unavailable on current frontier models," not present it as a live knob. *(2026-08-02: `ideate-core` now has **zero** open issues — the 20-finding audit `ideate-core#86` that produced B1 and B2 is fully remediated, including its two cross-repo template items. See Appendix A, item 2.)*
 
 ---
 
@@ -62,7 +63,7 @@ Verified against current sources (2026-07-30). **These are the assets that turn 
 
 ## 3. Design
 
-### 3.1 Arms (8 configurations)
+### 3.1 Arms (9 configurations)
 
 Panel size fixed at **5 agents**, `ideasPerAgent: 6`, `maxRounds: 2` (blind → pool) for every panel arm, so the *only* thing varying is model assignment.
 
@@ -104,6 +105,8 @@ Same prompt builders, same `ideasPerAgent`, same personas, same rounds, same emb
 | Send temperature where accepted | Confounds model with sampling policy — B's advantage would be uninterpretable | No |
 
 We strip it universally and **state the bias direction explicitly**: if the haiku arms still win on diversity, they did so with one lever disabled, which strengthens rather than weakens the finding. If they lose, the result is confounded and must be reported as such. This is registered in advance so it can't be rationalized after the fact.
+
+> **Implementation note (2026-08-02, [Appendix A](#appendix-a--amendments-dated-2026-08-02) item 3). The registered universal-strip decision above is UNCHANGED.** Recorded so a reader can see the code matches the registered decision rather than the library default: `ideate-core@0.4.0` ships `modelAcceptsSamplingParams` (at `ideate-core/integrations/sampling-params`), which strips **per-model** and returns `true` for Haiku. Using that helper unmodified would leave the Haiku arms the diversity lever and **invert** the registered bias direction — which materially affects **H4** (Haiku panel ≥ Opus panel). The generation adapter therefore **force-strips on every model**, Haiku included, rather than deferring to the helper's per-model default.
 
 ### 3.4 Replication and power
 
@@ -168,6 +171,12 @@ A study that can't fail its own sanity checks isn't measuring anything.
 2. Judge scores them blind.
 3. **Gate:** Spearman ρ between judge and expert *rankings* must clear a pre-registered floor (**ρ ≥ 0.4**, in the neighborhood of the human-human inter-rater agreement Si et al. themselves report — confirm their reported figure and set the floor to it, rather than to a number we like).
 4. **If the gate fails, the idea-level metrics are dropped from the study** and we report pool-level metrics only. We do not proceed with a judge we know doesn't track humans. This is registered in advance.
+
+> **⚠️ Amended 2026-08-02 ([Appendix A](#appendix-a--amendments-dated-2026-08-02), item 4) — the gate metric and floor in point 3 are SUPERSEDED. Point 4's consequence is unchanged.**
+>
+> **Si et al. 2024 do not report a human-human Spearman ρ** (verified against arXiv:2409.04109 on 2026-08-02; footnote 11 explicitly rejects correlation-style agreement metrics like Krippendorff's α for their non-overlapping reviews). The number point 3 reaches for **does not exist**, so the `ρ ≥ 0.4` placeholder rests on a false premise and is **withdrawn**.
+>
+> **Registered replacement.** The gate metric becomes Si et al.'s **own** split-half top/bottom-25% **balanced-accuracy** construction (Lu et al. 2024; Si et al. Section 5 / Table 11), floored at their reported **human-human figure, 56.1%** — the faithful reading of point 3's own instruction to "confirm their reported figure and set the floor to it." Spearman ρ is **retained as a descriptive statistic** (still computed and reported) but is no longer the gate. Three registered consequences, all recorded before any data is collected — see Appendix A item 4 for the full construction and the 53.3% Claude-3.5 comparator.
 
 ### 5.2 Self-preference bias — measured, not assumed
 
@@ -240,8 +249,11 @@ A separate `price.mjs` applies a **pinned, dated rate table** at read time. Re-p
 | Claude Opus 5 | 5.00 | 25.00 | claude-api skill (cached 2026-06-24) |
 | Claude Sonnet 5 | 3.00 (2.00 intro → 2026-08-31) | 15.00 (10.00 intro) | same |
 | Claude Haiku 4.5 | 1.00 | 5.00 | same |
-| OpenAI (mid/large tiers) | ~2.00–5.00 | ~12.00–30.00 | ⚠️ **aggregator sites, not openai.com** — must verify before running |
+| OpenAI `gpt-5.6-terra` (mid tier) | 2.00 | 12.00 | **developers.openai.com/api/docs/pricing — verified first-party 2026-08-02** |
+| OpenAI `gpt-5.6-sol` (large tier) | 5.00 | 30.00 | same |
 | Voyage-4-lite embeddings | 0.02 | — | + **200M free tokens/account**; batch −33% |
+
+> *Amended 2026-08-02 ([Appendix A](#appendix-a--amendments-dated-2026-08-02), item 5). The OpenAI row previously read `~2.00–5.00 / ~12.00–30.00` sourced from "aggregator sites, not openai.com — must verify before running". Now verified first-party against `developers.openai.com/api/docs/pricing` (2026-08-02); the **50% Batch API discount** is confirmed on the same page. The full per-model OpenAI rate table lives with the OpenAI adapter (#22) and in `lib/price.mjs`'s dated `RATE_TABLE` + `OPENAI_PRICE_VERIFICATION` record. **Anthropic rates are correct as written and are unchanged.***
 
 **Two levers cut this roughly in half:**
 - **Anthropic Batch API: −50%.** Evals are latency-insensitive → ideal fit. (Not available on Bedrock/Vertex; first-party only.)
@@ -364,3 +376,70 @@ Every knob the study varies is config, not code:
 ### Phase 2a — the pilot for the pilot
 
 Before the ~200-run grid, a **~20-run smoke study** (2 arms × 2 briefs × 5 reps, cheapest models) runs end-to-end: generation → metrics → judge → ledger → reconcile → analysis. Its purpose is **not** to measure anything about models. It is to prove the harness produces a complete, reconciled, repriceable dataset and that no stage silently swallows a cell. Its results are discarded from the confirmatory analysis by construction (different `configHash` if anything changed; explicitly excluded if not).
+
+---
+
+## Appendix A — Amendments (dated 2026-08-02)
+
+Per the amendment rule at the top of this document, substantive changes made after the pre-registration was first committed are recorded here as dated entries stating **what changed and why**, never applied silently in place. Each entry is cross-linked from the section it amends.
+
+**Nothing in §6 (hypotheses and analysis plan) is changed by any entry below.** The registered hypotheses H1–H5, the mixed-effects model, the multiplicity correction, and the stopping rule are all exactly as first registered. The amendment rule binds §6; no §6 edit is proposed.
+
+### Item 1 — §0: pin the real engine version (was a stale SHA)
+
+**What changed.** §0's `Target SHA: ideate-core develop @ 920c086 + fix A1` → **`ideate-core@0.4.0`** (npm, published 2026-08-02), pinned. The manifest's runtime `engineSha` is now the resolved package version rather than the `"unpinned"` literal `evals/run.mjs` originally shipped.
+
+**Why.** `920c086` predates the remediation of the registered blockers. `ideate-core@0.4.0` is published and contains the fixes for **both** B1 and B2 (item 2). Pinning the real version is what makes `configHash` (§11) actually change when the engine changes — the whole point of pinning it.
+
+### Item 2 — §1: blockers B1 and B2 are closed; B3 remains open
+
+**What changed.** B1 and B2 are marked **CLOSED** with their issue references; B3 remains **OPEN**.
+
+- **B1** (IC-01, duplicate candidate IDs when agents share a persona — would silently truncate mixed-arm pools and fake a result against arms E/F/G) — fixed, **`ideate-core#87`**, closed 2026-07-31; shipped in `ideate-core@0.4.0`.
+- **B2** (`temperature` rejected with HTTP 400 by current frontier models) — fixed, **`ideate-core#89`**, closed 2026-07-31; `ideate-core@0.4.0` exports the strip-and-warn helper at `ideate-core/integrations/sampling-params` (see item 3).
+- **B3** (no token accounting in `ideate-core`) — **still open**, and correctly homed in the adapter: it closes when the generation adapter captures the provider's `usage` object. Left standing until then.
+
+**Why.** §1's own instruction is "do not run before these land." B1 and B2 have landed; recording it (with references) is what lets a reader confirm the run is now unblocked on those two. Also worth recording, since §1 framed B2 as "a finding about the library": `ideate-core` now has **zero** open issues — the 20-finding audit `ideate-core#86` that produced B1 and B2 is fully remediated, including its two cross-repo template items.
+
+### Item 3 — §3.3: the shipped strip helper diverges from the library default (decision unchanged)
+
+**What changed.** Nothing in the registered decision — §3.3 still registers stripping `temperature` **universally**, with the stated bias direction (against the Haiku arms). This entry records an **implementation** fact only.
+
+**Why it must be recorded.** `ideate-core@0.4.0` ships `modelAcceptsSamplingParams` (at `ideate-core/integrations/sampling-params`), which strips **per-model** and returns `true` for Haiku. Using that helper unmodified would leave the Haiku arms the diversity lever and **invert** the registered bias direction — which materially affects **H4** (Haiku panel ≥ Opus panel). The generation adapter therefore **force-strips on every model**, Haiku included, so the implementation matches the *registered* decision rather than the library's per-model default. Recorded so a reader can see the code matches §3.3 rather than silently diverging from it.
+
+### Item 4 — §5.1: the ρ floor rests on a false premise; the gate metric and floor are replaced (**the substantive amendment**)
+
+**What changed.** §5.1's gate metric changes from **Spearman ρ (floored at the placeholder ρ ≥ 0.4)** to **Si et al.'s own split-half top/bottom-25% balanced-accuracy construction, floored at their reported human-human figure of 56.1%**. The arbitrary `0.4` is **withdrawn**. §5.1 point 4's consequence (a failed gate drops idea-level metrics and reports pool-level only) is **unchanged**.
+
+**Why.** **Si et al. 2024 do not report a human-human Spearman ρ** (verified against arXiv:2409.04109 on 2026-08-02). Footnote 11 explicitly rejects correlation-style agreement metrics: the balanced-accuracy metric "avoids the limitations of other agreement metrics like Krippendorff's alpha, which require overlapping reviews and would result in a sparse matrix" — their reviews do not overlap enough to support a correlation statistic. The number §5.1 point 3 reaches for does not exist, so the gate cannot be instantiated as registered.
+
+What they **do** report (Section 5 / Table 11) is a split-half balanced accuracy: reviewers of each paper are randomly split in half; one half ranks the top and bottom 25% of ideas; agreement is measured against the held-out half.
+
+| Comparison | Balanced accuracy |
+|---|---|
+| **Si et al. expert reviewers (human-human)** | **56.1%** |
+| NeurIPS 2021 consistency experiment | 66.0% |
+| ICLR 2024 LM-related submissions (1.2K) | 71.9% |
+| Best LLM evaluator they tested (Claude-3.5 pairwise ranker) | 53.3% |
+
+Study size: N = 79 expert reviewers, 298 unique reviews, 49 ideas.
+
+**Three consequences, all registered in advance:**
+
+1. **Spearman ρ is retained as a descriptive statistic** (`evals/judge/gate.mjs`'s `spearmanRho` stays and is still reported), but it is **no longer the gate**. The arbitrary 0.4 is withdrawn.
+2. **The floor is demanding, deliberately.** Si et al.'s own best LLM evaluator scored 53.3% and would fail the 56.1% floor. Per §5.1 point 4 the registered consequence is that idea-level metrics are dropped and only pool-level results are reported — an acceptable, pre-registered outcome, provided it comes from a real measurement rather than an unrun gate.
+3. **53.3% becomes a registered comparator.** Because Table 11 measures the best LLM evaluator on the *same* metric, we can state in advance whether our judge beats it, rather than deciding after we look.
+
+The implementing code change (`resolveRhoFloor` → the registered balanced-accuracy floor, `validateJudge` reading the new metric and constant) lands with **#16 / #24**, not here. This entry is the pre-registration record of the decision.
+
+### Item 5 — §8.1: OpenAI rates were aggregator-sourced; now verified first-party
+
+**What changed.** §8.1's OpenAI row (previously `~2.00–5.00 / ~12.00–30.00`, flagged "aggregator sites, not openai.com — must verify before running") is replaced with **first-party verified per-model rates**: `gpt-5.6-terra` (mid) at 2.00 / 12.00 and `gpt-5.6-sol` (large) at 5.00 / 30.00, verified against `developers.openai.com/api/docs/pricing` on 2026-08-02. The **50% Batch API discount** the batch-first budget assumes is confirmed on the same page. **Anthropic rates are correct as written and are unchanged** (Opus 5 $5/$25, Sonnet 5 $3/$15 with the $2/$10 introductory rate through 2026-08-31, Haiku 4.5 $1/$5).
+
+**Why.** §8.1 itself flagged the OpenAI row as unverified and forbade running against it. The full per-model OpenAI table and its verification record live with the OpenAI adapter (#22) and in `lib/price.mjs`'s dated `RATE_TABLE` + `OPENAI_PRICE_VERIFICATION`.
+
+### Item 6 — §3.1 heading: count fix (cosmetic)
+
+**What changed.** The §3.1 heading "Arms (**8** configurations)" → "Arms (**9** configurations)".
+
+**Why.** The arm table is A–H (8) **plus** the A′ ablation, and §3.4 and the epic both say 9 arms. A one-character count correction, folded in with the substantive amendments above rather than spending a separate change on it.
