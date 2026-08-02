@@ -401,8 +401,12 @@ export function validationKey({ judgeHash, sliceId }) {
  *   @param {string} [o.metric]        default "balanced-accuracy"
  *   @param {string} [o.construction]  default CONSTRUCTION_ID
  *   @param {string} [o.judgeModel]    judge model id, or "mixed" (default)
+ *   @param {string} [o.axis]          judge axis validated (issue #36) — stored
+ *     in the record when supplied, so the record is self-describing.
+ *   @param {string} [o.expertColumn]  the Si et al. expert column the axis was
+ *     validated against (issue #36) — stored when supplied.
  */
-export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, verdict, n, rho, metric = "balanced-accuracy", construction = CONSTRUCTION_ID, judgeModel = "mixed" }) {
+export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, verdict, n, rho, metric = "balanced-accuracy", construction = CONSTRUCTION_ID, judgeModel = "mixed", axis, expertColumn }) {
   if (!store) throw new Error("recordValidation: store is required");
   if (verdict !== "pass" && verdict !== "drop") {
     throw new Error(`recordValidation: verdict must be "pass" or "drop", got ${JSON.stringify(verdict)}`);
@@ -414,13 +418,18 @@ export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, v
     throw new Error("recordValidation: n must be a positive integer (the idea count the accuracy was computed over)");
   }
   const key = validationKey({ judgeHash, sliceId });
+  // axis/expertColumn are added ONLY when supplied, so a record written without
+  // them (pre-#36 callers) keeps its exact prior shape.
+  const result = { kind: "judge-validation", metric, construction, n, accuracy, floor, verdict, rho };
+  if (axis !== undefined) result.axis = axis;
+  if (expertColumn !== undefined) result.expertColumn = expertColumn;
   return store.put({
     key,
     armId: "__judge-validation__",
     briefId: sliceId,
     replicate: 0,
     cfg: judgeHash,
-    result: { kind: "judge-validation", metric, construction, n, accuracy, floor, verdict, rho },
+    result,
     resolvedModels: { judge: judgeModel },
     accounting: { state: "completed" },
     costRows: [],

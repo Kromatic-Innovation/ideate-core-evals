@@ -177,6 +177,8 @@ A study that can't fail its own sanity checks isn't measuring anything.
 > **Si et al. 2024 do not report a human-human Spearman ρ** (verified against arXiv:2409.04109 on 2026-08-02; footnote 11 explicitly rejects correlation-style agreement metrics like Krippendorff's α for their non-overlapping reviews). The number point 3 reaches for **does not exist**, so the `ρ ≥ 0.4` placeholder rests on a false premise and is **withdrawn**.
 >
 > **Registered replacement.** The gate metric becomes Si et al.'s **own** split-half top/bottom-25% **balanced-accuracy** construction (Lu et al. 2024; Si et al. Section 5 / Table 11), floored at their reported **human-human figure, 56.1%** — the faithful reading of point 3's own instruction to "confirm their reported figure and set the floor to it." Spearman ρ is **retained as a descriptive statistic** (still computed and reported) but is no longer the gate. Three registered consequences, all recorded before any data is collected — see Appendix A item 4 for the full construction and the 53.3% Claude-3.5 comparator.
+>
+> **Which axis, against which column ([Appendix A](#appendix-a--amendments-dated-2026-08-02) item 7).** Point 1's "expert scores" is one column and point 2's "judge scores them" is one of four axes — the mapping between them was never registered. Item 7 registers it: the judge's **`originality`** axis validates against the Si et al. **`overall_score`** column, with the construct mismatch disclosed. It also records the shape-matched **51.7%** (Claude-3.5 *Direct*) comparator alongside the existing 53.3% (*Pairwise*), and the median-threshold / split-count construction deviations.
 
 ### 5.2 Self-preference bias — measured, not assumed
 
@@ -443,3 +445,30 @@ The implementing code change (`resolveRhoFloor` → the registered balanced-accu
 **What changed.** The §3.1 heading "Arms (**8** configurations)" → "Arms (**9** configurations)".
 
 **Why.** The arm table is A–H (8) **plus** the A′ ablation, and §3.4 and the epic both say 9 arms. A one-character count correction, folded in with the substantive amendments above rather than spending a separate change on it.
+
+### Item 7 — §5.1: register the judge-axis ↔ expert-column validation mapping, correct the LLM comparator, state the construction deviations
+
+*Registered 2026-08-02, before any judge results are seen — a pre-registration act, not a post-hoc choice.*
+
+**What changed.** §5.1's validation gate now registers **which** judge axis is validated against **which** Si et al. expert-review column: the judge's **`originality`** axis ↔ the **`overall_score`** column. The mapping lives as named constants (`JUDGE_VALIDATION_AXIS` / `SI_ET_AL_EXPERT_SCORE_FIELD` in `evals/judge/config.mjs`), and the composition that runs it (`runJudgeValidation`, `evals/judge/validate.mjs`) threads `readSiEtAlSlice → sliceToJudgePool → judge.score → judgeScoresForAxis → validateJudge → recordValidation`, recording the axis and expert column actually used.
+
+**Why `originality` ↔ `overall_score`.**
+
+1. **Why `originality`.** Novelty is the study's primary idea-level metric (§4.2) and Si et al.'s own headline finding, so `originality` is the axis whose validity most needs establishing.
+2. **Why `overall_score`.** The registered 56.1% floor (item 4) is human-human split-half agreement on **one column**. The floor is **coupled to the column**: validating against `novelty_score` instead would require deriving and registering a *different* floor — a second pre-registration act. `overall_score` is the only choice whose floor is already registered.
+3. **The construct mismatch is real and is DISCLOSED, not hidden.** This validates a *novelty* judgment against an *overall-quality* answer key. `REPORT.md` must state this plainly as a limitation. It is registered here so the limitation is on record before any number is seen. (`feasibility` ↔ `feasibility_score` is a plausible future addition, but it needs its own derived floor and is **not** registered here.)
+
+**Comparator correction — the shape-matched figure is 51.7%, not 53.3%.** Item 4's table registers **53.3%** as "best LLM evaluator". Verified against arXiv:2409.04109 Table 11 (2026-08-02): that figure is **Claude-3.5 Pairwise**. **Claude-3.5 Direct is 51.7%.** Our judge is a *direct, score-only* scorer, so **51.7% is the apples-to-apples comparator** for our shape; 53.3% remains valid as "their best evaluator of any shape". Both are now registered as named constants (`SI_ET_AL_LLM_COMPARATOR_DIRECT = 0.517`, `SI_ET_AL_LLM_COMPARATOR_PAIRWISE = 0.533`) and both are reported, so the comparison is not misleading.
+
+| Comparison | Balanced accuracy | Shape |
+|---|---|---|
+| **Si et al. expert reviewers (human-human)** — the floor | **56.1%** | — |
+| Claude-3.5 **Pairwise** ranker (their best LLM evaluator, any shape) | 53.3% | ranker |
+| Claude-3.5 **Direct** score-only (shape-matched to our judge) | **51.7%** | direct scorer |
+
+**Construction deviations, stated rather than silently differed.** Our balanced-accuracy construction differs from Si et al.'s in two ways that must be disclosed before any comparison is drawn:
+
+- **Thresholding.** Si et al. threshold LLM evaluators at their **median score**; `balancedAccuracyTopBottom` ranks the labelled top-k/bottom-k set and splits there. Different construction.
+- **Split count.** Footnote 11 states they average **20** random splits; `balancedAccuracySplitHalf` defaults to `splits = 100` and `reproduce-si-et-al.mjs` passes **1000**. State the seed and the count with any reported number (item 4 point 1 / `docs/fetching-si-et-al.md`).
+
+**What lands where.** The registered constants (`config.mjs`) and the composition + its hermetic tests (`validate.mjs`, `validate.test.mjs`) land with **#36**. Running the composition against the **real** slice needs the live judge key and metered spend and stays on **#16**; it also depends on the #35 slice-join repair landing first (native `blocked_by` edge). This entry is the pre-registration record of the decision.

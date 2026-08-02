@@ -47,3 +47,50 @@ export function resolveRhoFloor(config) {
   }
   return rhoFloor;
 }
+
+// ── #36: the registered judge-axis ↔ Si et al. expert-column validation mapping ──
+//
+// docs/PREREGISTRATION.md §5.1 + Appendix A item 7 register WHICH judge axis is
+// validated against WHICH Si et al. expert-review column. This is a
+// pre-registration act — decided before any judge result is seen — so the mapping
+// lives here as named constants the gate reads, never a literal buried at a call
+// site (issue #36 AC: "the gate reads a registered value").
+
+/** The judge axis validated against the Si et al. expert score (issue #36).
+ *  `originality` — novelty is the study's primary idea-level metric (§4.2) and
+ *  Si et al.'s own headline finding, so it is the axis whose validity most needs
+ *  establishing. One of prompt.mjs JUDGE_AXES. */
+export const JUDGE_VALIDATION_AXIS = "originality";
+
+/** The Si et al. reviews column the axis validates against (issue #36).
+ *  `overall_score` — the registered 56.1% floor is human-human split-half
+ *  agreement on THIS column, so it is the only choice whose floor is already
+ *  registered; validating against another column (e.g. `novelty_score`) would
+ *  require deriving and registering a DIFFERENT floor — a second pre-registration
+ *  act. This couples in a real CONSTRUCT MISMATCH — a novelty judgment scored
+ *  against an overall-quality answer key — which is disclosed as a limitation in
+ *  REPORT.md, not hidden (Appendix A item 7). Matches slice.mjs DEFAULT_SCORE_FIELD. */
+export const SI_ET_AL_EXPERT_SCORE_FIELD = "overall_score";
+
+/** The registered mapping as one frozen pair, for callers that want it together. */
+export const JUDGE_VALIDATION_MAPPING = Object.freeze({
+  axis: JUDGE_VALIDATION_AXIS,
+  expertColumn: SI_ET_AL_EXPERT_SCORE_FIELD,
+});
+
+// ── #36: registered LLM-evaluator comparators (Si et al. Table 11) ──
+// Both are balanced accuracy on Si et al.'s OWN split-half top/bottom-25%
+// construction, so our judge's number is directly comparable. Registered before
+// any judge result is seen, so we can state in advance whether we beat them.
+
+/** Claude-3.5 DIRECT score-only evaluator — 51.7% (arXiv:2409.04109 Table 11,
+ *  verified 2026-08-02). The SHAPE-MATCHED comparator: our judge is a direct,
+ *  score-only scorer, so this is the apples-to-apples figure. */
+export const SI_ET_AL_LLM_COMPARATOR_DIRECT = 0.517;
+
+/** Claude-3.5 PAIRWISE ranker — 53.3% (Table 11). Si et al.'s best LLM evaluator
+ *  of ANY shape, but a pairwise ranker rather than a direct scorer, so it is NOT
+ *  shape-matched to our judge. Retained as "their best evaluator", reported
+ *  alongside the direct figure so the comparison is not misleading (Appendix A
+ *  item 7). */
+export const SI_ET_AL_LLM_COMPARATOR_PAIRWISE = 0.533;
