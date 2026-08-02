@@ -26,13 +26,52 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
 
 import { CORPUS, CORPUS_HASH } from "./corpus/index.mjs";
 import { ResultsStore } from "../lib/store.mjs";
 import { runSpec } from "./harness/runner.mjs";
+import { AnthropicBatchProvider } from "./harness/provider.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
+
+/**
+ * Resolve the installed `ideate-core` package's own version from its
+ * package.json, WITHOUT assuming `exports` allows requiring
+ * "ideate-core/package.json" directly (ideate-core@0.4.0's `exports` map
+ * does not expose that subpath -- see the DEVIATION note above this
+ * function's call site in main()). `require.resolve("ideate-core")` still
+ * works because module RESOLUTION honors `exports`' "." entry; from that
+ * resolved entry file, walk up parent directories reading `package.json` via
+ * plain `fs` (a filesystem read, not a module resolution, so it is not
+ * subject to the exports map) until the one named "ideate-core" is found --
+ * i.e. the actual installed package root, however deep the entry file lives
+ * under it.
+ */
+function getInstalledEngineVersion() {
+  const require = createRequire(import.meta.url);
+  let dir = dirname(require.resolve("ideate-core"));
+  for (let i = 0; i < 6; i++) {
+    // an arbitrary-but-generous depth cap, well beyond any plausible
+    // node_modules/ideate-core/<subdir>/<file> nesting, so a future layout
+    // change fails loud (see the throw below) rather than looping forever.
+    const pkgPath = join(dir, "package.json");
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+      if (pkg.name === "ideate-core") return pkg.version;
+    } catch {
+      // no package.json here, or unparsable -- keep walking up
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  throw new Error(
+    "run.mjs: could not resolve ideate-core's installed version by walking up from its resolved entry file -- " +
+      "has the package layout changed? (see getInstalledEngineVersion in evals/run.mjs)",
+  );
+}
 
 // Parse argv[i+1] as a required numeric value for flag `name`, throwing
 // loudly on a missing or non-numeric argument rather than letting
@@ -107,19 +146,44 @@ async function main() {
   const armsConfig = JSON.parse(readFileSync(join(REPO_ROOT, "arms.config.json"), "utf8"));
   const armIds = Object.keys(armsConfig.arms);
 
-  // The engine/prompt/judge/embedder identity feeding configHash is left as
-  // TBD placeholders here -- the harness (evals/harness/runner.mjs) treats
-  // config identity as an opaque input, and the real values are populated by
-  // whichever issue wires the engine call (out of scope for #5, which is
-  // provider-agnostic via dependency injection). corpusHash IS real, since
-  // evals/corpus/ (#2) already ships it.
+  // engineSha now feeds off the REAL, resolved ideate-core version (issue
+  // #19) rather than an "unpinned" placeholder, so configHash (lib/manifest.mjs)
+  // actually changes when the engine changes -- that's the whole point of
+  // pinning it: a study resumed against a different ideate-core version must
+  // NOT be silently treated as directly comparable data (lib/manifest.mjs's
+  // never-silently-pool guarantee).
+  //
+  // This runs ONLY inside main() -- which itself only runs on a real CLI
+  // invocation (see the `import.meta.url` guard at the bottom of this file),
+  // never during `node --test` -- so it never threatens the hermetic-CI
+  // invariant even though `ideate-core` is a real runtime dependency now.
+  // --dry-run still reaches this line (dry-run builds the real spec,
+  // including configHash, so its projection matches a real run's) -- that's
+  // fine because --dry-run is a real CLI invocation on a machine with deps
+  // installed, exactly like any other non-test invocation of this file.
+  //
+  // DEVIATION from the issue's suggested one-liner
+  // (`require("ideate-core/package.json").version`): ideate-core@0.4.0's
+  // package.json `exports` map does NOT expose a `./package.json` subpath
+  // (only ".", "./converge", "./feedback", and two ./integrations/* entries
+  // -- see node_modules/ideate-core/package.json), so that require() throws
+  // ERR_PACKAGE_PATH_NOT_EXPORTED. `getInstalledEngineVersion` below
+  // resolves the SAME information a different way: `require.resolve` the
+  // package's real entry file (which respects `exports`, so it still works
+  // regardless of internal layout), then walk up parent directories reading
+  // `package.json` via plain `fs` (bypassing the exports map entirely, since
+  // this is a filesystem read, not a module resolution) until it finds the
+  // one whose `name` is "ideate-core".
+  const engineVersion = getInstalledEngineVersion();
+  const engineSha = process.env.IDEATE_CORE_ENGINE_SHA || `ideate-core@${engineVersion}`;
+
   const spec = {
     arms: armIds.map((id) => ({ id })),
     briefs: CORPUS.map((b) => ({ id: b.id })),
     replicates: args.replicates ?? 1,
     config: {
       harnessVersion: "0.0.1",
-      engineSha: process.env.IDEATE_CORE_ENGINE_SHA || "unpinned",
+      engineSha,
       promptHash: "unpinned",
       corpusHash: CORPUS_HASH,
     },
@@ -127,21 +191,34 @@ async function main() {
 
   const store = new ResultsStore(join(REPO_ROOT, "results"));
 
+  // Provider wiring: --dry-run calls nothing (provider: undefined, unchanged
+  // from before #19 -- runSpec() only requires a provider when !dryRun -- see
+  // runner.mjs). A real run constructs the actual AnthropicBatchProvider
+  // (issue #19); ANTHROPIC_API_KEY is read here, at the CLI boundary, and
+  // its absence fails LOUDLY with a clear, actionable message -- never an
+  // invented/placeholder key and never a bare stack trace. This is
+  // deliberately checked BEFORE constructing the provider (rather than
+  // deferring to AnthropicBatchProvider's own internal no-apiKey guard) so a
+  // misconfigured real run fails at the moment you'd expect -- immediately,
+  // pre-flight -- not three network calls deep.
+  let provider;
+  if (!args.dryRun) {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      throw new Error(
+        "run.mjs: ANTHROPIC_API_KEY is not set. A real (non-dry-run) invocation calls the live " +
+          "Anthropic Message Batches API and requires a real API key -- this harness never invents " +
+          "or defaults one. Set ANTHROPIC_API_KEY in the environment, or pass --dry-run to plan the " +
+          "run without calling anything.",
+      );
+    }
+    provider = new AnthropicBatchProvider({ apiKey, corpus: CORPUS, armsConfig });
+  }
+
   await runSpec(spec, {
     store,
     armsConfig,
-    // No provider wired at the CLI layer yet -- real Anthropic/OpenAI Batch
-    // adapters are documented stubs in evals/harness/provider.mjs (out of
-    // scope for #5). --dry-run works today; a real run will throw until a
-    // provider is supplied here in a follow-up issue.
-    provider: args.dryRun ? undefined : (() => {
-      throw new Error(
-        "run.mjs: no live provider is wired yet -- evals/harness/provider.mjs's " +
-          "AnthropicBatchProvider/OpenAIBatchProvider are documented stubs, not " +
-          "implementations. Use --dry-run, or inject a provider programmatically " +
-          "via runSpec() (see evals/harness/*.test.mjs for the pattern).",
-      );
-    })(),
+    provider,
     batch: !args.noBatch,
     dryRun: args.dryRun,
     maxSpendUsd: args.maxSpendUsd,
