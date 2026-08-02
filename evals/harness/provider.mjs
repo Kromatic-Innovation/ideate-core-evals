@@ -643,11 +643,374 @@ export function pickFailureKind(classification, fallback) {
   return fallback;
 }
 
+// ── OpenAIBatchProvider: the real OpenAI adapter (issue #22) ────────────────
+//
+// Makes arm H (homogeneous OpenAI) runnable and supplies the OpenAI generation
+// path arm G (cross-provider) needs. Same interface contract as
+// AnthropicBatchProvider — `{ mode }` in, `{ terminalState, result, tokens,
+// failureKind? }` out, never throws for a transport failure — and the SAME
+// barrier-batcher shape: ideate-core fires a round's N agents synchronously via
+// Promise.all, so `#completeBatched` buffers each `complete(req)` and, on the
+// first push, schedules `#flush()` on a subsequent macrotask, submitting the
+// whole round as ONE OpenAI Batch. Every network/timer/engine seam is
+// injectable with a live default, so evals/harness/openai-batch.test.mjs
+// exercises this class with zero network and an empty node_modules.
+//
+// ── OpenAI Batches API differs from Anthropic's (a file, not an inline array) ──
+//   1. POST /v1/files (multipart, purpose=batch) with a JSONL body, one line
+//      per request { custom_id, method, url: "/v1/chat/completions", body }.
+//   2. POST /v1/batches { input_file_id, endpoint, completion_window }.
+//   3. Poll GET /v1/batches/{id} until status === "completed".
+//   4. GET /v1/files/{output_file_id}/content -> JSONL, one line per custom_id
+//      { custom_id, response: { status_code, body: { choices, usage } }, error }.
+// Results are keyed by custom_id (never line position), same requirement as the
+// Anthropic path.
+//
+// ── Force-strip by construction (§3.3), same as the Anthropic path ──────────
+// buildOpenAIChatParams builds the request body field-by-field from an explicit
+// allowlist (model, messages, max_completion_tokens) and NEVER reads
+// temperature/top_p/top_k for any model — so a per-provider difference cannot
+// reintroduce the confound the pre-registration eliminated.
 export class OpenAIBatchProvider {
-  async generate() {
-    throw new Error(
-      "OpenAIBatchProvider is a documented stub -- issue #5 does not call real provider APIs. " +
-        "Implement against the OpenAI Batches API (batch mode) / chat completions (single mode) in a follow-up issue.",
-    );
+  /**
+   * @param {object} [opts]  same seams as AnthropicBatchProvider.
+   *   @param {string}   [opts.apiKey]      OPENAI_API_KEY; a missing key returns a
+   *     classified harness_error on the first call rather than throwing.
+   *   @param {Array}    [opts.corpus]      briefs; text looked up by cell.briefId.
+   *   @param {object}   [opts.armsConfig]  parsed arms.config.json (panel shape).
+   *   @param {typeof fetch} [opts.fetchImpl]
+   *   @param {Function} [opts.ideateImpl]  live default dynamically imports ideate-core.
+   *   @param {Function} [opts.sleep]       (ms)=>Promise; injectable for instant tests.
+   *   @param {number}   [opts.pollIntervalMs]  (live default 2000ms)
+   *   @param {number}   [opts.maxPollMs]       (live default 15 min)
+   *   @param {number}   [opts.maxRetries]      (default 3)
+   *   @param {(msg:string)=>void} [opts.logger]
+   */
+  constructor({
+    apiKey = process.env.OPENAI_API_KEY,
+    corpus = [],
+    armsConfig,
+    fetchImpl = globalThis.fetch,
+    ideateImpl = async (...a) => (await import("ideate-core")).ideateCore(...a),
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    pollIntervalMs = 2000,
+    maxPollMs = 15 * 60 * 1000,
+    maxRetries = 3,
+    logger = (msg) => console.error(msg),
+  } = {}) {
+    this.apiKey = apiKey;
+    this.corpus = corpus;
+    this.armsConfig = armsConfig;
+    this.fetchImpl = fetchImpl;
+    this.ideateImpl = ideateImpl;
+    this.sleep = sleep;
+    this.pollIntervalMs = pollIntervalMs;
+    this.maxPollMs = maxPollMs;
+    this.maxRetries = maxRetries;
+    this.logger = logger;
+    this.#pending = [];
+    this.#flushScheduled = false;
   }
+
+  #pending;
+  #flushScheduled;
+
+  async generate(cell, arm, { mode = "batch" } = {}) {
+    if (!this.apiKey) {
+      return { terminalState: "failed", failureKind: "harness_error", detail: "OpenAIBatchProvider: no apiKey (OPENAI_API_KEY unset) -- refusing to call the network with no credential", tokens: { tokens_by_model: {} } };
+    }
+    const brief = this.corpus.find((b) => b.id === cell.briefId);
+    if (!brief) {
+      return { terminalState: "failed", failureKind: "harness_error", detail: `OpenAIBatchProvider: no corpus brief found for briefId '${cell.briefId}'`, tokens: { tokens_by_model: {} } };
+    }
+
+    const { agents, maxRounds } = resolveIdeateAgents(arm, this.armsConfig);
+    const tokensByModel = {};
+    const addUsage = (model, usage) => {
+      if (!model || !usage) return;
+      const row = (tokensByModel[model] = tokensByModel[model] || { input_tokens: 0, output_tokens: 0 });
+      // OpenAI reports prompt_tokens / completion_tokens; map to the ledger's
+      // input_tokens / output_tokens shape (lib/accounting.mjs costRow).
+      row.input_tokens += usage.prompt_tokens || usage.input_tokens || 0;
+      row.output_tokens += usage.completion_tokens || usage.output_tokens || 0;
+    };
+    const classification = { transportError: false, rateLimited: false, timedOut: false };
+
+    const complete =
+      mode === "single"
+        ? (req) => this.#completeSingle(req, { addUsage, classification })
+        : (req) => this.#completeBatched(req, { addUsage, classification });
+
+    let ideateResult;
+    try {
+      ideateResult = await this.ideateImpl(
+        { context: { slug: cell.briefId, brief: brief.text } },
+        {
+          complete,
+          buildRound1Prompt,
+          buildRound2Prompt,
+          agents,
+          maxRounds,
+          onAgentError: (err, ctx) => {
+            this.logger(`OpenAIBatchProvider: agent error (round ${ctx && ctx.round}, agent ${ctx && ctx.agentId}): ${err && err.message}`);
+          },
+        },
+      );
+    } catch (err) {
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, "transport_error"), detail: `OpenAIBatchProvider: ideateImpl threw: ${err && err.message}`, tokens: { tokens_by_model: tokensByModel } };
+    }
+
+    const candidates = (ideateResult && ideateResult.candidates) || [];
+    if (candidates.length === 0) {
+      const allRefused = ideateResult && ideateResult.meta && ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted;
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, allRefused ? "refusal" : "empty_pool"), detail: "OpenAIBatchProvider: ideateCore returned an empty candidate pool", tokens: { tokens_by_model: tokensByModel } };
+    }
+
+    return { terminalState: "completed", result: { candidates, agents: ideateResult.agents, meta: ideateResult.meta }, tokens: { tokens_by_model: tokensByModel } };
+  }
+
+  // ── single mode: POST /v1/chat/completions directly ──────────────────────
+  async #completeSingle(req, { addUsage, classification }) {
+    const params = buildOpenAIChatParams(req);
+    const { ok, status, json, error } = await openaiFetchWithRetry(
+      this.fetchImpl,
+      "https://api.openai.com/v1/chat/completions",
+      openaiHeaders(this.apiKey),
+      params,
+      { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!ok) {
+      classifyTransportOutcome(status, error, classification);
+      return { ok: false };
+    }
+    addUsage(req.model, json.usage);
+    return { ok: true, text: extractOpenAIText(json) };
+  }
+
+  // ── batch mode: buffer this call; flush the round as one OpenAI Batch ─────
+  #completeBatched(req, ctx) {
+    return new Promise((resolve, reject) => {
+      this.#pending.push({ req, resolve, reject, ctx });
+      if (!this.#flushScheduled) {
+        this.#flushScheduled = true;
+        setTimeout(() => this.#flush(), 0);
+      }
+    });
+  }
+
+  async #flush() {
+    const batch = this.#pending;
+    this.#pending = [];
+    this.#flushScheduled = false;
+    if (!batch.length) return;
+
+    const lines = batch.map((entry, i) => ({
+      custom_id: `req-${i}-${Math.random().toString(36).slice(2, 8)}`,
+      method: "POST",
+      url: "/v1/chat/completions",
+      body: buildOpenAIChatParams(entry.req),
+    }));
+    const byCustomId = new Map(lines.map((l, i) => [l.custom_id, batch[i]]));
+    const jsonl = lines.map((l) => JSON.stringify(l)).join("\n");
+
+    // 1. Upload the JSONL as a batch input file (multipart/form-data).
+    const form = new FormData();
+    form.append("purpose", "batch");
+    form.append("file", new Blob([jsonl], { type: "application/jsonl" }), "batch-input.jsonl");
+    const upload = await openaiFetchWithRetry(
+      this.fetchImpl,
+      "https://api.openai.com/v1/files",
+      openaiAuthOnlyHeaders(this.apiKey),
+      form,
+      { formData: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!upload.ok) {
+      const kind = classifyTransportKind(upload.status);
+      for (const entry of batch) {
+        classifyTransportOutcome(upload.status, upload.error, entry.ctx.classification);
+        entry.resolve({ ok: false, __failureKind: kind });
+      }
+      return;
+    }
+
+    // 2. Create the batch job over that file.
+    const create = await openaiFetchWithRetry(
+      this.fetchImpl,
+      "https://api.openai.com/v1/batches",
+      openaiHeaders(this.apiKey),
+      { input_file_id: upload.json.id, endpoint: "/v1/chat/completions", completion_window: "24h" },
+      { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!create.ok) {
+      for (const entry of batch) {
+        classifyTransportOutcome(create.status, create.error, entry.ctx.classification);
+        entry.resolve({ ok: false, __failureKind: classifyTransportKind(create.status) });
+      }
+      return;
+    }
+
+    const batchId = create.json.id;
+    const deadline = Date.now() + this.maxPollMs;
+    let batchStatus = create.json;
+    // Terminal OpenAI batch states: completed | failed | expired | cancelled.
+    while (batchStatus.status !== "completed") {
+      if (batchStatus.status === "failed" || batchStatus.status === "expired" || batchStatus.status === "cancelled") {
+        for (const entry of batch) {
+          entry.ctx.classification.transportError = true;
+          entry.resolve({ ok: false, __failureKind: "transport_error" });
+        }
+        return;
+      }
+      if (Date.now() > deadline) {
+        for (const entry of batch) {
+          entry.ctx.classification.timedOut = true;
+          entry.resolve({ ok: false, __failureKind: "timeout" });
+        }
+        return;
+      }
+      await this.sleep(this.pollIntervalMs);
+      const poll = await openaiFetchWithRetry(
+        this.fetchImpl,
+        `https://api.openai.com/v1/batches/${batchId}`,
+        openaiHeaders(this.apiKey),
+        undefined,
+        { method: "GET", maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+      );
+      if (!poll.ok) {
+        for (const entry of batch) {
+          classifyTransportOutcome(poll.status, poll.error, entry.ctx.classification);
+          entry.resolve({ ok: false, __failureKind: classifyTransportKind(poll.status) });
+        }
+        return;
+      }
+      batchStatus = poll.json;
+    }
+
+    // 3. Download the output file (JSONL, keyed by custom_id).
+    const results = await openaiFetchWithRetry(
+      this.fetchImpl,
+      `https://api.openai.com/v1/files/${batchStatus.output_file_id}/content`,
+      openaiHeaders(this.apiKey),
+      undefined,
+      { method: "GET", raw: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!results.ok) {
+      for (const entry of batch) {
+        classifyTransportOutcome(results.status, results.error, entry.ctx.classification);
+        entry.resolve({ ok: false, __failureKind: classifyTransportKind(results.status) });
+      }
+      return;
+    }
+
+    const seen = new Set();
+    for (const line of results.text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const entry = byCustomId.get(row.custom_id);
+      if (!entry) continue;
+      seen.add(row.custom_id);
+      const resp = row.response;
+      if (!row.error && resp && resp.status_code >= 200 && resp.status_code < 300 && resp.body) {
+        entry.ctx.addUsage(entry.req.model, resp.body.usage);
+        entry.resolve({ ok: true, text: extractOpenAIText(resp.body) });
+      } else if (resp && resp.status_code === 429) {
+        entry.ctx.classification.rateLimited = true;
+        entry.resolve({ ok: false, __failureKind: "rate_limited" });
+      } else {
+        entry.ctx.classification.transportError = true;
+        entry.resolve({ ok: false, __failureKind: "transport_error" });
+      }
+    }
+    for (const [customId, entry] of byCustomId) {
+      if (!seen.has(customId)) {
+        entry.ctx.classification.transportError = true;
+        entry.resolve({ ok: false, __failureKind: "transport_error" });
+      }
+    }
+  }
+}
+
+// ── OpenAI transport (mirrors the Anthropic helpers; force-strip by construction) ──
+
+/**
+ * Build the OpenAI chat-completions request body BY CONSTRUCTION from an
+ * explicit allowlist — model, messages, max_completion_tokens — and never a
+ * sampling param, for ANY model (§3.3 force-strip; see the class header and the
+ * matching buildAnthropicMessageParams rationale). A future edit cannot leak a
+ * temperature through because there is no field-copy path that would carry one.
+ */
+export function buildOpenAIChatParams(req) {
+  return {
+    model: req.model,
+    messages: [{ role: "user", content: req.prompt }],
+    max_completion_tokens: req.maxTokens ?? 2048,
+    // Deliberately no temperature / top_p / top_k, for any model. See above.
+  };
+}
+
+function openaiHeaders(apiKey) {
+  return { authorization: `Bearer ${apiKey}`, "content-type": "application/json" };
+}
+
+/** Auth-only headers for a multipart upload — fetch sets the multipart
+ *  Content-Type (with boundary) itself when the body is a FormData, so we must
+ *  NOT set content-type here or the boundary is lost. */
+function openaiAuthOnlyHeaders(apiKey) {
+  return { authorization: `Bearer ${apiKey}` };
+}
+
+/** choices[0].message.content of an OpenAI chat completion, or "". */
+export function extractOpenAIText(body) {
+  const choice = body && Array.isArray(body.choices) ? body.choices[0] : undefined;
+  const content = choice && choice.message ? choice.message.content : undefined;
+  return typeof content === "string" ? content : "";
+}
+
+/**
+ * OpenAI fetch wrapper with retry/backoff on 429/5xx, using the injected
+ * `sleep`. Never throws — resolves to { ok, json|text } or { ok:false, status,
+ * error }. `formData:true` sends the body as-is (a FormData) with no JSON
+ * serialization and no content-type override (the multipart boundary must come
+ * from fetch); otherwise the body is JSON-serialized.
+ */
+export async function openaiFetchWithRetry(fetchImpl, url, headers, body, { method = "POST", raw = false, formData = false, maxRetries = 3, sleep, logger } = {}) {
+  let lastStatus;
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let res;
+    try {
+      res = await fetchImpl(url, {
+        method,
+        headers,
+        body: body === undefined ? undefined : formData ? body : JSON.stringify(body),
+      });
+    } catch (err) {
+      lastError = err;
+      lastStatus = undefined;
+      if (attempt < maxRetries) {
+        if (logger) logger(`openaiFetchWithRetry: fetch rejected (attempt ${attempt + 1}/${maxRetries + 1}): ${err && err.message}`);
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      return { ok: false, status: undefined, error: err };
+    }
+    if (res.ok) {
+      return raw ? { ok: true, text: await res.text() } : { ok: true, json: await res.json() };
+    }
+    lastStatus = res.status;
+    const retryable = res.status === 429 || res.status >= 500;
+    if (retryable && attempt < maxRetries) {
+      if (logger) logger(`openaiFetchWithRetry: HTTP ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying`);
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+    return { ok: false, status: res.status, error: undefined };
+  }
+  return { ok: false, status: lastStatus, error: lastError };
 }

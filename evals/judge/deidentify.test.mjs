@@ -7,7 +7,7 @@ import { deidentifyPool, assembleJudgePayload } from "./deidentify.mjs";
 const LABELED_POOL = [
   { text: "Use a swarm of low-cost drones for reef survey", arm: "D", model: "claude-opus-5", persona: "proposer_3" },
   { text: "Deploy citizen-science phone photography", arm: "B", model: "claude-haiku-4-5", persona: "proposer_1" },
-  { text: "Satellite hyperspectral imaging pipeline", arm: "G", model: "openai-large-tier", persona: "proposer_5" },
+  { text: "Satellite hyperspectral imaging pipeline", arm: "G", model: "gpt-5.6-sol", persona: "proposer_5" },
 ];
 
 test("deidentifyPool strips arm/model/persona from every candidate", () => {
@@ -22,7 +22,7 @@ test("AC3 — none of the identity strings appear anywhere in the assembled judg
   const payload = assembleJudgePayload({ pool: LABELED_POOL, arm: { id: "D" }, briefText: "Design a low-cost coral reef health monitoring approach." });
   const serialized = JSON.stringify(payload);
 
-  const identityStrings = ["D", "B", "G", "claude-opus-5", "claude-haiku-4-5", "openai-large-tier", "proposer_3", "proposer_1", "proposer_5"];
+  const identityStrings = ["D", "B", "G", "claude-opus-5", "claude-haiku-4-5", "gpt-5.6-sol", "proposer_3", "proposer_1", "proposer_5"];
   for (const s of identityStrings) {
     // "D", "B", "G" are short enough to false-positive-match inside prose
     // (e.g. the word "Deploy" contains a capital D... no, actually contains

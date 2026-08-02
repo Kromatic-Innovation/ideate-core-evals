@@ -52,12 +52,13 @@ const INTERIM_RATES_USD_PER_MTOK = {
   "claude-opus-5": { in: 5.0, out: 25.0 },
   "claude-sonnet-5": { in: 3.0, out: 15.0 },
   "claude-haiku-4-5": { in: 1.0, out: 5.0 },
-  // OpenAI arms (G, H) are unpriced placeholders until the adapter + real
-  // rates land (see arms.config.json's openaiModelId note) -- estimate at a
-  // representative mid-tier rate from §8.1's range so --max-spend still has a
-  // number, clearly not authoritative.
-  "openai-mid-tier": { in: 3.5, out: 18.0 },
-  "openai-large-tier": { in: 3.5, out: 18.0 },
+  // OpenAI arms (G, H) now use real, first-party-verified ids and rates (#22 /
+  // lib/price.mjs RATE_TABLE). These INTERIM figures remain a coarse pre-flight
+  // estimate for --max-spend only (this table is superseded by lib/price.mjs's
+  // authoritative RATE_TABLE at read time); they mirror the real rates so the
+  // pre-flight projection is not wildly off.
+  "gpt-5.6-terra": { in: 2.0, out: 12.0 },
+  "gpt-5.6-sol": { in: 5.0, out: 30.0 },
 };
 
 // Per-run token estimate from docs/PREREGISTRATION.md §8.2 projection table:

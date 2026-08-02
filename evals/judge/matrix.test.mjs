@@ -13,17 +13,17 @@ const ARMS_CONFIG = JSON.parse(readFileSync(join(__dirname, "..", "..", "arms.co
 
 const ARM_B = { id: "B", ...ARMS_CONFIG.arms.B }; // all-haiku
 const ARM_D = { id: "D", ...ARMS_CONFIG.arms.D }; // all-opus
-const ARM_H = { id: "H", ...ARMS_CONFIG.arms.H }; // all-openai-mid-tier
+const ARM_H = { id: "H", ...ARMS_CONFIG.arms.H }; // all-gpt-5.6-terra
 
 const JUDGE_MODELS = {
   anthropic: ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"],
-  openai: ["openai-large-tier", "openai-mid-tier"],
+  openai: ["gpt-5.6-sol", "gpt-5.6-terra"],
 };
 
 test("providerOf infers anthropic / openai from model id prefix", () => {
   assert.equal(providerOf("claude-sonnet-5"), "anthropic");
   assert.equal(providerOf("claude-haiku-4-5"), "anthropic");
-  assert.equal(providerOf("openai-mid-tier"), "openai");
+  assert.equal(providerOf("gpt-5.6-terra"), "openai");
   assert.equal(providerOf("gpt-4.1"), "openai");
   assert.throws(() => providerOf("mystery-model"), /cannot infer a provider/);
   assert.throws(() => providerOf(""), /non-empty string/);
@@ -81,8 +81,8 @@ test("rows carry generator_providers reflecting the arm's own slot providers", (
       { persona: "proposer_1", model: "claude-haiku-4-5" },
       { persona: "proposer_2", model: "claude-sonnet-5" },
       { persona: "proposer_3", model: "claude-opus-5" },
-      { persona: "proposer_4", model: "openai-mid-tier" },
-      { persona: "proposer_5", model: "openai-large-tier" },
+      { persona: "proposer_4", model: "gpt-5.6-terra" },
+      { persona: "proposer_5", model: "gpt-5.6-sol" },
     ],
   };
   const wideJudgeModels = { anthropic: ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5", "claude-sonnet-4"], openai: ["openai-small-tier"] };
@@ -93,10 +93,10 @@ test("rows carry generator_providers reflecting the arm's own slot providers", (
 });
 
 test("throws when no distinct judge exists for a provider", () => {
-  // ARM_H uses openai-mid-tier for every slot; if the ONLY openai candidate is
-  // openai-mid-tier, no distinct openai judge exists for this arm.
+  // ARM_H uses gpt-5.6-terra for every slot; if the ONLY openai candidate is
+  // gpt-5.6-terra, no distinct openai judge exists for this arm.
   assert.throws(
-    () => buildJudgeMatrix([{ poolKey: "arm=H|brief=b1", arm: ARM_H }], { judgeModels: { anthropic: ["claude-sonnet-5"], openai: ["openai-mid-tier"] } }),
+    () => buildJudgeMatrix([{ poolKey: "arm=H|brief=b1", arm: ARM_H }], { judgeModels: { anthropic: ["claude-sonnet-5"], openai: ["gpt-5.6-terra"] } }),
     /no distinct openai judge available/,
   );
 });

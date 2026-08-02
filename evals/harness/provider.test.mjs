@@ -59,8 +59,12 @@ test("MockProvider records the mode it was called with -- how the runner's batch
   assert.equal(provider.calls[0].mode, "single");
 });
 
-test("OpenAIBatchProvider is still a documented stub -- it throws rather than silently no-op (separate issue)", async () => {
-  await assert.rejects(() => new OpenAIBatchProvider().generate(), /documented stub/);
+test("OpenAIBatchProvider is no longer a stub -- constructing it does not throw, and a missing key returns a classified failure rather than throwing (issue #22)", async () => {
+  assert.doesNotThrow(() => new OpenAIBatchProvider({ apiKey: "test-key", corpus: [], armsConfig: { arms: {} } }));
+  // Explicit falsy key so this does not depend on process.env.OPENAI_API_KEY.
+  const resp = await new OpenAIBatchProvider({ apiKey: "" }).generate({ briefId: "b" }, { slots: [] }, { mode: "batch" });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "harness_error");
 });
 
 test("AnthropicBatchProvider is no longer a stub -- constructing it does not throw (issue #19)", () => {
