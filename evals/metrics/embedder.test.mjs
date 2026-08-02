@@ -48,6 +48,41 @@ function makeFakeFetch({ reverseOrder = false, tokensPerCall = 10 } = {}) {
   return { fetchImpl, calls };
 }
 
+// A fake `fetchImpl` that returns a scripted SEQUENCE of responses, so the
+// 429/5xx retry path is testable without a network. Each script element is
+// either `200` (a normal success whose embeddings are derived from the request
+// texts exactly like makeFakeFetch, so slot-correctness is still assertable) or
+// a failure spec `{ status, statusText?, retryAfter?, body? }`. When the script
+// runs out, its LAST element repeats (so `[429]` means "always 429").
+function makeScriptedFetch(script, { tokensPerCall = 10 } = {}) {
+  const calls = [];
+  let i = 0;
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    const step = script[Math.min(i, script.length - 1)];
+    i++;
+    if (step === 200) {
+      const body = JSON.parse(init.body);
+      const data = body.input.map((text, idx) => ({
+        index: idx,
+        embedding: [text.length + 1, text.length + 2, text.length + 3],
+      }));
+      return { ok: true, status: 200, statusText: "OK", json: async () => ({ data, usage: { total_tokens: tokensPerCall } }) };
+    }
+    const { status, statusText = "Error", retryAfter, body = "transient failure body" } = step;
+    const headers = retryAfter != null ? { "retry-after": String(retryAfter) } : undefined;
+    return { ok: false, status, statusText, headers, text: async () => body };
+  };
+  return { fetchImpl, calls };
+}
+
+// A no-op sleep that RECORDS the backoff durations it was asked to wait, so a
+// test can assert the retry/backoff schedule without any real elapsed time.
+function makeRecordingSleep() {
+  const sleeps = [];
+  return { sleeps, sleepImpl: async (ms) => void sleeps.push(ms) };
+}
+
 test("fixtureEmbedder returns the exact committed vector for a known text", async () => {
   const embedder = fixtureEmbedder(FIXTURES);
   const someText = Object.keys(FIXTURES.vectors)[0];
@@ -190,4 +225,117 @@ test("voyageEmbedder.embed() omits input_type entirely when not supplied", async
   await embedder.embed(["hello world"]);
   const body = JSON.parse(calls[0].init.body);
   assert.equal("input_type" in body, false);
+});
+
+// ── Transient-failure retry (429 / 5xx), bounded backoff — issue #31 ──
+
+test("voyageEmbedder.embed() retries a 429 then succeeds (retry-then-succeed)", async () => {
+  const { fetchImpl, calls } = makeScriptedFetch([{ status: 429, statusText: "Too Many Requests" }, 200]);
+  const { sleeps, sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl });
+
+  const vecs = await embedder.embed(["alpha", "beta idea"]);
+  assert.equal(vecs.length, 2);
+  for (const vec of vecs) assert.ok(Math.abs(l2Norm(vec) - 1) < 1e-9);
+  assert.equal(calls.length, 2, "one failed attempt + one successful retry");
+  assert.equal(sleeps.length, 1, "backed off exactly once before the retry");
+});
+
+test("voyageEmbedder.embed() retries 5xx as well as 429", async () => {
+  const { fetchImpl, calls } = makeScriptedFetch([{ status: 503, statusText: "Service Unavailable" }, 200]);
+  const { sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl });
+
+  const vecs = await embedder.embed(["gamma"]);
+  assert.equal(vecs.length, 1);
+  assert.equal(calls.length, 2, "5xx is transient and retried");
+});
+
+test("voyageEmbedder.embed() gives up after maxRetries and throws the loud, unchanged error (retry-exhausted)", async () => {
+  const { fetchImpl, calls } = makeScriptedFetch([{ status: 429, statusText: "Too Many Requests", body: "still rate limited" }]);
+  const { sleeps, sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl, maxRetries: 2 });
+
+  await assert.rejects(
+    () => embedder.embed(["alpha"]),
+    /voyageEmbedder\.embed: Voyage API returned 429 Too Many Requests: still rate limited/,
+  );
+  assert.equal(calls.length, 3, "initial attempt + maxRetries(2) retries = 3 total");
+  assert.equal(sleeps.length, 2, "one backoff before each of the 2 retries");
+});
+
+test("voyageEmbedder.embed() does NOT retry a non-429 4xx — fails immediately with the existing message", async () => {
+  const { fetchImpl, calls } = makeScriptedFetch([{ status: 400, statusText: "Bad Request", body: "malformed request" }]);
+  const { sleeps, sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl });
+
+  await assert.rejects(
+    () => embedder.embed(["alpha"]),
+    /voyageEmbedder\.embed: Voyage API returned 400 Bad Request: malformed request/,
+  );
+  assert.equal(calls.length, 1, "a 4xx is a hard failure — no retry");
+  assert.equal(sleeps.length, 0, "never backed off");
+});
+
+test("voyageEmbedder.embed() does not retry a 401 (bad key) — a wrong key must fail loudly at once", async () => {
+  const { fetchImpl, calls } = makeScriptedFetch([{ status: 401, statusText: "Unauthorized", body: "bad key" }]);
+  const { sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "wrong-key", fetchImpl, sleepImpl });
+  await assert.rejects(() => embedder.embed(["alpha"]), /returned 401 Unauthorized/);
+  assert.equal(calls.length, 1);
+});
+
+test("voyageEmbedder.embed() uses exponential backoff (baseDelayMs, doubling) when no retry-after header is sent", async () => {
+  const { fetchImpl } = makeScriptedFetch([{ status: 429 }, { status: 429 }, 200]);
+  const { sleeps, sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl, baseDelayMs: 500 });
+
+  await embedder.embed(["alpha"]);
+  assert.deepEqual(sleeps, [500, 1000], "500 * 2**0, then 500 * 2**1");
+});
+
+test("voyageEmbedder.embed() honors a numeric retry-after header (delta-seconds) over the exponential schedule", async () => {
+  const { fetchImpl } = makeScriptedFetch([{ status: 429, retryAfter: 2 }, 200]);
+  const { sleeps, sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl, baseDelayMs: 500 });
+
+  await embedder.embed(["alpha"]);
+  assert.deepEqual(sleeps, [2000], "retry-after: 2 seconds -> 2000ms, not the 500ms exponential value");
+});
+
+test("voyageEmbedder.embed() caps a huge retry-after at maxDelayMs so a hostile header cannot hang a run", async () => {
+  const { fetchImpl } = makeScriptedFetch([{ status: 429, retryAfter: 99999 }, 200]);
+  const { sleeps, sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl, maxDelayMs: 30000 });
+
+  await embedder.embed(["alpha"]);
+  assert.deepEqual(sleeps, [30000], "99999s would be ~27h; capped at maxDelayMs");
+});
+
+test("voyageEmbedder.embed() retry does not corrupt batch reassembly — a retried chunk lands in its correct slots", async () => {
+  // batchSize=2 over 5 texts -> chunks (2,2,1). The SECOND chunk 429s once
+  // then succeeds; every vector must still land in its own text's slot.
+  const { fetchImpl, calls } = makeScriptedFetch([200, { status: 429 }, 200, 200]);
+  const { sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl, batchSize: 2 });
+
+  const texts = ["one", "two", "three", "four", "five"];
+  const vecs = await embedder.embed(texts);
+
+  assert.equal(vecs.length, 5);
+  assert.equal(calls.length, 4, "3 chunks, with one extra attempt for the retried middle chunk");
+  texts.forEach((t, i) => {
+    const raw = [t.length + 1, t.length + 2, t.length + 3];
+    const norm = Math.sqrt(raw.reduce((s, x) => s + x * x, 0));
+    const expected = raw.map((x) => x / norm);
+    vecs[i].forEach((component, j) => assert.ok(Math.abs(component - expected[j]) < 1e-9, `slot ${i} scrambled`));
+  });
+});
+
+test("voyageEmbedder.embed() with maxRetries:0 disables retry — a 429 fails on the first attempt", async () => {
+  const { fetchImpl, calls } = makeScriptedFetch([{ status: 429, statusText: "Too Many Requests" }]);
+  const { sleepImpl } = makeRecordingSleep();
+  const embedder = voyageEmbedder({ apiKey: "fake-key", fetchImpl, sleepImpl, maxRetries: 0 });
+  await assert.rejects(() => embedder.embed(["alpha"]), /returned 429/);
+  assert.equal(calls.length, 1);
 });
