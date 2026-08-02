@@ -65,16 +65,68 @@ per axis, `topic`, `condition`, `idea_id`, `timestamp`, `consent`, `no_ai`,
   punctuation, whitespace; `normalizeTitle`) → matches `id_title_mapping.csv` →
   `idea_id`. AI/AI_Rerank files resolve through the same normalized-title lookup
   (their `Title:` line, falling back to the filename slug).
-- **Totality is asserted both directions.** Every idea file must resolve to an
-  `idea_id`, and every `idea_id` in the reviews must resolve to exactly one idea
-  file. A partial join **throws** rather than silently shrinking the slice.
+- **The mapping's second column is `Title / Filename` — a title for Human rows,
+  a *filename* for the AI rows (issue #35).** The AI rows hold a `.json`
+  filename, sometimes with a trailing space, e.g.
+  `temporal_bias_decay_simulation.json ` — not a prose title. Before comparison
+  the reader strips a trailing `.json`/`.txt` extension and surrounding
+  whitespace from the mapping value (`stripMappingExtension`), so the
+  filename-style value normalizes to the same token stream as the idea file's
+  `.txt` stem and joins. One source `idea_id` also carries a stray internal
+  space (`'Bias_1 _AI_Rerank'`); it falls in the excluded condition (below), but
+  the parser tolerates it.
+- **Totality is asserted both directions.** Every idea file in an *included*
+  condition must resolve to an `idea_id`, and every `idea_id` in the reviews
+  *under an included condition* must resolve to exactly one idea file. A partial
+  join **throws** rather than silently shrinking the slice.
+
+### Excluded conditions (issue #35)
+
+The reader drops a whole condition only by **explicit, named configuration**
+(`DEFAULT_EXCLUDED_CONDITIONS` in `slice.mjs`, default `["AI_Rerank"]`). An
+excluded condition's directory is skipped whole and its review `idea_id`s are
+removed from **both** totality checks; the exclusion and its reason are returned
+in the read result (`exclusions`) so they reach the validation record and
+`REPORT.md`. This is the **only** carve-out — an unresolved file in an included
+condition still throws; exclusion is never a general "drop what doesn't join".
+
+- **`AI_Rerank` (`AI_Human_Ideas_Txt/`, 49 files) — excluded.** Operator
+  decision, 2026-08-02. Of its 49 filenames, only **18** also appear in
+  `AI_AI_Ideas_Processed/` and are suffix-swap recoverable; the other **31** draw
+  from a larger generated pool than the AI condition's 49 sampled ideas and
+  **cannot have their `idea_id` recovered from the released mapping at all**
+  (the mapping contains zero `*_AI_Rerank` rows — 54 review idea_ids appear
+  nowhere in it). Including only the recoverable 18 would represent the condition
+  by a non-random 37% subsample. Validation needs a *reliable* expert-scored set,
+  not a complete one — **Human + AI (98 ideas)** is sufficient. To include it
+  later (e.g. if a source for the 31 is found), pass `excludedConditions: []` (or
+  a narrower list) and register the recovery.
 
 ### Hand-resolved near-misses
 
-_None recorded yet — the join is run against the real payload in the #16
-real-data run. Any titles that do not normalize to a clean match there are
-resolved by hand and recorded in this section (filename → idea_id, with the
-reason), so the mapping is auditable and reproducible._
+A genuine straggler in an *included* condition — one whose `Title:` line and
+filename stem normalize to no mapping value — is bound by an explicit
+`HAND_RESOLVED_IDEA_IDS` override in `slice.mjs` (`<dir>/<filename>` → `idea_id`,
+validated against the reviews so a mistyped override throws rather than silently
+mis-binding). The default map is **empty**.
+
+- **`Human_Ideas_Txt_Processed/IdeaGeneration_Soham.txt`** — the one Human file
+  (of 49) that the other 48 `HumanIdeaForm_*` files' `Title:`-line join does not
+  cover (issue #35). The `stripMappingExtension` normalization above resolves it
+  automatically **iff** its mapping value is a filename; the real-data run (#16)
+  confirms this. **If it is still unresolved there,** the operator adds one line
+  to `HAND_RESOLVED_IDEA_IDS`, e.g.
+  `"Human_Ideas_Txt_Processed/IdeaGeneration_Soham.txt": "<its idea_id>"`, and
+  records the reason here, so the mapping stays auditable and reproducible.
+
+> **Operator confirmation still required (issue #35).** The acceptance criteria
+> that reference the *real* slice — all 49 AI files resolve, all 49 Human files
+> (incl. Soham) resolve, and `readSiEtAlSlice()` returns 98 ideas with non-empty
+> `expertScores` — can only be checked with `data/si-et-al/` present. The build
+> lane implemented and **hermetically** tested the mechanisms (extension
+> normalization, named exclusion, hand-resolution override); running the real
+> join and confirming the counts (and adding the Soham override if the automatic
+> resolution does not cover it) is the operator's step, on #16.
 
 ## Two leakage hazards (closed; `PREREGISTRATION.md` §5.3)
 

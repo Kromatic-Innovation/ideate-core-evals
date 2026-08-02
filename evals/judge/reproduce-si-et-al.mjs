@@ -41,6 +41,9 @@ const pct = (p) => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.leng
 console.log(`Si et al. split-half top/bottom-25% balanced accuracy`);
 console.log(`  ideas (n)            : ${n}`);
 console.log(`  reviews (release)    : ${slice.reviewCount}  (paper reports 298 — reconcile before trusting; see docs/fetching-si-et-al.md)`);
+for (const ex of slice.exclusions || []) {
+  console.log(`  excluded condition   : ${ex.condition} (${ex.fileCount} files) — ${ex.reason}`);
+}
 console.log(`  splits               : ${splits}  seed: ${seed}`);
 console.log(`  mean balanced acc    : ${mean.toFixed(4)}`);
 console.log(`  distribution [p05..p95]: ${pct(0.05).toFixed(4)} .. ${pct(0.95).toFixed(4)}`);
