@@ -32,6 +32,7 @@ import { CORPUS, CORPUS_HASH } from "./corpus/index.mjs";
 import { ResultsStore } from "../lib/store.mjs";
 import { runSpec } from "./harness/runner.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
+import { voyageEmbedder } from "./metrics/embedder.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -177,6 +178,19 @@ async function main() {
   const engineVersion = getInstalledEngineVersion();
   const engineSha = process.env.IDEATE_CORE_ENGINE_SHA || `ideate-core@${engineVersion}`;
 
+  // embedderId (issue #20, AC5): lib/manifest.mjs's CONFIG_FIELDS already
+  // keys configHash on `embedderId` (per docs/PREREGISTRATION.md §3.3 --
+  // the embedder is held CONSTANT across arms, and §10 names "embedding
+  // model shapes diversity metric" as a registered threat to validity), but
+  // until now nothing here actually SET it, so it never participated in the
+  // hash. Read it off `voyageEmbedder().modelId` -- constructing with no
+  // apiKey and never calling .embed() is safe and network-free (see
+  // embedder.mjs voyageEmbedder's header: construction never requires a key
+  // or touches fetch) -- rather than hardcoding the literal "voyage-4-lite"
+  // a second time, so the run harness and the embedder module cannot drift
+  // out of sync on what the production model id actually is.
+  const embedderId = voyageEmbedder().modelId;
+
   const spec = {
     arms: armIds.map((id) => ({ id })),
     briefs: CORPUS.map((b) => ({ id: b.id })),
@@ -185,6 +199,7 @@ async function main() {
       harnessVersion: "0.0.1",
       engineSha,
       promptHash: "unpinned",
+      embedderId,
       corpusHash: CORPUS_HASH,
     },
   };

@@ -1,8 +1,8 @@
 // embedder.mjs — the embedder interface every metric in this directory
 // depends on, plus the two concrete implementations: a hermetic FIXTURE
-// lookup (used by tests and negative controls) and a documented, unimplemented
-// Voyage-4-lite stub (the production embedder, per docs/PREREGISTRATION.md
-// §8.1 — "Voyage-4-lite embeddings").
+// lookup (used by tests and negative controls) and the live Voyage-4-lite
+// HTTP client (the production embedder, per docs/PREREGISTRATION.md §8.1 —
+// "Voyage-4-lite embeddings").
 //
 // ── Why the metrics take embeddings, not text ───────────────────────────────
 // distinct_k, poolDiversity, and collapseRate (./clustering.mjs,
@@ -18,6 +18,16 @@
 //   embed(texts: string[]) -> Promise<number[][]>
 // One vector per input text, same order, L2-normalized (cosine distance is
 // then just 1 - dot product, which every function in this directory assumes).
+//
+// ── Hermetic-CI safety: voyageEmbedder is network-capable, never network-eager ──
+// `voyageEmbedder()` never imports an SDK and never calls fetch at
+// construction or module-load time — only `.embed()` does, and only when
+// actually invoked with a real `fetchImpl`. Tests exercise the real batching/
+// ordering/normalization/usage-accounting logic by injecting a FAKE
+// `fetchImpl` (see embedder.test.mjs), so `node --test` never makes a live
+// network call even though this module is the production HTTP client. The
+// live path is exercised only by ./live-validation.mjs, an opt-in script no
+// test imports (see that file's header).
 
 /**
  * The hermetic embedder: a pure text -> vector LOOKUP over a committed JSON
@@ -70,45 +80,156 @@ export function fixtureEmbedder(fixtures) {
 }
 
 /**
- * The PRODUCTION embedder stub — Voyage-4-lite (API), per
- * docs/PREREGISTRATION.md §8.1 ("Voyage-4-lite embeddings", $0.02/MTok + 200M
- * free tokens/account). Deliberately UNIMPLEMENTED here: this issue (#3)
- * scopes the metric machinery and its hermetic validation, not a live network
- * client. Calling `.embed()` throws rather than silently returning garbage or
- * quietly falling back to the fixture embedder — a metrics module that
- * silently swapped embedders on missing credentials would produce numbers
- * that LOOK like a real run and aren't.
+ * The PRODUCTION embedder — Voyage-4-lite (API), per docs/PREREGISTRATION.md
+ * §8.1 ("Voyage-4-lite embeddings", $0.02/MTok + 200M free tokens/account).
  *
- * ── What wiring this up for real requires (follow-up work, not in #3) ──────
- *   - A `VOYAGE_API_KEY` (or similar) env var, read here, never hardcoded.
- *   - A batched HTTP client honoring Voyage's rate limits / batch endpoint.
- *   - Feeding `input_tokens` into the accounting ledger (lib/accounting.mjs
- *     `costRow`) the same way generation calls do — embeddings are billed too.
- *   - Its OWN run-time DAT check (see this module's file-level deviation
- *     note below) — the hermetic DAT replication in ../dat-replication.test.mjs
- *     validates the FIXTURE embedder + the metric machinery, not this one.
- *     Voyage-4-lite could in principle fail to recover DAT ordering even
- *     though MiniLM does; nothing in this repo currently checks that, and
- *     that gap is a stated limitation (see PR body), not a hidden one.
+ * ── Construction never requires a key ───────────────────────────────────────
+ * `voyageEmbedder()` (no args, no key) must NOT throw — run.mjs constructs
+ * one just to read `.modelId` for configHash (see run.mjs main()), and a
+ * --dry-run invocation must never touch the network or demand credentials
+ * just to look up a model id string. The key is only required at `.embed()`
+ * call time (see below) — construction-time failure would be surprising for
+ * a pure "what model id would this run use" query.
+ *
+ * ── embed() fails loudly, never silently degrades ───────────────────────────
+ * Calling `.embed()` with no apiKey throws immediately, before any network
+ * call — never invents/defaults a key, and never silently falls back to the
+ * hermetic fixture embedder. A metrics module that quietly swapped embedders
+ * on missing credentials would produce numbers that LOOK like a real run and
+ * aren't, which is worse than an obvious crash (see ./fixtureEmbedder's own
+ * "throws on unknown text" reasoning above — same honesty principle, applied
+ * to credentials instead of vocabulary).
+ *
+ * ── Batching, ordering, normalization ───────────────────────────────────────
+ * Texts are chunked into groups of `batchSize` (Voyage's own batch limit is
+ * generous, but chunking bounds any single request's payload/latency and
+ * keeps retry blast-radius small). Each chunk is POSTed independently; the
+ * response's `data[].index` is honored explicitly (sorted before reassembly)
+ * rather than trusting response order to match request order, since nothing
+ * in Voyage's docs guarantees that and every function in this directory
+ * (clustering.mjs, diversity.mjs) assumes strict input-order correspondence.
+ * Every returned vector is L2-normalized defensively — Voyage returns unit
+ * vectors by default, but re-normalizing here costs nothing and removes an
+ * entire class of "was this actually unit-length" doubt from every
+ * downstream cosineDistance call (see clustering.mjs cosineDistance, which
+ * itself re-divides by magnitude for the same defensive reason).
+ *
+ * ── Usage accounting ─────────────────────────────────────────────────────
+ * `usage.total_tokens` is accumulated across chunks onto the returned
+ * embedder's `.usage.total_tokens` so a future metrics-run can ledger it the
+ * way lib/accounting.mjs costRow() ledgers generation calls. This function
+ * does NOT wire into lib/accounting.mjs itself — no metrics-run pipeline
+ * consumes embedder usage yet; wiring it in is follow-up work, not invented
+ * here.
  *
  * @param {object} [opts]
  * @param {string} [opts.apiKey]  never invented/defaulted — must be supplied
  *   explicitly (e.g. from process.env.VOYAGE_API_KEY by the caller) so a
- *   missing key fails at construction, not deep inside a run.
+ *   missing key fails at the FIRST embed() call, not deep inside a batch.
+ * @param {typeof fetch} [opts.fetchImpl]  injected fetch, defaulting to
+ *   globalThis.fetch — the seam that keeps this hermetic-safe: tests inject a
+ *   fake that never touches the network, so importing this module (even
+ *   calling voyageEmbedder() to read .modelId) never risks a live call. Only
+ *   an actual `.embed()` invocation with a real fetchImpl reaches the network.
+ * @param {string} [opts.model]  Voyage model id, default "voyage-4-lite" per
+ *   §8.1 — also becomes `.modelId`, which feeds lib/manifest.mjs configHash.
+ * @param {number} [opts.batchSize]  texts per HTTP request, default 128.
+ * @param {string} [opts.inputType]  optional Voyage `input_type` ("query" |
+ *   "document") — omitted from the request body entirely when not supplied,
+ *   matching Voyage's own "omit for symmetric use" default behavior.
  */
 export function voyageEmbedder(opts = {}) {
-  const { apiKey } = opts;
-  return {
-    modelId: "voyage-4-lite",
-    dim: null, // unknown until implemented; Voyage-4-lite's published dim, not guessed here
-    async embed(_texts) {
-      throw new Error(
-        "voyageEmbedder: not implemented. This is a documented interface stub (issue #3 scopes the " +
-          "metric machinery + hermetic fixture embedder only). Implementing this requires a live " +
-          "Voyage API client, a VOYAGE_API_KEY, and its own run-time DAT validity check — see this " +
-          "function's header comment. apiKey supplied: " +
-          (apiKey ? "yes (unused — stub)" : "no"),
-      );
+  const { apiKey, fetchImpl = globalThis.fetch, model = "voyage-4-lite", batchSize = 128, inputType } = opts;
+
+  const embedder = {
+    modelId: model,
+    dim: null, // unknown until the first live response; Voyage-4-lite's published dim, not guessed here
+    usage: { total_tokens: 0 },
+    async embed(texts) {
+      if (!Array.isArray(texts) || texts.length === 0) {
+        throw new Error("voyageEmbedder.embed: texts must be a non-empty array");
+      }
+      if (!apiKey) {
+        throw new Error(
+          "voyageEmbedder.embed: no API key supplied. Set VOYAGE_API_KEY in the environment and pass " +
+            "it explicitly as voyageEmbedder({ apiKey: process.env.VOYAGE_API_KEY }) — this module never " +
+            "invents or defaults a key, and never silently falls back to the hermetic fixture embedder.",
+        );
+      }
+
+      // Preallocate so out-of-order chunk resolution (shouldn't happen since
+      // chunks are awaited sequentially below, but keeps the invariant
+      // explicit) can't scramble which output slot a chunk's vectors land in.
+      const results = new Array(texts.length);
+
+      for (let start = 0; start < texts.length; start += batchSize) {
+        const chunk = texts.slice(start, start + batchSize);
+        const body = {
+          input: chunk,
+          model,
+          ...(inputType ? { input_type: inputType } : {}),
+        };
+
+        const res = await fetchImpl("https://api.voyageai.com/v1/embeddings", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => "<unreadable body>");
+          throw new Error(`voyageEmbedder.embed: Voyage API returned ${res.status} ${res.statusText}: ${text}`);
+        }
+
+        const payload = await res.json();
+        if (!payload || !Array.isArray(payload.data)) {
+          throw new Error("voyageEmbedder.embed: malformed Voyage API response (missing `data` array)");
+        }
+        if (payload.data.length !== chunk.length) {
+          throw new Error(
+            `voyageEmbedder.embed: expected ${chunk.length} embeddings for this batch, got ${payload.data.length}`,
+          );
+        }
+
+        // Sort by the server's own `index` before reassembly — never trust
+        // response array order to match request order (see header comment).
+        const sorted = [...payload.data].sort((a, b) => a.index - b.index);
+        sorted.forEach((row, i) => {
+          const vec = l2Normalize(row.embedding);
+          results[start + i] = vec;
+          if (embedder.dim === null) embedder.dim = vec.length;
+        });
+
+        if (payload.usage && Number.isFinite(payload.usage.total_tokens)) {
+          embedder.usage.total_tokens += payload.usage.total_tokens;
+        }
+      }
+
+      return results;
     },
   };
+
+  return embedder;
+}
+
+/**
+ * L2-normalize a vector in place-safe fashion (returns a new array). Applied
+ * defensively to every vector voyageEmbedder returns — see that function's
+ * header for why re-normalizing known-unit vectors is cheap insurance rather
+ * than redundant work.
+ *
+ * @param {number[]} vec
+ * @returns {number[]}
+ */
+function l2Normalize(vec) {
+  let sumSq = 0;
+  for (const x of vec) sumSq += x * x;
+  const norm = Math.sqrt(sumSq);
+  if (norm === 0) {
+    throw new Error("voyageEmbedder: received a zero-magnitude embedding vector, cannot normalize");
+  }
+  return vec.map((x) => x / norm);
 }
