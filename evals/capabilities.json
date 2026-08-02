@@ -1,0 +1,51 @@
+{
+  "_comment": "capabilities.json — a ledger of the LIVE capabilities docs/PREREGISTRATION.md REQUIRES, keyed to the pre-registration (issue #25), NOT to discovered stubs. Motivation (2026-08-02 retro): an automated kickback on #8 named two missing live paths; there were four. It missed evals/metrics/embedder.mjs and, worse, the judge's live scoring call -- which had NO implementing module at all, so an absence had no sentinel for a stub-marker sweep to find. Keying the ledger to the pre-registration's REQUIRED capabilities inverts that: the ledger asks 'what must exist', so a capability with no implementing module is a first-class `absent` row rather than an unobserved gap. evals/capabilities.test.mjs asserts every required capability has an entry, every `live` entry resolves to an export that does not throw on invocation, and that `absent` is caught when something claims `live` on a producer that does not exist.",
+  "_status_values": "live = a real implementing module whose producer resolves and is invocable at its safe surface without throwing | stub = a placeholder/fixture stands in for the real producer | absent = the pre-registration requires this capability but NO implementing module exists yet",
+  "capabilities": [
+    {
+      "id": "generation",
+      "requiredBy": "PREREGISTRATION.md §3 / §9 — the generator adapter that turns an arm config into a candidate pool",
+      "module": "./harness/provider.mjs",
+      "export": "AnthropicBatchProvider",
+      "probe": "provider",
+      "status": "live",
+      "note": "AnthropicBatchProvider (#19) + OpenAIBatchProvider (#22) drive ideate-core against the real Message Batches / OpenAI Batches APIs; both never throw for a transport failure. Hermetic-safe: fetch/ideate seams are injectable."
+    },
+    {
+      "id": "engine-under-study",
+      "requiredBy": "PREREGISTRATION.md §0 / §11 — ideate-core is the engine being measured; a run must invoke the REAL engine, pinned (§11 configHash)",
+      "module": "./harness/provider.mjs",
+      "export": "AnthropicBatchProvider",
+      "probe": "engine-wiring",
+      "status": "live",
+      "note": "ideate-core@0.4.0 (package.json dependency) is wired via the provider's `ideateImpl` seam, dynamically imported at CALL time so the hermetic suite (empty node_modules) never loads it. The probe verifies the wiring module loads and constructs without throwing; it cannot import ideate-core itself under CI, by design."
+    },
+    {
+      "id": "embedding",
+      "requiredBy": "PREREGISTRATION.md §4.1 — distinct_k (the headline metric), pool diversity, collapse rate, and the DAT validity control are all defined over embeddings",
+      "module": "./metrics/embedder.mjs",
+      "export": "voyageEmbedder",
+      "probe": "factory",
+      "status": "live",
+      "note": "voyageEmbedder is the production Voyage-4-lite HTTP client (§8.1) — network-capable but never network-eager (construction never touches the network; .embed() reaches Voyage only when invoked with a real key). The 2026-08-02 retro flagged this path; on develop it is the real client, not a stub. Wiring it into an end-to-end live metrics RUN over real pools is separate integration work, not asserted here."
+    },
+    {
+      "id": "judge-scoring",
+      "requiredBy": "PREREGISTRATION.md §5 — the judge's live scoring call: a de-identified, order-randomized pool -> per-axis scores via a real model call",
+      "module": "./judge/score.mjs",
+      "export": "AnthropicJudgeProvider",
+      "probe": "judge",
+      "status": "live",
+      "note": "AnthropicJudgeProvider + runJudgeMatrix (#21). This is the capability the #8 kickback MISSED entirely: before #21 there was no producer at all (gate.mjs took judgeScores as an input array), so a stub-marker sweep could never find it. Now live for the Anthropic leg."
+    },
+    {
+      "id": "judge-scoring-openai-leg",
+      "requiredBy": "PREREGISTRATION.md §5.2 / H5 — the cross-judge matrix requires EVERY pool scored by both an Anthropic AND an OpenAI judge; H5's self-preference bias term needs both legs",
+      "module": null,
+      "export": null,
+      "probe": null,
+      "status": "absent",
+      "note": "No OpenAIJudgeProvider (a judge scorer with score()) exists yet. #21's runJudgeMatrix records this leg as `deferred` (never silently dropped); #22 supplied the OpenAI GENERATION adapter but, per its own out-of-scope note, not the judge leg. This is a first-class `absent` row exactly because the pre-registration requires the capability and no implementing module exists — the shape the retro's stub-sweep could not catch."
+    }
+  ]
+}
