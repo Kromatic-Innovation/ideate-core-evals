@@ -540,7 +540,16 @@ export function buildAnthropicMessageParams(req) {
   };
 }
 
-function anthropicHeaders(apiKey) {
+// ── Shared Anthropic transport, exported for reuse by the judge scorer (#21) ──
+// evals/judge/score.mjs implements the judge's LIVE scoring call and, per that
+// issue ("reuse the generation adapter's provider interface and its batch path
+// where possible"), drives the SAME Anthropic Messages / Message Batches
+// transport this adapter uses rather than duplicating headers, retry/backoff,
+// text extraction, and failure classification. These helpers are pure and
+// stateless (no `this`), so exporting them is additive — the generation path is
+// unchanged, and there is exactly one implementation of "how this repo talks to
+// the Anthropic API" for both generation and judging.
+export function anthropicHeaders(apiKey) {
   return {
     "x-api-key": apiKey,
     "anthropic-version": "2023-06-01",
@@ -549,7 +558,7 @@ function anthropicHeaders(apiKey) {
 }
 
 /** Concatenate the `text` of every text content block in an Anthropic message. */
-function extractAnthropicText(message) {
+export function extractAnthropicText(message) {
   if (!message || !Array.isArray(message.content)) return "";
   return message.content
     .filter((block) => block && block.type === "text" && typeof block.text === "string")
@@ -563,7 +572,7 @@ function extractAnthropicText(message) {
  * `{ ok: true, json }` (or `{ ok: true, text }` when `raw` is requested, for
  * the JSONL results download) or `{ ok: false, status, error }`.
  */
-async function anthropicFetchWithRetry(fetchImpl, url, headers, body, { method = "POST", raw = false, maxRetries = 3, sleep, logger } = {}) {
+export async function anthropicFetchWithRetry(fetchImpl, url, headers, body, { method = "POST", raw = false, maxRetries = 3, sleep, logger } = {}) {
   let lastStatus;
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -609,13 +618,13 @@ function backoffMs(attempt) {
 }
 
 /** Mutate `classification` in place based on a failed fetch's status/error. */
-function classifyTransportOutcome(status, error, classification) {
+export function classifyTransportOutcome(status, error, classification) {
   if (status === 429) classification.rateLimited = true;
   else classification.transportError = true;
 }
 
 /** Same signal as classifyTransportOutcome, but returned as a FAILURE_KINDS value. */
-function classifyTransportKind(status) {
+export function classifyTransportKind(status) {
   return status === 429 ? "rate_limited" : "transport_error";
 }
 
@@ -627,7 +636,7 @@ function classifyTransportKind(status) {
  * set (e.g. a batch that both saw a transient 429 AND then blew the poll
  * ceiling should report timeout, not rate_limited).
  */
-function pickFailureKind(classification, fallback) {
+export function pickFailureKind(classification, fallback) {
   if (classification.timedOut) return "timeout";
   if (classification.rateLimited) return "rate_limited";
   if (classification.transportError) return "transport_error";
