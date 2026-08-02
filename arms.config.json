@@ -1,6 +1,6 @@
 {
   "_comment": "arms.config.json — arm -> model configuration (issue #5, pre-registration §3.1). Config, not code: the runner (evals/harness/runner.mjs) READS this file; it never hardcodes a model ID. Panel size is fixed at 5 agents / ideasPerAgent: 6 / maxRounds: 2 for every panel arm (A is the one exception - a single solo call, no panel) so the ONLY thing varying between arms is model assignment, per the pre-registration's design intent ('the only thing varying is model assignment').",
-  "_modelIdSource": "Model IDs verified against the claude-api skill (cached 2026-06-24) and docs/PREREGISTRATION.md §8.1 rate table: claude-opus-5, claude-sonnet-5, claude-haiku-4-5. OpenAI model IDs are placeholders pending the OpenAI adapter (§8.1 flags OpenAI rates as 'aggregator sites, not openai.com -- must verify before running'); openaiModelId marks them explicitly as UNVERIFIED so nothing downstream mistakes a placeholder for a priced, confirmed identifier.",
+  "_modelIdSource": "Anthropic model IDs verified against the claude-api skill (cached 2026-06-24) and docs/PREREGISTRATION.md §8.1: claude-opus-5, claude-sonnet-5, claude-haiku-4-5. OpenAI model IDs verified first-party against developers.openai.com/api/docs/pricing (2026-08-02, issue #22) -- see lib/price.mjs's OPENAI_PRICE_VERIFICATION record; the earlier UNVERIFIED placeholders (openai-mid-tier / openai-large-tier) are removed. Tier-matching judgment (issue #22): the study varies model configuration only, so G's two OpenAI slots sit at tiers comparable to the Anthropic slots they contrast with -- gpt-5.6-terra (mid tier, ~Sonnet-comparable) and gpt-5.6-sol (flagship tier, ~Opus-comparable); H is homogeneous OpenAI at the mid tier (gpt-5.6-terra x5), the OpenAI analogue of arm C (homogeneous Sonnet).",
   "panel": {
     "size": 5,
     "ideasPerAgent": 6,
@@ -91,8 +91,8 @@
         { "persona": "proposer_1", "model": "claude-haiku-4-5" },
         { "persona": "proposer_2", "model": "claude-sonnet-5" },
         { "persona": "proposer_3", "model": "claude-opus-5" },
-        { "persona": "proposer_4", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
-        { "persona": "proposer_5", "model": "openai-large-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" }
+        { "persona": "proposer_4", "model": "gpt-5.6-terra" },
+        { "persona": "proposer_5", "model": "gpt-5.6-sol" }
       ]
     },
     "H": {
@@ -101,11 +101,11 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
-        { "persona": "proposer_2", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
-        { "persona": "proposer_3", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
-        { "persona": "proposer_4", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" },
-        { "persona": "proposer_5", "model": "openai-mid-tier", "openaiModelId": "UNVERIFIED-pending-issue-7-price-and-adapter" }
+        { "persona": "proposer_1", "model": "gpt-5.6-terra" },
+        { "persona": "proposer_2", "model": "gpt-5.6-terra" },
+        { "persona": "proposer_3", "model": "gpt-5.6-terra" },
+        { "persona": "proposer_4", "model": "gpt-5.6-terra" },
+        { "persona": "proposer_5", "model": "gpt-5.6-terra" }
       ]
     },
     "A'": {

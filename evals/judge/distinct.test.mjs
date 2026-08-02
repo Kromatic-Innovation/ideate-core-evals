@@ -18,20 +18,20 @@ const ARM_G_CROSS_PROVIDER = {
     { persona: "proposer_1", model: "claude-haiku-4-5" },
     { persona: "proposer_2", model: "claude-sonnet-5" },
     { persona: "proposer_3", model: "claude-opus-5" },
-    { persona: "proposer_4", model: "openai-mid-tier" },
-    { persona: "proposer_5", model: "openai-large-tier" },
+    { persona: "proposer_4", model: "gpt-5.6-terra" },
+    { persona: "proposer_5", model: "gpt-5.6-sol" },
   ],
 };
 
 test("throws when the judge model is a generator model in the arm", () => {
   assert.throws(() => assertEvaluatorDistinct("claude-opus-5", ARM_D_ALL_OPUS), /judge must never score output produced by itself/);
-  assert.throws(() => assertEvaluatorDistinct("openai-mid-tier", ARM_G_CROSS_PROVIDER), /judge must never score output produced by itself/);
+  assert.throws(() => assertEvaluatorDistinct("gpt-5.6-terra", ARM_G_CROSS_PROVIDER), /judge must never score output produced by itself/);
 });
 
 test("does not throw when the judge model is distinct from every generator in the arm", () => {
   assert.doesNotThrow(() => assertEvaluatorDistinct("claude-sonnet-5", ARM_D_ALL_OPUS));
   assert.doesNotThrow(() => assertEvaluatorDistinct("claude-haiku-4-5", ARM_D_ALL_OPUS));
-  assert.doesNotThrow(() => assertEvaluatorDistinct("openai-large-tier", ARM_D_ALL_OPUS));
+  assert.doesNotThrow(() => assertEvaluatorDistinct("gpt-5.6-sol", ARM_D_ALL_OPUS));
 });
 
 test("throws for malformed input", () => {
