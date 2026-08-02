@@ -59,7 +59,10 @@ test("MockProvider records the mode it was called with -- how the runner's batch
   assert.equal(provider.calls[0].mode, "single");
 });
 
-test("the real adapters are documented stubs -- they throw rather than silently no-op", async () => {
-  await assert.rejects(() => new AnthropicBatchProvider().generate(), /documented stub/);
+test("OpenAIBatchProvider is still a documented stub -- it throws rather than silently no-op (separate issue)", async () => {
   await assert.rejects(() => new OpenAIBatchProvider().generate(), /documented stub/);
+});
+
+test("AnthropicBatchProvider is no longer a stub -- constructing it does not throw (issue #19)", () => {
+  assert.doesNotThrow(() => new AnthropicBatchProvider({ apiKey: "test-key", corpus: [], armsConfig: { arms: {} } }));
 });

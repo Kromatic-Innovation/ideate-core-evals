@@ -17,5 +17,8 @@
   "author": "Kromatic Innovation (https://www.kromatic.com/)",
   "devDependencies": {
     "@huggingface/transformers": "^4.2.0"
+  },
+  "dependencies": {
+    "ideate-core": "0.4.0"
   }
 }

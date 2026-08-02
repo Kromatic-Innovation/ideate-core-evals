@@ -1,6 +1,7 @@
 // provider.mjs — the provider INTERFACE the runner drives, plus a hermetic
-// mock implementation, plus documented (unimplemented) stubs for the real
-// Anthropic/OpenAI adapters.
+// mock implementation, plus the real AnthropicBatchProvider adapter (issue
+// #19) and a documented (unimplemented) stub for OpenAIBatchProvider (a
+// separate, later issue -- arms G/H, out of scope here).
 //
 // ── Why an interface at all ──────────────────────────────────────────────────
 // Issue #5 is batch-first BY DESIGN, but it does not call real provider batch
@@ -37,6 +38,7 @@
 // distinguishable from a genuine harness defect.
 
 import { FAILURE_KINDS } from "../../lib/accounting.mjs";
+import { buildRound1Prompt, buildRound2Prompt } from "./prompts.mjs";
 
 /**
  * Validate a provider's return shape against the interface contract above.
@@ -118,37 +120,518 @@ function defaultCompletion(cell, arm, latencyMs) {
   };
 }
 
-// ── Real adapters: documented stubs, not implemented ────────────────────────
+// ── AnthropicBatchProvider: the real adapter (issue #19) ────────────────────
 //
-// These are where the real Anthropic Batch API / OpenAI Batch API adapters
-// plug in. They are deliberately NOT implemented here -- issue #5 has no
-// network access requirement and must stay hermetically testable; wiring a
-// live key is out of scope (and this repo's own instructions forbid inventing
-// secrets). A future issue implements these against the real batch endpoints:
+// Wires ideate-core@0.4.0 in as the engine under test and drives it against
+// the real Anthropic Message Batches API (batch mode, the DEFAULT) or plain
+// Messages API (single mode, --no-batch only). Every seam that would touch
+// the network, timers, or ideate-core itself is INJECTABLE with a live
+// default -- see the constructor -- so evals/harness/anthropic-batch.test.mjs
+// exercises this class with zero network and an EMPTY node_modules (fake
+// fetchImpl + fake ideateImpl), preserving the hermetic-CI invariant this
+// repo's tests depend on (see the header comment on this file and CI's
+// `node --test` with no `npm install`).
 //
-//   AnthropicBatchProvider.generate(cell, arm, { mode: "batch", ... })
-//     -> POST /v1/messages/batches (batch mode, the DEFAULT -- see
-//        SKILL.md/claude-api "Message Batches" for the request/poll/results
-//        shape) or plain POST /v1/messages (single/fallback mode, used only
-//        when --no-batch is passed or a cell needs low latency).
+// ── Why ideate-core is loaded via dynamic import, not a top-level one ───────
+// This file is imported by evals/harness/provider.test.mjs, which in turn is
+// loaded by `node --test` in CI with an EMPTY node_modules. A top-level
+// `import "ideate-core"` here would throw MODULE_NOT_FOUND before a single
+// test runs. `ideateImpl`'s LIVE default reaches ideate-core with
+// `await import("ideate-core")` -- deferred until the first real `generate()`
+// call, which only happens outside the test suite (tests always inject a
+// fake `ideateImpl`).
 //
-//   OpenAIBatchProvider.generate(cell, arm, { mode: "batch", ... })
-//     -> OpenAI Batches API (analogous 50%-discount batch submission), single
-//        mode falling back to a plain chat completion.
-//
-// Both would resolve the `model` string per persona slot from arms.config.json
-// (already wired -- see runner.mjs's resolveModels()), capture the provider's
-// `usage` object into the `tokens`/`tokens_by_model` shape this interface
-// requires (per docs/PREREGISTRATION.md §7 -- "adapter must capture it"), and
-// translate provider-side failures (refusal, rate limit, timeout, transport
-// error) into the FAILURE_KINDS taxonomy rather than throwing.
+// ── The barrier-batcher ──────────────────────────────────────────────────────
+// ideate-core dispatches a round's N agents via `Promise.all(agents.map(...))`
+// (see node_modules/ideate-core/lib/ideate-core.mjs) -- so all N `complete(req)`
+// calls for a given round happen SYNCHRONOUSLY within one microtask tick, with
+// no signal marking "this is the last one". We turn that into ONE Message
+// Batch per round by buffering: every `complete(req)` call pushes
+// `{req, resolve, reject}` onto `this.#pending` and, on the FIRST push of a
+// fresh batch, schedules `this.#flush()` via `setTimeout(fn, 0)` -- a
+// subsequent-MACROTASK debounce, which fires only after every synchronously
+// queued microtask (i.e. every agent's `complete()` call for this round) has
+// already pushed onto the buffer. `flush()` then submits everything
+// accumulated as a single batch and resolves each caller by `custom_id`.
 export class AnthropicBatchProvider {
-  async generate() {
-    throw new Error(
-      "AnthropicBatchProvider is a documented stub -- issue #5 does not call real provider APIs. " +
-        "Implement against POST /v1/messages/batches (batch mode) / POST /v1/messages (single mode) in a follow-up issue.",
-    );
+  /**
+   * @param {object} [opts]
+   *   @param {string} [opts.apiKey]           Anthropic API key. Required for
+   *     any real call; if absent, generate() returns a classified failure
+   *     (harness_error) on the FIRST call rather than throwing -- see below.
+   *     (The CLI itself already guards this with a loud pre-flight error;
+   *     this fallback exists so the class is safe to construct/use directly,
+   *     e.g. from a test or a script that bypasses run.mjs.)
+   *   @param {Array}  [opts.corpus]           CORPUS -- array of briefs, each
+   *     `{ id, text, ... }`. Brief text is looked up by `cell.briefId`.
+   *   @param {object} [opts.armsConfig]       parsed arms.config.json, used
+   *     for `panel.ideasPerAgent` / `panel.maxRounds`.
+   *   @param {typeof fetch} [opts.fetchImpl]  INJECTED in tests; defaults to
+   *     globalThis.fetch for live use.
+   *   @param {Function} [opts.ideateImpl]     `(input, deps) => Promise<{candidates,...}>`.
+   *     Live default dynamically imports ideate-core (see above); tests
+   *     inject a fake so no real engine call happens.
+   *   @param {Function} [opts.sleep]          `(ms) => Promise<void>`; injectable
+   *     for fast, deterministic retry/backoff tests.
+   *   @param {number} [opts.pollIntervalMs]   batch-poll interval (live default 2000ms).
+   *   @param {number} [opts.maxPollMs]        poll ceiling before classifying `timeout` (live default 15 min).
+   *   @param {number} [opts.maxRetries]       429/5xx retry budget before classifying (default 3).
+   *   @param {(msg: string) => void} [opts.logger]  defaults to console.error; tests inject a silent logger.
+   */
+  constructor({
+    apiKey = process.env.ANTHROPIC_API_KEY,
+    corpus = [],
+    armsConfig,
+    fetchImpl = globalThis.fetch,
+    ideateImpl = async (...a) => (await import("ideate-core")).ideateCore(...a),
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    pollIntervalMs = 2000,
+    maxPollMs = 15 * 60 * 1000,
+    maxRetries = 3,
+    logger = (msg) => console.error(msg),
+  } = {}) {
+    this.apiKey = apiKey;
+    this.corpus = corpus;
+    this.armsConfig = armsConfig;
+    this.fetchImpl = fetchImpl;
+    this.ideateImpl = ideateImpl;
+    this.sleep = sleep;
+    this.pollIntervalMs = pollIntervalMs;
+    this.maxPollMs = maxPollMs;
+    this.maxRetries = maxRetries;
+    this.logger = logger;
+
+    // Barrier-batcher state -- see the class header comment. Reset per
+    // in-flight batch: `#pending` accumulates {req, resolve, reject} entries;
+    // `#flushScheduled` guards against scheduling more than one flush timer
+    // per batch.
+    this.#pending = [];
+    this.#flushScheduled = false;
   }
+
+  #pending;
+  #flushScheduled;
+
+  /**
+   * The interface method (see the file header). Never throws for a transport
+   * failure -- every catchable error is classified via FAILURE_KINDS and
+   * returned, per the interface contract.
+   */
+  async generate(cell, arm, { mode = "batch", timestamp } = {}) {
+    if (!this.apiKey) {
+      // The CLI (evals/run.mjs) already fails loudly BEFORE constructing this
+      // provider when ANTHROPIC_API_KEY is unset -- this branch is a second
+      // line of defense for direct construction (e.g. a script, a future
+      // caller) that skips the CLI's guard. Classified as harness_error: a
+      // missing key is a caller/config bug, not a modeled provider failure
+      // (rate limit, refusal, etc.) -- it never even reaches the network.
+      return {
+        terminalState: "failed",
+        failureKind: "harness_error",
+        detail: "AnthropicBatchProvider: no apiKey (ANTHROPIC_API_KEY unset) -- refusing to call the network with no credential",
+        tokens: { tokens_by_model: {} },
+      };
+    }
+
+    const brief = this.corpus.find((b) => b.id === cell.briefId);
+    if (!brief) {
+      return {
+        terminalState: "failed",
+        failureKind: "harness_error",
+        detail: `AnthropicBatchProvider: no corpus brief found for briefId '${cell.briefId}'`,
+        tokens: { tokens_by_model: {} },
+      };
+    }
+
+    const { agents, maxRounds } = resolveIdeateAgents(arm, this.armsConfig);
+
+    // Per-call token accounting, scoped to THIS generate() invocation (one
+    // cell). Populated by every `complete()` resolution below, success or
+    // failure, so a partially-completed cell still reports what it consumed
+    // (spec: "Return tokens even on failure").
+    const tokensByModel = {};
+    const addUsage = (model, usage) => {
+      if (!model || !usage) return;
+      const row = (tokensByModel[model] = tokensByModel[model] || {
+        input_tokens: 0,
+        output_tokens: 0,
+      });
+      row.input_tokens += usage.input_tokens || 0;
+      row.output_tokens += usage.output_tokens || 0;
+      if (usage.cache_read_input_tokens) {
+        row.cache_read_input_tokens = (row.cache_read_input_tokens || 0) + usage.cache_read_input_tokens;
+      }
+      if (usage.cache_creation_input_tokens) {
+        row.cache_creation_input_tokens = (row.cache_creation_input_tokens || 0) + usage.cache_creation_input_tokens;
+      }
+    };
+
+    // Classification signals threaded through `complete()` calls, read after
+    // ideateCore settles (or throws) to pick the most specific FAILURE_KINDS
+    // value -- see the bottom of this method.
+    const classification = { transportError: false, rateLimited: false, timedOut: false };
+
+    const complete =
+      mode === "single"
+        ? (req) => this.#completeSingle(req, { addUsage, classification })
+        : (req) => this.#completeBatched(req, { addUsage, classification });
+
+    let ideateResult;
+    try {
+      ideateResult = await this.ideateImpl(
+        { context: { slug: cell.briefId, brief: brief.text } },
+        {
+          complete,
+          buildRound1Prompt,
+          buildRound2Prompt,
+          agents,
+          maxRounds,
+          onAgentError: (err, ctx) => {
+            this.logger(`AnthropicBatchProvider: agent error (round ${ctx && ctx.round}, agent ${ctx && ctx.agentId}): ${err && err.message}`);
+          },
+        },
+      );
+    } catch (err) {
+      // ideate-core's own contract is "never throw" (robustness over
+      // strictness -- it swallows per-agent failures), so reaching this catch
+      // means something OUTSIDE that contract broke: a transport error our
+      // own `complete()` failed to swallow, or a genuine harness bug. Prefer
+      // the most specific classification we detected along the way.
+      return {
+        terminalState: "failed",
+        failureKind: pickFailureKind(classification, "transport_error"),
+        detail: `AnthropicBatchProvider: ideateImpl threw: ${err && err.message}`,
+        tokens: { tokens_by_model: tokensByModel },
+      };
+    }
+
+    const candidates = (ideateResult && ideateResult.candidates) || [];
+    if (candidates.length === 0) {
+      // IC-08 silent mode: ideateCore resolved cleanly (no throw) but the
+      // pool is empty. Distinguish "everyone refused" from "everyone
+      // errored/timed out/rate-limited" using whatever the complete() calls
+      // observed; empty_pool is the correct default per spec when nothing
+      // more specific was detected.
+      const allRefused =
+        ideateResult && ideateResult.meta && ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted;
+      return {
+        terminalState: "failed",
+        failureKind: pickFailureKind(classification, allRefused ? "refusal" : "empty_pool"),
+        detail: "AnthropicBatchProvider: ideateCore returned an empty candidate pool",
+        tokens: { tokens_by_model: tokensByModel },
+      };
+    }
+
+    return {
+      terminalState: "completed",
+      result: { candidates, agents: ideateResult.agents, meta: ideateResult.meta },
+      tokens: { tokens_by_model: tokensByModel },
+    };
+  }
+
+  // ── single mode: POST /v1/messages directly, resolve immediately ─────────
+  async #completeSingle(req, { addUsage, classification }) {
+    const params = buildAnthropicMessageParams(req);
+    const { ok, status, json, error } = await anthropicFetchWithRetry(
+      this.fetchImpl,
+      "https://api.anthropic.com/v1/messages",
+      anthropicHeaders(this.apiKey),
+      params,
+      { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!ok) {
+      classifyTransportOutcome(status, error, classification);
+      return { ok: false };
+    }
+    addUsage(req.model, json.usage);
+    return { ok: true, text: extractAnthropicText(json) };
+  }
+
+  // ── batch mode: buffer this call; flush the whole round as one batch ─────
+  #completeBatched(req, ctx) {
+    return new Promise((resolve, reject) => {
+      this.#pending.push({ req, resolve, reject, ctx });
+      if (!this.#flushScheduled) {
+        this.#flushScheduled = true;
+        // Subsequent-macrotask debounce: every agent's complete() call for
+        // this round is already queued (they were all fired synchronously by
+        // ideate-core's Promise.all) by the time a setTimeout(fn, 0) callback
+        // runs, because a macrotask never runs before the current + already
+        // queued microtasks drain.
+        setTimeout(() => this.#flush(), 0);
+      }
+    });
+  }
+
+  async #flush() {
+    const batch = this.#pending;
+    this.#pending = [];
+    this.#flushScheduled = false;
+    if (!batch.length) return;
+
+    const requests = batch.map((entry, i) => ({
+      custom_id: `req-${i}-${Math.random().toString(36).slice(2, 8)}`,
+      params: buildAnthropicMessageParams(entry.req),
+    }));
+    const byCustomId = new Map(requests.map((r, i) => [r.custom_id, batch[i]]));
+
+    const submit = await anthropicFetchWithRetry(
+      this.fetchImpl,
+      "https://api.anthropic.com/v1/messages/batches",
+      anthropicHeaders(this.apiKey),
+      { requests },
+      { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!submit.ok) {
+      const kind = classifyTransportKind(submit.status, submit.error);
+      for (const entry of batch) {
+        classifyTransportOutcome(submit.status, submit.error, entry.ctx.classification);
+        entry.resolve({ ok: false, __failureKind: kind });
+      }
+      return;
+    }
+
+    const batchId = submit.json.id;
+    const deadline = Date.now() + this.maxPollMs;
+    // `batchStatus` tracks the most recently observed batch object (submit's
+    // response initially, then each poll's) so "ended" can be detected
+    // whether it happens on the submit response itself (a trivially fast
+    // batch, e.g. in a test) or only after one or more polls.
+    let batchStatus = submit.json;
+
+    while (batchStatus.processing_status !== "ended") {
+      if (Date.now() > deadline) {
+        for (const entry of batch) {
+          entry.ctx.classification.timedOut = true;
+          entry.resolve({ ok: false, __failureKind: "timeout" });
+        }
+        return;
+      }
+      await this.sleep(this.pollIntervalMs);
+      const poll = await anthropicFetchWithRetry(
+        this.fetchImpl,
+        `https://api.anthropic.com/v1/messages/batches/${batchId}`,
+        anthropicHeaders(this.apiKey),
+        undefined,
+        { method: "GET", maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+      );
+      if (!poll.ok) {
+        for (const entry of batch) {
+          classifyTransportOutcome(poll.status, poll.error, entry.ctx.classification);
+          entry.resolve({ ok: false, __failureKind: classifyTransportKind(poll.status, poll.error) });
+        }
+        return;
+      }
+      batchStatus = poll.json;
+    }
+
+    const resultsUrl = batchStatus.results_url;
+    const results = await anthropicFetchWithRetry(
+      this.fetchImpl,
+      resultsUrl,
+      anthropicHeaders(this.apiKey),
+      undefined,
+      { method: "GET", raw: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!results.ok) {
+      for (const entry of batch) {
+        classifyTransportOutcome(results.status, results.error, entry.ctx.classification);
+        entry.resolve({ ok: false, __failureKind: classifyTransportKind(results.status, results.error) });
+      }
+      return;
+    }
+
+    // JSONL: one result line per custom_id, arbitrary order -- key by
+    // custom_id, never by array position (spec + AC requirement).
+    const seen = new Set();
+    for (const line of results.text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        continue; // a malformed JSONL line is a per-result transport hiccup, not a whole-batch failure
+      }
+      const entry = byCustomId.get(row.custom_id);
+      if (!entry) continue; // unknown custom_id -- ignore rather than crash
+      seen.add(row.custom_id);
+
+      if (row.result && row.result.type === "succeeded") {
+        const message = row.result.message;
+        entry.ctx.addUsage(entry.req.model, message && message.usage);
+        entry.resolve({ ok: true, text: extractAnthropicText(message) });
+      } else if (row.result && row.result.type === "errored") {
+        const err = row.result.error || {};
+        if (err.type === "rate_limit_error") entry.ctx.classification.rateLimited = true;
+        else entry.ctx.classification.transportError = true;
+        entry.resolve({ ok: false, __failureKind: err.type === "rate_limit_error" ? "rate_limited" : "transport_error" });
+      } else {
+        // "canceled" / "expired" / anything else Anthropic might add later --
+        // treat as a transport-classified failure for this entry, never throw.
+        entry.ctx.classification.transportError = true;
+        entry.resolve({ ok: false, __failureKind: "transport_error" });
+      }
+    }
+    // Any request that never got a matching result line (should not happen
+    // per the API contract, but robustness over strictness applies here too)
+    // resolves as a transport error rather than hanging forever.
+    for (const [customId, entry] of byCustomId) {
+      if (!seen.has(customId)) {
+        entry.ctx.classification.transportError = true;
+        entry.resolve({ ok: false, __failureKind: "transport_error" });
+      }
+    }
+  }
+}
+
+// ── Arm -> ideate-core invocation mapping (spec item: "map arms to real
+// ideate-core calls") ────────────────────────────────────────────────────────
+//
+// Solo (arm.mode === "solo", i.e. Arm A): ONE agent, `agentCount` 1,
+// `maxRounds: 1` (no build-on round -- matched on total ideas requested, not
+// on panel shape). Panel: one agent per slot, `armsConfig.panel.ideasPerAgent`
+// / `armsConfig.panel.maxRounds` held constant across every panel arm (per
+// arms.config.json's own top-level comment).
+export function resolveIdeateAgents(arm, armsConfig) {
+  if (!arm) throw new Error("resolveIdeateAgents: arm is required");
+  if (arm.mode === "solo") {
+    const slot = (arm.slots && arm.slots[0]) || {};
+    return {
+      agents: [{ id: slot.persona || "solo", persona: slot.persona, model: slot.model, ideasPerAgent: arm.totalIdeasRequested }],
+      maxRounds: 1,
+    };
+  }
+  const panel = (armsConfig && armsConfig.panel) || {};
+  const slots = arm.slots || [];
+  return {
+    agents: slots.map((slot, i) => ({
+      id: `${slot.persona}#${i}`,
+      persona: slot.persona,
+      model: slot.model,
+      ideasPerAgent: panel.ideasPerAgent,
+    })),
+    maxRounds: panel.maxRounds,
+  };
+}
+
+// ── Force-strip sampling params BY CONSTRUCTION (docs/PREREGISTRATION.md
+// §3.3) ──────────────────────────────────────────────────────────────────────
+//
+// ideate-core@0.4.0 ships `modelAcceptsSamplingParams` at
+// ideate-core/integrations/sampling-params, which returns `true` for Haiku
+// (Haiku still accepts temperature/top_p/top_k) -- using that helper
+// unmodified would keep the diversity lever the pre-registration explicitly
+// says was removed for THIS study, and would INVERT the registered bias
+// direction (§3.3: "strip universally ... if the haiku arms still win on
+// diversity, they did so with one lever disabled"). So this adapter never
+// calls that helper at all: `buildAnthropicMessageParams` simply never reads
+// `req.temperature` / `req.top_p` / `req.top_k` for ANY model, Haiku
+// included -- the params object is built field-by-field from an explicit
+// allowlist, so there is no code path that could carry a sampling param
+// through even by accident (as opposed to a strip-after-the-fact `delete`,
+// which a future edit could bypass by constructing params a different way).
+export function buildAnthropicMessageParams(req) {
+  return {
+    model: req.model,
+    max_tokens: req.maxTokens ?? 2048,
+    messages: [{ role: "user", content: req.prompt }],
+    // Deliberately no temperature / top_p / top_k, for any model. See above.
+  };
+}
+
+function anthropicHeaders(apiKey) {
+  return {
+    "x-api-key": apiKey,
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json",
+  };
+}
+
+/** Concatenate the `text` of every text content block in an Anthropic message. */
+function extractAnthropicText(message) {
+  if (!message || !Array.isArray(message.content)) return "";
+  return message.content
+    .filter((block) => block && block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("");
+}
+
+/**
+ * fetchImpl wrapper with minimal retry/backoff on 429 / 5xx, using the
+ * injected `sleep` so tests run instantly. Never throws -- always resolves to
+ * `{ ok: true, json }` (or `{ ok: true, text }` when `raw` is requested, for
+ * the JSONL results download) or `{ ok: false, status, error }`.
+ */
+async function anthropicFetchWithRetry(fetchImpl, url, headers, body, { method = "POST", raw = false, maxRetries = 3, sleep, logger } = {}) {
+  let lastStatus;
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let res;
+    try {
+      res = await fetchImpl(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+    } catch (err) {
+      // A rejected fetch (DNS failure, connection reset, etc.) -- retry like
+      // any other transient transport failure, never throw out of this
+      // helper.
+      lastError = err;
+      lastStatus = undefined;
+      if (attempt < maxRetries) {
+        if (logger) logger(`anthropicFetchWithRetry: fetch rejected (attempt ${attempt + 1}/${maxRetries + 1}): ${err && err.message}`);
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      return { ok: false, status: undefined, error: err };
+    }
+
+    if (res.ok) {
+      return raw ? { ok: true, text: await res.text() } : { ok: true, json: await res.json() };
+    }
+
+    lastStatus = res.status;
+    const retryable = res.status === 429 || res.status >= 500;
+    if (retryable && attempt < maxRetries) {
+      if (logger) logger(`anthropicFetchWithRetry: HTTP ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying`);
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+    return { ok: false, status: res.status, error: undefined };
+  }
+  return { ok: false, status: lastStatus, error: lastError };
+}
+
+function backoffMs(attempt) {
+  return 2 ** attempt * 100; // 100ms, 200ms, 400ms, ... -- tests inject a no-op sleep so this never actually delays a test
+}
+
+/** Mutate `classification` in place based on a failed fetch's status/error. */
+function classifyTransportOutcome(status, error, classification) {
+  if (status === 429) classification.rateLimited = true;
+  else classification.transportError = true;
+}
+
+/** Same signal as classifyTransportOutcome, but returned as a FAILURE_KINDS value. */
+function classifyTransportKind(status) {
+  return status === 429 ? "rate_limited" : "transport_error";
+}
+
+/**
+ * Pick the most specific failure kind observed during this cell's calls,
+ * falling back to `fallback` when nothing more specific was recorded.
+ * Precedence: timeout > rate_limited > transport_error > fallback -- a
+ * timeout is the most actionable/specific signal when multiple flags got
+ * set (e.g. a batch that both saw a transient 429 AND then blew the poll
+ * ceiling should report timeout, not rate_limited).
+ */
+function pickFailureKind(classification, fallback) {
+  if (classification.timedOut) return "timeout";
+  if (classification.rateLimited) return "rate_limited";
+  if (classification.transportError) return "transport_error";
+  return fallback;
 }
 
 export class OpenAIBatchProvider {
