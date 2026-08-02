@@ -244,6 +244,27 @@ test("readSiEtAlSlice — a hand-resolved override binds a straggler whose Title
   assert.deepEqual(soham.expertScores, [6]);
 });
 
+test("readSiEtAlSlice — a review idea_id with an UNKNOWN (unlabeled) condition is fail-closed, not silently dropped (issue #35)", () => {
+  const root = tmpRoot("undef-condition");
+  fs.mkdirSync(root, { recursive: true });
+  const csv = ["ID,Title", "H1,Alpha Title", "U1,Unknown Title"].join("\n");
+  fs.writeFileSync(path.join(root, "id_title_mapping.csv"), csv);
+  // U1's review carries a null (label-lost) condition — neither a known condition
+  // nor an excluded one. It must still resolve to a file — or the join throws.
+  fs.writeFileSync(
+    path.join(root, "data_points_all_anonymized.json"),
+    JSON.stringify({ idea_id: ["H1", "U1"], condition: ["Human", null], overall_score: [4, 6] }),
+  );
+  fs.mkdirSync(path.join(root, "Human_Ideas_Txt_Processed"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Human_Ideas_Txt_Processed", "HumanIdeaForm_A.txt"), "Title: Alpha Title\nbody\n");
+  fs.mkdirSync(path.join(root, "AI_AI_Ideas_Processed"), { recursive: true });
+  fs.mkdirSync(path.join(root, "AI_Human_Ideas_Txt"), { recursive: true });
+
+  // U1 has no idea file and is NOT excluded → the reverse totality assertion
+  // catches it rather than the exclusion filter bypassing it.
+  assert.throws(() => readSiEtAlSlice({ root }), /resolved to no idea file/);
+});
+
 test("readSiEtAlSlice — a hand-resolved override to an unknown or wrong-condition idea_id throws (no silent mis-bind)", () => {
   const root = tmpRoot("handresolved-bad");
   fs.mkdirSync(root, { recursive: true });

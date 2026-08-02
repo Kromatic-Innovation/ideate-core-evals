@@ -400,10 +400,15 @@ export function readSiEtAlSlice({
   }
   // Reverse totality is asserted only over INCLUDED conditions: an excluded
   // condition's review idea_ids have no idea file by design, and must not be
-  // counted as an unresolved residue (issue #35).
-  const reviewIdeaIds = [...byIdea.keys()].filter(
-    (id) => !excludedSet.has(byIdea.get(id).condition),
-  );
+  // counted as an unresolved residue (issue #35). An idea_id whose condition is
+  // UNKNOWN (undefined — e.g. a review that lost its condition label) is
+  // deliberately NOT dropped: it stays in the assertion and must resolve to a
+  // file or throw. Only an explicitly-excluded condition is dropped; nothing
+  // else silently shrinks the slice.
+  const reviewIdeaIds = [...byIdea.keys()].filter((id) => {
+    const cond = byIdea.get(id).condition;
+    return cond === undefined || !excludedSet.has(cond);
+  });
   const unresolvedReviewIds = reviewIdeaIds.filter((id) => !boundIdeaIds.has(id));
   if (unresolvedReviewIds.length > 0) {
     throw new Error(
