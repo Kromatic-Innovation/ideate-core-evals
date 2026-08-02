@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { fixtureEmbedder } from "./embedder.mjs";
-import { datReplication, negativeControls } from "./validation.mjs";
+import { datReplication, negativeControls, randomPoolVerdict } from "./validation.mjs";
 import { distinctK } from "./clustering.mjs";
 import { poolDiversity, collapseRate } from "./diversity.mjs";
 import { CLUSTER_DISTANCE_THRESHOLD } from "./calibration.mjs";
@@ -69,4 +69,43 @@ test("distinctK, poolDiversity, and collapseRate compute end-to-end over one emb
   // (see diversity.mjs collapseRate's header on why it takes k as a plain
   // number rather than re-clustering).
   assert.equal(rate, 1 - k / RANDOM_TEXT_POOL.length);
+});
+
+// ── randomPoolVerdict (evals/24 sentry thread on live-validation.mjs:108) ──
+// The random-pool check asserts two independent halves; these are pure
+// unit tests over the verdict function itself, no embedder/network involved.
+
+test("randomPoolVerdict: ordering holds and diversity clears the floor -> both halves pass", () => {
+  const v = randomPoolVerdict({ distinctK: 28, diversity: 0.75, poolSize: 30, datHigh: 0.6, orderingHolds: true });
+  assert.equal(v.distinctKPass, true);
+  assert.equal(v.floorVerdict, "pass");
+  assert.equal(v.failed, false);
+});
+
+test("randomPoolVerdict: ordering holds but diversity is below the floor -> floor half fails and sets failed", () => {
+  const v = randomPoolVerdict({ distinctK: 28, diversity: 0.5, poolSize: 30, datHigh: 0.6, orderingHolds: true });
+  assert.equal(v.distinctKPass, true);
+  assert.equal(v.floorVerdict, "fail");
+  assert.equal(v.failed, true);
+});
+
+test("randomPoolVerdict: ordering broken -> floor is inconclusive regardless of diversity, and does not set failed on its own (diversity below the broken floor)", () => {
+  const v = randomPoolVerdict({ distinctK: 28, diversity: 0.4, poolSize: 30, datHigh: 0.6, orderingHolds: false });
+  assert.equal(v.distinctKPass, true);
+  assert.equal(v.floorVerdict, "inconclusive");
+  assert.equal(v.failed, false);
+});
+
+test("randomPoolVerdict: ordering broken -> floor is inconclusive even when diversity is ABOVE the broken floor", () => {
+  const v = randomPoolVerdict({ distinctK: 28, diversity: 0.9, poolSize: 30, datHigh: 0.6, orderingHolds: false });
+  assert.equal(v.distinctKPass, true);
+  assert.equal(v.floorVerdict, "inconclusive");
+  assert.equal(v.failed, false);
+});
+
+test("randomPoolVerdict: distinct_k below the 90% bound fails regardless of the floor verdict", () => {
+  const v = randomPoolVerdict({ distinctK: 25, diversity: 0.9, poolSize: 30, datHigh: 0.6, orderingHolds: true });
+  assert.equal(v.distinctKPass, false); // Math.ceil(30 * 0.9) = 27, 25 < 27
+  assert.equal(v.floorVerdict, "pass");
+  assert.equal(v.failed, true);
 });

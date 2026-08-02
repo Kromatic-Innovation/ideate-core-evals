@@ -31,7 +31,7 @@
 // cleanly with CI-adjacent tooling even though it isn't run BY CI itself.
 
 import { voyageEmbedder } from "./embedder.mjs";
-import { datReplication, negativeControls } from "./validation.mjs";
+import { datReplication, negativeControls, randomPoolVerdict } from "./validation.mjs";
 import { RANDOM_TEXT_POOL, DUPLICATE_POOL } from "./fixtures/control-texts.mjs";
 
 function fmt(n) {
@@ -104,14 +104,47 @@ async function main() {
   // negative-controls.test.mjs's own bound) and diversity clears the DAT-
   // replication-derived high-group floor computed ABOVE on this same live
   // embedder, i.e. the live run calibrates its own floor rather than
-  // borrowing the hermetic fixture's recorded number.
-  const randomPass = controls.random.distinctK >= Math.ceil(RANDOM_TEXT_POOL.length * 0.9) && controls.random.diversity >= dat.high;
-  if (randomPass) {
-    console.log("  PASS: random pool stays overwhelmingly distinct and clears the live DAT-high diversity floor");
+  // borrowing the hermetic fixture's recorded number. These are TWO
+  // independent claims reported separately (validation.mjs randomPoolVerdict):
+  // the distinct_k half needs nothing from the DAT run and is always
+  // judged; the diversity-floor half is only meaningful when
+  // `dat.orderingHolds` is true, because `dat.high` is a self-calibrated
+  // floor that is only calibrated when the DAT ordering (low < average <
+  // high) actually held on this embedder. When ordering breaks, `dat.high`
+  // can sit below `dat.average` or even `dat.low`, so asserting PASS/FAIL
+  // against it would mislead in either direction -- report INCONCLUSIVE
+  // instead and let the DAT-ordering failure above be the thing that fails
+  // the run.
+  const verdict = randomPoolVerdict({
+    distinctK: controls.random.distinctK,
+    diversity: controls.random.diversity,
+    poolSize: RANDOM_TEXT_POOL.length,
+    datHigh: dat.high,
+    orderingHolds: dat.orderingHolds,
+  });
+
+  if (verdict.distinctKPass) {
+    console.log(`  PASS: random pool stays overwhelmingly distinct (distinct_k >= ${Math.ceil(RANDOM_TEXT_POOL.length * 0.9)} of ${RANDOM_TEXT_POOL.length})`);
   } else {
     console.error(
-      "  FAIL: random pool did not stay distinct / diverse enough (want distinct_k >= 90% of pool and " +
-        `diversity >= live DAT-high floor of ${fmt(dat.high)}). Reported honestly, not worked around.`,
+      `  FAIL: random pool did not stay distinct enough (want distinct_k >= 90% of pool, got ${controls.random.distinctK}). ` +
+        "Reported honestly, not worked around.",
+    );
+    ok = false;
+  }
+
+  if (verdict.floorVerdict === "inconclusive") {
+    console.log(
+      `  INCONCLUSIVE: diversity=${fmt(controls.random.diversity)} is printed but not judged against the live DAT-high ` +
+        `floor of ${fmt(dat.high)} -- the floor is uncalibrated because the DAT ordering did not hold on this embedder ` +
+        "(see the DAT replication FAIL above).",
+    );
+  } else if (verdict.floorVerdict === "pass") {
+    console.log(`  PASS: random pool diversity clears the live DAT-high diversity floor of ${fmt(dat.high)}`);
+  } else {
+    console.error(
+      `  FAIL: random pool diversity (${fmt(controls.random.diversity)}) did not clear the live DAT-high floor of ` +
+        `${fmt(dat.high)}. Reported honestly, not worked around.`,
     );
     ok = false;
   }

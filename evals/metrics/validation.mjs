@@ -113,3 +113,48 @@ export async function negativeControls(embedder) {
     },
   };
 }
+
+/**
+ * Random-pool verdict (docs/PREREGISTRATION.md §4.4, live-validation.mjs
+ * random-pool check): the random-pool negative control asserts TWO
+ * independent things, and they must be reported independently because one
+ * of them has a precondition the other does not share.
+ *
+ *   1. distinct_k half — `distinctK >= 90% of poolSize`. This is a plain
+ *      count over the embedder's own clustering; it needs nothing from the
+ *      DAT replication run and is always meaningful.
+ *   2. diversity-floor half — `diversity >= datHigh`. `datHigh` is the live
+ *      DAT high-group pool diversity, used as a SELF-CALIBRATED floor (the
+ *      live run compares against its own DAT-high number rather than the
+ *      hermetic fixture's recorded one). That floor is only calibrated when
+ *      `orderingHolds` is true (low < average < high). When ordering is
+ *      broken, `datHigh` can sit below `datAverage` or even `datLow` — an
+ *      uncalibrated number that would silently mislead as a "floor" in
+ *      either direction (a spurious PASS if the broken high happens to be
+ *      low, or a spurious FAIL if it happens to be high). So this half is
+ *      reported PASS/FAIL only when `orderingHolds` is true; otherwise it is
+ *      INCONCLUSIVE — the diversity number is still measured and returned,
+ *      but not judged, and it must never fail the run on its own (the DAT
+ *      ordering failure above already does that).
+ *
+ * `failed` combines the two per that rule: the distinct_k half always
+ * contributes, the floor half only contributes when it actually rendered a
+ * verdict (`orderingHolds` true).
+ *
+ * @param {{ distinctK: number, diversity: number, poolSize: number, datHigh: number, orderingHolds: boolean }} args
+ * @returns {{ distinctKPass: boolean, floorVerdict: "pass" | "fail" | "inconclusive", failed: boolean }}
+ */
+export function randomPoolVerdict({ distinctK, diversity, poolSize, datHigh, orderingHolds }) {
+  const distinctKPass = distinctK >= Math.ceil(poolSize * 0.9);
+
+  let floorVerdict;
+  if (!orderingHolds) {
+    floorVerdict = "inconclusive";
+  } else {
+    floorVerdict = diversity >= datHigh ? "pass" : "fail";
+  }
+
+  const failed = !distinctKPass || floorVerdict === "fail";
+
+  return { distinctKPass, floorVerdict, failed };
+}
