@@ -24,13 +24,24 @@
 // flagged here per the issue's AC ("deviations documented and justified").
 //
 // ── Where the threshold comes from ──────────────────────────────────────────
-// The threshold is NOT hand-picked to make a test pass. It is derived from
-// the DAT replication fixtures (../dat-replication.test.mjs), which anchor
-// "low" vs "high" published human-normed semantic distance in THIS embedding
-// space. See CLUSTER_DISTANCE_THRESHOLD below and its derivation comment —
-// the number is computed from ../fixtures/embeddings.json at module load, not
-// a hardcoded literal, so re-running regen-fixtures.mjs with a different
-// embedding model keeps the threshold self-consistent with that model.
+// The threshold is NOT hand-picked to make a test pass. calibration.mjs
+// derives CLUSTER_DISTANCE_THRESHOLD from paraphrase/distinct-idea pair
+// populations, computed at module load from ../fixtures/embeddings.json, not
+// a hardcoded literal.
+//
+// ── That threshold is MiniLM-space only — production uses a different one
+// (issue #42) ────────────────────────────────────────────────────────────
+// CLUSTER_DISTANCE_THRESHOLD is derived from, and valid only for, the
+// hermetic MiniLM fixture embedder. Cosine-distance distributions do not
+// transfer across embedding models — re-running regen-fixtures.mjs with a
+// different model does NOT keep the threshold "self-consistent"; a
+// literal drift-free re-derivation would still be wrong if callers pointed
+// it at a different embedder without re-deriving. The PRODUCTION embedder
+// (Voyage-4-lite, ../embedder.mjs voyageEmbedder) is calibrated separately —
+// see ../voyage-calibration.mjs VOYAGE_CLUSTER_DISTANCE_THRESHOLD and
+// ../calibrate-voyage.mjs for that derivation. Any caller running
+// distinctK/clusterByThreshold against live Voyage vectors must use that
+// constant, not this file's CLUSTER_DISTANCE_THRESHOLD.
 
 /**
  * Cosine distance between two L2-normalized vectors: 1 - dot product.
