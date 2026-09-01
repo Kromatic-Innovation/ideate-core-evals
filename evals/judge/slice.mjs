@@ -242,8 +242,11 @@ function readReviews(jsonPath, scoreField) {
       if (condition !== undefined && entry.condition !== undefined && entry.condition !== condition) {
         throw new Error(`readReviews: idea_id ${id} appears under conflicting conditions ${entry.condition} and ${condition}`);
       }
-      if (topic !== undefined && entry.topic !== undefined && entry.topic !== topic) {
+      if (topic != null && entry.topic != null && entry.topic !== topic) {
         throw new Error(`readReviews: idea_id ${id} appears under conflicting topics '${entry.topic}' and '${topic}'`);
+      }
+      if (entry.topic == null && topic != null) {
+        entry.topic = topic; // backfill: an earlier row for this idea had no topic (undefined/null), a later row does
       }
     }
     entry.scores.push(score);

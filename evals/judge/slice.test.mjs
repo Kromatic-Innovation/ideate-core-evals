@@ -347,3 +347,54 @@ test("normalizeIdeaId — merges no distinct ids across a mixed clean/stray-spac
   assert.deepEqual(new Set(normalized), new Set(["Multilingual_9_Human", "Factuality_1_AI", "Bias_1_AI_Rerank"]));
   assert.equal(new Set(normalized).size, 3);
 });
+
+test("readSiEtAlSlice — a topic-less FIRST review row does not pin the idea's topic undefined (issue #45 review thread)", () => {
+  const root = tmpRoot("topic-backfill");
+  fs.mkdirSync(root, { recursive: true });
+  const csv = ["ID,Title", "H1,Alpha Title"].join("\n");
+  fs.writeFileSync(path.join(root, "id_title_mapping.csv"), csv);
+  // H1's FIRST review row carries no topic (as released data sometimes has —
+  // serialized as JSON null); its SECOND row carries the real topic. The
+  // idea's topic must resolve from the later, valid row rather than staying
+  // pinned to the missing first value.
+  fs.writeFileSync(
+    path.join(root, "data_points_all_anonymized.json"),
+    JSON.stringify({
+      idea_id: ["H1", "H1"],
+      condition: ["Human", "Human"],
+      topic: [null, "bias"],
+      overall_score: [4, 5],
+    }),
+  );
+  fs.mkdirSync(path.join(root, "Human_Ideas_Txt_Processed"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Human_Ideas_Txt_Processed", "HumanIdeaForm_A.txt"), "Title: Alpha Title\nbody\n");
+  fs.mkdirSync(path.join(root, "AI_AI_Ideas_Processed"), { recursive: true });
+  fs.mkdirSync(path.join(root, "AI_Human_Ideas_Txt"), { recursive: true });
+
+  const slice = readSiEtAlSlice({ root });
+  const byId = new Map(slice.ideas.map((i) => [i.ideaId, i]));
+  assert.equal(byId.get("H1").topic, "bias");
+  assert.deepEqual(byId.get("H1").expertScores, [4, 5]);
+});
+
+test("readSiEtAlSlice — genuinely conflicting topics for the same idea still throw", () => {
+  const root = tmpRoot("topic-conflict");
+  fs.mkdirSync(root, { recursive: true });
+  const csv = ["ID,Title", "H1,Alpha Title"].join("\n");
+  fs.writeFileSync(path.join(root, "id_title_mapping.csv"), csv);
+  fs.writeFileSync(
+    path.join(root, "data_points_all_anonymized.json"),
+    JSON.stringify({
+      idea_id: ["H1", "H1"],
+      condition: ["Human", "Human"],
+      topic: ["bias", "safety"],
+      overall_score: [4, 5],
+    }),
+  );
+  fs.mkdirSync(path.join(root, "Human_Ideas_Txt_Processed"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Human_Ideas_Txt_Processed", "HumanIdeaForm_A.txt"), "Title: Alpha Title\nbody\n");
+  fs.mkdirSync(path.join(root, "AI_AI_Ideas_Processed"), { recursive: true });
+  fs.mkdirSync(path.join(root, "AI_Human_Ideas_Txt"), { recursive: true });
+
+  assert.throws(() => readSiEtAlSlice({ root }), /conflicting topics 'bias' and 'safety'/);
+});
