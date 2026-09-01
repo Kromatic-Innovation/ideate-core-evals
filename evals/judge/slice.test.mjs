@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readSiEtAlSlice, sliceToJudgePool, normalizeTitle, stripMappingExtension } from "./slice.mjs";
+import { readSiEtAlSlice, sliceToJudgePool, normalizeTitle, stripMappingExtension, normalizeIdeaId } from "./slice.mjs";
 import { deidentifyPool } from "./deidentify.mjs";
 
 // The fixture mirrors the real layout, including the deliberate AI/AI_Rerank
@@ -291,4 +291,53 @@ test("readSiEtAlSlice — a hand-resolved override to an unknown or wrong-condit
     () => readSiEtAlSlice({ root, handResolved: { "Human_Ideas_Txt_Processed/IdeaGeneration_Soham.txt": "A1" } }),
     /binds a file in condition 'Human' to a review under condition 'AI'/,
   );
+});
+
+// ── issue #37: stray-space idea_id normalization ────────────────────────────
+
+test("normalizeIdeaId — strips whitespace, including a stray internal space before the condition suffix", () => {
+  assert.equal(normalizeIdeaId("Multilingual_9 _Human"), "Multilingual_9_Human");
+  assert.equal(normalizeIdeaId("Factuality_1 _AI"), "Factuality_1_AI");
+  assert.equal(normalizeIdeaId("Clean_Id_AI"), "Clean_Id_AI"); // untouched
+  assert.equal(normalizeIdeaId(42), 42); // non-string passthrough
+});
+
+test("readSiEtAlSlice — a review idea_id with a stray internal space still joins its clean CSV id (issue #37)", () => {
+  const root = tmpRoot("stray-space-id");
+  fs.mkdirSync(root, { recursive: true });
+  const csv = ["ID,Title", "H1,Alpha Title", "Multilingual_9_Human,Beta Title"].join("\n");
+  fs.writeFileSync(path.join(root, "id_title_mapping.csv"), csv);
+  // The reviews JSON carries the DEFECTIVE id with a stray space, as released;
+  // the mapping CSV carries only the clean id.
+  fs.writeFileSync(
+    path.join(root, "data_points_all_anonymized.json"),
+    JSON.stringify({
+      idea_id: ["H1", "H1", "Multilingual_9 _Human", "Multilingual_9 _Human"],
+      condition: ["Human", "Human", "Human", "Human"],
+      overall_score: [4, 5, 6, 7],
+    }),
+  );
+  fs.mkdirSync(path.join(root, "Human_Ideas_Txt_Processed"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Human_Ideas_Txt_Processed", "HumanIdeaForm_A.txt"), "Title: Alpha Title\nbody\n");
+  fs.writeFileSync(path.join(root, "Human_Ideas_Txt_Processed", "HumanIdeaForm_B.txt"), "Title: Beta Title\nbody\n");
+  fs.mkdirSync(path.join(root, "AI_AI_Ideas_Processed"), { recursive: true });
+  fs.mkdirSync(path.join(root, "AI_Human_Ideas_Txt"), { recursive: true });
+
+  const slice = readSiEtAlSlice({ root });
+  assert.equal(slice.ideaCount, 2);
+  assert.equal(slice.nearMisses.length, 0);
+  const byId = new Map(slice.ideas.map((i) => [i.ideaId, i]));
+  // Bound under the CLEAN id (the CSV's), with the defective-id review scores.
+  assert.ok(byId.has("Multilingual_9_Human"));
+  assert.deepEqual(byId.get("Multilingual_9_Human").expertScores, [6, 7]);
+});
+
+test("normalizeIdeaId — merges no distinct ids across a mixed clean/stray-space population", () => {
+  const raw = ["Multilingual_9_Human", "Multilingual_9 _Human", "Factuality_1_AI", "Factuality_1 _AI", "Bias_1_AI_Rerank", "Bias_1 _AI_Rerank"];
+  const normalized = raw.map(normalizeIdeaId);
+  // Each stray-space id collapses onto its own clean counterpart (3 pairs -> 3
+  // unique normalized ids), not into some other id — normalization is a 1:1
+  // repair, not a lossy collapse across genuinely distinct ids.
+  assert.deepEqual(new Set(normalized), new Set(["Multilingual_9_Human", "Factuality_1_AI", "Bias_1_AI_Rerank"]));
+  assert.equal(new Set(normalized).size, 3);
 });
