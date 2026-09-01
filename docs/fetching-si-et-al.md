@@ -10,13 +10,13 @@ the payload itself.
 
 ## Source
 
-| | |
-|---|---|
-| Paper | Si, Yang & Hashimoto 2024, *Can LLMs Generate Novel Research Ideas?* |
-| arXiv | [2409.04109](https://arxiv.org/abs/2409.04109) |
-| Code (MIT) | [NoviScl/AI-Researcher](https://github.com/NoviScl/AI-Researcher) |
-| Review data | `reviews_ideation/data_points_all_anonymized.json` (scores + rationales), `reviews_ideation/id_title_mapping.csv` (ID → title) — in the MIT-licensed repo |
-| Idea payloads | Google Drive archives linked from the repo README (the three condition directories below) |
+|               |                                                                                                                                                           |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Paper         | Si, Yang & Hashimoto 2024, _Can LLMs Generate Novel Research Ideas?_                                                                                      |
+| arXiv         | [2409.04109](https://arxiv.org/abs/2409.04109)                                                                                                            |
+| Code (MIT)    | [NoviScl/AI-Researcher](https://github.com/NoviScl/AI-Researcher)                                                                                         |
+| Review data   | `reviews_ideation/data_points_all_anonymized.json` (scores + rationales), `reviews_ideation/id_title_mapping.csv` (ID → title) — in the MIT-licensed repo |
+| Idea payloads | Google Drive archives linked from the repo README (the three condition directories below)                                                                 |
 
 ## Terms
 
@@ -66,18 +66,27 @@ per axis, `topic`, `condition`, `idea_id`, `timestamp`, `consent`, `no_ai`,
   `idea_id`. AI/AI_Rerank files resolve through the same normalized-title lookup
   (their `Title:` line, falling back to the filename slug).
 - **The mapping's second column is `Title / Filename` — a title for Human rows,
-  a *filename* for the AI rows (issue #35).** The AI rows hold a `.json`
+  a _filename_ for the AI rows (issue #35).** The AI rows hold a `.json`
   filename, sometimes with a trailing space, e.g.
   `temporal_bias_decay_simulation.json ` — not a prose title. Before comparison
   the reader strips a trailing `.json`/`.txt` extension and surrounding
   whitespace from the mapping value (`stripMappingExtension`), so the
   filename-style value normalizes to the same token stream as the idea file's
-  `.txt` stem and joins. One source `idea_id` also carries a stray internal
-  space (`'Bias_1 _AI_Rerank'`); it falls in the excluded condition (below), but
-  the parser tolerates it.
-- **Totality is asserted both directions.** Every idea file in an *included*
+  `.txt` stem and joins.
+- **Six `idea_id` values in the reviews carry a stray internal space** before
+  the condition suffix (e.g. `'Multilingual_9 _Human'` instead of
+  `'Multilingual_9_Human'`), while `id_title_mapping.csv` contains zero such
+  ids. `readReviews` normalizes whitespace out of `idea_id` (`normalizeIdeaId`)
+  when keying `byIdea`, so a defective review id still binds to its clean CSV
+  counterpart. One of the six, `'Bias_1 _AI_Rerank'`, falls in the excluded
+  AI_Rerank condition and is moot either way; the other five (`Multilingual_9`
+  ×2, `Factuality_1`, `Factuality_2`, `Math_1`) are in included conditions and,
+  before this fix, dropped their idea files out of `titleIndex` entirely — see
+  "Hand-resolved near-misses" below for the mechanism and why `Soham` was the
+  same defect.
+- **Totality is asserted both directions.** Every idea file in an _included_
   condition must resolve to an `idea_id`, and every `idea_id` in the reviews
-  *under an included condition* must resolve to exactly one idea file. A partial
+  _under an included condition_ must resolve to exactly one idea file. A partial
   join **throws** rather than silently shrinking the slice.
 
 ### Excluded conditions (issue #35)
@@ -97,43 +106,51 @@ condition still throws; exclusion is never a general "drop what doesn't join".
   **cannot have their `idea_id` recovered from the released mapping at all**
   (the mapping contains zero `*_AI_Rerank` rows — 54 review idea_ids appear
   nowhere in it). Including only the recoverable 18 would represent the condition
-  by a non-random 37% subsample. Validation needs a *reliable* expert-scored set,
+  by a non-random 37% subsample. Validation needs a _reliable_ expert-scored set,
   not a complete one — **Human + AI (98 ideas)** is sufficient. To include it
   later (e.g. if a source for the 31 is found), pass `excludedConditions: []` (or
   a narrower list) and register the recovery.
 
 ### Hand-resolved near-misses
 
-A genuine straggler in an *included* condition — one whose `Title:` line and
+A genuine straggler in an _included_ condition — one whose `Title:` line and
 filename stem normalize to no mapping value — is bound by an explicit
 `HAND_RESOLVED_IDEA_IDS` override in `slice.mjs` (`<dir>/<filename>` → `idea_id`,
 validated against the reviews so a mistyped override throws rather than silently
 mis-binding). The default map is **empty**.
 
-- **`Human_Ideas_Txt_Processed/IdeaGeneration_Soham.txt`** — the one Human file
-  (of 49) that the other 48 `HumanIdeaForm_*` files' `Title:`-line join does not
-  cover (issue #35). The `stripMappingExtension` normalization above resolves it
-  automatically **iff** its mapping value is a filename; the real-data run (#16)
-  confirms this. **If it is still unresolved there,** the operator adds one line
-  to `HAND_RESOLVED_IDEA_IDS`, e.g.
-  `"Human_Ideas_Txt_Processed/IdeaGeneration_Soham.txt": "<its idea_id>"`, and
-  records the reason here, so the mapping stays auditable and reproducible.
+**`Human_Ideas_Txt_Processed/IdeaGeneration_Soham.txt` is NOT a hand-resolved
+near-miss** — it was misdiagnosed as one. Its `Title:` line normalizes to an
+exact match for the mapping's `Multilingual_9_Human` title; the file itself
+joins cleanly. It failed only because `Multilingual_9_Human`'s reviews were
+keyed under the _defective_ id `'Multilingual_9 _Human'` (a stray internal
+space, see "The join" above) and so dropped out of `titleIndex` entirely — the
+title had nothing to join against, not because extension-stripping missed it.
+Once `readReviews` normalizes whitespace out of `idea_id` (issue #37, fixed in
+`slice.mjs`), Soham resolves automatically with no override, no hand-binding,
+and no entry in `HAND_RESOLVED_IDEA_IDS`. The class is six ids total (five in
+included conditions, one — `'Bias_1 _AI_Rerank'` — in the excluded AI_Rerank
+condition and moot); Soham was simply the one included-condition file whose
+resolution the missing review made visible as a thrown near-miss.
 
-> **Operator confirmation still required (issue #35).** The acceptance criteria
-> that reference the *real* slice — all 49 AI files resolve, all 49 Human files
-> (incl. Soham) resolve, and `readSiEtAlSlice()` returns 98 ideas with non-empty
-> `expertScores` — can only be checked with `data/si-et-al/` present. The build
-> lane implemented and **hermetically** tested the mechanisms (extension
-> normalization, named exclusion, hand-resolution override); running the real
-> join and confirming the counts (and adding the Soham override if the automatic
-> resolution does not cover it) is the operator's step, on #16.
+`HAND_RESOLVED_IDEA_IDS` stays **empty**: every current near-miss is closed by
+normalization (extension-stripping for the AI conditions' filename-style
+mapping values, whitespace-stripping for the stray-space `idea_id`s), so no
+operator hand-binding is needed. The override mechanism above remains
+available for a future genuine straggler, should one appear.
+
+**Confirmed against the real payload (issue #37).** `node
+evals/judge/reproduce-si-et-al.mjs` runs clean: 98 ideas (49 Human + 49 AI),
+0 unresolved, 0 reverse-unresolved, the `AI_Rerank` exclusion still reported.
+Normalization was also checked to merge no distinct ids: 147 raw `idea_id`
+values normalize to 147 unique, and the 98 CSV ids normalize to 98 unique.
 
 ## Two leakage hazards (closed; `PREREGISTRATION.md` §5.3)
 
 1. **Filename format reveals condition.** `HumanIdeaForm_*` / `IdeaGeneration_*`
    vs a slugified-title filename tells you human-vs-AI before a word is read.
 2. **Human idea writers' first names are in the human filenames** (the review
-   data is anonymized by the authors; the idea *filenames* were not — contents
+   data is anonymized by the authors; the idea _filenames_ were not — contents
    were spot-checked clean).
 
 Both are closed structurally: `slice.mjs` returns idea **text** (contents) plus
@@ -150,8 +167,8 @@ construction is implemented as `balancedAccuracySplitHalf()` in `gate.mjs` and i
 exercised hermetically on a synthetic fixture here. **Reproducing 56.1% from the
 real released reviews requires the payload above and is the human-gated #16
 real-data run** — it cannot run in CI (the payload is never committed), and it is
-deliberately not part of this build (issue #24 "Out of scope": *running the
-validation for real against the fetched slice*).
+deliberately not part of this build (issue #24 "Out of scope": _running the
+validation for real against the fetched slice_).
 
 Two things must be settled in that run before the reproduced number is trusted:
 

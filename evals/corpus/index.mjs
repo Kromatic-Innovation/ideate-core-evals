@@ -1,4 +1,4 @@
-// index.mjs — the frozen, content-hashed 12-brief stratified corpus (issue #2).
+// index.mjs — the frozen, content-hashed 24-brief stratified corpus (issues #2, #43).
 //
 // ── What "frozen" means here ─────────────────────────────────────────────────
 // Per docs/PREREGISTRATION.md §3.2 and §11: "Briefs are frozen and hashed into
@@ -31,7 +31,7 @@ import { createHash } from "node:crypto";
 import { BRIEFS } from "./briefs.mjs";
 
 const STRATA = ["business", "product", "scientific", "aut"];
-const EXPECTED_STRATUM_COUNTS = { business: 4, product: 3, scientific: 3, aut: 2 };
+const EXPECTED_STRATUM_COUNTS = { business: 6, product: 6, scientific: 6, aut: 6 };
 
 /** sha256(text), hex, truncated to 12 chars — same convention as configHash. */
 export function briefContentHash(brief) {
@@ -62,7 +62,7 @@ export function corpusHash(corpus) {
 
 /**
  * Validate the corpus against the frozen shape the pre-registration commits
- * to: exactly 12 briefs, the 4/3/3/2 stratum split, provenance + source
+ * to: exactly 24 briefs, the 6/6/6/6 stratum split, provenance + source
  * present where required. Throws with a specific message on the first
  * violation rather than returning a boolean — a malformed corpus should be
  * loud, since a silently-short corpus would quietly narrow the study.
@@ -70,8 +70,8 @@ export function corpusHash(corpus) {
  * @param {Array} corpus
  */
 export function validateCorpus(corpus) {
-  if (!Array.isArray(corpus) || corpus.length !== 12) {
-    throw new Error(`validateCorpus: expected exactly 12 briefs, got ${corpus?.length ?? "non-array"}`);
+  if (!Array.isArray(corpus) || corpus.length !== 24) {
+    throw new Error(`validateCorpus: expected exactly 24 briefs, got ${corpus?.length ?? "non-array"}`);
   }
 
   const ids = new Set();

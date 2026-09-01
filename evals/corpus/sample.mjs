@@ -97,7 +97,11 @@ export function sampleKeywords(keywords, count, seed) {
 // list from the frozen keyword snapshot — i.e. this constant is not an
 // independent source of truth, it is a checked-in expectation.
 export const SCIENTIFIC_SAMPLE_SEED = 20260731; // date this stratum was drawn, YYYYMMDD
-export const SCIENTIFIC_SAMPLE_COUNT = 3;
+// Bumped 3 -> 6 for the pre-data corpus expansion (issue #43, 2026-09-01).
+// Same seed means the first 3 draws are unchanged (mulberry32 is a sequential
+// draw-without-replacement walk) — sci-01..03 keep their original keyword and
+// drawIndex; sci-04..06 are new draws appended by extending count only.
+export const SCIENTIFIC_SAMPLE_COUNT = 6;
 export const SCIENTIFIC_SAMPLE_ALGORITHM =
   "seeded partial Fisher-Yates draw without replacement over the de-duplicated, " +
   "lexicographically-sorted LiveIdeaBench keyword list, using the mulberry32 PRNG";
