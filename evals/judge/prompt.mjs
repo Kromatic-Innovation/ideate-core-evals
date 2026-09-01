@@ -12,6 +12,22 @@
 // §4.3's metrics table already commit to ("Fluency / Flexibility: LiveIdeaBench
 // axes").
 //
+// ── issue #45: fluency and flexibility are POOL-level, not per-idea ─────────
+// LiveIdeaBench defines fluency as a COUNT of valid ideas across a pool, and
+// flexibility as the breadth of conceptually distinct categories a POOL
+// touches ("in the context of the pool it was drawn from" — the old wording
+// here said so explicitly). But score.mjs's judge submits exactly ONE
+// candidate per scoring request — the judge never sees the pool, so scoring
+// either axis per-idea was meaningless (a per-idea "count" is trivially 1;
+// a per-idea "breadth relative to the pool" cannot be judged without the
+// pool). Both axes are REMOVED from JUDGE_AXES/JUDGE_PROMPT below and
+// recovered as pool-level operational metrics computed directly from
+// extractCandidates' pool size and the pool's clustering assignments — see
+// evals/metrics/operational.mjs `poolFluency`/`poolFlexibility`, alongside
+// the existing §4.3 operational metrics (never re-derived per idea by a
+// judge call). Only `originality` and `feasibility` remain genuinely
+// per-idea judgments and stay in the judge.
+//
 // ── Novelty and feasibility are NEVER averaged (§4.3, §5, the issue's own AC) ──
 // docs/PREREGISTRATION.md §4.3: "Novelty (judged, 1-5) — Split-axis per
 // Rietzschel et al. 2010 — *never* averaged with feasibility into a single
@@ -20,7 +36,7 @@
 // preference — an idea can be highly novel and wildly infeasible (or safely
 // feasible and utterly derivative), and averaging those into one scalar
 // destroys exactly the signal H1-H5 need to distinguish. So this module:
-//   (a) keeps JUDGE_AXES as four SEPARATE named axes, never a composite;
+//   (a) keeps JUDGE_AXES as separate named axes, never a composite;
 //   (b) exports `assertAxesNotCollapsed`, a runtime guard any caller handling
 //       judge output MUST run before storing/reporting a score, so a future
 //       refactor that "helpfully" averages the axes into `overallScore` fails
@@ -45,13 +61,16 @@
 
 import { createHash } from "node:crypto";
 
-/** The four LiveIdeaBench axes, in the paper's published order. Frozen: this
- *  array is referenced by `assertAxesNotCollapsed` and by any judge-payload
- *  assembly code, so an accidental in-place `.push`/`.sort` mutation would be
- *  a silent, hard-to-trace scoring bug. Object.freeze on an array of strings
- *  is enough (strings are already immutable); the array container itself is
- *  what we're guarding. */
-export const JUDGE_AXES = Object.freeze(["originality", "feasibility", "fluency", "flexibility"]);
+/** The two genuinely per-idea LiveIdeaBench axes the judge scores (issue #45:
+ *  fluency and flexibility are POOL-level constructs — see the file header —
+ *  and were removed from here; they live on as pool metrics in
+ *  evals/metrics/operational.mjs). Frozen: this array is referenced by
+ *  `assertAxesNotCollapsed` and by any judge-payload assembly code, so an
+ *  accidental in-place `.push`/`.sort` mutation would be a silent,
+ *  hard-to-trace scoring bug. Object.freeze on an array of strings is enough
+ *  (strings are already immutable); the array container itself is what we're
+ *  guarding. */
+export const JUDGE_AXES = Object.freeze(["originality", "feasibility"]);
 
 /**
  * Deep-freeze helper — recursively applies Object.freeze so no nested object
@@ -72,19 +91,23 @@ function deepFreeze(value) {
 // ── The rubric text ──────────────────────────────────────────────────────────
 // Axis definitions are the standard one-line LiveIdeaBench glosses (arXiv
 // 2412.17596 §3.2 "Evaluation Metrics"): originality (novelty/uncommonness of
-// the idea), feasibility (practical realizability), fluency (validity/
-// relevance of the response to the prompt), flexibility (breadth/diversity of
-// conceptual categories touched). Each axis is scored independently on the
-// paper's 1-10 scale; nothing here computes or requests a composite.
+// the idea), feasibility (practical realizability). fluency and flexibility
+// are LiveIdeaBench axes too but are POOL-level constructs (see the file
+// header) and are computed as operational metrics instead of scored here.
+// Each remaining axis is scored independently on a 1-10 scale — registered to
+// match in docs/PREREGISTRATION.md §4.2 (issue #45 item 1: code and
+// registration must agree; 1-10 was kept for the judge's extra resolution,
+// and §4.2 was updated to match rather than narrowing the code to 1-5) —
+// nothing here computes or requests a composite.
 export const JUDGE_PROMPT = deepFreeze({
-  version: "liveideabench-4axis-v1",
+  version: "liveideabench-2axis-v2",
   instructions:
     "You are scoring a single candidate idea against a fixed research brief. " +
-    "Score the idea on EACH of the four axes below, independently, on a 1-10 " +
+    "Score the idea on EACH of the two axes below, independently, on a 1-10 " +
     "scale. Do NOT compute or report any combined/overall/average score — " +
-    "report each axis separately. In particular, originality (novelty) and " +
-    "feasibility measure different, often-opposed properties of an idea and " +
-    "must never be blended into a single number.",
+    "report each axis separately. Originality (novelty) and feasibility " +
+    "measure different, often-opposed properties of an idea and must never " +
+    "be blended into a single number.",
   axes: {
     originality: {
       label: "Originality",
@@ -100,24 +123,10 @@ export const JUDGE_PROMPT = deepFreeze({
         "be implemented or pursued with realistic resources, methods, and " +
         "constraints, independent of how novel it is.",
     },
-    fluency: {
-      label: "Fluency",
-      definition:
-        "The validity and relevance of the response to the prompt — whether " +
-        "the idea is a coherent, on-topic, substantive answer to the brief " +
-        "rather than an empty, malformed, or off-topic reply.",
-    },
-    flexibility: {
-      label: "Flexibility",
-      definition:
-        "The breadth of conceptually distinct categories or approaches the " +
-        "idea (in the context of the pool it was drawn from) touches on, " +
-        "rather than repeating the same underlying approach in different words.",
-    },
   },
   outputFormat:
     "Return a JSON object with exactly the keys originality, feasibility, " +
-    "fluency, flexibility, each mapping to a number in [1, 10]. No other keys.",
+    "each mapping to a number in [1, 10]. No other keys.",
 });
 
 /**
@@ -191,7 +200,7 @@ export function assertAxesNotCollapsed(scores) {
   }
   for (const axis of JUDGE_AXES) {
     if (typeof scores[axis] !== "number") {
-      throw new Error(`assertAxesNotCollapsed: missing numeric axis '${axis}' — all four JUDGE_AXES must be present and distinct`);
+      throw new Error(`assertAxesNotCollapsed: missing numeric axis '${axis}' — every JUDGE_AXES entry must be present and distinct`);
     }
   }
 }

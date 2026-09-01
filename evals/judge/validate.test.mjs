@@ -27,7 +27,7 @@ const EXPERT_BY_INDEX = Array.from({ length: N }, (_, i) => i + 1);
 // Build a synthetic slice of the real shape. AI rows use a `.json`-with-trailing-
 // space mapping value (issue #35), so the composition exercises the extension
 // normalization too. AI_Rerank is present and excluded by default.
-function writeValidationFixture(root) {
+function writeValidationFixture(root, { topicFor = () => "bias" } = {}) {
   fs.mkdirSync(root, { recursive: true });
   const humanDir = path.join(root, "Human_Ideas_Txt_Processed");
   const aiDir = path.join(root, "AI_AI_Ideas_Processed");
@@ -35,7 +35,7 @@ function writeValidationFixture(root) {
   for (const d of [humanDir, aiDir, rerankDir]) fs.mkdirSync(d, { recursive: true });
 
   const csvRows = ["ID,Title / Filename"];
-  const reviews = { idea_id: [], condition: [], overall_score: [] };
+  const reviews = { idea_id: [], condition: [], topic: [], overall_score: [] };
 
   for (let i = 0; i < HUMAN; i++) {
     const id = `H${pad(i)}`;
@@ -43,8 +43,15 @@ function writeValidationFixture(root) {
     csvRows.push(`${id},${title}`);
     fs.writeFileSync(path.join(humanDir, `HumanIdeaForm_${pad(i)}.txt`), `Title: ${title}\nA human idea body.\n`);
     const s = EXPERT_BY_INDEX[i];
+    const topic = topicFor(i);
     reviews.idea_id.push(id, id);
     reviews.condition.push("Human", "Human");
+    // Default topicFor returns a single constant topic for every idea --
+    // keeps the DEFAULT (topic-grouping) path a single group/single judge
+    // call, so the existing alignment assertions (provider.calls.length===1
+    // etc.) hold. Multi-topic grouping is exercised by a dedicated test
+    // below with a topicFor that varies.
+    reviews.topic.push(topic, topic);
     reviews.overall_score.push(s, s);
   }
   for (let j = 0; j < AI; j++) {
@@ -53,14 +60,17 @@ function writeValidationFixture(root) {
     csvRows.push(`${id},${slug}.json `); // filename value with a trailing space
     fs.writeFileSync(path.join(aiDir, `${slug}.txt`), `Title: An AI Idea Number ${pad(j)}\nAn AI idea body.\n`);
     const s = EXPERT_BY_INDEX[HUMAN + j];
+    const topic = topicFor(HUMAN + j);
     reviews.idea_id.push(id, id);
     reviews.condition.push("AI", "AI");
+    reviews.topic.push(topic, topic);
     reviews.overall_score.push(s, s);
   }
   // An AI_Rerank review with no mapping row / idea file — excluded by default, so
   // it must not break the join.
   reviews.idea_id.push("R00");
   reviews.condition.push("AI_Rerank");
+  reviews.topic.push("bias");
   reviews.overall_score.push(5);
 
   fs.writeFileSync(path.join(root, "id_title_mapping.csv"), csvRows.join("\n"));
@@ -73,13 +83,11 @@ const tmpRoot = (tag) => fs.mkdtempSync(path.join(os.tmpdir(), `si-validate-${ta
 // alignment between judge and expert is exactly controlled.
 function mockWithOriginality(byIndex) {
   return new MockJudgeProvider({
-    // Non-primary axes VARY per idea (not constant), so validateJudge's
+    // The non-primary axis VARIES per idea (not constant), so validateJudge's
     // spearmanRho has non-zero rank variance whichever axis a test selects.
     scoreFor: (_text, { index }) => ({
       originality: byIndex[index],
-      feasibility: 4,
-      fluency: (index % 7) + 1,
-      flexibility: (index % 5) + 2,
+      feasibility: (index % 7) + 1,
     }),
   });
 }
@@ -146,21 +154,21 @@ test("runJudgeValidation — a non-default (axis, expert column) is threaded int
   const store = makeTempStore("judge-validate-axis-");
   const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
 
-  // Validate the 'fluency' axis (constant 6 in the mock) against overall_score.
+  // Validate the 'feasibility' axis (varies per idea in the mock) against overall_score.
   const out = await runJudgeValidation({
     store,
     judgeProvider: provider,
     judgeModel: JUDGE_MODEL,
-    axis: "fluency",
+    axis: "feasibility",
     sliceRoot: root,
   });
-  assert.equal(out.axis, "fluency");
+  assert.equal(out.axis, "feasibility");
   assert.equal(out.expertColumn, "overall_score");
-  assert.equal(out.sliceId, judgeValidationSliceId({ axis: "fluency", expertScoreField: "overall_score" }));
+  assert.equal(out.sliceId, judgeValidationSliceId({ axis: "feasibility", expertScoreField: "overall_score" }));
 
   const judgeHash = computeJudgeHash({ judgeModels: { anthropic: [JUDGE_MODEL] } });
   const stored = store.get(validationKey({ judgeHash, sliceId: out.sliceId }));
-  assert.equal(stored.result.axis, "fluency");
+  assert.equal(stored.result.axis, "feasibility");
 });
 
 test("runJudgeValidation — a failed judge run throws, never records a validation", async () => {
@@ -187,7 +195,7 @@ test("runJudgeValidation — a score/idea count mismatch throws rather than vali
     async score(payload, { judgeModel }) {
       const scores = payload.candidates
         .slice(0, -1)
-        .map(() => ({ originality: 5, feasibility: 4, fluency: 6, flexibility: 5 }));
+        .map(() => ({ originality: 5, feasibility: 4 }));
       return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
     },
   };
@@ -214,8 +222,6 @@ test("runJudgeValidation — supplies the non-empty RESEARCH BRIEF the real judg
       const scores = payload.candidates.map((_c, index) => ({
         originality: EXPERT_BY_INDEX[index],
         feasibility: 4,
-        fluency: (index % 7) + 1,
-        flexibility: (index % 5) + 2,
       }));
       return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
     },
@@ -223,11 +229,86 @@ test("runJudgeValidation — supplies the non-empty RESEARCH BRIEF the real judg
   const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
   assert.equal(out.verdict, "pass");
   assert.ok(seenBrief && seenBrief.length > 0, "the judge must receive a non-empty research brief");
+  // Default (no explicit briefText override): the brief is the idea's own
+  // topic (issue #45 item 3), not a generic shared brief.
+  assert.equal(seenBrief, "bias");
 
   // An explicitly empty briefText is rejected rather than sent to the judge.
   await assert.rejects(
     () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, briefText: "" }),
     /briefText must be a non-empty string/,
+  );
+});
+
+// ── issue #45 item 3: per-topic grouping ─────────────────────────────────────
+
+test("runJudgeValidation — DEFAULT groups by each idea's own topic: one judge.score() call PER TOPIC, and scores stay aligned to their own idea", async () => {
+  const root = tmpRoot("multi-topic");
+  // Alternate between two topics by index parity, so the two topic groups
+  // interleave through the flat slice order (0,2,4,... vs 1,3,5,...) rather
+  // than occupying contiguous ranges -- this is what makes a group-local-index
+  // vs. original-slice-index mixup (scores[j] vs scores[origIndex]) visible.
+  writeValidationFixture(root, { topicFor: (i) => (i % 2 === 0 ? "bias" : "coding") });
+  const store = makeTempStore("judge-validate-multitopic-");
+
+  // Recover each candidate's ORIGINAL (pre-grouping) slice index from its text
+  // -- the fixture's titles ("Human Idea NN" / "An AI Idea Number NN") encode
+  // it -- and score it with EXACTLY that idea's own expert score. Since
+  // EXPERT_BY_INDEX is strictly increasing and distinct per idea, a judge that
+  // reproduces it exactly can ONLY do so if every score actually landed back
+  // on its own idea after the per-topic score() calls are re-assembled; any
+  // misalignment (e.g. writing to the group-local index instead of the
+  // original slice index) scrambles the vector and balanced accuracy drops
+  // below a perfect 1.0.
+  const decodeIndex = (text) => {
+    const human = text.match(/Human Idea (\d+)/);
+    if (human) return Number(human[1]);
+    const ai = text.match(/AI Idea Number (\d+)/);
+    if (ai) return HUMAN + Number(ai[1]);
+    throw new Error(`test fixture text didn't match either title pattern: ${text}`);
+  };
+
+  const briefsSeen = [];
+  const provider = {
+    calls: [],
+    async score(payload, { judgeModel }) {
+      this.calls.push({ briefText: payload.briefText, n: payload.candidates.length });
+      briefsSeen.push(payload.briefText);
+      const scores = payload.candidates.map((c) => ({
+        originality: EXPERT_BY_INDEX[decodeIndex(c.text)],
+        feasibility: 4,
+      }));
+      return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
+    },
+  };
+
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+
+  // Exactly one call per distinct topic, never one call for the whole slice.
+  assert.equal(provider.calls.length, 2, "two distinct topics -> two judge.score() calls");
+  assert.deepEqual(new Set(briefsSeen), new Set(["bias", "coding"]), "each call's briefText is the topic itself");
+  // Every idea in the (24-idea) slice reached SOME call, split across the two
+  // topic groups (12 even-indexed "bias", 12 odd-indexed "coding").
+  const totalScored = provider.calls.reduce((sum, c) => sum + c.n, 0);
+  assert.equal(totalScored, N);
+  assert.deepEqual(provider.calls.map((c) => c.n).sort(), [12, 12]);
+
+  // THE alignment assertion: a judge score vector that is a per-idea-perfect
+  // reproduction of the (strictly increasing, all-distinct) expert vector
+  // scores balanced accuracy exactly 1.0 -- and can only do so if re-assembly
+  // put each topic-group score back at its own idea's original slice index.
+  assert.equal(out.accuracy, 1.0, "judge scores must land back on their own idea after per-topic re-assembly");
+  assert.equal(out.verdict, "pass");
+});
+
+test("runJudgeValidation — a missing topic on an included idea fails loud (no silent fallback to a generic brief)", async () => {
+  const root = tmpRoot("no-topic");
+  writeValidationFixture(root, { topicFor: (i) => (i === 0 ? "" : "bias") }); // idea 0 has no topic
+  const store = makeTempStore("judge-validate-notopic-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+  await assert.rejects(
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    /has no non-empty 'topic'/,
   );
 });
 
