@@ -133,6 +133,23 @@ export function normalizeTitle(s) {
 }
 
 /**
+ * Normalize an `idea_id` from the reviews JSON by stripping ALL whitespace
+ * (issue #37). Five of the 147 released `idea_id` values carry a stray
+ * internal space before the condition suffix (e.g. `"Multilingual_9 _Human"`
+ * instead of `"Multilingual_9_Human"`), and a sixth (`"Bias_1 _AI_Rerank"`)
+ * falls in the excluded AI_Rerank condition. `id_title_mapping.csv` contains
+ * zero such ids, so an un-normalized key lookup (`byIdea.get(csvId)`) silently
+ * misses these five, dropping them out of `titleIndex` and starving their idea
+ * files of a match. Stripping whitespace (rather than just trimming) closes
+ * the gap without any hand-resolution. Verified against the real payload to
+ * merge no distinct ids: 147 raw idea_ids normalize to 147 unique, and the 98
+ * CSV ids (Human + AI) normalize to 98 unique — no collision.
+ */
+export function normalizeIdeaId(id) {
+  return typeof id === "string" ? id.replace(/\s+/g, "") : id;
+}
+
+/**
  * Strip a trailing `.json`/`.txt` filename extension and surrounding whitespace
  * from a mapping value before it is normalized (issue #35). The mapping's
  * `ID,Title / Filename` column is a prose title for Human rows but a FILENAME
@@ -192,6 +209,9 @@ function readIdTitleMapping(csvPath) {
 /**
  * Read the column-oriented reviews JSON (a dict of equal-length arrays) and
  * group per idea_id: condition + the expert score of each review of that idea.
+ * `idea_id` is run through `normalizeIdeaId` (whitespace-stripped) as it is
+ * keyed, so a stray-space id (issue #37) still binds to its clean CSV
+ * counterpart.
  * @returns {{ byIdea: Map<string, {condition: string, scores: number[]}>, reviewCount: number }}
  */
 function readReviews(jsonPath, scoreField) {
@@ -209,7 +229,7 @@ function readReviews(jsonPath, scoreField) {
   const n = ideaIds.length;
   const byIdea = new Map();
   for (let i = 0; i < n; i++) {
-    const id = ideaIds[i];
+    const id = normalizeIdeaId(ideaIds[i]);
     const score = scores[i];
     const condition = Array.isArray(conditions) ? conditions[i] : undefined;
     const topic = Array.isArray(topics) ? topics[i] : undefined;
