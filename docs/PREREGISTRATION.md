@@ -368,6 +368,7 @@ Every knob the study varies is config, not code:
 | Knob | Flag | Notes |
 |---|---|---|
 | Spend ceiling | `--max-spend <usd>` | Pre-flight prices the planned grid from the pinned rate table and **refuses to start** if the projection exceeds it. Cells skipped for budget are recorded as `skipped: budget_exceeded`, never dropped. |
+| Per-provider spend ceiling | `--max-spend-anthropic <usd>`, `--max-spend-openai <usd>` | Same fail-closed semantics as `--max-spend`, evaluated independently per provider (issue #51 -- a single global ceiling cannot express an asymmetric budget). Attribution is derived from `tokens_by_model`, not a flat per-cell assignment, so a cross-provider cell (arm G) splits correctly across both. A tripped ceiling names its provider: `skipped: budget_exceeded:<provider>`. |
 | Which arms | `--arms A,B,E` | Subset the grid |
 | Which models | `arms.config.json` | Model IDs per persona slot, per arm |
 | Replicates | `--replicates <n>` | Additive — raising it queues only new cells |

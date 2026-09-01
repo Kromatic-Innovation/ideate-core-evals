@@ -4,6 +4,7 @@
 // Usage:
 //   node evals/run.mjs --dry-run
 //   node evals/run.mjs --max-spend 50 --arms A,B --briefs biz-01,biz-02 --replicates 2
+//   node evals/run.mjs --max-spend-anthropic 300 --max-spend-openai 150
 //   node evals/run.mjs --phase 0
 //
 // This file is intentionally thin: it parses argv, loads the corpus + arm
@@ -31,6 +32,7 @@ import { createRequire } from "node:module";
 import { CORPUS, CORPUS_HASH } from "./corpus/index.mjs";
 import { ResultsStore } from "../lib/store.mjs";
 import { runSpec } from "./harness/runner.mjs";
+import { runnerPriceGrid } from "../lib/price.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
 
@@ -100,6 +102,19 @@ export function parseArgs(argv) {
         break;
       case "--max-spend":
         args.maxSpendUsd = parseRequiredNumber(argv, ++i, "--max-spend");
+        break;
+      case "--max-spend-anthropic":
+        // Per-provider ceiling (issue #51) -- §12 registers a single global
+        // --max-spend, but the operator's actual constraint is asymmetric
+        // (substantial Anthropic headroom, a firm preference against
+        // comparable OpenAI spend), which a single ceiling cannot express.
+        // Stored under args.maxSpendByProviderUsd (a { anthropic?, openai? }
+        // map), keyed the same way lib/price.mjs's providerOf() names a
+        // provider, so main() can hand it to runSpec with no translation.
+        args.maxSpendByProviderUsd = { ...args.maxSpendByProviderUsd, anthropic: parseRequiredNumber(argv, ++i, "--max-spend-anthropic") };
+        break;
+      case "--max-spend-openai":
+        args.maxSpendByProviderUsd = { ...args.maxSpendByProviderUsd, openai: parseRequiredNumber(argv, ++i, "--max-spend-openai") };
         break;
       case "--arms":
         args.arms = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
@@ -236,7 +251,17 @@ async function main() {
     provider,
     batch: !args.noBatch,
     dryRun: args.dryRun,
+    // --max-spend-anthropic/--max-spend-openai (issue #51) need real,
+    // pinned-rate-table pricing to be meaningful pre-flight -- the interim
+    // estimator runSpec() falls back to when no priceGrid is injected has no
+    // per-model rate for every model and is explicitly labelled a
+    // placeholder (see runner.mjs's own header). Wiring lib/price.mjs's
+    // runnerPriceGrid() here is the "follow-up PR" that module's own header
+    // comment names as the way the CLI adopts it -- zero changes to
+    // runner.mjs's own default were needed for this.
+    priceGrid: runnerPriceGrid(),
     maxSpendUsd: args.maxSpendUsd,
+    maxSpendByProviderUsd: args.maxSpendByProviderUsd,
     armIds: args.arms,
     briefIds: args.briefs,
     replicates: args.replicates,

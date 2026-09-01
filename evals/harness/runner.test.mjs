@@ -52,6 +52,37 @@ const SPEC = {
   config: CFG,
 };
 
+// ── issue #51: per-provider --max-spend fixtures ────────────────────────
+// H2 (Anthropic-only panel), H3 (OpenAI-only panel), and G2 (a small arm-G
+// shape: 1 Anthropic + 1 OpenAI slot, cross-provider IN ONE CELL) -- enough
+// to exercise per-provider admission control and the mixed-arm attribution
+// case without the real study's full 5-slot panels.
+const ARMS_CONFIG_PROVIDERS = {
+  arms: {
+    H2: {
+      mode: "panel",
+      slots: [{ persona: "proposer_1", model: "claude-haiku-4-5" }],
+    },
+    H3: {
+      mode: "panel",
+      slots: [{ persona: "proposer_1", model: "gpt-5.6-terra" }],
+    },
+    G2: {
+      mode: "panel",
+      slots: [
+        { persona: "proposer_1", model: "claude-opus-5" },
+        { persona: "proposer_2", model: "gpt-5.6-sol" },
+      ],
+    },
+  },
+};
+const SPEC_PROVIDERS = {
+  arms: [{ id: "H2" }, { id: "H3" }, { id: "G2" }],
+  briefs: [{ id: "b1" }],
+  replicates: 1,
+  config: CFG,
+};
+
 const silentLog = () => {};
 
 // ── AC1: --dry-run prints a plan and spends nothing ─────────────────────────
@@ -164,6 +195,102 @@ test("max-spend at or above the full projection runs every cell normally", async
   assert.equal(summary.completed, 4);
   assert.equal(summary.skipped, 0);
   assert.equal(provider.calls.length, 4);
+});
+
+// ── issue #51: --max-spend-anthropic / --max-spend-openai ───────────────────
+
+test("a per-provider ceiling of $0 skips only that provider's cells, budget_exceeded:<provider> named -- the other provider's cells still run", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+
+  const { summary, account } = await runSpec(SPEC_PROVIDERS, {
+    store,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2", "H3"], // single-provider arms only -- isolates the per-provider skip from the mixed-arm case
+    maxSpendByProviderUsd: { anthropic: 0 },
+    log: silentLog,
+  });
+
+  assert.equal(summary.planned, 2);
+  assert.equal(summary.completed, 1, "the OpenAI-only cell (H3) still ran");
+  assert.equal(summary.skipped, 1, "the Anthropic-only cell (H2) was skipped");
+  const h2Key = cellKey({ armId: "H2", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const h2State = account.states.get(h2Key);
+  assert.equal(h2State.state, "skipped");
+  assert.match(h2State.detail, /^budget_exceeded:anthropic$/, "the skip detail names the tripping provider");
+  assert.equal(provider.calls.length, 1, "the provider was never called for the skipped Anthropic cell");
+  assert.deepEqual(provider.calls.map((c) => c.armId), ["H3"]);
+});
+
+test("a cross-provider cell (arm-G shape) is admission-controlled against BOTH ceilings -- skipped if EITHER provider's ceiling would be crossed", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+
+  const { summary, account } = await runSpec(SPEC_PROVIDERS, {
+    store,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["G2"],
+    // Anthropic has ample headroom; OpenAI is capped at $0 -- the cell must
+    // still be skipped, because it also spends under OpenAI (the gpt-5.6-sol
+    // slot). A bug that only checked the FIRST provider in the map, or
+    // flat-assigned the whole cell to Anthropic, would wrongly admit this cell.
+    maxSpendByProviderUsd: { anthropic: 1000, openai: 0 },
+    log: silentLog,
+  });
+
+  assert.equal(summary.planned, 1);
+  assert.equal(summary.skipped, 1);
+  const g2Key = cellKey({ armId: "G2", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  assert.match(account.states.get(g2Key).detail, /^budget_exceeded:openai$/);
+  assert.deepEqual(provider.calls, [], "the cross-provider cell was never sent to the provider");
+});
+
+test("mixed-arm attribution (the #51 subtlety): a completed cross-provider cell's ACTUAL spend is derived from tokens_by_model and lands on BOTH providers, never flat-assigned to whichever model is listed first", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["G2"], // the cross-provider arm alone -- isolates its attribution
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 1);
+  assert.ok(summary.spendByProvider, "runSpec's summary exposes actual per-provider spend");
+  assert.ok(summary.spendByProvider.anthropic > 0, "the claude-opus-5 slot's real tokens contributed a positive Anthropic total");
+  assert.ok(summary.spendByProvider.openai > 0, "the gpt-5.6-sol slot's real tokens contributed a positive OpenAI total");
+});
+
+test("running per-provider totals are tracked between cells, not only in the pre-flight -- a later cell is skipped once EARLIER completed cells already exhausted its provider's ceiling", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+
+  // Two Anthropic-only cells (H2 x 2 briefs). Price the first cell alone so
+  // the ceiling admits exactly it and nothing more -- proving the SECOND
+  // cell's skip decision is driven by the ACTUAL running total left behind
+  // by the first cell's real tokens_by_model, not a static pre-flight number
+  // computed once before either cell ran.
+  const twoBriefSpec = { ...SPEC_PROVIDERS, briefs: [{ id: "b1" }, { id: "b2" }] };
+  const { projection } = planAndPrice(twoBriefSpec, { store, armsConfig: ARMS_CONFIG_PROVIDERS, batch: true });
+  const h2Cells = projection.breakdown.filter((b) => b.cellKey.includes("H2"));
+  const firstCellUsd = h2Cells[0].usd;
+
+  const { summary } = await runSpec(twoBriefSpec, {
+    store,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2"],
+    maxSpendByProviderUsd: { anthropic: firstCellUsd },
+    log: silentLog,
+  });
+
+  assert.equal(summary.planned, 2);
+  assert.equal(summary.completed, 1, "only the first cell fit under the ceiling once its ACTUAL cost was booked");
+  assert.equal(summary.skipped, 1, "the second cell was skipped -- the running total already accounted for the first cell's real spend");
 });
 
 // ── AC3: resume -- killing mid-grid and restarting re-runs only incomplete cells ──

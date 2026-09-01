@@ -39,6 +39,15 @@
 import { planRun } from "../../lib/manifest.mjs";
 import { RunAccount, costRow, TERMINAL_STATES } from "../../lib/accounting.mjs";
 import { assertValidProviderResponse } from "./provider.mjs";
+// providerOf/priceRowByProvider (issue #51, per-provider --max-spend): pure
+// data-shape utilities, not the interim estimator this module owns -- see
+// lib/price.mjs's own header for why the RATE_TABLE-backed pricer stays a
+// separate, injectable seam (runnerPriceGrid) rather than being imported
+// wholesale here. providerOf/priceRowByProvider carry no rate-table opinion of
+// their own (they take one as a parameter), so importing them does not couple
+// this module to lib/price.mjs's RATE_TABLE the way importing runnerPriceGrid
+// itself would.
+import { providerOf, priceRowByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
 
 // ── Interim pricing estimator -- INTERIM, superseded by lib/price.mjs in #7 ──
 // A minimal per-model token-estimate table so --max-spend/--dry-run have
@@ -111,15 +120,22 @@ export function interimPriceGrid(plannedCells, arms, { batch = true } = {}) {
     const perSlotOut = totalOut / Math.max(slots.length, 1);
 
     let cellUsd = 0;
+    // byProvider: same per-slot split runnerPriceGrid computes (issue #51) --
+    // this INTERIM pricer is a fallback/default, but a caller that injects
+    // it and asks for per-provider ceilings still gets a real, mixed-arm-safe
+    // split rather than a flat per-cell assignment.
+    const byProvider = {};
     for (const slot of slots) {
       const rate = INTERIM_RATES_USD_PER_MTOK[slot.model];
       if (!rate) {
         throw new Error(`interimPriceGrid: no interim rate for model '${slot.model}' (arm '${cell.armId}') -- add it to INTERIM_RATES_USD_PER_MTOK or wait for lib/price.mjs (#7)`);
       }
-      cellUsd += (perSlotIn / 1_000_000) * rate.in + (perSlotOut / 1_000_000) * rate.out;
+      const slotUsd = ((perSlotIn / 1_000_000) * rate.in + (perSlotOut / 1_000_000) * rate.out) * discount;
+      cellUsd += slotUsd;
+      const provider = providerOf(slot.model);
+      byProvider[provider] = (byProvider[provider] || 0) + slotUsd;
     }
-    cellUsd *= discount;
-    breakdown.push({ cellKey: cell.key, usd: cellUsd });
+    breakdown.push({ cellKey: cell.key, usd: cellUsd, byProvider });
     usd += cellUsd;
   }
   return { usd, breakdown };
@@ -195,7 +211,7 @@ function subsetSpec(spec, { arms, briefs, replicates } = {}) {
  *
  * @returns {{ plan: {todo, reuse, stale}, projection: {usd, breakdown} }}
  */
-export function planAndPrice(spec, { store, armsConfig, priceGrid = interimPriceGrid, batch = true }) {
+export function planAndPrice(spec, { store, armsConfig, priceGrid = interimPriceGrid, batch = true } = {}) {
   if (!store) throw new Error("planAndPrice: store is required (feeds planRun's resume/reuse diff)");
   if (!armsConfig || !armsConfig.arms) throw new Error("planAndPrice: armsConfig (arms.config.json shape, with an .arms map) is required");
 
@@ -224,6 +240,22 @@ export function planAndPrice(spec, { store, armsConfig, priceGrid = interimPrice
  *     projection exceeds it, the run refuses to start (see below for the
  *     precise semantics -- this is a per-cell admission control, not just an
  *     abort switch, so a run can still make partial progress under a cap).
+ *   @param {Object<string,number>} [opts.maxSpendByProviderUsd] per-provider
+ *     ceilings (issue #51), e.g. `{ anthropic: 300, openai: 150 }` -- keyed by
+ *     `lib/price.mjs`'s `providerOf()` output. Same fail-closed, per-cell
+ *     admission-control semantics as `maxSpendUsd`, evaluated independently
+ *     PER PROVIDER: a cell is skipped once THAT cell's provider(s) would push
+ *     their own running total over THEIR ceiling, even if other providers (or
+ *     the global `maxSpendUsd`) still have headroom. A cross-provider cell
+ *     (arm G) is checked against every provider it actually spends under, not
+ *     just one. The skip detail names the specific provider that tripped
+ *     (`budget_exceeded:<provider>`), distinct from the unqualified
+ *     `"budget_exceeded"` the global ceiling records.
+ *   @param {object} [opts.rateTable] the pinned, dated rate table used to
+ *     derive ACTUAL per-provider spend from each completed/failed cell's real
+ *     `tokens_by_model` (never a flat per-cell/per-run assignment -- see the
+ *     per-cell loop). Defaults to `lib/price.mjs`'s `RATE_TABLE`; only ever
+ *     overridden by a test.
  *   @param {string[]} [opts.armIds]     --arms subset
  *   @param {string[]} [opts.briefIds]   --briefs subset
  *   @param {number}   [opts.replicates] --replicates override
@@ -240,6 +272,8 @@ export async function runSpec(spec, opts) {
     batch = true, // batch-first: the DEFAULT is true, not a flag callers must set
     dryRun = false,
     maxSpendUsd,
+    maxSpendByProviderUsd,
+    rateTable = DEFAULT_RATE_TABLE,
     armIds,
     briefIds,
     replicates,
@@ -281,6 +315,39 @@ export async function runSpec(spec, opts) {
   const overBudget = maxSpendUsd !== undefined && projection.usd > maxSpendUsd;
   if (maxSpendUsd !== undefined) {
     log(`[max-spend] ceiling=$${maxSpendUsd} projected=$${projection.usd.toFixed(4)} ${overBudget ? "(over budget -- admission-controlling cells)" : "(within budget)"}`);
+  }
+
+  // ── --max-spend-<provider>: the SAME fail-closed pre-flight, priced PER
+  // PROVIDER from the pinned dated rate table (issue #51 -- a single global
+  // ceiling cannot express "substantial Anthropic headroom, a firm preference
+  // against comparable OpenAI spend"). Requires every priced todo cell to
+  // carry a `byProvider` breakdown (both interimPriceGrid and
+  // lib/price.mjs's runnerPriceGrid do, built slot-by-slot so a cross-provider
+  // cell like arm G is split proportionally, never flat-assigned to one
+  // provider) -- fail loud if an injected priceGrid omits it, the same
+  // "missing from the breakdown" precedent the per-cell loop already applies
+  // to `usd` below.
+  if (maxSpendByProviderUsd) {
+    const projectedByProvider = {};
+    for (const entry of projection.breakdown) {
+      if (!entry.byProvider) {
+        throw new Error(
+          `runSpec: --max-spend-<provider> requires every priced todo cell to carry a 'byProvider' breakdown, but '${entry.cellKey}' has none -- ` +
+            `the injected priceGrid must report per-provider cost (see lib/price.mjs's runnerPriceGrid / interimPriceGrid)`,
+        );
+      }
+      for (const [provider, usd] of Object.entries(entry.byProvider)) {
+        projectedByProvider[provider] = (projectedByProvider[provider] || 0) + usd;
+      }
+    }
+    for (const [provider, ceiling] of Object.entries(maxSpendByProviderUsd)) {
+      const projected = projectedByProvider[provider] || 0;
+      const providerOverBudget = projected > ceiling;
+      log(
+        `[max-spend-${provider}] ceiling=$${ceiling} projected=$${projected.toFixed(4)} ` +
+          `${providerOverBudget ? `(over budget -- refusing to start ${provider} cells beyond the ceiling)` : "(within budget)"}`,
+      );
+    }
   }
 
   const plannedKeys = [...plan.reuse.map((c) => c.key), ...plan.todo.map((c) => c.key)];
@@ -334,7 +401,33 @@ export async function runSpec(spec, opts) {
   }
 
   const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usd]));
+  // Projected per-provider cost for each todo cell, split slot-by-slot (see
+  // the pre-flight block above) -- used to decide, BEFORE a cell runs,
+  // whether admitting it would cross a provider's ceiling.
+  const providerByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.byProvider || {}]));
   let runningTotal = 0;
+  // runningTotalByProvider: ACTUAL spend, tracked BETWEEN cells as they
+  // complete (issue #51 -- "not only in the pre-flight") -- seeded at 0 and
+  // updated below from each completed/failed cell's REAL `tokens_by_model`,
+  // never from the pre-run projection. A still-to-run cell's projected
+  // byProvider cost is added on TOP of this actual total only for the
+  // admission decision itself (below); the running total this variable holds
+  // is always what was actually spent so far.
+  const runningTotalByProvider = {};
+
+  // Fold one cell's cost rows (real `tokens_by_model`, priced at read time
+  // from `rateTable`) into `runningTotalByProvider`, grouped by provider --
+  // NEVER a flat per-cell/per-run assignment. This is what makes arm G's
+  // actual spend land correctly split across Anthropic and OpenAI instead of
+  // wholly on whichever model happens to be listed first in the row.
+  function recordActualSpend(costRows) {
+    for (const row of costRows) {
+      const { byProvider } = priceRowByProvider(row, rateTable, { batch });
+      for (const [provider, usd] of Object.entries(byProvider)) {
+        runningTotalByProvider[provider] = (runningTotalByProvider[provider] || 0) + usd;
+      }
+    }
+  }
 
   for (const cell of plan.todo) {
     // `priceByKey.get(cell.key) || 0` would mask two distinct situations as
@@ -347,7 +440,26 @@ export async function runSpec(spec, opts) {
       throw new Error(`runSpec: priceGrid's breakdown is missing an entry for planned cell '${cell.key}' -- every todo cell must be priced`);
     }
     const cellCost = priceByKey.get(cell.key);
-    if (maxSpendUsd !== undefined && runningTotal + cellCost > maxSpendUsd) {
+
+    // Per-provider admission control (issue #51): a cell is skipped once ANY
+    // provider it spends under would cross ITS OWN ceiling -- checked as
+    // `already-actually-spent + this-cell's-projected-share`, so the decision
+    // uses REAL spend for every prior cell and only estimates the one cell
+    // about to run (its actual cost isn't known until after the call).
+    let trippedProvider = null;
+    if (maxSpendByProviderUsd) {
+      const cellByProvider = providerByKey.get(cell.key) || {};
+      for (const [provider, ceiling] of Object.entries(maxSpendByProviderUsd)) {
+        const already = runningTotalByProvider[provider] || 0;
+        const projected = cellByProvider[provider] || 0;
+        if (already + projected > ceiling) {
+          trippedProvider = provider;
+          break;
+        }
+      }
+    }
+
+    if (trippedProvider || (maxSpendUsd !== undefined && runningTotal + cellCost > maxSpendUsd)) {
       // Budget-skipped: recorded via RunAccount as a classified skip, never
       // dropped from the plan (see reconcile()'s tally below and the AC's
       // own wording: "recorded skipped: budget_exceeded, never dropped").
@@ -364,7 +476,7 @@ export async function runSpec(spec, opts) {
       // Leaving it store-absent means the next invocation (any --max-spend,
       // including none) sees it as `todo` again, which is the only sane
       // resume behavior for "we chose not to spend on this yet."
-      account.skip(cell.key, "budget_exceeded");
+      account.skip(cell.key, trippedProvider ? `budget_exceeded:${trippedProvider}` : "budget_exceeded");
       continue;
     }
     runningTotal += cellCost;
@@ -396,6 +508,7 @@ export async function runSpec(spec, opts) {
       account.complete(cell.key, response.result);
       const costRows = costRowsFor(cell.key, response.tokens, timestamp);
       for (const row of costRows) account.addCost(row);
+      recordActualSpend(costRows);
       store.put({
         key: cell.key,
         armId: cell.armId,
@@ -413,6 +526,7 @@ export async function runSpec(spec, opts) {
       account.fail(cell.key, response.failureKind, response.detail || "");
       const costRows = costRowsFor(cell.key, response.tokens, timestamp);
       for (const row of costRows) account.addCost(row);
+      recordActualSpend(costRows);
       store.put({
         key: cell.key,
         armId: cell.armId,
@@ -432,6 +546,11 @@ export async function runSpec(spec, opts) {
   // none computed in this module, but the summary below is derived from
   // reconcile()'s own tally, so it is definitionally post-gate.
   const summary = account.reconcile();
+  // spendByProvider: the ACTUAL per-provider total this run spent, derived
+  // from real tokens_by_model (issue #51) -- exposed on the summary so a
+  // caller (report, next --max-spend-<provider> invocation) can see exactly
+  // what this session cost per provider, not just the pre-flight estimate.
+  summary.spendByProvider = runningTotalByProvider;
   log(`[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
   return { summary, account };
 }
