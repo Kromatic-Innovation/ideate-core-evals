@@ -9,8 +9,15 @@
 // exactly the kind of "rigged to pass" artifact the issue warns against.
 //
 // We derive it from two small calibration populations in
-// ./fixtures/control-texts.mjs, embedded by the SAME model as everything
-// else (Xenova/all-MiniLM-L6-v2 via ../regen-fixtures.mjs):
+// ./fixtures/control-texts.mjs, embedded with Xenova/all-MiniLM-L6-v2 (via
+// ../regen-fixtures.mjs) — the HERMETIC fixture embedder every test in this
+// directory uses. This is NOT the production embedder (Voyage-4-lite, see
+// ./embedder.mjs voyageEmbedder) — cosine-distance distributions do not
+// transfer across embedding models (issue #42). The constant this module
+// exports (CLUSTER_DISTANCE_THRESHOLD) is valid ONLY for MiniLM-embedded
+// vectors (i.e. the hermetic fixtureEmbedder). Production code must use
+// VOYAGE_CLUSTER_DISTANCE_THRESHOLD (./voyage-calibration.mjs) instead — see
+// that module and ./calibrate-voyage.mjs for the Voyage-space derivation:
 //   PARAPHRASE_PAIRS      — 4 pairs, same idea reworded. These SHOULD cluster
 //                            together; their pairwise cosine distance is the
 //                            "definitely one idea" population.

@@ -1,4 +1,11 @@
-// briefs.mjs — the 12 frozen briefs, stratified per §3.2 of the pre-registration.
+// briefs.mjs — the 24 frozen briefs, stratified per §3.2 of the pre-registration.
+//
+// ── Corpus expansion (issue #43, 2026-09-01) ────────────────────────────────
+// Expanded 12 -> 24 briefs (4/3/3/2 -> 6/6/6/6 per stratum) while the
+// pre-registration window was still open (no study data collected). See
+// docs/PREREGISTRATION.md §3.2 and issue #43 for the rationale; the dated
+// amendment disclosing this (including the authored-briefs conflict of
+// interest) lands separately in Appendix B per issue #44.
 //
 // ── Neutrality note (AC4: domain-agnostic, no unfair fit) ──────────────────────
 // This corpus feeds EVERY arm's prompt builder identically (§3.3: "same prompt
@@ -80,7 +87,7 @@ function scientificSelectionMeta(keyword, index) {
 
 /** @type {Brief[]} */
 export const BRIEFS = [
-  // ── Business / go-to-market (4, authored) ─────────────────────────────────
+  // ── Business / go-to-market (6, authored) ─────────────────────────────────
   // The actual use case (§3.2). Kept generic per the neutrality note above.
   {
     id: "biz-01",
@@ -116,8 +123,25 @@ export const BRIEFS = [
       "Generate as many genuinely different explanations and responses to this " +
       "problem as you can.",
   },
+  {
+    id: "biz-05",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company must decide how to structure its sales effort as it grows past its " +
+      "first ten customers. Generate as many genuinely different ways to structure " +
+      "it as you can.",
+  },
+  {
+    id: "biz-06",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company's biggest competitor just cut its price by half. Generate as many " +
+      "genuinely different ways to respond as you can.",
+  },
 
-  // ── Product / feature ideation (3, authored) ──────────────────────────────
+  // ── Product / feature ideation (6, authored) ──────────────────────────────
   {
     id: "prod-01",
     stratum: "product",
@@ -144,8 +168,32 @@ export const BRIEFS = [
       "the next release. Generate as many genuinely different candidate features as " +
       "you can.",
   },
+  {
+    id: "prod-04",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A product's most-used feature is also its most complained-about. Generate as " +
+      "many genuinely different ways to address this as you can.",
+  },
+  {
+    id: "prod-05",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A team must decide what to build next with little data about what its users " +
+      "actually want. Generate as many genuinely different ways to decide as you can.",
+  },
+  {
+    id: "prod-06",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A product works well on one device type but poorly on another. Generate as " +
+      "many genuinely different ways to fix this as you can.",
+  },
 
-  // ── Scientific (3, sampled from LiveIdeaBench) ────────────────────────────
+  // ── Scientific (6, sampled from LiveIdeaBench) ────────────────────────────
   // Each brief wraps one sampled keyword in a fixed, minimal template so the
   // ONLY varying content across this stratum's briefs is the keyword itself —
   // matching LiveIdeaBench's own single-keyword prompt design (§2 of the
@@ -158,7 +206,7 @@ export const BRIEFS = [
     selection: scientificSelectionMeta(keyword, i),
   })),
 
-  // ── Classic divergent-thinking (2, authored, AUT-style) ───────────────────
+  // ── Classic divergent-thinking (6, authored, AUT-style) ───────────────────
   // Alternate Uses Task phrasing — the only stratum OCSAI can score (§3.2,
   // §4.2: "OCSAI originality — AUT stratum only").
   {
@@ -172,5 +220,29 @@ export const BRIEFS = [
     stratum: "aut",
     provenance: "authored",
     text: "Generate as many genuinely different uses for a paperclip as you can.",
+  },
+  {
+    id: "aut-03",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a towel as you can.",
+  },
+  {
+    id: "aut-04",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a rubber band as you can.",
+  },
+  {
+    id: "aut-05",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a cardboard box as you can.",
+  },
+  {
+    id: "aut-06",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a spoon as you can.",
   },
 ];

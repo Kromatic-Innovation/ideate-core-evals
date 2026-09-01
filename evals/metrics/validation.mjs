@@ -83,22 +83,29 @@ export async function datReplication(embedder) {
  * hermetic test must already be in the committed fixture map, and these
  * already are (see control-texts.mjs ALL_FIXTURE_TEXTS).
  *
- * Uses CLUSTER_DISTANCE_THRESHOLD (./calibration.mjs) — the same
- * data-derived threshold every other distinct_k computation in this repo
- * uses — so a live-embedder run and the hermetic fixture run are clustering
- * under a consistent, non-arbitrary rule (not re-tuned per embedder).
+ * ── Threshold is a PARAMETER, not a hardcoded import (issue #42) ───────────
+ * CLUSTER_DISTANCE_THRESHOLD (./calibration.mjs) is derived from MiniLM
+ * embeddings and is only the right default when `embedder` IS the MiniLM
+ * fixture embedder (the hermetic-test case). A caller running this against a
+ * different embedder (e.g. live Voyage-4-lite) MUST pass that embedder's own
+ * calibrated threshold explicitly (see ./voyage-calibration.mjs) — using the
+ * MiniLM number against Voyage embeddings is exactly the cross-space-
+ * threshold defect issue #42 fixes. The default below exists only so the
+ * hermetic MiniLM-fixture call sites (validation.test.mjs,
+ * dat-replication.test.mjs-adjacent usage) don't have to pass it explicitly.
  *
  * @param {{ embed: (texts: string[]) => Promise<number[][]> }} embedder
+ * @param {{ threshold?: number }} [opts]
  * @returns {Promise<{
  *   duplicate: { distinctK: number, diversity: number, collapseRate: number },
  *   random: { distinctK: number, diversity: number, collapseRate: number },
  * }>}
  */
-export async function negativeControls(embedder) {
+export async function negativeControls(embedder, { threshold = CLUSTER_DISTANCE_THRESHOLD } = {}) {
   const [dupVecs, randVecs] = await Promise.all([embedder.embed(DUPLICATE_POOL), embedder.embed(RANDOM_TEXT_POOL)]);
 
-  const dupK = distinctK(dupVecs, CLUSTER_DISTANCE_THRESHOLD);
-  const randK = distinctK(randVecs, CLUSTER_DISTANCE_THRESHOLD);
+  const dupK = distinctK(dupVecs, threshold);
+  const randK = distinctK(randVecs, threshold);
 
   return {
     duplicate: {

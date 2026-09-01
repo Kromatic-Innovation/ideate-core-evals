@@ -1,0 +1,30 @@
+{
+  "embedderId": "voyage-4-lite",
+  "generatedAt": "2026-09-01T22:54:21.214Z",
+  "pairSetHash": "4be4622bfbad",
+  "pairSetSize": 108,
+  "pairSetProvenance": {
+    "labelledBy": "model",
+    "model": "claude-sonnet-5 (Claude Code)",
+    "date": "2026-09-01",
+    "note": "Every pair (text and same/different label) was authored by an LLM, not collected from human raters. Presented here as model-generated calibration data, not human ground truth. See issue #42."
+  },
+  "selectionRule": "candidates = midpoints of consecutive sorted observed pairwise distances; select threshold(s) maximising balanced accuracy (mean of sensitivity, specificity) on the same/different pair labels; ties broken by the midpoint of the widest run of consecutive candidate thresholds achieving the maximum",
+  "clusterDistanceThreshold": 0.23141118234233987,
+  "achievedBalancedAccuracy": 0.9652777777777778,
+  "miniLmThresholdOnThisSet": {
+    "threshold": 0.49234346496597087,
+    "balancedAccuracy": 0.5833333333333334
+  },
+  "narrowFixtureTransferCheck": {
+    "miniLmThreshold": 0.49234346496597087,
+    "voyageMaxParaphraseDistance": 0.09689660424263369,
+    "voyageMinDistinctDistance": 0.5634141997513202,
+    "populationsOverlap": false,
+    "thresholdSitsBetweenPopulations": true
+  },
+  "deviationNotes": [
+    "Threshold selected as pairwise-optimal balanced accuracy; consumed by clusterByThreshold under average-linkage over ~30-item pools, which merges on a mean cross-cluster distance, not a single pairwise distance. A defensible proxy, not an identical quantity.",
+    "±0.05 sensitivity band (see sensitivity.mjs) is a MiniLM-era registered figure, not re-derived from the Voyage same/different gap -- report it as a fraction of the observed gap alongside any sensitivity result."
+  ]
+}
