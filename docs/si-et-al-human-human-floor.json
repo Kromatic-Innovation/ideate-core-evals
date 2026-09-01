@@ -1,7 +1,7 @@
 {
   "kind": "si-et-al-human-human-recomputation",
   "issue": 47,
-  "computedAt": "2026-09-01T22:58:21.049Z",
+  "computedAt": "2026-09-01T23:46:31.936Z",
   "slice": {
     "n": 98,
     "conditions": [
@@ -25,15 +25,16 @@
     "splitSeed": 1,
     "splitCount": 1000,
     "bootstrapSeed": 2,
-    "bootstrapDraws": 2000
+    "bootstrapDraws": 2000,
+    "bootstrapSplitsPerDraw": 200
   },
   "result": {
     "mean": 0.5533750000000008,
     "splitDistributionP05": 0.5,
     "splitDistributionP95": 0.625,
     "bootstrapCi95": [
-      0.4166666666666667,
-      0.7083333333333334
+      0.4483333333333333,
+      0.670208333333333
     ],
     "overlapsRegisteredFloor": true,
     "excludesChance": false

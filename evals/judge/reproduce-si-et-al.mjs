@@ -31,6 +31,10 @@
 //                        no reviewer id exists in the anonymized release)
 //   split seed        : 1     split count : 1000   (point distribution)
 //   bootstrap seed     : 2     bootstrap draws : 2000  (idea-resampling CI)
+//   bootstrap splits/draw : 200  (averaged per resample -- see bootstrapSplitsPerDraw
+//                        below; the reported point estimate is itself a mean over
+//                        `splits` draws, so the bootstrap must resample that same
+//                        mean statistic, not a single split, to be a valid CI for it)
 //   exclusions         : AI_Rerank (DEFAULT_EXCLUDED_CONDITIONS, slice.mjs)
 //
 // ── Why a bootstrap CI, not a point estimate ─────────────────────────────────
@@ -54,6 +58,7 @@ import {
 } from "./config.mjs";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name);
@@ -64,6 +69,16 @@ const splits = arg("--splits", 1000);
 const seed = arg("--seed", 1);
 const bootstrapDraws = arg("--bootstrap-draws", 2000);
 const bootstrapSeed = arg("--bootstrap-seed", 2);
+// Splits averaged PER bootstrap resample. Fixes a CI-inflation bug: the
+// reported point estimate is a MEAN over `splits` draws (default 1000), but
+// each bootstrap resample used to call balancedAccuracySplitHalf with
+// splits:1 -- that measures Var(single-split-on-resample), which is
+// Var_idea(E[stat]) + E[Var_split], strictly WIDER than the sampling
+// variance of the reported mean statistic. Averaging S>=100 splits per
+// resample instead estimates the sampling variance of the MEAN, matching
+// what's actually reported. S=200 chosen: 2000 draws x 200 splits = 400,000
+// split computations, tractable in-process (single run, not CI-gated).
+const bootstrapSplitsPerDraw = arg("--bootstrap-splits-per-draw", 200);
 
 // Local PRNG for idea-resampling only — deliberately separate from gate.mjs's
 // internal mulberry32 (which drives the within-idea review split and is not
@@ -93,19 +108,32 @@ if (tooFew.length > 0) {
 // ── Point distribution: repeated random within-idea review splits ───────────
 const { mean, values, n } = balancedAccuracySplitHalf({ ideaReviews, splits, seed });
 const sorted = values.slice().sort((a, b) => a - b);
-const pct = (arr, p) => arr[Math.min(arr.length - 1, Math.floor(p * arr.length))];
+// Symmetric percentile index: floor for the lower tail, ceil-1 for the upper
+// tail (matches evals/analysis/pareto.mjs's costDiversityRatio CI form).
+// A single floor() for both tails is off by ~1 order statistic on the upper
+// tail relative to the lower -- e.g. p=0.05 and p=0.95 on n=100 give indices
+// 5 and 95 (floor), not the symmetric 5 and 94.
+const pct = (arr, p) => {
+  const idx = p <= 0.5 ? Math.floor(p * arr.length) : Math.ceil(p * arr.length) - 1;
+  return arr[Math.max(0, Math.min(arr.length - 1, idx))];
+};
 
-// ── Bootstrap CI: resample ideas with replacement, one split-half draw each ──
+// ── Bootstrap CI: resample ideas with replacement, averaging bootstrapSplitsPerDraw split-half draws each ──
 const bootRand = mulberry32(bootstrapSeed);
 const bootValues = new Array(bootstrapDraws);
 for (let b = 0; b < bootstrapDraws; b++) {
   const resampled = new Array(n);
   for (let i = 0; i < n; i++) resampled[i] = ideaReviews[Math.floor(bootRand() * n)];
-  // One split-half draw per bootstrap resample; the point distribution above
-  // already characterizes split-draw variance, so the bootstrap need not
-  // re-average over many splits per resample.
-  const { values: v } = balancedAccuracySplitHalf({ ideaReviews: resampled, splits: 1, seed: bootstrapSeed * 1_000_003 + b + 1 });
-  bootValues[b] = v[0];
+  // Average bootstrapSplitsPerDraw split-half draws per bootstrap resample --
+  // the reported point estimate is itself a mean over `splits` draws, so the
+  // bootstrap must estimate the sampling variance of THAT mean, not of a
+  // single split (see header comment on bootstrapSplitsPerDraw above).
+  const { mean: resampledMean } = balancedAccuracySplitHalf({
+    ideaReviews: resampled,
+    splits: bootstrapSplitsPerDraw,
+    seed: bootstrapSeed * 1_000_003 + b + 1,
+  });
+  bootValues[b] = resampledMean;
 }
 const bootSorted = bootValues.slice().sort((a, b) => a - b);
 const ciLo = pct(bootSorted, 0.025);
@@ -123,6 +151,7 @@ for (const ex of slice.exclusions || []) {
 }
 console.log(`  split seed / count       : ${seed} / ${splits}`);
 console.log(`  bootstrap seed / draws   : ${bootstrapSeed} / ${bootstrapDraws}  (resamples IDEAS with replacement)`);
+console.log(`  bootstrap splits/draw    : ${bootstrapSplitsPerDraw}  (averaged per resample, matching the reported mean's construction)`);
 console.log(`  mean balanced acc        : ${mean.toFixed(4)}`);
 console.log(`  split distribution p05-p95: ${pct(sorted, 0.05).toFixed(4)} .. ${pct(sorted, 0.95).toFixed(4)}`);
 console.log(`  bootstrap 95% CI         : ${ciLo.toFixed(4)} .. ${ciHi.toFixed(4)}`);
@@ -136,7 +165,9 @@ console.log(`  => 95% CI ${overlapsFloor ? "OVERLAPS" : "does NOT overlap"} the 
 console.log(`  => 95% CI ${excludesChance ? "EXCLUDES" : "does NOT exclude"} chance (0.50).`);
 
 // ── Durable, machine-readable output for #44's Appendix B ───────────────────
-const outPath = path.join("docs", "si-et-al-human-human-floor.json");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const outPath = path.join(__dirname, "..", "..", "docs", "si-et-al-human-human-floor.json");
 const record = {
   kind: "si-et-al-human-human-recomputation",
   issue: 47,
@@ -156,6 +187,7 @@ const record = {
     splitCount: splits,
     bootstrapSeed,
     bootstrapDraws,
+    bootstrapSplitsPerDraw,
   },
   result: {
     mean,
