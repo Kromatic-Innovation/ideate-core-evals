@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { providerOf, buildJudgeMatrix } from "./matrix.mjs";
 import { assertEvaluatorDistinct } from "./distinct.mjs";
+import { JUDGE_MODELS as REGISTERED_JUDGE_MODELS } from "./config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ARMS_CONFIG = JSON.parse(readFileSync(join(__dirname, "..", "..", "arms.config.json"), "utf8"));
@@ -99,6 +100,45 @@ test("throws when no distinct judge exists for a provider", () => {
     () => buildJudgeMatrix([{ poolKey: "arm=H|brief=b1", arm: ARM_H }], { judgeModels: { anthropic: ["claude-sonnet-5"], openai: ["gpt-5.6-terra"] } }),
     /no distinct openai judge available/,
   );
+});
+
+// ── issue #45 item 4: EMPIRICALLY verify every arm in arms.config.json is
+//    judgeable, using the REGISTERED candidate lists (config.mjs JUDGE_MODELS)
+//    — not a synthetic candidate list. Before #45, no test ever ran
+//    buildJudgeMatrix against the real arms.config.json arms at all, so
+//    arm G's (and arm E's — see config.mjs's comment) throw was unverified. ──
+
+test("issue #45 item 4 — buildJudgeMatrix constructs a valid schedule for EVERY arm in arms.config.json, including G", () => {
+  for (const [armId, armCfg] of Object.entries(ARMS_CONFIG.arms)) {
+    const arm = { id: armId, ...armCfg };
+    const pool = [{ poolKey: `arm=${armId}|brief=b1`, arm }];
+    let rows;
+    assert.doesNotThrow(
+      () => (rows = buildJudgeMatrix(pool, { judgeModels: REGISTERED_JUDGE_MODELS })),
+      `buildJudgeMatrix must not throw for arm ${armId} with the registered judge candidate lists`,
+    );
+    assert.equal(rows.length, 2, `arm ${armId} must get exactly one anthropic + one openai judge row`);
+    const providers = rows.map((r) => r.judge_provider).sort();
+    assert.deepEqual(providers, ["anthropic", "openai"]);
+    for (const row of rows) {
+      assert.doesNotThrow(() => assertEvaluatorDistinct(row.judge_model, arm), `arm ${armId}'s ${row.judge_provider} judge must be distinct from its own generators`);
+    }
+  }
+});
+
+test("issue #45 item 4 — WITHOUT the reserved fallback models, arm E and arm G are unjudgeable (regression proof the fix is load-bearing)", () => {
+  const naiveJudgeModels = {
+    anthropic: ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"],
+    openai: ["gpt-5.6-terra", "gpt-5.6-sol"],
+  };
+  for (const armId of ["E", "G"]) {
+    const arm = { id: armId, ...ARMS_CONFIG.arms[armId] };
+    assert.throws(
+      () => buildJudgeMatrix([{ poolKey: `arm=${armId}|brief=b1`, arm }], { judgeModels: naiveJudgeModels }),
+      /no distinct anthropic judge available/,
+      `arm ${armId} exhausts every naive anthropic candidate`,
+    );
+  }
 });
 
 test("throws on malformed input", () => {

@@ -21,6 +21,26 @@
 // implemented; matrix.mjs and any future module needing it should import
 // `providerOf` rather than re-deriving the prefix rule.
 //
+// ── issue #45 item 5: what H5's bias term actually measures ─────────────────
+// H5's regression term is `judge_provider × generator_provider` — PROVIDER
+// level, not model level. "Same provider" and "same model family" are not the
+// same thing here: arm D is homogeneous Opus, and its Anthropic-provider judge
+// leg (this matrix always schedules ONE Anthropic + one OpenAI judge, never
+// the arm's own generator model — see assertEvaluatorDistinct) is satisfied by
+// e.g. claude-sonnet-5 judging claude-opus-5 output. That is same-PROVIDER,
+// different-MODEL judging. Wataoka et al.'s self-preference effect is a
+// model-SELF-preference claim (a model favoring its own outputs specifically),
+// not a provider-preference claim. So H5, as specified, tests whether a judge
+// favors its own PROVIDER's arms in aggregate — a real and worth-testing
+// effect — but it CANNOT isolate model self-preference from same-provider,
+// different-model bias, and a positive H5 finding should not be reported as
+// confirming Wataoka et al.'s effect without that caveat. This is a disclosed
+// scope limitation, not a bug: fixing it would require a same-MODEL judge
+// leg (a model judging its own outputs), which this matrix's distinctness
+// invariant (§13, assertEvaluatorDistinct) deliberately forbids for the
+// PRIMARY cross-judge schedule, since a non-distinct judge is exactly the
+// confound H5 exists to detect in the first place.
+//
 // ── Judge selection policy ───────────────────────────────────────────────────
 // `judgeModels` maps provider -> an ORDERED list of candidate judge model ids
 // (most-preferred first, e.g. sonnet before haiku before opus, or whatever
