@@ -79,19 +79,17 @@ export const JUDGE_VALIDATION_MAPPING = Object.freeze({
 });
 
 /**
- * The research brief the judge scores the Si et al. slice ideas AGAINST during
- * validation (issue #36). The judge's scoring prompt requires a non-empty
- * `RESEARCH BRIEF` (score.mjs `buildJudgeScoringPrompt`), but the expert-score
- * slice carries idea text only — no per-idea brief — so validation supplies one
- * shared brief describing the Si et al. research-ideation task.
- *
- * NOTE (reversible default, #36 / self-heal aperture #250): this wording is a
- * safe, reversible default — it lives in one named constant, changing it changes
- * nothing irreversible, and it only takes effect when the REAL validation is run
- * (issue #16, operator + live judge key). The #16 operator should confirm or
- * override it (`runJudgeValidation({ briefText })`), and consider whether the
- * study's per-topic briefs should be used instead of one shared brief. Recorded
- * so the choice is visible rather than hidden at a call site.
+ * A generic fallback research brief describing the Si et al. research-ideation
+ * task as a WHOLE (issue #36). SUPERSEDED as validate.mjs's default by issue
+ * #45 item 3: the reviews carry a per-idea `topic` column (bias / coding /
+ * safety / multilingual / factuality / math / uncertainty — surfaced by
+ * slice.mjs), and "originality relative to the brief" is undefined against
+ * this one generic brief when 98 ideas actually span 7 distinct topics.
+ * `runJudgeValidation` (validate.mjs) now defaults to grouping by each idea's
+ * own topic and using the topic itself as that group's brief; this constant
+ * remains available ONLY as an explicit `runJudgeValidation({ briefText })`
+ * override for a caller that deliberately wants the old one-shared-brief
+ * behavior (e.g. comparing against it), never as an implicit fallback.
  */
 export const SI_ET_AL_VALIDATION_BRIEF =
   "Propose a novel, expert-level research idea in natural language processing. " +

@@ -198,6 +198,7 @@ function readReviews(jsonPath, scoreField) {
   const cols = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
   const ideaIds = cols.idea_id;
   const conditions = cols.condition;
+  const topics = cols.topic;
   const scores = cols[scoreField];
   if (!Array.isArray(ideaIds) || !Array.isArray(scores)) {
     throw new Error(
@@ -211,13 +212,19 @@ function readReviews(jsonPath, scoreField) {
     const id = ideaIds[i];
     const score = scores[i];
     const condition = Array.isArray(conditions) ? conditions[i] : undefined;
+    const topic = Array.isArray(topics) ? topics[i] : undefined;
     if (typeof score !== "number" || !Number.isFinite(score)) {
       throw new Error(`readReviews: non-numeric ${scoreField} at review index ${i} (idea_id=${id})`);
     }
     let entry = byIdea.get(id);
-    if (!entry) { entry = { condition, scores: [] }; byIdea.set(id, entry); }
-    else if (condition !== undefined && entry.condition !== undefined && entry.condition !== condition) {
-      throw new Error(`readReviews: idea_id ${id} appears under conflicting conditions ${entry.condition} and ${condition}`);
+    if (!entry) { entry = { condition, topic, scores: [] }; byIdea.set(id, entry); }
+    else {
+      if (condition !== undefined && entry.condition !== undefined && entry.condition !== condition) {
+        throw new Error(`readReviews: idea_id ${id} appears under conflicting conditions ${entry.condition} and ${condition}`);
+      }
+      if (topic !== undefined && entry.topic !== undefined && entry.topic !== topic) {
+        throw new Error(`readReviews: idea_id ${id} appears under conflicting topics '${entry.topic}' and '${topic}'`);
+      }
     }
     entry.scores.push(score);
   }
@@ -386,7 +393,14 @@ export function readSiEtAlSlice({
         );
       }
       boundIdeaIds.add(ideaId);
-      ideas.push({ ideaId, condition, text, expertScores: byIdea.get(ideaId).scores });
+      // topic (issue #45 item 3) is carried through when the reviews carry a
+      // `topic` column, but NOT force-required here — this reader's job is
+      // the (directory, filename) <-> idea_id join, and requiring topic on
+      // every fixture/slice shape would conflate that with the validation
+      // brief's own requirement. The topic-required check (fail loud, no
+      // silent generic-brief fallback) lives where topic is actually
+      // consumed as a brief — see validate.mjs's per-topic grouping.
+      ideas.push({ ideaId, condition, topic: byIdea.get(ideaId).topic, text, expertScores: byIdea.get(ideaId).scores });
     }
   }
 
