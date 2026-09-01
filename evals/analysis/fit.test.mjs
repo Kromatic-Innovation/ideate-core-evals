@@ -142,6 +142,54 @@ test("fitR2: recovers the known arm offsets on a noiseless grid", () => {
   assert.ok(Math.abs(fit.coefficients[2] - 4) < 1e-8);
 });
 
+// #46 QA MUST #4: the only prior CR2 coverage was `vcov[i][i] > 0` on a
+// PERFECTLY-BALANCED, zero-residual grid (fitR2's other test above) --
+// degenerate for CR2 (zero residuals -> zero meat -> the sandwich's
+// numerator vanishes, so a bug in the meat accumulation could pass
+// silently). This fixture has genuine non-zero residuals, and the expected
+// vcov below is hand-derived by explicit CR2 scalar arithmetic (H_g, I-H_g,
+// its inverse-sqrt, u_g, v_g, the meat, the sandwich) worked independently
+// in the PR description/commit, not by calling fitR2 or linalg.mjs.
+test("fitR2: CR2 vcov matches an independently hand-derived reference on a small, non-degenerate fixture", () => {
+  // 2 params (Intercept, arm[T.B]), 3 clusters (briefs), 1 obs/arm/brief --
+  // every cluster has the SAME leverage by symmetry (H_g = (1/3)*I for
+  // every g), which is what makes the by-hand CR2 derivation tractable:
+  //   beta = [3, 4]  (OLS: Intercept = mean(A) = 3, arm[T.B] = mean(B) - mean(A) = 4)
+  //   residuals: b1 (A=-1, B=-2), b2 (A=1, B=-1), b3 (A=0, B=3)
+  //   H_g = [[1/3, 0], [0, 1/3]] for every g -> I-H_g = (2/3)*I
+  //   A_g = (I-H_g)^(-1/2) = sqrt(3/2)*I
+  //   w_g = [e_A+e_B, e_B]: w1=[-3,-2], w2=[0,-1], w3=[3,3]
+  //   meat = (3/2) * sum(w_g w_g') = [[27, 22.5], [22.5, 21]]
+  //   vcov = (X'X)^-1 * meat * (X'X)^-1, (X'X)^-1 = [[1/3,-1/3],[-1/3,2/3]]
+  //        = [[1/3, -1/6], [-1/6, 7/3]]
+  const rows = [
+    { armId: "A", briefId: "b1", response: 2 },
+    { armId: "B", briefId: "b1", response: 5 },
+    { armId: "A", briefId: "b2", response: 4 },
+    { armId: "B", briefId: "b2", response: 6 },
+    { armId: "A", briefId: "b3", response: 3 },
+    { armId: "B", briefId: "b3", response: 10 },
+  ];
+  const fit = fitR2(rows, ["A", "B"], "A");
+  assert.equal(fit.converged, true);
+  assert.equal(fit.df, 2); // 3 clusters - 1
+  assert.ok(Math.abs(fit.coefficients[0] - 3) < 1e-9, `Intercept ${fit.coefficients[0]} vs 3`);
+  assert.ok(Math.abs(fit.coefficients[1] - 4) < 1e-9, `arm[T.B] ${fit.coefficients[1]} vs 4`);
+
+  const expectedVcov = [
+    [1 / 3, -1 / 6],
+    [-1 / 6, 7 / 3],
+  ];
+  for (let i = 0; i < 2; i++) {
+    for (let j = 0; j < 2; j++) {
+      assert.ok(
+        Math.abs(fit.vcov[i][j] - expectedVcov[i][j]) < 1e-6,
+        `vcov[${i}][${j}] = ${fit.vcov[i][j]}, expected ${expectedVcov[i][j]}`,
+      );
+    }
+  }
+});
+
 test("fitR2: fails cleanly (does not throw) when clusters <= parameters", () => {
   // Only 2 briefs but 3 parameters (Intercept, arm[T.B], arm[T.D]).
   const rows = [];
@@ -284,9 +332,14 @@ test("analysisHash: is deterministic given the same inputs", () => {
   assert.equal(analysisHash(fit, SIDECAR_SCRIPT_PATH), analysisHash(fit, SIDECAR_SCRIPT_PATH));
 });
 
-// ── Determinism: running the ladder twice on the same fixture -> identical JSON ─
+// ── Determinism: runLadder() is a pure function of its inputs given a fixed
+//    fake runner — NOT a claim about re-running against the same on-disk
+//    store (that would need buildFrame()/priceRows()/a real ResultsStore in
+//    the loop, none of which this file touches; see #46 QA SHOULD, which
+//    flagged the old name as overclaiming a "re-run on the same store"
+//    property this test cannot support). ─────────────────────────────────
 
-test("determinism: running the ladder twice on the same fixture produces byte-identical JSON (no wall-clock, no absolute paths)", async () => {
+test("runLadder: is a pure function of its inputs — same fixture twice produces byte-identical JSON, no wall-clock, no absolute paths", async () => {
   const rows = makeRows();
   const runner = makeRunner({
     R0: {

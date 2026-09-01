@@ -15,6 +15,24 @@ import { balancedAnovaOracle } from "./anova-oracle.mjs";
 
 const RUN = process.env.ANALYSIS_SIDECAR === "1";
 
+// #46 QA MUST #4 (the "denominator" requirement): a green `node --test`
+// must never let a reader assume the statistics were checked when the
+// real-sidecar layer was skipped. This test ALWAYS runs (never gated on
+// ANALYSIS_SIDECAR) and prints an unmissable, greppable line naming exactly
+// which layer ran. It intentionally does no assertion of its own beyond
+// "this line was printed" -- the actual verification is the gated test
+// below; this one exists purely so CI output can never be silently
+// ambiguous about whether layer 3 executed.
+test("test-layer denominator: report whether the real-sidecar layer (layer 3) ran or was skipped", () => {
+  const line = RUN
+    ? "ANALYSIS TEST LAYERS: layer1=identity-oracle RAN, layer2=fake-runner RAN, layer3=real-sidecar RAN (ANALYSIS_SIDECAR=1)"
+    : "ANALYSIS TEST LAYERS: layer1=identity-oracle RAN, layer2=fake-runner RAN, layer3=real-sidecar SKIPPED " +
+      "(ANALYSIS_SIDECAR unset -- CR2/REML NOT verified against the real sidecar this run; " +
+      "set ANALYSIS_SIDECAR=1 to run it)";
+  console.log(line);
+  assert.ok(line.includes("layer3="));
+});
+
 const ARM_LEVELS = ["A", "B", "D"];
 const BRIEF_LEVELS = ["b1", "b2", "b3", "b4"];
 const REPLICATES = 3;

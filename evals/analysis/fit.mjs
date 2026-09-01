@@ -218,10 +218,20 @@ export function fitR2(rows, armLevels, referenceArm) {
   const briefIds = rows.map((r) => r.briefId);
   const uniqueClusters = Array.from(new Set(briefIds));
 
+  // df = G - 1 (clusters, i.e. briefs, minus 1) — the standard G-1 t
+  // reference for cluster-robust inference at a small cluster count (#46 QA
+  // SHOULD). This is NOT full Bell-McCaffrey Satterthwaite df (that needs
+  // every cluster's leverage-adjusted variance contribution); contrasts.mjs
+  // consumes this as `fit.df` and switches its CI/p to the Student-t
+  // reference whenever it's present and finite/positive (see
+  // distributions.mjs and contrasts.mjs's evaluateContrast()).
+  const df = uniqueClusters.length - 1;
+
   const base = {
     rung: "R2",
     coefficientNames,
     n,
+    df,
     varianceComponents: {},
     toolchain: { node: process.version, method: "OLS+CR2 (pure JS, evals/analysis/linalg.mjs)" },
     method: "OLS+CR2",

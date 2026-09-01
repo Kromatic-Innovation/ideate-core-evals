@@ -1,6 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paretoFrontier, costDiversityRatio, costDiversityRatioByArm } from "./pareto.mjs";
+import { paretoFrontier, costDiversityRatio, costDiversityRatioByArm, seedFromString } from "./pareto.mjs";
+
+// ── seedFromString: the seed must actually derive from configHash (#46 QA
+//    SHOULD — the comment claimed this while the code used a hardcoded
+//    default and never consulted configHash at all). ───────────────────────
+
+test("seedFromString: deterministic for the same input", () => {
+  assert.equal(seedFromString("cfgabc123"), seedFromString("cfgabc123"));
+});
+
+test("seedFromString: different configHash inputs produce different seeds (not a hardcoded constant)", () => {
+  assert.notEqual(seedFromString("cfgabc123"), seedFromString("cfgdef456"));
+});
+
+test("seedFromString: always a non-negative 32-bit integer, safe as a mulberry32 seed", () => {
+  const s = seedFromString("some-config-hash");
+  assert.ok(Number.isInteger(s) && s >= 0 && s <= 0xffffffff);
+});
 
 test("paretoFrontier: a strictly dominated point is excluded", () => {
   const arms = [

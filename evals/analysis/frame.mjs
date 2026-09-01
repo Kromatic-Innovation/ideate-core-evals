@@ -48,6 +48,32 @@
 import { priceRows } from "../../lib/price.mjs";
 import { configHash as computeConfigHash } from "../../lib/manifest.mjs";
 
+/**
+ * Thrown by buildFrame() when an arm level has ZERO completed rows (every
+ * cell for that arm failed and/or was skipped) — differential attrition
+ * (§6.3's own named validity threat), never allowed to surface downstream
+ * as fit.mjs's SidecarUnavailableError / a coefficientNames mismatch (#46
+ * QA SHOULD: that failure mode is badly misleading about what actually
+ * happened — the design was never sent to the sidecar with a level that
+ * has no data). Named and thrown HERE, at the frame boundary, where the
+ * failure/skip tallies that explain WHY are already in hand.
+ */
+export class DifferentialAttritionError extends Error {
+  constructor(armId, failuresByArm, skippedByArm) {
+    const failed = failuresByArm[armId] || {};
+    const failedStr = Object.entries(failed).map(([k, c]) => `${k}: ${c}`).join(", ") || "none";
+    const skipped = skippedByArm[armId] || 0;
+    super(
+      `buildFrame: arm '${armId}' has zero completed rows (every cell failed and/or was skipped) — ` +
+        `differential attrition, not a modeling failure (failed: ${failedStr}; skipped: ${skipped}). ` +
+        `Fitting this arm's level would produce a singular design (R2) or a coefficientNames mismatch ` +
+        `(R0/R1) that reads as SidecarUnavailableError but is actually this.`,
+    );
+    this.name = "DifferentialAttritionError";
+    this.armId = armId;
+  }
+}
+
 /** Read a dotted path (e.g. "distinct_k" or "judge.score") off an object.
  *  Returns undefined if any segment is missing — never throws, so callers
  *  can distinguish "missing" (a named error) from "present but falsy". */
@@ -168,6 +194,23 @@ export function buildFrame(store, opts = {}) {
 
   const armLevels = opts.armLevels || Array.from(seenArms).sort();
   const briefLevels = opts.briefLevels || Array.from(seenBriefs).sort();
+
+  // A factor level with zero rows because every one of its cells failed
+  // and/or was skipped must never reach the fit — it would surface later as
+  // fit.mjs's SidecarUnavailableError (a coefficientNames mismatch) or a
+  // singular R2 design, both badly misleading about the actual cause. Catch
+  // it here, where the failure/skip tallies that explain why are in hand.
+  // Scoped to `seenArms` (an arm with at least one cfg-matching cell) —
+  // NOT all of `armLevels`, so a caller-pinned level that was simply never
+  // run (opts.armLevels naming an arm the store has no cells for at all)
+  // stays a normal, allowed "not yet run" state, not attrition.
+  const rowCountByArm = new Map();
+  for (const row of rows) rowCountByArm.set(row.armId, (rowCountByArm.get(row.armId) || 0) + 1);
+  for (const armId of armLevels) {
+    if (seenArms.has(armId) && !rowCountByArm.get(armId)) {
+      throw new DifferentialAttritionError(armId, failuresByArm, skippedByArm);
+    }
+  }
 
   return {
     rows,

@@ -31,6 +31,26 @@ test("holmBonferroni: rejects out-of-range p-values", () => {
   assert.throws(() => holmBonferroni([]), /non-empty/);
 });
 
+// ── familySize enforcement (#46 QA MUST #2): the registered family is 6
+//    slots (H1+H2+H4+H5=1 each, H3=2 sub-contrasts) -- a caller-declared
+//    familySize is enforced here, not merely documented. ───────────────────
+
+test("holmBonferroni: familySize enforces the caller's declared count", () => {
+  assert.throws(
+    () => holmBonferroni([0.01, 0.02, 0.03], { familySize: 6 }),
+    /expected exactly 6 p-values/,
+  );
+  // Correct count passes through unchanged.
+  assert.deepEqual(
+    holmBonferroni([0.01], { familySize: 1 }),
+    [0.01],
+  );
+});
+
+test("holmBonferroni: familySize is optional -- omitting it does not assert a count", () => {
+  assert.deepEqual(holmBonferroni([0.03]), [0.03]);
+});
+
 test("benjaminiHochberg: known worked example", () => {
   // p = [0.01, 0.02, 0.03, 0.04], m=4
   // sorted q: 0.04*4/4=0.04, 0.03*4/3=0.04, 0.02*4/2=0.04, 0.01*4/1=0.04

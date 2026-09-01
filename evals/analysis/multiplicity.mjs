@@ -3,11 +3,19 @@
 //
 // §6.2 / B7 (closing line): "Holm-Bonferroni is applied across the 5
 // registered hypotheses regardless of which rung each lane landed on." The
-// family Holm corrects is FIXED at 5 (H1..H5) — callers must pass exactly
-// that many p-values (in H1..H5 order) to holmBonferroni() for the
-// registered family; it is not "however many contrasts happened to get
-// computed this run." Exploratory contrasts (per-arm-vs-A breakdowns, etc.)
-// get their own, separately-sized BH family — see benjaminiHochberg().
+// family Holm corrects is FIXED IN SLOT COUNT, not hypothesis count — H1,
+// H2, H4, H5 each contribute one p-value slot, but H3 is registered as TWO
+// sub-contrasts (G-D, G-H; see contrasts.mjs's H3 doc comment), so the
+// REGISTERED family is 6 SLOTS across 5 hypotheses (1+1+2+1+1), not 5 or 6
+// hypotheses. H5 stays unimplemented but still occupies its slot with p=1
+// (contrasts.mjs's evaluateSpec()) precisely so wiring it later changes
+// only its own result, never rescales the other four. Callers must pass
+// exactly `registeredFamilySlotCount()`'s worth of p-values (in H1..H5
+// order, H3 expanded) — pass `familySize` (from contrasts.mjs's
+// `registeredFamilySlotCount(family)`) to have holmBonferroni() ENFORCE
+// this itself rather than trusting the caller got the count right.
+// Exploratory contrasts (per-arm-vs-A breakdowns, etc.) get their own,
+// separately-sized BH family — see benjaminiHochberg().
 
 /**
  * Holm-Bonferroni step-down correction. Returns ADJUSTED p-values in the
@@ -19,11 +27,19 @@
  * sorted order), cap at 1.
  *
  * @param {number[]} pValues
+ * @param {object} [opts]
+ *   @param {number} [opts.familySize]  when given, the family this call is
+ *     REQUIRED to represent (e.g. contrasts.mjs's
+ *     `registeredFamilySlotCount(family)`) — a `pValues.length` mismatch is
+ *     a hard error instead of a silently-different multiplicity correction.
  * @returns {number[]} adjusted p-values, same order/length as input
  */
-export function holmBonferroni(pValues) {
+export function holmBonferroni(pValues, opts = {}) {
   if (!Array.isArray(pValues) || pValues.length === 0) {
     throw new Error("holmBonferroni: pValues must be a non-empty array");
+  }
+  if (opts.familySize !== undefined && pValues.length !== opts.familySize) {
+    throw new Error(`holmBonferroni: expected exactly ${opts.familySize} p-values (the registered family size) but got ${pValues.length}`);
   }
   for (const p of pValues) {
     if (typeof p !== "number" || !Number.isFinite(p) || p < 0 || p > 1) {

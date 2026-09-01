@@ -38,6 +38,26 @@ export function paretoFrontier(arms) {
   });
 }
 
+/**
+ * Derive a numeric PRNG seed from a configHash string (or any string) —
+ * deterministic, never wall-clock. `costDiversityRatio()`'s default
+ * (`opts.seed ?? 1`) is only a fallback for callers that don't pass one
+ * (e.g. a unit test fixture with no real configHash); analysis.mjs wires
+ * this in for the real pipeline (#46 QA SHOULD — the seed must actually be
+ * derived from configHash, not just documented as if it were).
+ *
+ * @param {string} str
+ * @returns {number}  a 32-bit unsigned int seed
+ */
+export function seedFromString(str) {
+  let h = 0x811c9dc5; // FNV-1a
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 /** Deterministic PRNG (mulberry32) — bootstrap resampling must be
  *  reproducible from `seed` (derived from configHash, never wall-clock; see
  *  frame.mjs / fit.mjs's determinism requirements), so this module never

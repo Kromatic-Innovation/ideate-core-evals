@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeTempStore } from "../../lib/store.mjs";
 import { cellKey, configHash } from "../../lib/manifest.mjs";
-import { buildFrame, summarizeByArm } from "./frame.mjs";
+import { buildFrame, summarizeByArm, DifferentialAttritionError } from "./frame.mjs";
 
 const CONFIG = { harnessVersion: "0.0.1", engineSha: "abc", promptHash: "p1" };
 const CFG = configHash(CONFIG);
@@ -160,4 +160,34 @@ test("summarizeByArm: mean response and mean cost per arm, ordered by armLevels"
 
 test("buildFrame: rejects a non-store argument", () => {
   assert.throws(() => buildFrame({}, { config: CONFIG }), /ResultsStore/);
+});
+
+// ── Differential attrition (#46 QA SHOULD): an arm whose cells all failed
+//    and/or were skipped must be caught HERE, named accurately, never left
+//    to surface downstream as a misleading fit.mjs error. ──────────────────
+
+test("buildFrame: an arm with zero completed rows (all failed) throws DifferentialAttritionError, not silently included", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 });
+  put(store, { armId: "B", briefId: "b1", replicate: 0, state: "failed" });
+  assert.throws(() => buildFrame(store, { config: CONFIG }), DifferentialAttritionError);
+  assert.throws(() => buildFrame(store, { config: CONFIG }), /arm 'B' has zero completed rows/);
+});
+
+test("buildFrame: an arm with zero completed rows (all skipped) also throws DifferentialAttritionError", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 });
+  put(store, { armId: "B", briefId: "b1", replicate: 0, state: "skipped" });
+  assert.throws(() => buildFrame(store, { config: CONFIG }), DifferentialAttritionError);
+});
+
+test("buildFrame: a caller-pinned armLevel the store has NO cells for at all is 'not yet run', not attrition", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 });
+  // "C" never appears in the store in any state (completed/failed/skipped)
+  // -- distinct from attrition (an arm that WAS run and all its cells
+  // failed/skipped). Pinning a not-yet-run level must still be allowed
+  // (existing behavior this fix must not regress).
+  const frame = buildFrame(store, { config: CONFIG, armLevels: ["A", "C"] });
+  assert.deepEqual(frame.armLevels, ["A", "C"]);
 });

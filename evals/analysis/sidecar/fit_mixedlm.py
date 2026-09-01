@@ -151,8 +151,14 @@ def fit(request):
         except Exception:
             variance_components["brief:arm"] = None
 
+    # Default to NOT converged when the attribute is missing (rather than
+    # True) -- a missing `converged` must never silently look identical to
+    # an explicit success and disable the R0->R1 descent criterion (#46 QA
+    # SHOULD). statsmodels' MixedLMResults always sets this in practice, but
+    # "defaults to converged" is exactly the kind of silent-degradation bug
+    # this file's whole design (fail loud, never guess) exists to prevent.
     return {
-        "converged": bool(getattr(result, "converged", True)),
+        "converged": bool(getattr(result, "converged", False)),
         "coefficients": coefficients,
         "coefficientNames": coefficient_names,
         "vcov": vcov,

@@ -62,3 +62,20 @@ test("symmetricInverseSqrt: M^(-1/2) * M^(-1/2) ~= M^-1 for a well-conditioned m
   const shouldBeInverse = multiply(sqrtInv, sqrtInv);
   approxEqualMatrix(shouldBeInverse, invert(M), 1e-5);
 });
+
+// #46 QA MUST #4: fit.test.mjs's CR2 coverage was `vcov[i][i] > 0` only --
+// nothing pinned symmetricInverseSqrt's actual identity A*M*A = I (which is
+// exactly what CR2's A_g = (I - H_g)^(-1/2) adjustment relies on). This
+// pins the eigen path directly, independent of fitR2()'s meat-accumulation
+// loop.
+test("symmetricInverseSqrt: A is symmetric and A * M * A ~= I (the identity CR2's A_g relies on)", () => {
+  const M = [[3, 1, 0.4], [1, 2, 0.2], [0.4, 0.2, 1.5]];
+  const A = symmetricInverseSqrt(M);
+  for (let i = 0; i < A.length; i++) {
+    for (let j = 0; j < i; j++) {
+      assert.ok(Math.abs(A[i][j] - A[j][i]) < 1e-9, `A not symmetric at [${i}][${j}]`);
+    }
+  }
+  const AMA = multiply(multiply(A, M), A);
+  approxEqualMatrix(AMA, identity(3), 1e-5);
+});

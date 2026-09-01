@@ -13,10 +13,10 @@ function baseInput() {
     },
     ladder: { rung: "R0", history: [{ rung: "R0", descended: false }] },
     registeredResults: [
-      { id: "H1", description: "mean(panel) - A", estimate: 2.1, ci: [0.5, 3.7], p: 0.01 },
+      { id: "H1", description: "mean(panel) - A", kind: "superiority", estimate: 2.1, ci: [0.5, 3.7], p: 0.01, holmP: 0.02, significant: true },
       [
-        { id: "H3:G-D", estimate: 1.0, ci: [0.1, 1.9], p: 0.03 },
-        { id: "H3:G-H", estimate: -0.5, ci: [-1.2, 0.2], p: 0.2, supported: false },
+        { id: "H3:G-D", kind: "pairwise-max", oneSided: true, estimate: 1.0, ci: [0.1, 1.9], p: 0.03, holmP: 0.06, supported: true },
+        { id: "H3:G-H", kind: "pairwise-max", oneSided: true, estimate: -0.5, ci: [-1.2, 0.2], p: 0.2, holmP: 0.2, supported: false },
       ],
     ],
     holmAdjusted: [0.02, 0.06, 0.2],
@@ -61,6 +61,21 @@ test("renderReport: cost lane is labeled descriptive, includes CI", () => {
   const md = renderReport(baseInput());
   assert.match(md, /descriptive/i);
   assert.match(md, /16\.000/);
+});
+
+test("renderReport: verdict reads the Holm-adjusted result, not a raw CI/p (regression for #46 QA MUST #1)", () => {
+  const input = baseInput();
+  // A raw CI/p that WOULD look supported (ci[0] > 0, p < 0.05) but whose
+  // Holm-adjusted p (holmP) is above threshold and supported:false, as
+  // applyHolmVerdicts() would actually produce after multiplicity
+  // correction wipes out the raw significance.
+  input.registeredResults = [
+    { id: "H2", description: "E >= D", kind: "non-inferiority", oneSided: true, estimate: 1.0, ci: [0.2, 1.8], p: 0.001, holmP: 0.5, supported: false },
+  ];
+  input.holmAdjusted = [0.5];
+  const md = renderReport(input);
+  assert.match(md, /not supported/);
+  assert.doesNotMatch(md, /\| supported \|/);
 });
 
 test("renderReport: an unimplemented H5 entry renders without throwing", () => {

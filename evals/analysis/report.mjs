@@ -19,9 +19,18 @@ function ciStr(ci, digits = 3) {
  *   @param {ReturnType<typeof import("./frame.mjs").buildFrame>} input.frame
  *   @param {{rung: string, fit: object|null}} input.ladder     runLadder() result
  *   @param {Array<object>} input.registeredResults    evaluateSpec() output for
- *                                                       H1..H5 (H3 expands to 2)
- *   @param {number[]} input.holmAdjusted               same order/length as the
- *                                                       flattened registered p-values
+ *                                                       H1..H5 (H3 expands to 2),
+ *                                                       already run through
+ *                                                       contrasts.mjs's
+ *                                                       applyHolmVerdicts() —
+ *                                                       every entry (besides
+ *                                                       unimplemented/
+ *                                                       deltaUnregistered)
+ *                                                       carries `holmP` and
+ *                                                       `supported`/`significant`;
+ *                                                       renderReport() never
+ *                                                       recomputes a verdict
+ *                                                       from a raw p or CI.
  *   @param {Array<object>} [input.exploratoryResults]  evaluateSpec() output, exploratory
  *   @param {number[]} [input.bhAdjusted]
  *   @param {Array<object>} input.paretoPoints          pareto.mjs paretoFrontier() output
@@ -47,7 +56,7 @@ export function renderReport(input) {
   }
   lines.push("");
 
-  lines.push("## Registered hypotheses (Holm-Bonferroni, family of 5)");
+  lines.push("## Registered hypotheses (Holm-Bonferroni, family of 6 slots across H1-H5 -- H3 expands to 2)");
   lines.push("");
   lines.push("| ID | Description | Estimate | 95% CI | Holm-adjusted p | Verdict |");
   lines.push("|---|---|---|---|---|---|");
@@ -58,11 +67,15 @@ export function renderReport(input) {
       lines.push(`| ${r.id} | (judge-score frame not wired — #45/B5) | — | — | — | unimplemented |`);
       continue;
     }
-    const adj = holmAdjusted[i];
+    // Verdict is read from applyHolmVerdicts()'s output ONLY (r.holmP +
+    // r.supported/r.significant) -- never recomputed here from a raw CI or
+    // a bare `holmAdjusted[i]` lookup, which is exactly the bug (#46 QA
+    // MUST #1) that let H2/H3/H4's verdicts escape multiplicity correction.
+    const adj = r.holmP ?? (holmAdjusted ? holmAdjusted[i] : undefined);
     const verdict = r.deltaUnregistered
       ? "estimation only (delta unregistered)"
-      : r.supported === undefined
-        ? (adj < 0.05 ? "significant" : "not significant")
+      : r.kind === "superiority"
+        ? (r.significant ? "significant" : "not significant")
         : (r.supported ? "supported" : "not supported");
     lines.push(`| ${r.id} | ${r.description || ""} | ${fmt(r.estimate)} | ${ciStr(r.ci)} | ${fmt(adj, 4)} | ${verdict} |`);
   }

@@ -20,9 +20,9 @@ import { dirname, join } from "node:path";
 
 import { ResultsStore } from "../../lib/store.mjs";
 import { buildFrame, summarizeByArm } from "./frame.mjs";
-import { buildRegisteredFamily, evaluateSpec } from "./contrasts.mjs";
+import { buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts } from "./contrasts.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
-import { paretoFrontier, costDiversityRatioByArm } from "./pareto.mjs";
+import { paretoFrontier, costDiversityRatioByArm, seedFromString } from "./pareto.mjs";
 import { renderParetoSvg } from "./plot.mjs";
 import { runLadder, makeSidecarRunner, analysisHash as computeAnalysisHash } from "./fit.mjs";
 import { renderAnalysisDataCsv, renderLme4FitR } from "./reproducibility.mjs";
@@ -64,13 +64,27 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   const family = buildRegisteredFamily({ referenceArm: args.referenceArm, panelArms });
-  const registeredResults = family.map((spec) => evaluateSpec(spec, ladder.fit));
-  const flat = registeredResults.flat().filter((r) => !r.unimplemented);
-  const holmAdjusted = holmBonferroni(flat.map((r) => r.p));
+  const evaluated = family.map((spec) => evaluateSpec(spec, ladder.fit));
+  const flat = evaluated.flat();
+  const holmAdjusted = holmBonferroni(
+    flat.map((r) => r.p),
+    { familySize: registeredFamilySlotCount(family) },
+  );
+  // applyHolmVerdicts() needs the SAME flattened order/shape it was fed to
+  // holmBonferroni() with -- rebuild registeredResults preserving the
+  // original per-spec grouping (H3's two sub-contrasts stay a nested array)
+  // so report.mjs's H3 handling is unaffected.
+  const verdictByFlatIndex = applyHolmVerdicts(flat, holmAdjusted);
+  let cursor = 0;
+  const registeredResults = evaluated.map((entry) =>
+    Array.isArray(entry)
+      ? entry.map(() => verdictByFlatIndex[cursor++])
+      : verdictByFlatIndex[cursor++],
+  );
 
   const armSummaries = summarizeByArm(frame);
   const paretoPoints = paretoFrontier(armSummaries.map((a) => ({ armId: a.armId, meanCostUsd: a.meanCostUsd, meanResponse: a.meanResponse })));
-  const costRatioByArm = costDiversityRatioByArm(frame);
+  const costRatioByArm = costDiversityRatioByArm(frame, { seed: seedFromString(frame.configHash) });
 
   const hash = computeAnalysisHash(ladder.fit);
 
