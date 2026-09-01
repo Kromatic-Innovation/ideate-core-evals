@@ -49,6 +49,21 @@
 // scores aligned to its input candidate order (the same contract runJudgeMatrix
 // relies on), so judge score i lines up with expert score i for the same idea.
 // A length mismatch throws rather than silently validating misaligned vectors.
+//
+// ── Stated assumption: cross-topic comparability (issue #45 SHOULD item) ────
+// Per-topic grouping scores each idea against ITS OWN topic as the brief (7
+// distinct briefs across the 98-idea slice) — a brief-RELATIVE originality
+// judgment. The gate (gate.mjs's balancedAccuracyTopBottom) then ranks and
+// splits the top/bottom 25% ACROSS the whole slice, mixing all 7 topics into
+// one ranking. That treats "originality relative to brief A" and "originality
+// relative to brief B" as points on the SAME scale, which is a real,
+// unavoidable methodological assumption this composition makes but does not
+// derive or test — it was never separately registered before this note. It is
+// exactly as reasonable as the underlying rubric being topic-agnostic (issue
+// #4's LiveIdeaBench-derived axis definitions are topic-agnostic by design),
+// but it is an assumption, not a proven invariant, and REPORT.md must state it
+// as a limitation alongside the axis/expert-column construct mismatch already
+// registered in docs/PREREGISTRATION.md Appendix A item 7.
 
 import { readSiEtAlSlice, sliceToJudgePool } from "./slice.mjs";
 import { validateJudge, recordValidation } from "./gate.mjs";
