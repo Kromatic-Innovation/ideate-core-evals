@@ -135,3 +135,90 @@ export function operationalSummary(account) {
     latency: latencyPercentiles(account),
   };
 }
+
+// ── Pool-level metrics (issue #45 item 2) ────────────────────────────────────
+// docs/PREREGISTRATION.md §4.2's table names two LiveIdeaBench axes —
+// `fluency` (count of valid ideas) and `flexibility` (breadth of conceptually
+// distinct categories touched) — as things to measure. Both are POOL
+// properties by LiveIdeaBench's own definition (arXiv 2412.17596 §3.2), not
+// per-idea judgments: fluency is a count OVER a pool, and flexibility is
+// explicitly relative to "the pool [an idea] was drawn from". They were
+// previously (incorrectly) scored per idea by the judge — evals/judge/score.mjs
+// submits exactly ONE candidate per scoring request, so the judge never saw
+// the pool and a per-idea "flexibility" score was meaningless (a per-idea
+// "fluency" score was trivially constant). Removed from evals/judge/prompt.mjs
+// JUDGE_AXES (#45 item 2); recovered here, alongside the account-level §4.3
+// metrics above, as what they actually are — pool-level operational metrics.
+//
+// Same "never recomputed independently" discipline as the rest of this file:
+// `poolFluency` takes the pool of ALREADY-EXTRACTED candidates (ideate-core's
+// extractCandidates has already dropped anything without a non-empty `.text`
+// — see evals/harness/prompts.mjs's header — so a pool's length IS the count
+// of valid ideas, no re-validation needed here) and `poolFlexibility` takes
+// an ALREADY-COMPUTED distinct_k count (evals/metrics/clustering.mjs
+// distinctK) rather than re-embedding/re-clustering — the same pattern
+// evals/metrics/diversity.mjs's collapseRate uses, so flexibility and
+// distinct_k/collapse-rate always agree on what a cluster is (one shared
+// clustering call, not two).
+
+/**
+ * Pool-level fluency (LiveIdeaBench) — the count of valid candidate ideas in
+ * a pool.
+ *
+ * @param {Array} pool  a pool of ALREADY-EXTRACTED candidates (each with a
+ *   non-empty `.text`, per ideate-core's extractCandidates/buildCandidate)
+ * @returns {number}
+ */
+export function poolFluency(pool) {
+  if (!Array.isArray(pool)) {
+    throw new Error("poolFluency: pool must be an array of already-extracted candidates");
+  }
+  return pool.length;
+}
+
+/**
+ * Pool-level flexibility (LiveIdeaBench) — the breadth of conceptually
+ * distinct categories/approaches a pool touches, substituted (like the rest
+ * of this study's distinct_k usage — see clustering.mjs's header) by the
+ * number of semantic equivalence classes (clusters) the pool's embedded
+ * ideas occupy.
+ *
+ * @param {number} distinctKCount  distinct_k for this pool (clustering.mjs
+ *   `distinctK`/`clusterByThreshold(...).k`) — computed ONCE by the caller
+ *   and passed in, never recomputed here.
+ * @returns {number}
+ *
+ * ⚠ COLLINEARITY WARNING (issue #45 SHOULD item): this is a pure identity
+ * pass-through of `distinctKCount` — `poolFlexibility(k) === k`, always, by
+ * construction. It exists as a NAME (the registered LiveIdeaBench axis
+ * §4.1/§4.2 references) over an already-registered metric (`distinct_k`,
+ * §4.1's headline metric), not as an independently measured construct. If
+ * any analysis lane treats `flexibility` as a DV *alongside* `distinct_k` —
+ * e.g. entering both into the same mixed-effects model or the Holm/BH
+ * multiplicity correction (§6) — they are PERFECTLY collinear (r = 1.0) and
+ * the correction is being applied over one outcome counted twice. Report
+ * `flexibility` as an alias/rename of `distinct_k` in REPORT.md, or give it
+ * a genuinely distinct definition before treating it as a separate DV — do
+ * not add it to any DV list without addressing this.
+ */
+export function poolFlexibility(distinctKCount) {
+  if (!Number.isInteger(distinctKCount) || distinctKCount < 0) {
+    throw new Error("poolFlexibility: distinctKCount must be a non-negative integer (evals/metrics/clustering.mjs distinctK)");
+  }
+  return distinctKCount;
+}
+
+/**
+ * Convenience bundle of both pool-level LiveIdeaBench metrics for one pool,
+ * mirroring operationalSummary's "one pass, one report unit" shape.
+ *
+ * @param {object} o
+ *   @param {Array} o.pool               already-extracted candidates
+ *   @param {number} o.distinctKCount    this pool's distinct_k (clustering.mjs)
+ */
+export function poolMetricsSummary({ pool, distinctKCount }) {
+  return {
+    fluency: poolFluency(pool),
+    flexibility: poolFlexibility(distinctKCount),
+  };
+}

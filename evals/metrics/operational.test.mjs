@@ -13,6 +13,9 @@ import {
   refusalRate,
   latencyPercentiles,
   operationalSummary,
+  poolFluency,
+  poolFlexibility,
+  poolMetricsSummary,
 } from "./operational.mjs";
 
 function makeReconciledAccount() {
@@ -110,6 +113,35 @@ test("operationalSummary bundles all four metrics from one reconciled account", 
   assert.equal(summary.emptyPoolRate, 0.25);
   assert.equal(summary.refusalRate, 0);
   assert.equal(summary.latency.n, 2);
+});
+
+// ── Pool-level LiveIdeaBench metrics (issue #45 item 2) ─────────────────────
+
+test("poolFluency is the count of already-extracted candidates", () => {
+  assert.equal(poolFluency([{ text: "a" }, { text: "b" }, { text: "c" }]), 3);
+  assert.equal(poolFluency([]), 0);
+});
+
+test("poolFluency rejects a non-array", () => {
+  assert.throws(() => poolFluency("not an array"), /pool must be an array/);
+  assert.throws(() => poolFluency(null), /pool must be an array/);
+});
+
+test("poolFlexibility passes through an already-computed distinct_k count", () => {
+  assert.equal(poolFlexibility(5), 5);
+  assert.equal(poolFlexibility(0), 0);
+});
+
+test("poolFlexibility rejects a non-integer or negative distinct_k", () => {
+  assert.throws(() => poolFlexibility(-1), /non-negative integer/);
+  assert.throws(() => poolFlexibility(2.5), /non-negative integer/);
+  assert.throws(() => poolFlexibility("5"), /non-negative integer/);
+});
+
+test("poolMetricsSummary bundles fluency and flexibility for one pool", () => {
+  const pool = [{ text: "a" }, { text: "b" }, { text: "c" }, { text: "d" }];
+  const summary = poolMetricsSummary({ pool, distinctKCount: 2 });
+  assert.deepEqual(summary, { fluency: 4, flexibility: 2 });
 });
 
 test("a cell recorded as skipped (e.g. budget_exceeded) counts toward the denominator but no failure kind", () => {
