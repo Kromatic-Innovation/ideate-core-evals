@@ -128,6 +128,7 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 | **`distinct_k` per dollar** | `distinct_k` ÷ run cost | **The headline metric.** Answers the question actually asked. |
 | **Pool diversity** | Mean pairwise cosine *distance* across the embedded pool | ideate-core's own `poolDiversity` — tests the library's own metric |
 | **Collapse rate** | 1 − (semantic-dedup survivors ÷ raw candidates) | Direct mode-collapse measure |
+| **Fluency / Flexibility** | LiveIdeaBench axes: count of valid candidates emitted; breadth of distinct categories (clusters) covered — pool properties, computed by `evals/metrics/operational.mjs` (`poolFluency`/`poolFlexibility`) | See §4.2 amendment below — moved here from the idea-level table ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 2) |
 
 ### 4.2 Secondary (idea-level, split axes — never collapsed)
 
@@ -137,6 +138,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 | **Feasibility** (judged, 1–5) | Same |
 | **OCSAI originality** | AUT stratum only; instrument with published r = 0.81 to humans |
 | **Fluency / Flexibility** | LiveIdeaBench axes: valid candidates emitted; distinct categories covered |
+
+> *Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), items 1–2). Novelty/Feasibility's registered scale was 1–5; the judge implementation (`evals/judge/prompt.mjs`) scores 1–10, and the code is kept (more resolution, the gate is rank-based) rather than narrowed to match this table. Fluency/Flexibility are POOL properties (count of valid candidates, breadth of distinct categories), not per-idea judgments — a per-idea judge scoring them was never coherent (it sees one candidate at a time, never the pool) — moved to §4.1 as operational metrics. See the appendix for the full record.*
 
 ### 4.3 Operational (the ones that bite in production)
 
@@ -472,3 +475,34 @@ The implementing code change (`resolveRhoFloor` → the registered balanced-accu
 - **Split count.** Footnote 11 states they average **20** random splits; `balancedAccuracySplitHalf` defaults to `splits = 100` and `reproduce-si-et-al.mjs` passes **1000**. State the seed and the count with any reported number (item 4 point 1 / `docs/fetching-si-et-al.md`).
 
 **What lands where.** The registered constants (`config.mjs`) and the composition + its hermetic tests (`validate.mjs`, `validate.test.mjs`) land with **#36**. Running the composition against the **real** slice needs the live judge key and metered spend and stays on **#16**; it also depends on the #35 slice-join repair landing first (native `blocked_by` edge). This entry is the pre-registration record of the decision.
+
+---
+
+## Appendix B — Amendments (dated 2026-09-01)
+
+Per the amendment rule at the top of this document. **Nothing in §6 is changed by either entry below.**
+
+### Item 1 — §4.2: judged-axis scale corrected 1–5 → 1–10 (code and registration must agree)
+
+**What changed.** §4.2 registered Novelty and Feasibility as judged on a **1–5** scale. `evals/judge/prompt.mjs`'s `JUDGE_PROMPT` has always scored **1–10**. The registration is corrected to match the code: **1–10**, kept for the judge's extra resolution rather than narrowing the code to 1–5. The original 1–5 text in §4.2 is left in place, marked amended, per the amendment rule.
+
+**Why.** A registered value that disagreed with the shipped code would silently misdescribe every judge score in `REPORT.md`. Caught during the review pass on issue #45.
+
+### Item 2 — §4.1/§4.2: Fluency/Flexibility are pool properties, moved out of the per-idea table
+
+**What changed.** §4.2's **Fluency / Flexibility** row ("LiveIdeaBench axes: valid candidates emitted; distinct categories covered") is left in place, marked amended. The metric itself moves to §4.1 (pool-level) as `evals/metrics/operational.mjs`'s `poolFluency`/`poolFlexibility`, and is **no longer scored per idea by the judge**.
+
+**Why.** An earlier draft had the per-idea judge score Fluency/Flexibility. That is undefined for a scorer that sees one candidate at a time and never sees the pool — "breadth of distinct categories covered" is a property of the whole pool, not of any single idea. Caught during the review pass on issue #45 (item 2).
+
+**What lands where.** Both corrections land with the same code change registering §4.2 item 3 (`prompt.mjs` — the judge prompt continuing to score 1–10, and no longer asked for fluency/flexibility per idea) and the pool metrics module. This entry is the pre-registration record of the decision, not the implementation.
+
+### Item 3 — §4.2/§11: the item 2 code change bumps `judgePromptHash`/`judgeHash`/`configHash` (registered so the consequence is on record)
+
+**What changed.** `evals/judge/prompt.mjs`'s `JUDGE_PROMPT.version` moves from `liveideabench-4axis-v1` to `liveideabench-2axis-v2` and the fluency/flexibility axis definitions are dropped from the frozen prompt object (item 2). Because `judgePromptHash()` hashes the whole frozen prompt object, this changes the hash:
+
+| | `judgePromptHash()` |
+|---|---|
+| Before (`liveideabench-4axis-v1`) | `36963b8959ba` |
+| After (`liveideabench-2axis-v2`) | `6bd11b4fceb4` |
+
+**Consequence, registered in advance.** `judgeHash` is a `CONFIG_FIELDS` entry (`lib/manifest.mjs`), so `judgePromptHash` feeding `computeJudgeHash` changes `judgeHash`, which changes every run's `configHash`, which changes every `cellKey` (§11). This is **correct and intended** — the rubric genuinely changed, and the whole point of hashing it into `configHash` is that a rubric change must not be silently pooled with cells scored under the old rubric. Per `planRun`, any pre-existing stored cell keyed under the old `configHash` becomes `stale` rather than being reused. **Impact today is nil** — no data has been collected under either hash — but the record is the deliverable: this is what a reader checking whether the code matches the registration should find.

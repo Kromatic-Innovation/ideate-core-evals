@@ -35,7 +35,7 @@ const BRIEF = "Design a low-cost coral reef health monitoring approach.";
  *  (originality encodes i+1 so a test can prove scores are un-permuted back to
  *  INPUT order). i must be <= 9 so the value stays within the [1,10] scale. */
 function scoreJsonForIndex(i) {
-  return JSON.stringify({ originality: i + 1, feasibility: 3, fluency: 7, flexibility: 5 });
+  return JSON.stringify({ originality: i + 1, feasibility: 3 });
 }
 
 function jsonResponse(status, obj) {
@@ -92,9 +92,9 @@ test("buildJudgeScoringPrompt embeds the frozen rubric axes, the brief, and the 
   assert.ok(/ONLY that JSON object/i.test(p));
 });
 
-test("parseAxisScores reads the four axes as distinct numbers and tolerates a ```json fence", () => {
-  const s = parseAxisScores('```json\n{"originality":8,"feasibility":3,"fluency":9,"flexibility":6}\n```');
-  assert.deepEqual(s, { originality: 8, feasibility: 3, fluency: 9, flexibility: 6 });
+test("parseAxisScores reads both axes as distinct numbers and tolerates a ```json fence", () => {
+  const s = parseAxisScores('```json\n{"originality":8,"feasibility":3}\n```');
+  assert.deepEqual(s, { originality: 8, feasibility: 3 });
 });
 
 test("parseAxisScores rejects a COLLAPSED scalar (novelty/feasibility never averaged, §4.3/§5)", () => {
@@ -103,10 +103,10 @@ test("parseAxisScores rejects a COLLAPSED scalar (novelty/feasibility never aver
 });
 
 test("parseAxisScores rejects an out-of-range axis and a non-numeric axis", () => {
-  assert.throws(() => parseAxisScores('{"originality":11,"feasibility":3,"fluency":7,"flexibility":5}'), /outside the \[1, 10\]/);
+  assert.throws(() => parseAxisScores('{"originality":11,"feasibility":3}'), /outside the \[1, 10\]/);
   // A non-numeric axis is rejected up front by assertAxesNotCollapsed (which
-  // requires all four JUDGE_AXES present as distinct numeric fields).
-  assert.throws(() => parseAxisScores('{"originality":8,"feasibility":3,"fluency":"high","flexibility":5}'), /axis 'fluency'|must be present|distinct/);
+  // requires every JUDGE_AXES entry present as a distinct numeric field).
+  assert.throws(() => parseAxisScores('{"originality":8,"feasibility":"high"}'), /axis 'feasibility'|must be present|distinct/);
 });
 
 // ── AC1 + AC4: a pool goes assembleJudgePayload -> per-axis scores via a real
@@ -334,7 +334,7 @@ test("judgeScoresForAxis feeds validateJudge without averaging any axes", () => 
   // A 24-idea synthetic set (>= MIN_IDEAS_N). Judge originality tracks expert score.
   const n = 24;
   const expert = Array.from({ length: n }, (_, i) => i + 1);
-  const scores = expert.map((e) => ({ originality: e, feasibility: 5, fluency: 5, flexibility: 5 }));
+  const scores = expert.map((e) => ({ originality: e, feasibility: 5 }));
   const judgeScores = judgeScoresForAxis(scores, "originality");
   assert.deepEqual(judgeScores, expert);
   const record = validateJudge({ judgeScores, expertScores: expert });

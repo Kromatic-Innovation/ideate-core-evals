@@ -7,8 +7,8 @@ import { configHash, cellKey } from "../../lib/manifest.mjs";
 
 // ── AC1: rubric shape ────────────────────────────────────────────────────────
 
-test("JUDGE_AXES are exactly LiveIdeaBench's published 4 axes, in order", () => {
-  assert.deepEqual(JUDGE_AXES, ["originality", "feasibility", "fluency", "flexibility"]);
+test("JUDGE_AXES are exactly the two genuinely per-idea LiveIdeaBench axes, in order (issue #45: fluency/flexibility are pool-level, removed)", () => {
+  assert.deepEqual(JUDGE_AXES, ["originality", "feasibility"]);
 });
 
 test("JUDGE_PROMPT carries a definition for every axis", () => {
@@ -42,27 +42,27 @@ test("assertAxesNotCollapsed throws on a single averaged scalar", () => {
   assert.throws(() => assertAxesNotCollapsed([7, 8, 9, 10]), /distinct per-axis fields/);
 });
 
-test("assertAxesNotCollapsed passes when all four axes are distinct numeric fields", () => {
+test("assertAxesNotCollapsed passes when both axes are distinct numeric fields", () => {
   assert.doesNotThrow(() =>
-    assertAxesNotCollapsed({ originality: 8, feasibility: 4, fluency: 9, flexibility: 6 }),
+    assertAxesNotCollapsed({ originality: 8, feasibility: 4 }),
   );
 });
 
 test("assertAxesNotCollapsed throws if a composite field rides alongside the real axes", () => {
   assert.throws(
-    () => assertAxesNotCollapsed({ originality: 5, feasibility: 5, fluency: 8, flexibility: 6, overallScore: 5 }),
+    () => assertAxesNotCollapsed({ originality: 5, feasibility: 5, overallScore: 5 }),
     /overallScore.*alongside/,
   );
 });
 
 test("assertAxesNotCollapsed throws if any axis is missing", () => {
-  assert.throws(() => assertAxesNotCollapsed({ originality: 8, feasibility: 4, fluency: 9 }), /missing numeric axis 'flexibility'/);
+  assert.throws(() => assertAxesNotCollapsed({ originality: 8 }), /originality.*feasibility.*distinct/s);
 });
 
 // ── (c) novelty (originality) and feasibility are distinct axes, never averaged ──
 
 test("originality and feasibility are independent fields, not derived from one another", () => {
-  const scores = { originality: 9, feasibility: 2, fluency: 7, flexibility: 5 };
+  const scores = { originality: 9, feasibility: 2 };
   assertAxesNotCollapsed(scores); // does not throw
   assert.notEqual(scores.originality, (scores.originality + scores.feasibility) / 2);
   // The scores object must not itself carry any averaged key.
