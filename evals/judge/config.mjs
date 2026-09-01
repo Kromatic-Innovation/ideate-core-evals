@@ -114,3 +114,47 @@ export const SI_ET_AL_LLM_COMPARATOR_DIRECT = 0.517;
  *  alongside the direct figure so the comparison is not misleading (Appendix A
  *  item 7). */
 export const SI_ET_AL_LLM_COMPARATOR_PAIRWISE = 0.533;
+
+// ── #45 item 4: the registered candidate judge models ────────────────────────
+//
+// buildJudgeMatrix/runJudgeMatrix (matrix.mjs/score.mjs) take `judgeModels`
+// as a caller parameter and had NO registered default anywhere in this repo
+// before #45 — every call site (all of them tests) supplied its own ad hoc
+// list. That is exactly why arm G's judgeability was unverified: nothing ever
+// ran buildJudgeMatrix against arms.config.json's REAL arms with a REAL
+// candidate list.
+//
+// Empirically running buildJudgeMatrix against every arm in arms.config.json
+// (issue #45 item 4) with only the study's three generator models as
+// Anthropic candidates (claude-sonnet-5, claude-haiku-4-5, claude-opus-5) and
+// its two generator models as OpenAI candidates (gpt-5.6-terra, gpt-5.6-sol)
+// showed it throws for TWO arms, not just the one the issue named:
+//   - arm G (3 Claude models + both OpenAI models) — the issue's own concern
+//   - arm E (all three Anthropic tiers: 2xHaiku, 2xSonnet, 1xOpus) — every
+//     Anthropic candidate is also one of E's generators
+// Both arms exhaust every model in their provider's naive candidate list, so
+// no ordering of THOSE THREE models could ever have worked for either arm —
+// the fix has to add a model neither arm (nor any other arm) ever generates
+// with.
+//
+// Fix: reserve ONE Anthropic model and ONE OpenAI model that arms.config.json
+// never uses as a generator, appended LAST (lowest preference) in each
+// provider's candidate list so every arm still prefers a cheaper study model
+// when one is distinct, and only arms E/G fall through to the reserved model:
+//   - claude-sonnet-4-6 — a real, current Anthropic model id (claude-api
+//     skill's Current Models table) distinct from all three arms.config.json
+//     generator ids.
+//   - gpt-5.6-luna — a real OpenAI model id from the SAME first-party
+//     verification fetch lib/price.mjs's OPENAI_PRICE_VERIFICATION already
+//     recorded (developers.openai.com/api/docs/pricing, 2026-07-31) — entry
+//     tier, distinct from gpt-5.6-terra/gpt-5.6-sol. NOTE: neither reserved
+//     model has a lib/price.mjs RATE_TABLE row yet — add one before any live
+//     judge call that could reach it (arms E/G) needs cost accounting.
+//
+// Order matters for judgeHash (computeJudgeHash) only through SET membership
+// (it sorts before hashing — order-insensitive), so re-ordering preference
+// here does not change judgeHash; adding/removing a candidate model does.
+export const JUDGE_MODELS = Object.freeze({
+  anthropic: Object.freeze(["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5", "claude-sonnet-4-6"]),
+  openai: Object.freeze(["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]),
+});
