@@ -187,6 +187,19 @@ export function poolFluency(pool) {
  *   `distinctK`/`clusterByThreshold(...).k`) — computed ONCE by the caller
  *   and passed in, never recomputed here.
  * @returns {number}
+ *
+ * ⚠ COLLINEARITY WARNING (issue #45 SHOULD item): this is a pure identity
+ * pass-through of `distinctKCount` — `poolFlexibility(k) === k`, always, by
+ * construction. It exists as a NAME (the registered LiveIdeaBench axis
+ * §4.1/§4.2 references) over an already-registered metric (`distinct_k`,
+ * §4.1's headline metric), not as an independently measured construct. If
+ * any analysis lane treats `flexibility` as a DV *alongside* `distinct_k` —
+ * e.g. entering both into the same mixed-effects model or the Holm/BH
+ * multiplicity correction (§6) — they are PERFECTLY collinear (r = 1.0) and
+ * the correction is being applied over one outcome counted twice. Report
+ * `flexibility` as an alias/rename of `distinct_k` in REPORT.md, or give it
+ * a genuinely distinct definition before treating it as a separate DV — do
+ * not add it to any DV list without addressing this.
  */
 export function poolFlexibility(distinctKCount) {
   if (!Number.isInteger(distinctKCount) || distinctKCount < 0) {
