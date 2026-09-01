@@ -27,7 +27,7 @@
 // A length mismatch throws rather than silently validating misaligned vectors.
 
 import { readSiEtAlSlice, sliceToJudgePool } from "./slice.mjs";
-import { validateJudge, recordValidation } from "./gate.mjs";
+import { validateJudge, recordValidation, meterJudgeCall } from "./gate.mjs";
 import { judgeScoresForAxis, computeJudgeHash } from "./score.mjs";
 import { assertAxesNotCollapsed } from "./prompt.mjs";
 import { providerOf } from "./matrix.mjs";
@@ -111,6 +111,22 @@ export async function runJudgeValidation({
     throw new Error("runJudgeValidation: briefText must be a non-empty string (the research brief the judge scores against)");
   }
   const resp = await judgeProvider.score({ briefText, candidates: pool }, { judgeModel, mode, seed, timestamp });
+
+  // Meter the judge call's token cost BEFORE the completion check (issue #53:
+  // this is a REAL provider call — the #16 live validation run — and its usage
+  // must reach lib/accounting.mjs regardless of whether validation itself
+  // proceeds, exactly like runJudgeMatrix's meterJudgeCall in score.mjs does
+  // for the comparative-study judge calls. Previously this call's tokens were
+  // dropped on the floor entirely: recordValidation always writes costRows: []
+  // (by design — see gate.mjs's header comment — because a validation record's
+  // OWN accounting is separate from the calls that produced it), and nothing
+  // else in this function ever called meterJudgeCall.
+  const meterTimestamp = timestamp || new Date().toISOString();
+  const sliceId = judgeValidationSliceId({ axis, expertScoreField });
+  if (resp && resp.tokens && (resp.tokens.input_tokens || resp.tokens.output_tokens)) {
+    meterJudgeCall({ store, cellKey: sliceId, judgeModel, tokens: resp.tokens, timestamp: meterTimestamp });
+  }
+
   if (!resp || resp.terminalState !== "completed") {
     const detail = resp ? (resp.detail || resp.failureKind || resp.terminalState) : "no response";
     throw new Error(
@@ -135,7 +151,6 @@ export async function runJudgeValidation({
 
   // 6. Record — self-describing: the axis + expert column actually used.
   const judgeHash = computeJudgeHash({ judgeModels: { [providerOf(judgeModel)]: [judgeModel] } });
-  const sliceId = judgeValidationSliceId({ axis, expertScoreField });
   recordValidation(store, {
     judgeHash,
     sliceId,

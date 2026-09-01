@@ -121,6 +121,39 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   assert.equal(stored.result.expertColumn, "overall_score");
   assert.equal(stored.result.verdict, "pass");
   assert.equal(stored.result.n, N);
+
+  // Issue #53 (B3): a validation run makes a REAL judge call and its usage
+  // must reach lib/accounting.mjs, not just the validation verdict. This is
+  // the accounting fix — previously nothing here ever called meterJudgeCall,
+  // so a live #16 run's judge tokens were silently dropped.
+  const costRecord = store.get(`judge-call|cell=${sliceId}|judge=${JUDGE_MODEL}`);
+  assert.ok(costRecord, "a judge-call cost record must be written for the validation run's judge call");
+  assert.equal(costRecord.costRows.length, 1);
+  assert.equal(costRecord.costRows[0].model, JUDGE_MODEL);
+  assert.equal(costRecord.costRows[0].input_tokens, provider.calls[0].n * 10); // MockJudgeProvider: 10 * n input, 5 * n output
+  assert.equal(costRecord.costRows[0].output_tokens, provider.calls[0].n * 5);
+});
+
+test("runJudgeValidation — a failed judge run still meters whatever tokens the judge consumed before failing", async () => {
+  const root = tmpRoot("fail-meters");
+  writeValidationFixture(root);
+  const store = makeTempStore("judge-validate-fail-meters-");
+  // MockJudgeProvider computes `tokens` before checking `failFor`, mirroring
+  // the real AnthropicJudgeProvider (tokens accumulate as replies come in,
+  // then the pool is judged failed) — so a forced failure still carries
+  // non-zero tokens that must not be dropped on the floor.
+  const provider = new MockJudgeProvider({ failFor: new Map([[JUDGE_MODEL, { failureKind: "transport_error" }]]) });
+
+  await assert.rejects(
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    /did not complete scoring/,
+  );
+
+  const sliceId = judgeValidationSliceId({ axis: JUDGE_VALIDATION_AXIS, expertScoreField: SI_ET_AL_EXPERT_SCORE_FIELD });
+  const costRecord = store.get(`judge-call|cell=${sliceId}|judge=${JUDGE_MODEL}`);
+  assert.ok(costRecord, "tokens consumed by a failed validation judge call must still be metered");
+  assert.equal(costRecord.costRows[0].input_tokens, N * 10);
+  assert.equal(costRecord.costRows[0].output_tokens, N * 5);
 });
 
 test("runJudgeValidation — end-to-end DROP: an anti-aligned judge fails the floor and is recorded 'drop'", async () => {
