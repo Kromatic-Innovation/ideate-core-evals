@@ -38,7 +38,7 @@
 //     the judge model id + JUDGE_PROMPT's hash feed configHash via computeJudgeHash
 //     — a changed rubric or a changed judge model gives cells a different
 //     cellKey and can never be silently pooled (§5.3, §11).
-//   - score-only: the prompt asks for the 4-axis JSON object and nothing else;
+//   - score-only: the prompt asks for the 2-axis JSON object and nothing else;
 //     novelty (originality) and feasibility stay SEPARATE axes and are never
 //     averaged (assertAxesNotCollapsed is re-run on every parsed score).
 //
@@ -67,7 +67,7 @@ import {
 } from "../harness/provider.mjs";
 
 /** A score-only reply is a tiny JSON object; 256 tokens is generous headroom
- *  for `{"originality":n,"feasibility":n,"fluency":n,"flexibility":n}` even
+ *  for `{"originality":n,"feasibility":n}` even
  *  with whitespace, and small enough that a model tempted to "explain" its
  *  score runs out of room rather than producing reasoning-then-score drift the
  *  §5 rubric forbids. */
@@ -114,7 +114,7 @@ export function buildJudgeScoringPrompt(briefText, candidateText) {
  * Parse a judge reply into a per-axis score object, validating it hard:
  *   - JSON object (a leading/trailing ```json fence is tolerated and stripped —
  *     a live model occasionally wraps JSON despite the instruction);
- *   - all four JUDGE_AXES present as distinct numeric fields (never a collapsed
+ *   - every JUDGE_AXES entry present as distinct numeric fields (never a collapsed
  *     scalar — assertAxesNotCollapsed enforces the §4.3/§5 novelty!=feasibility
  *     rule);
  *   - every axis a finite number within [1, 10].
@@ -122,7 +122,7 @@ export function buildJudgeScoringPrompt(briefText, candidateText) {
  * (never a thrown transport error).
  *
  * @param {string} text  the model's reply text
- * @returns {{originality:number, feasibility:number, fluency:number, flexibility:number}}
+ * @returns {{originality:number, feasibility:number}}
  */
 export function parseAxisScores(text) {
   if (typeof text !== "string" || text.trim().length === 0) {
@@ -198,7 +198,7 @@ function addUsageInto(acc, usage) {
  * `score(payload, opts)` returns, mirroring the generation interface:
  *   { terminalState: "completed"|"failed", scores?, tokens, failureKind?, detail? }
  *     scores  : on completed — an array aligned to payload.candidates INPUT order,
- *               each { originality, feasibility, fluency, flexibility } in [1,10].
+ *               each { originality, feasibility } in [1,10].
  *     tokens  : { model: judgeModel, input_tokens, output_tokens, ... } — one
  *               judge model per call, so the single-model costRow shape (not
  *               tokens_by_model). Present even on failure (whatever was consumed).
@@ -432,7 +432,7 @@ export class AnthropicJudgeProvider {
  */
 export class MockJudgeProvider {
   constructor({ scoreFor, failFor = new Map() } = {}) {
-    this.scoreFor = scoreFor || (() => ({ originality: 5, feasibility: 4, fluency: 6, flexibility: 5 }));
+    this.scoreFor = scoreFor || (() => ({ originality: 5, feasibility: 4 }));
     this.failFor = failFor;
     this.calls = [];
   }
@@ -457,7 +457,7 @@ export function judgeScoresKey({ poolKey, judgeModel }) {
 
 /**
  * Persist one pool's per-axis judge scores (issue #21 AC1: "a pool goes from
- * assembleJudgePayload to per-axis scores in the STORE"). The four axes are
+ * assembleJudgePayload to per-axis scores in the STORE"). The judge axes are
  * stored as distinct fields per candidate; assertAxesNotCollapsed is re-run on
  * every score first, so a collapsed/averaged score can never be written.
  */

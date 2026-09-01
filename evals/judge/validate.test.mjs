@@ -16,6 +16,7 @@ const HUMAN = 12;
 const AI = 12;
 const N = HUMAN + AI; // 24 >= MIN_IDEAS_N (20)
 const JUDGE_MODEL = "claude-sonnet-5";
+const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
 const pad = (i) => String(i).padStart(2, "0");
 
@@ -27,7 +28,7 @@ const EXPERT_BY_INDEX = Array.from({ length: N }, (_, i) => i + 1);
 // Build a synthetic slice of the real shape. AI rows use a `.json`-with-trailing-
 // space mapping value (issue #35), so the composition exercises the extension
 // normalization too. AI_Rerank is present and excluded by default.
-function writeValidationFixture(root) {
+function writeValidationFixture(root, { topicFor = () => "bias" } = {}) {
   fs.mkdirSync(root, { recursive: true });
   const humanDir = path.join(root, "Human_Ideas_Txt_Processed");
   const aiDir = path.join(root, "AI_AI_Ideas_Processed");
@@ -35,7 +36,7 @@ function writeValidationFixture(root) {
   for (const d of [humanDir, aiDir, rerankDir]) fs.mkdirSync(d, { recursive: true });
 
   const csvRows = ["ID,Title / Filename"];
-  const reviews = { idea_id: [], condition: [], overall_score: [] };
+  const reviews = { idea_id: [], condition: [], topic: [], overall_score: [] };
 
   for (let i = 0; i < HUMAN; i++) {
     const id = `H${pad(i)}`;
@@ -43,8 +44,15 @@ function writeValidationFixture(root) {
     csvRows.push(`${id},${title}`);
     fs.writeFileSync(path.join(humanDir, `HumanIdeaForm_${pad(i)}.txt`), `Title: ${title}\nA human idea body.\n`);
     const s = EXPERT_BY_INDEX[i];
+    const topic = topicFor(i);
     reviews.idea_id.push(id, id);
     reviews.condition.push("Human", "Human");
+    // Default topicFor returns a single constant topic for every idea --
+    // keeps the DEFAULT (topic-grouping) path a single group/single judge
+    // call, so the existing alignment assertions (provider.calls.length===1
+    // etc.) hold. Multi-topic grouping is exercised by a dedicated test
+    // below with a topicFor that varies.
+    reviews.topic.push(topic, topic);
     reviews.overall_score.push(s, s);
   }
   for (let j = 0; j < AI; j++) {
@@ -53,14 +61,17 @@ function writeValidationFixture(root) {
     csvRows.push(`${id},${slug}.json `); // filename value with a trailing space
     fs.writeFileSync(path.join(aiDir, `${slug}.txt`), `Title: An AI Idea Number ${pad(j)}\nAn AI idea body.\n`);
     const s = EXPERT_BY_INDEX[HUMAN + j];
+    const topic = topicFor(HUMAN + j);
     reviews.idea_id.push(id, id);
     reviews.condition.push("AI", "AI");
+    reviews.topic.push(topic, topic);
     reviews.overall_score.push(s, s);
   }
   // An AI_Rerank review with no mapping row / idea file — excluded by default, so
   // it must not break the join.
   reviews.idea_id.push("R00");
   reviews.condition.push("AI_Rerank");
+  reviews.topic.push("bias");
   reviews.overall_score.push(5);
 
   fs.writeFileSync(path.join(root, "id_title_mapping.csv"), csvRows.join("\n"));
@@ -73,13 +84,11 @@ const tmpRoot = (tag) => fs.mkdtempSync(path.join(os.tmpdir(), `si-validate-${ta
 // alignment between judge and expert is exactly controlled.
 function mockWithOriginality(byIndex) {
   return new MockJudgeProvider({
-    // Non-primary axes VARY per idea (not constant), so validateJudge's
+    // The non-primary axis VARIES per idea (not constant), so validateJudge's
     // spearmanRho has non-zero rank variance whichever axis a test selects.
     scoreFor: (_text, { index }) => ({
       originality: byIndex[index],
-      feasibility: 4,
-      fluency: (index % 7) + 1,
-      flexibility: (index % 5) + 2,
+      feasibility: (index % 7) + 1,
     }),
   });
 }
@@ -91,7 +100,7 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   // Judge originality perfectly aligned with expert overall_score → accuracy 1.0.
   const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
 
-  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
 
   // Defaults are the registered mapping.
   assert.equal(out.axis, JUDGE_VALIDATION_AXIS); // "originality"
@@ -126,12 +135,19 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   // must reach lib/accounting.mjs, not just the validation verdict. This is
   // the accounting fix — previously nothing here ever called meterJudgeCall,
   // so a live #16 run's judge tokens were silently dropped.
-  const costRecord = store.get(`judge-call|cell=${sliceId}|judge=${JUDGE_MODEL}`);
+  //
+  // The expectation is derived INDEPENDENTLY of the implementation's own call
+  // log (never `provider.calls[0].n`, issue #53/#56 QA finding: deriving the
+  // expected total from the implementation's own recorded calls lets the
+  // assertion stay green even when metering silently drops calls, since it's
+  // comparing the implementation to itself). N is the fixture's own known,
+  // independently-computed idea count.
+  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
   assert.ok(costRecord, "a judge-call cost record must be written for the validation run's judge call");
   assert.equal(costRecord.costRows.length, 1);
   assert.equal(costRecord.costRows[0].model, JUDGE_MODEL);
-  assert.equal(costRecord.costRows[0].input_tokens, provider.calls[0].n * 10); // MockJudgeProvider: 10 * n input, 5 * n output
-  assert.equal(costRecord.costRows[0].output_tokens, provider.calls[0].n * 5);
+  assert.equal(costRecord.costRows[0].input_tokens, N * 10); // MockJudgeProvider: 10 * n input, 5 * n output
+  assert.equal(costRecord.costRows[0].output_tokens, N * 5);
 });
 
 test("runJudgeValidation — a failed judge run still meters whatever tokens the judge consumed before failing", async () => {
@@ -145,12 +161,12 @@ test("runJudgeValidation — a failed judge run still meters whatever tokens the
   const provider = new MockJudgeProvider({ failFor: new Map([[JUDGE_MODEL, { failureKind: "transport_error" }]]) });
 
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
     /did not complete scoring/,
   );
 
   const sliceId = judgeValidationSliceId({ axis: JUDGE_VALIDATION_AXIS, expertScoreField: SI_ET_AL_EXPERT_SCORE_FIELD });
-  const costRecord = store.get(`judge-call|cell=${sliceId}|judge=${JUDGE_MODEL}`);
+  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
   assert.ok(costRecord, "tokens consumed by a failed validation judge call must still be metered");
   assert.equal(costRecord.costRows[0].input_tokens, N * 10);
   assert.equal(costRecord.costRows[0].output_tokens, N * 5);
@@ -164,7 +180,7 @@ test("runJudgeValidation — end-to-end DROP: an anti-aligned judge fails the fl
   const reversed = EXPERT_BY_INDEX.slice().reverse();
   const provider = mockWithOriginality(reversed);
 
-  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
   assert.equal(out.verdict, "drop");
   assert.ok(out.accuracy < out.floor);
 
@@ -179,21 +195,22 @@ test("runJudgeValidation — a non-default (axis, expert column) is threaded int
   const store = makeTempStore("judge-validate-axis-");
   const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
 
-  // Validate the 'fluency' axis (constant 6 in the mock) against overall_score.
+  // Validate the 'feasibility' axis (varies per idea in the mock) against overall_score.
   const out = await runJudgeValidation({
     store,
     judgeProvider: provider,
     judgeModel: JUDGE_MODEL,
-    axis: "fluency",
+    axis: "feasibility",
     sliceRoot: root,
+    timestamp: TIMESTAMP,
   });
-  assert.equal(out.axis, "fluency");
+  assert.equal(out.axis, "feasibility");
   assert.equal(out.expertColumn, "overall_score");
-  assert.equal(out.sliceId, judgeValidationSliceId({ axis: "fluency", expertScoreField: "overall_score" }));
+  assert.equal(out.sliceId, judgeValidationSliceId({ axis: "feasibility", expertScoreField: "overall_score" }));
 
   const judgeHash = computeJudgeHash({ judgeModels: { anthropic: [JUDGE_MODEL] } });
   const stored = store.get(validationKey({ judgeHash, sliceId: out.sliceId }));
-  assert.equal(stored.result.axis, "fluency");
+  assert.equal(stored.result.axis, "feasibility");
 });
 
 test("runJudgeValidation — a failed judge run throws, never records a validation", async () => {
@@ -203,7 +220,7 @@ test("runJudgeValidation — a failed judge run throws, never records a validati
   const provider = new MockJudgeProvider({ failFor: new Map([[JUDGE_MODEL, { failureKind: "transport" }]]) });
 
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
     /did not complete scoring/,
   );
   // No validation record was written.
@@ -220,12 +237,12 @@ test("runJudgeValidation — a score/idea count mismatch throws rather than vali
     async score(payload, { judgeModel }) {
       const scores = payload.candidates
         .slice(0, -1)
-        .map(() => ({ originality: 5, feasibility: 4, fluency: 6, flexibility: 5 }));
+        .map(() => ({ originality: 5, feasibility: 4 }));
       return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
     },
   };
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
     /misaligned/,
   );
 });
@@ -247,20 +264,127 @@ test("runJudgeValidation — supplies the non-empty RESEARCH BRIEF the real judg
       const scores = payload.candidates.map((_c, index) => ({
         originality: EXPERT_BY_INDEX[index],
         feasibility: 4,
-        fluency: (index % 7) + 1,
-        flexibility: (index % 5) + 2,
       }));
       return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
     },
   };
-  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
   assert.equal(out.verdict, "pass");
   assert.ok(seenBrief && seenBrief.length > 0, "the judge must receive a non-empty research brief");
+  // Default (no explicit briefText override): the brief is the idea's own
+  // topic (issue #45 item 3), not a generic shared brief.
+  assert.equal(seenBrief, "bias");
 
   // An explicitly empty briefText is rejected rather than sent to the judge.
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, briefText: "" }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, briefText: "", timestamp: TIMESTAMP }),
     /briefText must be a non-empty string/,
+  );
+});
+
+// ── issue #45 item 3: per-topic grouping ─────────────────────────────────────
+
+test("runJudgeValidation — DEFAULT groups by each idea's own topic: one judge.score() call PER TOPIC, and scores stay aligned to their own idea", async () => {
+  const root = tmpRoot("multi-topic");
+  // Alternate between two topics by index parity, so the two topic groups
+  // interleave through the flat slice order (0,2,4,... vs 1,3,5,...) rather
+  // than occupying contiguous ranges -- this is what makes a group-local-index
+  // vs. original-slice-index mixup (scores[j] vs scores[origIndex]) visible.
+  writeValidationFixture(root, { topicFor: (i) => (i % 2 === 0 ? "bias" : "coding") });
+  const store = makeTempStore("judge-validate-multitopic-");
+
+  // Recover each candidate's ORIGINAL (pre-grouping) slice index from its text
+  // -- the fixture's titles ("Human Idea NN" / "An AI Idea Number NN") encode
+  // it -- and score it with EXACTLY that idea's own expert score. Since
+  // EXPERT_BY_INDEX is strictly increasing and distinct per idea, a judge that
+  // reproduces it exactly can ONLY do so if every score actually landed back
+  // on its own idea after the per-topic score() calls are re-assembled; any
+  // misalignment (e.g. writing to the group-local index instead of the
+  // original slice index) scrambles the vector and balanced accuracy drops
+  // below a perfect 1.0.
+  const decodeIndex = (text) => {
+    const human = text.match(/Human Idea (\d+)/);
+    if (human) return Number(human[1]);
+    const ai = text.match(/AI Idea Number (\d+)/);
+    if (ai) return HUMAN + Number(ai[1]);
+    throw new Error(`test fixture text didn't match either title pattern: ${text}`);
+  };
+
+  const briefsSeen = [];
+  const provider = {
+    calls: [],
+    async score(payload, { judgeModel }) {
+      this.calls.push({ briefText: payload.briefText, n: payload.candidates.length });
+      briefsSeen.push(payload.briefText);
+      const scores = payload.candidates.map((c) => ({
+        originality: EXPERT_BY_INDEX[decodeIndex(c.text)],
+        feasibility: 4,
+      }));
+      return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
+    },
+  };
+
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
+
+  // Exactly one call per distinct topic, never one call for the whole slice.
+  assert.equal(provider.calls.length, 2, "two distinct topics -> two judge.score() calls");
+  assert.deepEqual(new Set(briefsSeen), new Set(["bias", "coding"]), "each call's briefText is the topic itself");
+  // Every idea in the (24-idea) slice reached SOME call, split across the two
+  // topic groups (12 even-indexed "bias", 12 odd-indexed "coding").
+  const totalScored = provider.calls.reduce((sum, c) => sum + c.n, 0);
+  assert.equal(totalScored, N);
+  assert.deepEqual(provider.calls.map((c) => c.n).sort(), [12, 12]);
+
+  // THE alignment assertion: a judge score vector that is a per-idea-perfect
+  // reproduction of the (strictly increasing, all-distinct) expert vector
+  // scores balanced accuracy exactly 1.0 -- and can only do so if re-assembly
+  // put each topic-group score back at its own idea's original slice index.
+  assert.equal(out.accuracy, 1.0, "judge scores must land back on their own idea after per-topic re-assembly");
+  assert.equal(out.verdict, "pass");
+});
+
+test("runJudgeValidation — metering: each topic-group judge call is metered under its own key, and the summed tokens equal the true independently-computed total (issue #56 x #61)", async () => {
+  const root = tmpRoot("multi-topic-meter");
+  writeValidationFixture(root, { topicFor: (i) => (i % 2 === 0 ? "bias" : "coding") });
+  const store = makeTempStore("judge-validate-multitopic-meter-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+
+  await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
+
+  const sliceId = judgeValidationSliceId({ axis: JUDGE_VALIDATION_AXIS, expertScoreField: SI_ET_AL_EXPERT_SCORE_FIELD });
+
+  // Two distinct topic groups -> two distinct judge-call cost records, never
+  // colliding on the same store key. Before the key carried a topic tag,
+  // every topic-group call collided on `judge-call|cell=${sliceId}|judge=...`
+  // and store.put's byte-identical-or-throw rule either silently dropped
+  // every group after the first or threw outright (the #56 x #61 bug).
+  const biasRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
+  const codingRecord = store.get(`judge-call|cell=${sliceId}|topic=coding|judge=${JUDGE_MODEL}`);
+  assert.ok(biasRecord, "the 'bias' topic group's judge call must be metered under its own key");
+  assert.ok(codingRecord, "the 'coding' topic group's judge call must be metered under its own key");
+
+  // The independently-computed true total: N ideas total, MockJudgeProvider
+  // reports 10 input / 5 output tokens per idea scored, regardless of how
+  // many judge.score() calls that work was split across.
+  const totalInput = biasRecord.costRows[0].input_tokens + codingRecord.costRows[0].input_tokens;
+  const totalOutput = biasRecord.costRows[0].output_tokens + codingRecord.costRows[0].output_tokens;
+  assert.equal(totalInput, N * 10);
+  assert.equal(totalOutput, N * 5);
+
+  // Exactly the two topic groups' records — nothing collapsed, nothing
+  // duplicated.
+  const allJudgeCallRecords = store.list().filter((e) => e.key.startsWith(`judge-call|cell=${sliceId}|`));
+  assert.equal(allJudgeCallRecords.length, 2);
+});
+
+test("runJudgeValidation — a missing topic on an included idea fails loud (no silent fallback to a generic brief)", async () => {
+  const root = tmpRoot("no-topic");
+  writeValidationFixture(root, { topicFor: (i) => (i === 0 ? "" : "bias") }); // idea 0 has no topic
+  const store = makeTempStore("judge-validate-notopic-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+  await assert.rejects(
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
+    /has no non-empty 'topic'/,
   );
 });
 
@@ -270,4 +394,19 @@ test("runJudgeValidation — validates its arguments", async () => {
   await assert.rejects(() => runJudgeValidation({ judgeProvider: provider, judgeModel: JUDGE_MODEL }), /store is required/);
   await assert.rejects(() => runJudgeValidation({ store, judgeModel: JUDGE_MODEL }), /judgeProvider with a \.score/);
   await assert.rejects(() => runJudgeValidation({ store, judgeProvider: provider }), /judgeModel is required/);
+});
+
+test("runJudgeValidation — a missing timestamp throws rather than substituting wall-clock (issue #53 SHOULD; consistent with score.mjs runJudgeMatrix)", async () => {
+  const root = tmpRoot("no-timestamp");
+  writeValidationFixture(root);
+  const store = makeTempStore("judge-validate-no-timestamp-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+  // No `timestamp` supplied — a wall-clock substitution here would make a
+  // re-run of this function non-idempotent (store.put() throws on a same-key
+  // row that isn't byte-identical to what's already stored), so this must
+  // fail loud instead, exactly like score.mjs's runJudgeMatrix.
+  await assert.rejects(
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    /timestamp is required/,
+  );
 });

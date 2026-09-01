@@ -79,19 +79,17 @@ export const JUDGE_VALIDATION_MAPPING = Object.freeze({
 });
 
 /**
- * The research brief the judge scores the Si et al. slice ideas AGAINST during
- * validation (issue #36). The judge's scoring prompt requires a non-empty
- * `RESEARCH BRIEF` (score.mjs `buildJudgeScoringPrompt`), but the expert-score
- * slice carries idea text only — no per-idea brief — so validation supplies one
- * shared brief describing the Si et al. research-ideation task.
- *
- * NOTE (reversible default, #36 / self-heal aperture #250): this wording is a
- * safe, reversible default — it lives in one named constant, changing it changes
- * nothing irreversible, and it only takes effect when the REAL validation is run
- * (issue #16, operator + live judge key). The #16 operator should confirm or
- * override it (`runJudgeValidation({ briefText })`), and consider whether the
- * study's per-topic briefs should be used instead of one shared brief. Recorded
- * so the choice is visible rather than hidden at a call site.
+ * A generic fallback research brief describing the Si et al. research-ideation
+ * task as a WHOLE (issue #36). SUPERSEDED as validate.mjs's default by issue
+ * #45 item 3: the reviews carry a per-idea `topic` column (bias / coding /
+ * safety / multilingual / factuality / math / uncertainty — surfaced by
+ * slice.mjs), and "originality relative to the brief" is undefined against
+ * this one generic brief when 98 ideas actually span 7 distinct topics.
+ * `runJudgeValidation` (validate.mjs) now defaults to grouping by each idea's
+ * own topic and using the topic itself as that group's brief; this constant
+ * remains available ONLY as an explicit `runJudgeValidation({ briefText })`
+ * override for a caller that deliberately wants the old one-shared-brief
+ * behavior (e.g. comparing against it), never as an implicit fallback.
  */
 export const SI_ET_AL_VALIDATION_BRIEF =
   "Propose a novel, expert-level research idea in natural language processing. " +
@@ -116,3 +114,47 @@ export const SI_ET_AL_LLM_COMPARATOR_DIRECT = 0.517;
  *  alongside the direct figure so the comparison is not misleading (Appendix A
  *  item 7). */
 export const SI_ET_AL_LLM_COMPARATOR_PAIRWISE = 0.533;
+
+// ── #45 item 4: the registered candidate judge models ────────────────────────
+//
+// buildJudgeMatrix/runJudgeMatrix (matrix.mjs/score.mjs) take `judgeModels`
+// as a caller parameter and had NO registered default anywhere in this repo
+// before #45 — every call site (all of them tests) supplied its own ad hoc
+// list. That is exactly why arm G's judgeability was unverified: nothing ever
+// ran buildJudgeMatrix against arms.config.json's REAL arms with a REAL
+// candidate list.
+//
+// Empirically running buildJudgeMatrix against every arm in arms.config.json
+// (issue #45 item 4) with only the study's three generator models as
+// Anthropic candidates (claude-sonnet-5, claude-haiku-4-5, claude-opus-5) and
+// its two generator models as OpenAI candidates (gpt-5.6-terra, gpt-5.6-sol)
+// showed it throws for TWO arms, not just the one the issue named:
+//   - arm G (3 Claude models + both OpenAI models) — the issue's own concern
+//   - arm E (all three Anthropic tiers: 2xHaiku, 2xSonnet, 1xOpus) — every
+//     Anthropic candidate is also one of E's generators
+// Both arms exhaust every model in their provider's naive candidate list, so
+// no ordering of THOSE THREE models could ever have worked for either arm —
+// the fix has to add a model neither arm (nor any other arm) ever generates
+// with.
+//
+// Fix: reserve ONE Anthropic model and ONE OpenAI model that arms.config.json
+// never uses as a generator, appended LAST (lowest preference) in each
+// provider's candidate list so every arm still prefers a cheaper study model
+// when one is distinct, and only arms E/G fall through to the reserved model:
+//   - claude-sonnet-4-6 — a real, current Anthropic model id (claude-api
+//     skill's Current Models table) distinct from all three arms.config.json
+//     generator ids.
+//   - gpt-5.6-luna — a real OpenAI model id from the SAME first-party
+//     verification fetch lib/price.mjs's OPENAI_PRICE_VERIFICATION already
+//     recorded (developers.openai.com/api/docs/pricing, 2026-07-31) — entry
+//     tier, distinct from gpt-5.6-terra/gpt-5.6-sol. NOTE: neither reserved
+//     model has a lib/price.mjs RATE_TABLE row yet — add one before any live
+//     judge call that could reach it (arms E/G) needs cost accounting.
+//
+// Order matters for judgeHash (computeJudgeHash) only through SET membership
+// (it sorts before hashing — order-insensitive), so re-ordering preference
+// here does not change judgeHash; adding/removing a candidate model does.
+export const JUDGE_MODELS = Object.freeze({
+  anthropic: Object.freeze(["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5", "claude-sonnet-4-6"]),
+  openai: Object.freeze(["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]),
+});
