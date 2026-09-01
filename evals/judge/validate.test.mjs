@@ -244,11 +244,29 @@ test("runJudgeValidation — supplies the non-empty RESEARCH BRIEF the real judg
 
 test("runJudgeValidation — DEFAULT groups by each idea's own topic: one judge.score() call PER TOPIC, and scores stay aligned to their own idea", async () => {
   const root = tmpRoot("multi-topic");
-  // Alternate between two topics by index parity. distinct EXPERT_BY_INDEX
-  // values and a per-index-varying mock keep the alignment fully checkable
-  // after re-assembly out of two interleaved topic groups.
+  // Alternate between two topics by index parity, so the two topic groups
+  // interleave through the flat slice order (0,2,4,... vs 1,3,5,...) rather
+  // than occupying contiguous ranges -- this is what makes a group-local-index
+  // vs. original-slice-index mixup (scores[j] vs scores[origIndex]) visible.
   writeValidationFixture(root, { topicFor: (i) => (i % 2 === 0 ? "bias" : "coding") });
   const store = makeTempStore("judge-validate-multitopic-");
+
+  // Recover each candidate's ORIGINAL (pre-grouping) slice index from its text
+  // -- the fixture's titles ("Human Idea NN" / "An AI Idea Number NN") encode
+  // it -- and score it with EXACTLY that idea's own expert score. Since
+  // EXPERT_BY_INDEX is strictly increasing and distinct per idea, a judge that
+  // reproduces it exactly can ONLY do so if every score actually landed back
+  // on its own idea after the per-topic score() calls are re-assembled; any
+  // misalignment (e.g. writing to the group-local index instead of the
+  // original slice index) scrambles the vector and balanced accuracy drops
+  // below a perfect 1.0.
+  const decodeIndex = (text) => {
+    const human = text.match(/Human Idea (\d+)/);
+    if (human) return Number(human[1]);
+    const ai = text.match(/AI Idea Number (\d+)/);
+    if (ai) return HUMAN + Number(ai[1]);
+    throw new Error(`test fixture text didn't match either title pattern: ${text}`);
+  };
 
   const briefsSeen = [];
   const provider = {
@@ -256,20 +274,15 @@ test("runJudgeValidation — DEFAULT groups by each idea's own topic: one judge.
     async score(payload, { judgeModel }) {
       this.calls.push({ briefText: payload.briefText, n: payload.candidates.length });
       briefsSeen.push(payload.briefText);
-      // Score each candidate in THIS call by its position in the ORIGINAL
-      // (pre-grouping) slice, recovered from the candidate text itself is not
-      // possible (text-only) -- instead exploit that MockJudgeProvider-style
-      // stubs are only asked to be self-consistent within a call: return a
-      // score derived from the call's own local index, then let the test
-      // recompute the expected per-topic ordering the same way runJudgeValidation
-      // builds it (grouping preserves each topic's ideas in slice order).
-      const scores = payload.candidates.map((_c, localIndex) => ({ originality: localIndex + 1, feasibility: 4 }));
+      const scores = payload.candidates.map((c) => ({
+        originality: EXPERT_BY_INDEX[decodeIndex(c.text)],
+        feasibility: 4,
+      }));
       return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
     },
   };
 
   const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
-  assert.ok(["pass", "drop"].includes(out.verdict), "completes end to end without throwing");
 
   // Exactly one call per distinct topic, never one call for the whole slice.
   assert.equal(provider.calls.length, 2, "two distinct topics -> two judge.score() calls");
@@ -279,6 +292,13 @@ test("runJudgeValidation — DEFAULT groups by each idea's own topic: one judge.
   const totalScored = provider.calls.reduce((sum, c) => sum + c.n, 0);
   assert.equal(totalScored, N);
   assert.deepEqual(provider.calls.map((c) => c.n).sort(), [12, 12]);
+
+  // THE alignment assertion: a judge score vector that is a per-idea-perfect
+  // reproduction of the (strictly increasing, all-distinct) expert vector
+  // scores balanced accuracy exactly 1.0 -- and can only do so if re-assembly
+  // put each topic-group score back at its own idea's original slice index.
+  assert.equal(out.accuracy, 1.0, "judge scores must land back on their own idea after per-topic re-assembly");
+  assert.equal(out.verdict, "pass");
 });
 
 test("runJudgeValidation — a missing topic on an included idea fails loud (no silent fallback to a generic brief)", async () => {
