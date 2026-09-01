@@ -1,0 +1,56 @@
+{
+  "kind": "si-et-al-human-human-recomputation",
+  "issue": 47,
+  "computedAt": "2026-09-01T23:46:31.936Z",
+  "slice": {
+    "n": 98,
+    "conditions": [
+      "Human",
+      "AI"
+    ],
+    "exclusions": [
+      {
+        "condition": "AI_Rerank",
+        "fileCount": 49,
+        "reason": "AI_Rerank excluded from judge validation (operator decision, issue #35, 2026-08-02). Of its 49 files, only 18 share a filename with the AI condition and are suffix-swap recoverable; the other 31 draw from a larger generated pool than the AI condition's 49 sampled ideas and their idea_id cannot be recovered from the released id_title_mapping.csv at all. Including only the recoverable 18 would represent the condition by a non-random 37% subsample. Validation needs a reliable expert-scored set, not a complete one — Human + AI (98 ideas) is sufficient."
+      }
+    ],
+    "reviewsIncluded": 228,
+    "reviewsFullRelease": 337
+  },
+  "construction": {
+    "scoreColumn": "overall_score",
+    "quantile": 0.25,
+    "splitRule": "split-half of each idea's own reviews (no reviewer id in the anonymized release)",
+    "splitSeed": 1,
+    "splitCount": 1000,
+    "bootstrapSeed": 2,
+    "bootstrapDraws": 2000,
+    "bootstrapSplitsPerDraw": 200
+  },
+  "result": {
+    "mean": 0.5533750000000008,
+    "splitDistributionP05": 0.5,
+    "splitDistributionP95": 0.625,
+    "bootstrapCi95": [
+      0.4483333333333333,
+      0.670208333333333
+    ],
+    "overlapsRegisteredFloor": true,
+    "excludesChance": false
+  },
+  "comparators": {
+    "paperReportedHumanHumanFloor": {
+      "value": 0.561,
+      "label": "paper-reported, different population and different split scheme (Si et al. 2024 Table 11: 147 ideas / 3 conditions / 337 reviews, reviewer split-half) — never 'reproduced'"
+    },
+    "claude35DirectShapeMatched": {
+      "value": 0.517,
+      "label": "Si et al. Table 11, same paper population"
+    },
+    "claude35Pairwise": {
+      "value": 0.533,
+      "label": "Si et al. Table 11, same paper population, their best LLM evaluator of any shape"
+    }
+  }
+}
