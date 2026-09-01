@@ -1,4 +1,4 @@
-// corpus.test.mjs — hermetic tests for the frozen 12-brief corpus (issue #2).
+// corpus.test.mjs — hermetic tests for the frozen 24-brief corpus (issues #2, #43).
 //
 // Hermetic on purpose: these tests exercise the FROZEN keyword snapshot in
 // ./liveideabench-keywords.mjs, never the network. The reproducibility claim
@@ -23,20 +23,20 @@ import { configHash } from "../../lib/manifest.mjs";
 
 // ── AC1: 12 briefs, correct stratum split, provenance recorded ─────────────
 
-test("the corpus has exactly 12 briefs", () => {
-  assert.equal(BRIEFS.length, 12);
+test("the corpus has exactly 24 briefs", () => {
+  assert.equal(BRIEFS.length, 24);
   assert.equal(CORPUS, BRIEFS, "CORPUS is the same frozen array BRIEFS exports");
 });
 
-test("stratum counts are exactly 4 business / 3 product / 3 scientific / 2 aut", () => {
+test("stratum counts are exactly 6 business / 6 product / 6 scientific / 6 aut", () => {
   const counts = { business: 0, product: 0, scientific: 0, aut: 0 };
   for (const b of BRIEFS) counts[b.stratum] = (counts[b.stratum] || 0) + 1;
-  assert.deepEqual(counts, { business: 4, product: 3, scientific: 3, aut: 2 });
+  assert.deepEqual(counts, { business: 6, product: 6, scientific: 6, aut: 6 });
 });
 
 test("every brief id is unique and stable (string)", () => {
   const ids = BRIEFS.map((b) => b.id);
-  assert.equal(new Set(ids).size, 12, "all 12 ids are distinct");
+  assert.equal(new Set(ids).size, 24, "all 24 ids are distinct");
   for (const id of ids) assert.equal(typeof id, "string");
 });
 
@@ -64,7 +64,7 @@ test("authored strata (business, product, aut) are all provenance: authored", ()
 
 test("the scientific stratum is provenance: sampled, sourced from LiveIdeaBench", () => {
   const sci = BRIEFS.filter((b) => b.stratum === "scientific");
-  assert.equal(sci.length, 3);
+  assert.equal(sci.length, 6);
   for (const b of sci) {
     assert.equal(b.provenance, "sampled");
     assert.equal(b.selection.source.repo, "x66ccff/liveideabench");
@@ -76,11 +76,11 @@ test("the scientific stratum is provenance: sampled, sourced from LiveIdeaBench"
 
 test("validateCorpus accepts the frozen corpus and rejects malformed ones", () => {
   assert.doesNotThrow(() => validateCorpus(BRIEFS));
-  assert.throws(() => validateCorpus(BRIEFS.slice(0, 11)), /expected exactly 12/);
-  const withDuplicateId = [...BRIEFS.slice(0, 11), { ...BRIEFS[11], id: BRIEFS[0].id }];
+  assert.throws(() => validateCorpus(BRIEFS.slice(0, 23)), /expected exactly 24/);
+  const withDuplicateId = [...BRIEFS.slice(0, 23), { ...BRIEFS[23], id: BRIEFS[0].id }];
   assert.throws(() => validateCorpus(withDuplicateId), /duplicate brief id/);
 
-  const wrongStratum = BRIEFS.slice(0, 11).concat([{ ...BRIEFS[11], stratum: "business" }]);
+  const wrongStratum = BRIEFS.slice(0, 23).concat([{ ...BRIEFS[23], stratum: "business" }]);
   assert.throws(() => validateCorpus(wrongStratum), /expected \d+/);
 });
 
@@ -96,7 +96,7 @@ test("briefContentHash is deterministic sha256(text) truncated to 12 hex chars",
 
 test("every brief has a distinct content hash (no accidental duplicate briefs)", () => {
   const hashes = BRIEFS.map(briefContentHash);
-  assert.equal(new Set(hashes).size, 12);
+  assert.equal(new Set(hashes).size, 24);
 });
 
 test("corpusHash is deterministic and order-independent over brief array position", () => {
@@ -162,15 +162,26 @@ test("mulberry32 with different seeds diverges", () => {
 });
 
 test("sampleKeywords is reproducible: same seed -> same selection", () => {
-  const run1 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, 3, SCIENTIFIC_SAMPLE_SEED);
-  const run2 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, 3, SCIENTIFIC_SAMPLE_SEED);
+  const run1 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, SCIENTIFIC_SAMPLE_COUNT, SCIENTIFIC_SAMPLE_SEED);
+  const run2 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, SCIENTIFIC_SAMPLE_COUNT, SCIENTIFIC_SAMPLE_SEED);
   assert.deepEqual(run1, run2, "identical seed and input reproduce identical, order-preserved output");
 });
 
 test("sampleKeywords with a different seed generally selects differently", () => {
-  const run1 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, 3, SCIENTIFIC_SAMPLE_SEED);
-  const run2 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, 3, SCIENTIFIC_SAMPLE_SEED + 1);
+  const run1 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, SCIENTIFIC_SAMPLE_COUNT, SCIENTIFIC_SAMPLE_SEED);
+  const run2 = sampleKeywords(LIVEIDEABENCH_KEYWORDS, SCIENTIFIC_SAMPLE_COUNT, SCIENTIFIC_SAMPLE_SEED + 1);
   assert.notDeepEqual(run1, run2);
+});
+
+test("extending the scientific sample count preserves the original draw prefix (issue #43)", () => {
+  // The corpus expansion bumped SCIENTIFIC_SAMPLE_COUNT 3 -> 6 under the SAME
+  // seed. Because sampleKeywords is a sequential draw-without-replacement walk,
+  // the first 3 draws of the count=6 run must be byte-identical to the
+  // original count=3 run — sci-01..03's keyword/drawIndex are preserved, not
+  // re-rolled, by the expansion.
+  const original = sampleKeywords(LIVEIDEABENCH_KEYWORDS, 3, SCIENTIFIC_SAMPLE_SEED);
+  const expanded = sampleKeywords(LIVEIDEABENCH_KEYWORDS, SCIENTIFIC_SAMPLE_COUNT, SCIENTIFIC_SAMPLE_SEED);
+  assert.deepEqual(expanded.slice(0, 3), original, "the original 3-draw prefix is unchanged by the expansion");
 });
 
 test("sampleKeywords samples without replacement and validates its inputs", () => {
@@ -217,7 +228,7 @@ test("authored briefs avoid obvious brand/framework names and marketing buzzword
 
 test("the classic divergent-thinking stratum uses AUT ('uses for X') phrasing", () => {
   const aut = BRIEFS.filter((b) => b.stratum === "aut");
-  assert.equal(aut.length, 2);
+  assert.equal(aut.length, 6);
   for (const b of aut) {
     assert.match(b.text.toLowerCase(), /uses for/, `${b.id} should be phrased as an Alternate Uses Task`);
   }

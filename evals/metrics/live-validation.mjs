@@ -33,6 +33,11 @@
 import { voyageEmbedder } from "./embedder.mjs";
 import { datReplication, negativeControls, randomPoolVerdict } from "./validation.mjs";
 import { RANDOM_TEXT_POOL, DUPLICATE_POOL } from "./fixtures/control-texts.mjs";
+// The Voyage-calibrated threshold (issue #42), NOT calibration.mjs's MiniLM
+// one — negativeControls' threshold is a parameter precisely so this live
+// run can use the number calibrated for the embedder it actually runs
+// against. See voyage-calibration.mjs header.
+import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD } from "./voyage-calibration.mjs";
 
 function fmt(n) {
   return Number.isFinite(n) ? n.toFixed(4) : String(n);
@@ -135,7 +140,8 @@ async function main() {
 
   // ── Negative controls ────────────────────────────────────────────────────
   console.log("\n[live-validation] running negative controls (§4.4) ...");
-  const controls = await negativeControls(embedder);
+  console.log(`  using Voyage-calibrated threshold ${VOYAGE_CLUSTER_DISTANCE_THRESHOLD} (see voyage-calibration.mjs, issue #42)`);
+  const controls = await negativeControls(embedder, { threshold: VOYAGE_CLUSTER_DISTANCE_THRESHOLD });
 
   console.log(
     `  duplicate pool (${DUPLICATE_POOL.length} copies): distinct_k=${controls.duplicate.distinctK}, ` +
