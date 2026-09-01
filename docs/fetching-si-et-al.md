@@ -159,30 +159,104 @@ judge inputs (re-asserted by `deidentify.mjs`), and no path, filename, directory
 or condition label is ever part of a judge payload, the store, a log, or
 `REPORT.md`. Condition is joined back only **after** scoring.
 
-## Reproducing the 56.1% floor (the #16 real-data run — out of scope for the build)
+## The 337-vs-298 review count: resolved (issue #47)
 
-The registered floor is Si et al.'s reported **56.1%** human-human split-half
-top/bottom-25% balanced accuracy (`SI_ET_AL_BALANCED_ACCURACY_FLOOR`). The
-construction is implemented as `balancedAccuracySplitHalf()` in `gate.mjs` and is
-exercised hermetically on a synthetic fixture here. **Reproducing 56.1% from the
-real released reviews requires the payload above and is the human-gated #16
-real-data run** — it cannot run in CI (the payload is never committed), and it is
-deliberately not part of this build (issue #24 "Out of scope": _running the
-validation for real against the fetched slice_).
+The release carries **337** review rows; a prior draft of this document flagged
+**298** as a paper-stated count and treated the gap as a blocking precondition
+on reproduction. That framing is wrong on two counts, both checked directly
+against the real payload (issue #47):
 
-Two things must be settled in that run before the reproduced number is trusted:
+- **298 is not reachable by filtering.** No filter on `consent`, `no_ai`,
+  `familiarity`, `experience`, or `confidence_score` lands on 298, and the
+  authors' own `stats_*.py` scripts filter on nothing but `condition`. The
+  paper's own Table 7 reports **337**, so "N = 298" is inconsistent with the
+  paper's own table, not with the release.
+- **The real driver is duplication, not filtering — verified 2026-09-01.**
+  `AI_AI_Ideas_Processed/` and `AI_Human_Ideas_Txt/` (the `AI_Rerank` directory)
+  share **18 identical filenames** — the same physical idea submission, judged
+  independently under both conditions. Counting review rows by condition on the
+  real payload: `AI = 109`, `AI_Rerank = 109`, `Human = 119` (sums to 337). Of
+  those, the 18 shared ideas alone account for **41** review rows under the
+  `AI` condition (independently, 43 under `AI_Rerank` — review counts per idea
+  are not required to match 1:1). Treating the 18 shared submissions as
+  double-counted once (subtracting the 41 `AI`-side rows for them):
+  `109 + 109 − 41 + 119 = 296` — a residual of **2** from the stated 298, in
+  the _opposite_ direction from the original 337-vs-298 gap. That residual-of-2
+  is not further explained here (only arXiv v1 exists to check against), but
+  duplication — not a missing filter — accounts for essentially all of the gap.
 
-- **The split is random.** Report the **distribution** across repeated splits
-  (state the seed), not a single lucky draw. `balancedAccuracySplitHalf` returns
-  every draw plus the mean for exactly this reason.
-- **Review-count discrepancy — 337 vs 298.** The release carries **337** reviews;
-  the paper states **N = 298 unique reviews**. This gap must be **investigated
-  and its resolution documented here before any reproduction is claimed** — it
-  may be a filtering step the paper applies and the release does not, and
-  applying it (or not) could move the reproduced accuracy. **Do not tune until
-  56.1% appears.** If the gap cannot be explained, say so and hold the floor
-  unregistered rather than registering a number matched by accident.
+**This is benign for us.** Our Human+AI slice (`AI_Rerank` excluded) is **228
+review rows, 228 unique reviews, zero duplication** — none of the 41
+cross-condition duplicates touch an included condition against itself. The
+337-vs-298 question is closed as explained; it is not a precondition on
+anything below.
 
-Until that run lands, the floor is registered at 0.561 on the strength of the
-paper's reported figure; if the reproduction fails, the floor is revisited (#16),
-not silently kept.
+## Human-human split-half balanced accuracy on OUR 98-idea slice (issue #47)
+
+**56.1% is a paper-reported comparator, not something reproduced here.** It is
+labelled that way everywhere in this repo (`SI_ET_AL_BALANCED_ACCURACY_FLOOR`'s
+docstring, `evals/judge/reproduce-si-et-al.mjs`'s output,
+`docs/si-et-al-human-human-floor.json`). Two real blockers stand between our
+number and the paper's, and neither is a data-quality problem to fix — they are
+structural differences in what is being measured:
+
+1. **Population mismatch.** The paper's 56.1% is computed over 147 ideas / 3
+   conditions / 337 reviews. Our slice is 98 ideas / 2 conditions (Human + AI;
+   `AI_Rerank` excluded, see above) / 228 reviews. The two numbers are not
+   expected to coincide even with a perfect implementation of the same
+   construction.
+2. **No reviewer identifier in the release.** The paper's construction splits
+   each idea's _reviewers_ into two random halves, so a lenient reviewer's
+   scores stay together across every idea they reviewed — a shared-reviewer
+   correlation that inflates the paper's figure. The anonymized release ships
+   no reviewer id (the authors' own `data/si-et-al/stats_per_reviewer.py` reads
+   `df['name']` and cannot run on the shipped file), so our construction splits
+   each idea's _reviews_ instead — within an idea, distinct rows are distinct
+   reviewers even without ids, but a reviewer's leniency does not carry across
+   ideas. This makes our number a **harder floor**, not an easier one — expect
+   it to read lower than 56.1%, and that is not a bug.
+
+The construction is implemented as `balancedAccuracySplitHalf()` in `gate.mjs`
+(exercised hermetically on a synthetic fixture there) and run against the real
+slice by `node evals/judge/reproduce-si-et-al.mjs`. Construction parameters are
+**registered — closed — before the run**, recorded in that script's header
+comment: score column `overall_score`, quantile 0.25, split rule (per-idea
+review split, not reviewer split), split seed 1 / 1000 splits, bootstrap seed 2
+/ 2000 draws, exclusion `AI_Rerank`. These must not be revisited after seeing
+any output below or any judge score.
+
+**105 of the 147 released ideas carry exactly 2 reviews**, so a split-half on
+those is one reviewer against one — large sampling error that must be visible,
+not averaged away. The script reports both (a) the distribution across 1000
+random within-idea review splits, and (b) a **bootstrap 95% CI** that resamples
+the 98 ideas themselves with replacement (2000 draws) — the CI is what should
+be quoted, not the point mean alone.
+
+**Recomputed result (issue #47, run against the real payload):**
+
+|                                                               |                      |
+| ------------------------------------------------------------- | -------------------- |
+| mean balanced accuracy                                        | **0.5534**           |
+| bootstrap 95% CI                                              | **0.4167 .. 0.7083** |
+| registered floor (paper-reported, different population/split) | 0.561                |
+| CI overlaps the floor?                                        | yes                  |
+| CI excludes chance (0.50)?                                    | **no**               |
+
+The mean (0.5534) sits a fraction below the paper's 56.1% — expected, given the
+harder per-idea-review split above, not a rounding artifact and not "within
+tolerance of the floor" by any stated tolerance (there is none). The 95% CI is
+wide enough to overlap 0.561, and it does **not** exclude 0.50: at our slice
+size (98 ideas, mostly 2 reviews each), this construction cannot statistically
+distinguish "humans agree somewhat" from "humans agree at chance." That is the
+honest state of the evidence, not an implementation defect.
+
+The full result — including the two Si et al. LLM-evaluator comparators
+(Claude-3.5 Direct 51.7%, shape-matched to our judge; Claude-3.5 Pairwise
+53.3%, their best evaluator of any shape) — is written machine-readably to
+`docs/si-et-al-human-human-floor.json` by the script, so #44's Appendix B can
+register it without re-deriving it.
+
+Rerun with `node evals/judge/reproduce-si-et-al.mjs [--splits N] [--seed S]
+[--bootstrap-draws N] [--bootstrap-seed S]`. This is a MANUAL, opt-in tool — the
+payload is gitignored and never committed, so it cannot run in CI and is
+deliberately not wired into `npm test`.
