@@ -1337,7 +1337,19 @@ export class AnthropicBatchProvider {
   async #recoverOutstanding(ctx) {
     const kept = [];
     for (const handle of ctx.outstanding) {
-      if (!handle || handle.provider !== "anthropic" || !handle.batchId) continue;
+      // A handle this adapter cannot act on is KEPT, never dropped. `kept`
+      // REPLACES ctx.outstanding, so a bare `continue` here would delete
+      // another provider's handle from the durable record -- and the
+      // invocation after that would pay for it again, which is the exact
+      // defect this feature exists to close, arriving through its own door.
+      // Not reachable from evals/run.mjs today (it constructs one Anthropic
+      // generation provider and no router), but the record shape is shared
+      // between both adapters, so the guard is unconditional rather than
+      // resting on a wiring fact that a cross-provider arm would change.
+      if (!handle || handle.provider !== "anthropic" || !handle.batchId) {
+        if (handle) kept.push(handle);
+        continue;
+      }
       // Anthropic keeps results downloadable for 29 days after batch creation
       // (verified 2026-09-02). Past that the GET would 404 or return a batch
       // with no results_url; skip the network call rather than spend a
@@ -2265,7 +2277,12 @@ export class OpenAIBatchProvider {
   async #recoverOutstanding(ctx) {
     const kept = [];
     for (const handle of ctx.outstanding) {
-      if (!handle || handle.provider !== "openai" || !handle.batchId) continue;
+      // Foreign handles are KEPT, not dropped -- see the Anthropic path for
+      // why deleting one is a re-spend rather than a tidy-up.
+      if (!handle || handle.provider !== "openai" || !handle.batchId) {
+        if (handle) kept.push(handle);
+        continue;
+      }
       if (batchResultsExpired(handle.submittedAt, OPENAI_RESULTS_RETENTION_MS)) {
         this.logger(
           `OpenAIBatchProvider: batch ${handle.batchId} is past the documented ${OPENAI_RESULTS_RETENTION_DAYS}-day output-file retention ` +

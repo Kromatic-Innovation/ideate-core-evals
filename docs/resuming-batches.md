@@ -145,10 +145,12 @@ therefore bounded by that cell's **failure** count, exactly like `#90`'s
 `generation-attempt` records, and the highest-numbered record shadows every
 older one.
 
-Superseded replay records are **not** yet evicted by `--prune`. They carry no
-money, so eviction needs no salvage and is a small, safe follow-up; it is left
-out of `#103` deliberately rather than bundled in. Until then they are dead
-weight, not a correctness problem.
+Superseded replay records are **not** yet reachable by `--prune` at all —
+compaction excludes the family deliberately (it would destroy the handle) and
+eviction selects through `parseCellKey`, which returns `null` for these keys.
+They carry no money, so removal needs no salvage and is a small, safe change;
+it is left out of `#103` rather than bundled in. Tracked at **#117**. Until
+then they are dead weight, not a correctness problem.
 
 ## Operator recipes
 

@@ -962,6 +962,150 @@ test("#103 end-to-end: runSpec persists the handle on the abandoned run and REPL
   assert.equal(spendToDate(store).totalUsd, spend.totalUsd, "and spends nothing");
 });
 
+test("#103 end-to-end: the MULTI-HOP case -- a cell that stalls twice accumulates its replies across attempts and never re-pays", async (t) => {
+  // The shape a 200-cell grid actually produces, and the one a single
+  // abandon-then-succeed test does not reach: round 1 lands, round 2 stalls,
+  // stalls AGAIN, then finally completes. Each hop must read the previous
+  // attempt's replies, grow them, and persist the union -- if accumulation
+  // drops anything, the next hop re-issues it and pays again.
+  const { store, cleanup } = tempStore();
+  t.after(cleanup);
+  const { cellKey, configHash } = await import("../../lib/manifest.mjs");
+  const armsConfig = armsConfigFor("B"); // a 5-slot panel arm, 2 rounds
+  const spec = { arms: [{ id: "B" }], briefs: [{ id: "brief-1" }], replicates: 1, config: SPEC_CONFIG };
+  const key = cellKey({ armId: "B", briefId: "brief-1", replicate: 0, cfg: configHash(SPEC_CONFIG) });
+
+  // ── Hop 1: round 1 ends; round 2 is submitted and stalls. ────────────────
+  const hop1 = { submits: [] };
+  let submitted = 0;
+  const p1 = new AnthropicBatchProvider({
+    apiKey: "k",
+    corpus: CORPUS,
+    armsConfig,
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u.endsWith("/cancel")) return jsonResponse(200, { id: "msgbatch_R2", processing_status: "canceling" });
+      if (u.endsWith("/v1/messages/batches")) {
+        submitted += 1;
+        hop1.submits.push(JSON.parse(opts.body));
+        return submitted === 1
+          ? jsonResponse(200, { id: "msgbatch_R1", processing_status: "ended", results_url: "https://api.anthropic.com/r1", created_at: new Date().toISOString() })
+          : jsonResponse(200, { id: "msgbatch_R2", processing_status: "in_progress", created_at: new Date().toISOString() });
+      }
+      if (u.endsWith("/r1")) return textResponse(hop1.submits[0].requests.map((r, i) => anthropicSucceeded(r.custom_id, ideasJson(`r1a${i}`))).join("\n"));
+      if (u.includes("/v1/messages/batches/")) return jsonResponse(200, { id: "msgbatch_R2", processing_status: "in_progress" });
+      throw new Error(`hop 1 unexpected ${u}`);
+    },
+    ideateImpl: twoRoundIdeate,
+    sleep: noopSleep,
+    maxPollMs: 1,
+    pollIntervalMs: 1,
+    logger: silentLogger,
+  });
+  await runSpec(spec, { store, armsConfig, provider: p1, log: silentLogger });
+
+  const afterHop1 = readBatchResumeRecord(store, key);
+  assert.equal(Object.keys(afterHop1.replies).length, 5, "round 1's five paid-for replies");
+  assert.equal(afterHop1.outstanding.length, 1);
+  assert.equal(afterHop1.attempt, 0);
+
+  // ── Hop 2: round 2 is STILL running. Nothing new may be submitted, and
+  // round 1's replies must survive into the next record. ───────────────────
+  const p2 = new AnthropicBatchProvider({
+    apiKey: "k",
+    corpus: CORPUS,
+    armsConfig,
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.endsWith("/v1/messages/batches")) throw new Error("hop 2 must submit nothing: round 1 replays and round 2 is still running");
+      if (u.includes("/v1/messages/batches/msgbatch_R2")) return jsonResponse(200, { id: "msgbatch_R2", processing_status: "in_progress" });
+      throw new Error(`hop 2 unexpected ${u}`);
+    },
+    ideateImpl: twoRoundIdeate,
+    sleep: noopSleep,
+    maxPollMs: 1,
+    pollIntervalMs: 1,
+    logger: silentLogger,
+  });
+  const run2 = await runSpec(spec, { store, armsConfig, provider: p2, log: silentLogger });
+  assert.equal(run2.summary.failed, 1);
+  assert.equal(run2.summary.spendByProvider.anthropic || 0, 0, "a stalled hop must cost exactly nothing");
+
+  const afterHop2 = readBatchResumeRecord(store, key);
+  assert.equal(afterHop2.attempt, 1, "a NEW record, numbered max+1, shadowing the old one");
+  assert.equal(Object.keys(afterHop2.replies).length, 5, "round 1's replies carried forward -- dropping them here is a re-spend next hop");
+  assert.deepEqual(Object.keys(afterHop2.replies).sort(), Object.keys(afterHop1.replies).sort());
+  assert.equal(afterHop2.outstanding[0].batchId, "msgbatch_R2", "and the handle is still retained");
+
+  // ── Hop 3: round 2 has finally ended. ────────────────────────────────────
+  const r2Ids = hop1.submits[1].requests.map((r) => r.custom_id);
+  const posted = [];
+  const p3 = new AnthropicBatchProvider({
+    apiKey: "k",
+    corpus: CORPUS,
+    armsConfig,
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.endsWith("/v1/messages/batches")) posted.push(u);
+      if (u.endsWith("/r2")) return textResponse(r2Ids.map((id, i) => anthropicSucceeded(id, ideasJson(`r2a${i}`))).join("\n"));
+      if (u.includes("/v1/messages/batches/msgbatch_R2")) return jsonResponse(200, { id: "msgbatch_R2", processing_status: "ended", results_url: "https://api.anthropic.com/r2" });
+      throw new Error(`hop 3 unexpected ${u}`);
+    },
+    ideateImpl: twoRoundIdeate,
+    sleep: noopSleep,
+    maxPollMs: 60000,
+    pollIntervalMs: 1,
+    logger: silentLogger,
+  });
+  const run3 = await runSpec(spec, { store, armsConfig, provider: p3, log: silentLogger });
+
+  assert.equal(run3.summary.completed, 1);
+  assert.equal(posted.length, 0, "three hops, and after the first not one request was ever re-issued");
+  assert.equal(store.get(key).result.candidates.length, 60, "5 agents x 6 ideas x 2 rounds -- the full pool, assembled across three sessions");
+
+  // The ledger: ten replies were billed (5 in round 1, 5 in round 2), each at
+  // 100 in / 50 out, and each reaches the store exactly once despite round 1
+  // being replayed twice.
+  const model = armsConfigJson.arms.B.slots[0].model;
+  const rows = store
+    .list()
+    .flatMap((e) => store.get(e.key).costRows)
+    .filter((r) => r.tokens_by_model && r.tokens_by_model[model]);
+  assert.equal(
+    rows.reduce((n, r) => n + r.tokens_by_model[model].input_tokens, 0),
+    10 * 100,
+    "round 1 was replayed twice and must still appear once -- metering a replay is the double count AC4 names",
+  );
+});
+
+test("#103: a handle belonging to another provider is KEPT, never dropped -- dropping it is a re-spend", async () => {
+  const foreign = { provider: "openai", batchId: "batch_FOREIGN", submittedAt: new Date().toISOString(), submitToCustom: {} };
+  const submits = [];
+  const provider = new AnthropicBatchProvider({
+    apiKey: "k",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u.endsWith("/v1/messages/batches")) {
+        submits.push(JSON.parse(opts.body));
+        return jsonResponse(200, { id: "msgbatch_NEW", processing_status: "ended", results_url: "https://api.anthropic.com/new" });
+      }
+      if (u.endsWith("/new")) return textResponse(anthropicSucceeded(submits[0].requests[0].custom_id, ideasJson("fresh", 30)));
+      throw new Error(`an Anthropic adapter must not touch an OpenAI handle, but reached ${u}`);
+    },
+    ideateImpl: soloRoundIdeate,
+    sleep: noopSleep,
+    maxPollMs: 60000,
+    pollIntervalMs: 1,
+    logger: silentLogger,
+  });
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch", resume: { replies: {}, outstanding: [foreign] } });
+
+  assert.equal(resp.terminalState, "completed");
+  assert.deepEqual(resp.resume.outstanding, [foreign], "the foreign handle survives for the adapter that CAN recover it");
+});
+
 test("#103 end-to-end: --no-resume makes runSpec re-submit rather than replay, and records nothing", async (t) => {
   const { store, cleanup } = tempStore();
   t.after(cleanup);
