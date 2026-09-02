@@ -45,6 +45,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { invert, multiply, transpose, symmetricInverseSqrt } from "./linalg.mjs";
+import { JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const SIDECAR_SCRIPT_PATH = join(__dirname, "sidecar", "fit_mixedlm.py");
@@ -301,6 +302,235 @@ export function fitR2(rows, armLevels, referenceArm) {
   const vcov = multiply(multiply(XtXinv, meat), XtXinv);
 
   return { ...base, converged: true, coefficients: beta, vcov };
+}
+
+// ── Judge-score lane (H5, issue #80 / docs/PREREGISTRATION.md Appendix B item
+//    6): judge_provider + judge_provider x generator_provider + (1|run). A
+//    SEPARATE, smaller ladder from the arm-based R0-R3 above -- one sidecar
+//    rung (J0, a MixedLM random intercept on `run`) then one pure-Node
+//    fallback (J1, OLS + CR2 clustered by `run`), never the R0-R3 rungs
+//    above (those fit a completely different design: arm dummies against a
+//    brief-clustered response, not judge_provider/sameProvider against a
+//    run-clustered one). See report.mjs's own note that H1's rung and
+//    H2-H5's rung are never the same statement -- this ladder is a THIRD,
+//    independent one again, for H5 alone. ───────────────────────────────────
+//
+// Design, in Node rather than a patsy formula string (deliberate -- see
+// judgeScoreFrame.mjs's header on why the registered "judge_provider x
+// generator_provider" interaction reduces to ONE derived binary coefficient,
+// JUDGE_SCORE_BIAS_COEFFICIENT): coefficients are
+//   ["Intercept", "judge_provider[T.<other judge providers>]", ...,
+//    JUDGE_SCORE_BIAS_COEFFICIENT]
+// -- a judge_provider main effect (one dummy per non-reference judge_provider
+// level) plus the single same-provider bias term. Sent to the sidecar as an
+// already-materialized design matrix (X + coefficientNames), never a formula
+// string, so there is no patsy-vs-Node naming ambiguity to keep in sync.
+
+/**
+ * @param {Array<{judgeProvider: string, sameProvider: boolean}>} rows
+ * @param {string[]} judgeProviderLevels
+ * @param {string} referenceJudgeProvider
+ * @returns {{X: number[][], coefficientNames: string[]}}
+ */
+export function buildJudgeScoreDesignMatrix(rows, judgeProviderLevels, referenceJudgeProvider) {
+  if (!judgeProviderLevels.includes(referenceJudgeProvider)) {
+    throw new Error(`buildJudgeScoreDesignMatrix: referenceJudgeProvider '${referenceJudgeProvider}' is not in judgeProviderLevels [${judgeProviderLevels.join(", ")}]`);
+  }
+  const others = judgeProviderLevels.filter((p) => p !== referenceJudgeProvider);
+  const coefficientNames = ["Intercept", ...others.map((p) => `judge_provider[T.${p}]`), JUDGE_SCORE_BIAS_COEFFICIENT];
+  const X = rows.map((r) => {
+    const row = new Array(coefficientNames.length).fill(0);
+    row[0] = 1; // Intercept
+    if (r.judgeProvider !== referenceJudgeProvider) {
+      const idx = coefficientNames.indexOf(`judge_provider[T.${r.judgeProvider}]`);
+      if (idx === -1) throw new Error(`buildJudgeScoreDesignMatrix: row references judge_provider '${r.judgeProvider}' not in judgeProviderLevels`);
+      row[idx] = 1;
+    }
+    row[coefficientNames.length - 1] = r.sameProvider ? 1 : 0;
+    return row;
+  });
+  return { X, coefficientNames };
+}
+
+/**
+ * Call the sidecar for the judge-score lane's one rung (J0): MixedLM with a
+ * random intercept on `run`, over an already-materialized design matrix
+ * (never a formula string -- see this section's header). Same hard-fail
+ * contract as fitViaSidecar(): a missing venv / non-zero exit / schema
+ * mismatch surfaces as SidecarUnavailableError, never a silent fallback.
+ *
+ * @param {Array<{judgeProvider: string, sameProvider: boolean, run: string, response: number}>} rows
+ * @param {string[]} judgeProviderLevels
+ * @param {string} referenceJudgeProvider
+ * @param {(request: object) => Promise<object>} runner
+ */
+export async function fitJudgeScoreViaSidecar(rows, judgeProviderLevels, referenceJudgeProvider, runner) {
+  if (typeof runner !== "function") throw new Error("fitJudgeScoreViaSidecar: runner must be an injectable function(request) -> response");
+  const { X, coefficientNames } = buildJudgeScoreDesignMatrix(rows, judgeProviderLevels, referenceJudgeProvider);
+  const request = {
+    rung: "J0",
+    y: rows.map((r) => r.response),
+    X,
+    coefficientNames,
+    groups: rows.map((r) => r.run),
+  };
+
+  let raw;
+  try {
+    raw = await runner(request);
+  } catch (err) {
+    throw new SidecarUnavailableError(`sidecar runner threw for rung J0 (judge-score lane): ${err.message}`, err);
+  }
+
+  let resp;
+  try {
+    resp = validateSidecarResponse(raw, coefficientNames);
+  } catch (err) {
+    if (err instanceof SidecarSchemaError) {
+      throw new SidecarUnavailableError(`sidecar response for rung J0 (judge-score lane) failed schema validation: ${err.message}`, err);
+    }
+    throw err;
+  }
+
+  return { rung: "J0", ...resp };
+}
+
+/**
+ * J1: pure-Node OLS + CR2 cluster-robust SEs, clustered by `run` -- the
+ * judge-score lane's fallback when J0 (the sidecar MixedLM) fails its
+ * descent criteria. Structurally identical to fitR2() above (same CR2
+ * algebra, evals/analysis/linalg.mjs), just over the judge-score design and
+ * clustered by `run` instead of `briefId` -- kept as a separate function
+ * rather than a generalized shared one so the arm lane's R2 and the
+ * judge-score lane's J1 can never accidentally drift onto the same clustering
+ * column by a parameter-order mistake.
+ *
+ * @param {Array<{judgeProvider: string, sameProvider: boolean, run: string, response: number}>} rows
+ * @param {string[]} judgeProviderLevels
+ * @param {string} referenceJudgeProvider
+ * @returns {{rung: "J1", converged: boolean, coefficients: number[],
+ *   coefficientNames: string[], vcov: number[][], varianceComponents: object,
+ *   n: number, toolchain: object, method: "OLS+CR2", failureReason?: string}}
+ */
+export function fitJudgeScoreR1(rows, judgeProviderLevels, referenceJudgeProvider) {
+  const { X, coefficientNames } = buildJudgeScoreDesignMatrix(rows, judgeProviderLevels, referenceJudgeProvider);
+  const k = coefficientNames.length;
+  const n = rows.length;
+  const y = rows.map((r) => r.response);
+  const runIds = rows.map((r) => r.run);
+  const uniqueClusters = Array.from(new Set(runIds));
+
+  const df = uniqueClusters.length - 1;
+
+  const base = {
+    rung: "J1",
+    coefficientNames,
+    n,
+    df,
+    varianceComponents: {},
+    toolchain: { node: process.version, method: "OLS+CR2 (pure JS, evals/analysis/linalg.mjs), clustered by run" },
+    method: "OLS+CR2",
+  };
+
+  if (uniqueClusters.length <= k) {
+    return {
+      ...base,
+      converged: false,
+      coefficients: new Array(k).fill(NaN),
+      vcov: Array.from({ length: k }, () => new Array(k).fill(NaN)),
+      failureReason: `fewer clusters (${uniqueClusters.length}, run) than parameters (${k}) -- CR2 sandwich is not identified`,
+    };
+  }
+
+  let XtXinv, beta, residuals;
+  try {
+    const Xt = transpose(X);
+    const XtX = multiply(Xt, X);
+    XtXinv = invert(XtX);
+    const XtY = multiply(Xt, y.map((v) => [v]));
+    const betaCol = multiply(XtXinv, XtY);
+    beta = betaCol.map((row) => row[0]);
+    const fitted = multiply(X, betaCol).map((row) => row[0]);
+    residuals = y.map((v, i) => v - fitted[i]);
+  } catch (err) {
+    return {
+      ...base,
+      converged: false,
+      coefficients: new Array(k).fill(NaN),
+      vcov: Array.from({ length: k }, () => new Array(k).fill(NaN)),
+      failureReason: `design matrix is singular: ${err.message}`,
+    };
+  }
+
+  const meat = Array.from({ length: k }, () => new Array(k).fill(0));
+  try {
+    for (const cluster of uniqueClusters) {
+      const idx = [];
+      for (let i = 0; i < n; i++) if (runIds[i] === cluster) idx.push(i);
+      const m = idx.length;
+      const Xg = idx.map((i) => X[i]);
+      const eg = idx.map((i) => [residuals[i]]);
+
+      const Hg = multiply(multiply(Xg, XtXinv), transpose(Xg));
+      const IminusHg = Array.from({ length: m }, (_, i) => Array.from({ length: m }, (_, j) => (i === j ? 1 : 0) - Hg[i][j]));
+      const Ag = symmetricInverseSqrt(IminusHg);
+      const ug = multiply(Ag, eg);
+      const v = multiply(transpose(Xg), ug);
+      for (let a = 0; a < k; a++) {
+        for (let b = 0; b < k; b++) {
+          meat[a][b] += v[a][0] * v[b][0];
+        }
+      }
+    }
+  } catch (err) {
+    return {
+      ...base,
+      converged: false,
+      coefficients: beta,
+      vcov: Array.from({ length: k }, () => new Array(k).fill(NaN)),
+      failureReason: `CR2 sandwich computation failed: ${err.message}`,
+    };
+  }
+
+  const vcov = multiply(multiply(XtXinv, meat), XtXinv);
+
+  return { ...base, converged: true, coefficients: beta, vcov };
+}
+
+/**
+ * Run the judge-score lane's ladder: J0 (sidecar MixedLM, (1|run)) -> J1
+ * (Node CR2, clustered by run) -> not computed. Sidecar-unavailable is the
+ * same hard failure it is for the arm lane (SidecarUnavailableError,
+ * propagated uncaught -- never silently degrades to J1).
+ *
+ * @param {object} opts
+ *   @param {Array<{judgeProvider: string, sameProvider: boolean, run: string, response: number}>} opts.rows
+ *   @param {string[]} opts.judgeProviderLevels
+ *   @param {string} opts.referenceJudgeProvider
+ *   @param {(request: object) => Promise<object>} opts.runner
+ * @returns {Promise<{rung: "J0"|"J1"|"J2", fit: object|null, history: Array<object>}>}
+ */
+export async function runJudgeScoreLadder(opts) {
+  const { rows, judgeProviderLevels, referenceJudgeProvider, runner } = opts;
+  const history = [];
+
+  const j0 = await fitJudgeScoreViaSidecar(rows, judgeProviderLevels, referenceJudgeProvider, runner);
+  const j0Descent = needsDescent(j0);
+  history.push({ rung: "J0", descended: j0Descent.descend, reason: j0Descent.reason });
+
+  if (!j0Descent.descend) {
+    return { rung: "J0", fit: j0, history };
+  }
+
+  const j1 = fitJudgeScoreR1(rows, judgeProviderLevels, referenceJudgeProvider);
+  const j1Descent = needsDescent(j1);
+  history.push({ rung: "J1", descended: j1Descent.descend, reason: j1Descent.reason || j1.failureReason });
+
+  if (!j1Descent.descend) {
+    return { rung: "J1", fit: j1, history };
+  }
+
+  return { rung: "J2", fit: null, history };
 }
 
 // ── The ladder orchestrator ─────────────────────────────────────────────────
