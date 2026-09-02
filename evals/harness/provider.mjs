@@ -181,12 +181,7 @@ export function classifyPoolFailure(diagnostics = [], { providerName = "provider
 
   let kind;
   let cause;
-  if (replies === 0) {
-    // No reply was ever recorded -- the model was never successfully reached.
-    // Nothing here is more specific than the caller's own transport signals.
-    kind = "empty_pool";
-    cause = "no_replies";
-  } else if (refused === replies || (allRefused && refused > 0)) {
+  if (replies > 0 && refused === replies) {
     kind = "refusal";
     cause = "refusal";
   } else if (truncated > 0) {
@@ -196,8 +191,17 @@ export function classifyPoolFailure(diagnostics = [], { providerName = "provider
     kind = "parse_failure";
     cause = "unparseable_complete";
   } else if (allRefused) {
+    // ideate-core's own "every agent failed" signal. Checked AFTER the
+    // reply-level causes (which are strictly more specific and more
+    // actionable) but BEFORE the empty_pool fallbacks, which preserves the
+    // pre-#93 behaviour: agentsFailed === agentsAttempted classified refusal.
     kind = "refusal";
     cause = "agents_all_failed";
+  } else if (replies === 0) {
+    // No reply was ever recorded -- the model was never successfully reached.
+    // Nothing here is more specific than the caller's own transport signals.
+    kind = "empty_pool";
+    cause = "no_replies";
   } else {
     // Every reply parsed and every reply was legitimately empty -- the model
     // really did return nothing usable. THIS is what `empty_pool` was always
@@ -1041,8 +1045,8 @@ export class OpenAIBatchProvider {
   }
 
   // ── single mode: POST /v1/chat/completions directly ──────────────────────
-  async #completeSingle(req, { addUsage, classification }) {
-    const params = buildOpenAIChatParams(req);
+  async #completeSingle(req, { addUsage, classification, diagnostics, cellMaxTokens }) {
+    const params = buildOpenAIChatParams(withCellMaxTokens(req, cellMaxTokens));
     const { ok, status, json, error } = await openaiFetchWithRetry(
       this.fetchImpl,
       "https://api.openai.com/v1/chat/completions",
