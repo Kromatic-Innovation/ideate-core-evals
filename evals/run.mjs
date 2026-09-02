@@ -152,6 +152,64 @@ export function parseArgs(argv) {
 // the real `results/` directory, so main()'s actual call site can be
 // asserted against directly. Both default to the real implementations, so a
 // genuine CLI invocation (`main()`, no args) is unchanged.
+/**
+ * Render `runSpec()`'s summary as operator-facing lines: this-invocation
+ * actual spend per provider, cumulative spend-to-date per provider, the
+ * cumulative grand total (`--max-spend`'s own basis -- provider spend PLUS
+ * non-provider/embedder spend, see runner.mjs's summary-assembly comment and
+ * docs/PREREGISTRATION.md §12 for why), and an explicit non-provider
+ * (embedder) line so that spend is named, not merely folded into a total
+ * silently. This is the ONLY place any of this reaches the terminal (PR #72
+ * review, HIGH): before this, `summary.*` was computed by runSpec() and then
+ * discarded -- `await runSpecFn(spec, runSpecOpts);` never captured the
+ * result -- so under the study's REGISTERED configuration
+ * (`--max-spend-anthropic 300 --max-spend-openai 150`, no global
+ * `--max-spend`) an operator watching a real invocation saw NO spend figure
+ * at all; the only log line (`runner.mjs`'s `[max-spend]`) is gated on the
+ * global ceiling being set, which this study's config never does.
+ *
+ * `summary.cumulativeSpendByProvider` etc. are `null` when no
+ * `--max-spend`/`--max-spend-<provider>` was passed this invocation (see
+ * runner.mjs's `priorSpend`) -- printed as an explicit "not computed" line,
+ * never a fabricated $0, matching the same non-negotiable this repo applies
+ * everywhere else a number could be silently wrong instead of loudly absent.
+ *
+ * @param {object} summary  runSpec()'s returned `summary` (absent on a
+ *   `--dry-run` invocation, which returns `{ dryRun }` instead -- callers
+ *   should not call this function for that case)
+ * @returns {string[]} lines, one per `console.log`/`log()` call
+ */
+export function formatSpendSummary(summary) {
+  if (!summary) return [];
+  const lines = [];
+  const fmt = (usd) => `$${Number(usd).toFixed(4)}`;
+  const byProviderLine = (label, obj) => {
+    const entries = Object.entries(obj || {});
+    if (entries.length === 0) return `${label}: (none)`;
+    return `${label}: ` + entries.map(([provider, usd]) => `${provider}=${fmt(usd)}`).join(", ");
+  };
+
+  lines.push("[spend] --- this invocation (actual) ---");
+  lines.push(byProviderLine("[spend] by provider", summary.spendByProvider));
+
+  // `== null` (loose) rather than `=== null` on purpose: runner.mjs's real
+  // summary sets this to `null` explicitly when no ceiling was active, but
+  // a bare/spy summary (e.g. run.test.mjs's spyRunSpec, which returns `{}`)
+  // leaves it `undefined` -- both mean the same thing here ("nothing to
+  // show"), and this function must not crash on either.
+  if (summary.cumulativeSpendByProvider == null) {
+    lines.push("[spend] --- cumulative (study-to-date) --- NOT COMPUTED");
+    lines.push("[spend] no --max-spend/--max-spend-<provider> was requested this invocation, so the store's full cost history was not read. Pass a ceiling flag to see cumulative spend, or query spendToDate(store) directly.");
+  } else {
+    lines.push("[spend] --- cumulative (study-to-date, across every prior invocation and configHash) ---");
+    lines.push(byProviderLine("[spend] by provider", summary.cumulativeSpendByProvider));
+    const nonProviderModels = summary.cumulativeNonProviderModels || [];
+    lines.push(`[spend] excluded (non-provider, e.g. embedder): ${fmt(summary.cumulativeNonProviderSpendUsd)}` + (nonProviderModels.length ? ` (${nonProviderModels.join(", ")})` : ""));
+    lines.push(`[spend] TOTAL (matches --max-spend's own basis: provider + non-provider): ${fmt(summary.cumulativeSpendUsd)}`);
+  }
+  return lines;
+}
+
 // Phase 0 (docs/PREREGISTRATION.md §8.3, issue #48): negative controls + DAT
 // replication against the live Voyage embedder. Pure formatter for
 // runPhase0()'s summary, separated from console.log the same way the
@@ -210,6 +268,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const {
     runSpecFn = runSpec,
     store: injectedStore,
+    // log (issue #64 follow-up, PR #72 review): injectable so tests can
+    // capture the end-of-run spend summary without polluting test output --
+    // defaults to console.log so a genuine CLI invocation is unchanged.
+    log = (msg) => console.log(msg),
     // getEngineVersion is injectable (issue #62 CI break): the real
     // implementation does `require.resolve("ideate-core")`, a genuine
     // dependency lookup that only succeeds when node_modules exists. CI runs
@@ -283,6 +345,18 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const { lines, allPassed } = formatPhase0Report(summary);
     for (const line of lines) console.log(line);
     if (!allPassed) process.exitCode = 1;
+    // INTENTIONAL early return (merge of #69/Phase 0 and #64's cumulative-
+    // spend follow-up, PR #72 review): Phase 0 never calls runSpec() -- it
+    // runs no arms/briefs cells at all (three fixed embedding-only
+    // controls, per the ignoredFlags rejection above, which already refuses
+    // --max-spend/--max-spend-<provider> for this phase) -- so there is no
+    // `summary` for `formatSpendSummary()` below to render. Returning here,
+    // before that code is ever reached, keeps it that way explicitly rather
+    // than as an accident of where this branch happens to sit in the
+    // function. A spend block after `formatPhase0Report`'s own report would
+    // be either empty (confusing -- "which run does this belong to?") or,
+    // if `store` already holds prior generation spend, present but
+    // unrelated to what --phase 0 just did -- misleading either way.
     return;
   }
   if (args.phase !== undefined) {
@@ -410,8 +484,17 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     armIds: args.arms,
     briefIds: args.briefs,
     replicates: args.replicates,
+    log, // same injectable log this function's own end-of-run summary uses
   };
-  await runSpecFn(spec, runSpecOpts);
+  const result = await runSpecFn(spec, runSpecOpts);
+  // Print the spend summary (issue #64 follow-up, PR #72 review, HIGH) --
+  // the ONLY place any of runSpec()'s spend accounting reaches the operator.
+  // `result.summary` is absent on --dry-run (runSpec returns `{ dryRun }`
+  // instead, and --dry-run already prints its own projection via `log` --
+  // see runner.mjs's dry-run branch), so formatSpendSummary's own
+  // `if (!summary) return []` guard makes this a no-op there.
+  for (const line of formatSpendSummary(result && result.summary)) log(line);
+  return result;
 }
 
 // Only auto-run when this file is the actual entry point (`node evals/run.mjs

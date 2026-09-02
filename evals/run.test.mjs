@@ -9,7 +9,7 @@
 // every cell through unthrottled instead of erroring).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, main, formatPhase0Report } from "./run.mjs";
+import { parseArgs, main, formatSpendSummary, formatPhase0Report } from "./run.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
@@ -33,6 +33,18 @@ function spyRunSpec() {
   const fn = async (spec, opts) => {
     calls.push({ spec, opts });
     return { summary: {}, account: { states: new Map() } };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+/** Like spyRunSpec, but returns a caller-supplied `summary` -- for testing
+ *  what main() does with runSpec's result, not just what it passes in. */
+function spyRunSpecWithSummary(summary) {
+  const calls = [];
+  const fn = async (spec, opts) => {
+    calls.push({ spec, opts });
+    return { summary, account: { states: new Map() } };
   };
   fn.calls = calls;
   return fn;
@@ -142,6 +154,57 @@ test("main() forwards --max-spend as maxSpendUsd and --arms/--briefs/--replicate
   assert.equal(opts.store, FAKE_STORE, "the injected store reaches runSpec unchanged");
 });
 
+// ── issue #64 follow-up (PR #72 review, HIGH): main() must actually PRINT the
+// spend summary -- before this, `await runSpecFn(spec, runSpecOpts);` never
+// captured or used its result, so `grep 'summary\.' evals/run.mjs` returned
+// nothing and an operator running the study's REGISTERED configuration
+// (--max-spend-anthropic 300 --max-spend-openai 150, no global --max-spend)
+// saw no spend figure at all. ──
+
+test("main() prints an end-of-run spend summary via the injected log -- the ONLY place summary.* reaches the operator", async () => {
+  // A realistic (non-dry-run-shaped) summary -- the spy stands in for
+  // runSpec regardless of the --dry-run flag below (which is passed only to
+  // skip main()'s ANTHROPIC_API_KEY/provider-construction requirement in
+  // this hermetic test), so it is deliberately given the shape a REAL run
+  // with an active per-provider ceiling would produce.
+  const summary = {
+    spendByProvider: { anthropic: 0.5 },
+    cumulativeSpendByProvider: { anthropic: 1.5 },
+    cumulativeSpendUsd: 1.75,
+    cumulativeNonProviderSpendUsd: 0.25,
+    cumulativeNonProviderModels: ["voyage-4-lite"],
+  };
+  const runSpecFn = spyRunSpecWithSummary(summary);
+  const lines = [];
+  await main(["--dry-run", "--max-spend-anthropic", "300"], {
+    runSpecFn,
+    store: FAKE_STORE,
+    getEngineVersion: STUB_ENGINE_VERSION,
+    log: (msg) => lines.push(msg),
+  });
+
+  const joined = lines.join("\n");
+  assert.match(joined, /anthropic=\$0\.5000/, "this-invocation actual spend is printed");
+  assert.match(joined, /anthropic=\$1\.5000/, "cumulative per-provider spend is printed");
+  assert.match(joined, /excluded \(non-provider, e\.g\. embedder\): \$0\.2500 \(voyage-4-lite\)/, "the excluded non-provider (embedder) spend is printed BY NAME, not silently folded away");
+  assert.match(joined, /TOTAL.*\$1\.7500/, "the cumulative grand total is printed");
+});
+
+test("main() prints an explicit 'NOT COMPUTED' line for cumulative spend, never a fabricated $0, when no ceiling was requested this invocation", async () => {
+  const runSpecFn = spyRunSpec(); // returns { summary: {} } -- no ceiling, so cumulative fields are absent, matching the real null case
+  const lines = [];
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION, log: (msg) => lines.push(msg) });
+
+  const joined = lines.join("\n");
+  assert.match(joined, /NOT COMPUTED/);
+  assert.doesNotMatch(joined, /TOTAL/, "no fabricated grand total when cumulative spend was never computed");
+});
+
+test("formatSpendSummary returns no lines for a dry-run result (no summary at all)", () => {
+  assert.deepEqual(formatSpendSummary(undefined), []);
+  assert.deepEqual(formatSpendSummary(null), []);
+});
+
 // ── --phase 0 wiring (issue #48) ────────────────────────────────────────────
 // The actual controls logic lives in evals/metrics/phase0.mjs and is tested
 // there (phase0.test.mjs); these tests exercise main()'s WIRING of it --
@@ -222,6 +285,32 @@ test("main() --phase 0 forwards apiKey/store to runPhase0Fn and does not touch t
     assert.equal(runPhase0Fn.calls[0].apiKey, "test-key-123");
     assert.equal(runPhase0Fn.calls[0].store, FAKE_STORE);
     assert.notEqual(process.exitCode, 1, "a passing Phase 0 must not set a failing exit code");
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("main() --phase 0 prints NO spend summary via the injected log -- it never calls runSpec, so there is no summary to render (merge of #64/PR #72 and #69/Phase 0)", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key-123";
+  const priorExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    const runSpecFn = spyRunSpec(); // must NEVER be called for --phase 0
+    const lines = [];
+    await main(["--phase", "0"], {
+      runPhase0Fn,
+      runSpecFn,
+      store: FAKE_STORE,
+      getEngineVersion: STUB_ENGINE_VERSION,
+      log: (msg) => lines.push(msg),
+    });
+
+    assert.equal(runSpecFn.calls.length, 0, "--phase 0 must never call runSpec -- it has no arms/briefs grid");
+    assert.deepEqual(lines, [], "formatSpendSummary's [spend] lines must never appear for --phase 0 -- it has no runSpec summary to render, only formatPhase0Report's own (console.log-only) report");
   } finally {
     if (prior === undefined) delete process.env.VOYAGE_API_KEY;
     else process.env.VOYAGE_API_KEY = prior;

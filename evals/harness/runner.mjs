@@ -47,7 +47,11 @@ import { assertValidProviderResponse } from "./provider.mjs";
 // their own (they take one as a parameter), so importing them does not couple
 // this module to lib/price.mjs's RATE_TABLE the way importing runnerPriceGrid
 // itself would.
-import { providerOf, priceRowByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
+// priceRows/priceRowsByProvider (issue #64, cumulative spend ceilings): the
+// same read-time pricer the ledger already uses for a report, now used to
+// reconstruct spend-to-date from the store's own cost rows before this
+// invocation's admission control runs -- see `spendToDate` below.
+import { providerOf, priceRowByProvider, priceRows, priceRowsByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
 
 // ── Interim pricing estimator -- INTERIM, superseded by lib/price.mjs in #7 ──
 // A minimal per-model token-estimate table so --max-spend/--dry-run have
@@ -204,6 +208,111 @@ function subsetSpec(spec, { arms, briefs, replicates } = {}) {
 }
 
 /**
+ * Reconstruct cumulative spend-to-date from the store's own cost rows --
+ * the DURABLE record -- rather than from any in-memory counter, which is
+ * exactly what dies with the process and is the bug issue #64 exists to fix
+ * ("a resumed run restarts its budget at zero"). Walks every stored cell's
+ * `costRows` and prices them at READ time via `lib/price.mjs` (`priceRows`/
+ * `priceRowsByProvider`) -- never a stored dollar figure; `store.put()`
+ * already refuses one (cron-fleet#75), and this function is the reader that
+ * honors that contract on the way back out.
+ *
+ * ── Scope: the WHOLE store, across every configHash (the AC's required,
+ * stated decision) ─────────────────────────────────────────────────────
+ * A configHash bump (harness version, prompt edit, ...) marks a cell as NOT
+ * COMPARABLE for analysis (lib/manifest.mjs's `stale` path) -- but it does
+ * not refund money already spent under the old config. The operator's
+ * ceiling is a cap on the study's real dollars, not a cap scoped to one
+ * config generation. Scoping this function to "only the current configHash"
+ * would let a harness bump silently reset the budget -- reproducing this
+ * exact issue's defect (spend resets on re-invocation) under a different
+ * trigger (spend resets on config change) instead of closing it. So this
+ * sums cost rows across the ENTIRE store, regardless of each record's `cfg`.
+ *
+ * ── What this measures, given issue #68 and the resume blind spot ───────
+ * This sums whatever cost rows the store actually holds -- nothing more,
+ * nothing less. Today that is GENERATION spend only: `runJudgeMatrix`/
+ * `runJudgeValidation` (evals/judge/*.mjs) have no caller on this
+ * `runSpec()` path (issue #68), so no judge cost row is ever written here.
+ * That is not this function under-reporting judge spend -- there is no
+ * judge spend recorded anywhere to report, because none has been billed
+ * through this path yet. Once #68 wires judging in and its cost rows start
+ * landing via `store.put()`, this function picks them up with zero changes,
+ * because it prices the ledger, never a projection.
+ *
+ * It also does NOT compensate for the separate, still-open resume blind
+ * spot: `runnerPriceGrid`'s judge-cost PROJECTION only estimates judging for
+ * `plan.todo` cells, so a cell reused this session (already generated in an
+ * earlier session, not yet judged) contributes no judging estimate either --
+ * neither here (nothing recorded) nor in the pre-flight projection (not
+ * `todo`). A cumulative ceiling built on top of both stays exposed to that
+ * gap; it is not fixed by this function and is not silently assumed away.
+ *
+ * @param {object} store       a lib/store.mjs ResultsStore
+ * @param {object} [rateTable=DEFAULT_RATE_TABLE]  pinned, dated rate table
+ * @param {{batch?: boolean}} [opts]  batch discount to apply when re-pricing
+ *   (matches the `batch` flag `runSpec()`/`runnerPriceGrid` price the plan
+ *   under -- this study is batch-first by default, see the module header)
+ * @returns {{ totalUsd: number, byProvider: Object<string, number>,
+ *   hasMissingRate: boolean, missingRateModels: string[],
+ *   excludedNonProviderUsd: number, excludedNonProviderModels: string[] }}
+ *   `totalUsd` includes excluded non-provider spend (e.g. the embedder);
+ *   `byProvider` never does -- see the excludedNonProviderUsd/Models fields
+ *   for that money, tracked separately rather than silently dropped.
+ */
+export function spendToDate(store, rateTable = DEFAULT_RATE_TABLE, { batch = true } = {}) {
+  if (!store) throw new Error("spendToDate: store is required");
+  // COST NOTE (PR #72 review): this reads and JSON-parses EVERY stored
+  // body -- store.get() is the only method that touches bodies/ (see
+  // lib/store.mjs's own header), and index.jsonl carries no per-cell cost
+  // rows of its own, so there is no cheaper path to "every cost row in the
+  // store" than this. On a large grid (hundreds of cells, each body
+  // potentially carrying a full provider reply) this is real work -- see
+  // runSpec()'s own comment at the call site for why it is now paid ONLY
+  // when a ceiling is actually requested, never on every invocation.
+  const allCostRows = [];
+  for (const entry of store.list()) {
+    let body;
+    try {
+      body = store.get(entry.key);
+    } catch (err) {
+      // A truncated/missing body (readFileSync/JSON.parse have no tolerance
+      // -- see lib/store.mjs) must not surface as a bare SyntaxError/ENOENT
+      // three stack frames from here. Name the offending key so whoever
+      // hits this has something to act on -- inspect or repair
+      // <store.dir>/bodies/, or accept the loss and manually strip the
+      // index.jsonl line for this key if the body is genuinely gone.
+      throw new Error(
+        `spendToDate: could not read the stored body for key '${entry.key}' (bodyFile '${entry.bodyFile}') -- ` +
+          `a spend ceiling cannot be enforced against a ledger entry it cannot read. Original error: ${err && err.message}. ` +
+          `Inspect '${store.bodiesDir}' for a truncated or missing file, or repair/remove the corresponding line in '${store.indexPath}' if the record is unrecoverable.`,
+      );
+    }
+    if (Array.isArray(body.costRows)) allCostRows.push(...body.costRows);
+  }
+  const totals = priceRows(allCostRows, rateTable, { batch });
+  const byProviderTotals = priceRowsByProvider(allCostRows, rateTable, { batch });
+  return {
+    totalUsd: totals.totalUsd,
+    byProvider: byProviderTotals.byProvider,
+    hasMissingRate: totals.hasMissingRate || byProviderTotals.hasMissingRate,
+    missingRateModels: [...new Set([...totals.missingRateModels, ...byProviderTotals.missingRateModels])],
+    // excludedNonProviderUsd/Models (issue #64 follow-up, cwc PR #72 review):
+    // KNOWN non-provider spend (currently just the embedder, `voyage-*` --
+    // Phase 0/#69 writes real `voyage-4-lite` cost rows to this SAME store)
+    // -- priced and counted in `totalUsd` above (priceRows() prices every
+    // row regardless of provider), but deliberately excluded from
+    // `byProvider`, so a per-provider ceiling is never gated by spend that
+    // isn't Anthropic or OpenAI spend, and `lib/price.mjs`'s `providerOf`
+    // is never asked to classify a model it correctly has no provider
+    // bucket for. Surfaced here -- not silently dropped -- so a caller can
+    // see embedder spend is tracked, just outside the provider ceilings.
+    excludedNonProviderUsd: byProviderTotals.excludedNonProviderUsd,
+    excludedNonProviderModels: byProviderTotals.excludedNonProviderModels,
+  };
+}
+
+/**
  * Plan a spec against the store (the shared first half of dry-run and a real
  * run) and price the `todo` set. Pulled out of runSpec() so --dry-run and the
  * real run price identically -- no drift between "what dry-run predicted" and
@@ -236,19 +345,26 @@ export function planAndPrice(spec, { store, armsConfig, priceGrid = interimPrice
  *     `batch: false`, never opt-in.
  *   @param {boolean} [opts.dryRun]      if true: prints the plan and returns
  *     WITHOUT touching the store or the provider. No side effects at all.
- *   @param {number}  [opts.maxSpendUsd] pre-flight ceiling; if the priced
- *     projection exceeds it, the run refuses to start (see below for the
- *     precise semantics -- this is a per-cell admission control, not just an
- *     abort switch, so a run can still make partial progress under a cap).
+ *   @param {number}  [opts.maxSpendUsd] pre-flight ceiling; if CUMULATIVE
+ *     spend-to-date (issue #64, reconstructed from the store's own cost rows
+ *     across every prior invocation and every configHash -- see
+ *     `spendToDate`) plus the priced projection exceeds it, the run refuses
+ *     to start (see below for the precise semantics -- this is a per-cell
+ *     admission control, not just an abort switch, so a run can still make
+ *     partial progress under a cap). A resumed run's ceiling therefore gates
+ *     the STUDY's total spend, not just this invocation's -- re-invoking the
+ *     runner N times no longer permits N x the stated cap.
  *   @param {Object<string,number>} [opts.maxSpendByProviderUsd] per-provider
  *     ceilings (issue #51), e.g. `{ anthropic: 300, openai: 150 }` -- keyed by
- *     `lib/price.mjs`'s `providerOf()` output. Same fail-closed, per-cell
- *     admission-control semantics as `maxSpendUsd`, evaluated independently
- *     PER PROVIDER: a cell is skipped once THAT cell's provider(s) would push
- *     their own running total over THEIR ceiling, even if other providers (or
- *     the global `maxSpendUsd`) still have headroom. A cross-provider cell
- *     (arm G) is checked against every provider it actually spends under, not
- *     just one. The skip detail names the specific provider that tripped
+ *     `lib/price.mjs`'s `providerOf()` output. Same fail-closed, per-cell,
+ *     CUMULATIVE admission-control semantics as `maxSpendUsd`, evaluated
+ *     independently PER PROVIDER: a cell is skipped once THAT cell's
+ *     provider(s) would push their own cumulative total (spend-to-date +
+ *     this invocation's real spend so far + this cell's projected share)
+ *     over THEIR ceiling, even if other providers (or the global
+ *     `maxSpendUsd`) still have headroom. A cross-provider cell (arm G) is
+ *     checked against every provider it actually spends under, not just
+ *     one. The skip detail names the specific provider that tripped
  *     (`budget_exceeded:<provider>`), distinct from the unqualified
  *     `"budget_exceeded"` the global ceiling records.
  *   @param {object} [opts.rateTable] the pinned, dated rate table used to
@@ -301,20 +417,59 @@ export async function runSpec(spec, opts) {
     return { dryRun: { plan, projection } };
   }
 
+  // ── Cumulative spend-to-date (issue #64): reconstructed from the store's
+  // own cost rows -- the durable record -- BEFORE any admission decision is
+  // made, so a ceiling is enforced against "everything this study has ever
+  // actually spent", not against an in-memory counter that resets to zero
+  // every time this function is called. See `spendToDate`'s own header for
+  // the full rationale, including why it sums across every configHash and
+  // what it does and does not measure given issues #68 and the resume
+  // judging blind spot.
+  //
+  // Computed ONLY when a ceiling is actually active (PR #72 review, MEDIUM):
+  // `spendToDate` reads and JSON-parses EVERY stored body (see that
+  // function's own cost note) -- on a real grid that is real work, and
+  // `store.get()` has no tolerance for a truncated/missing body file
+  // (readFileSync + JSON.parse, no try/catch of its own -- see
+  // lib/store.mjs). Computing this unconditionally would make EVERY
+  // invocation -- including one with no --max-spend/--max-spend-<provider>
+  // at all -- pay that cost and inherit that fragility for a number nothing
+  // is gating against. A run with no ceiling has nothing to enforce
+  // cumulative spend against, so it neither reads the full store history
+  // nor can be broken by damage to a body a plain generation run would
+  // never otherwise touch. The tradeoff: `summary.cumulativeSpendByProvider`/
+  // `cumulativeSpendUsd`/`cumulativeNonProviderSpendUsd`/
+  // `cumulativeNonProviderModels` below are `null` -- NOT `{}`/`0`, which
+  // would read as "checked, and it's zero" -- whenever no ceiling was
+  // requested this invocation. Call `spendToDate(store)` directly to get
+  // those figures on demand outside a ceiling-gated run.
+  const anyCeilingActive = maxSpendUsd !== undefined || !!maxSpendByProviderUsd;
+  const priorSpend = anyCeilingActive ? spendToDate(store, rateTable, { batch }) : null;
+  if (priorSpend && priorSpend.hasMissingRate) {
+    throw new Error(
+      `runSpec: cumulative spend-to-date cannot be priced -- the store already holds cost row(s) for model(s) with no RATE_TABLE entry ` +
+        `(${priorSpend.missingRateModels.join(", ")}) -- a spend ceiling cannot be enforced against a ledger it cannot fully price. ` +
+        `Add the missing model(s) to lib/price.mjs's RATE_TABLE.`,
+    );
+  }
+
   // ── --max-spend: pre-flight prices the planned grid and REFUSES TO START
-  // if the projection exceeds the ceiling. "Refuses to start" here means: no
-  // cell in the over-budget run is ever sent to the provider. We still want
-  // every planned cell accounted for (the non-negotiable), so cells are
-  // walked in order and skipped via RunAccount as soon as the running total
-  // would exceed the cap -- rather than aborting the process outright, which
-  // would leave earlier todo cells un-accounted. If maxSpendUsd is set below
-  // the FULL projection, the whole grid is skipped (running total starts at
-  // 0 and the very first cell already exceeds it if the ceiling is $0 or
-  // negative-effectively; a ceiling below the full total but above some
-  // prefix runs that prefix and skips the rest -- see the per-cell loop).
-  const overBudget = maxSpendUsd !== undefined && projection.usd > maxSpendUsd;
+  // if spend-to-date PLUS the projection exceeds the ceiling. "Refuses to
+  // start" here means: no cell in the over-budget run is ever sent to the
+  // provider. We still want every planned cell accounted for (the
+  // non-negotiable), so cells are walked in order and skipped via RunAccount
+  // as soon as the running total (spend-to-date + this session's real spend
+  // so far) would exceed the cap -- rather than aborting the process
+  // outright, which would leave earlier todo cells un-accounted. If
+  // spend-to-date alone already meets or exceeds the ceiling, the whole
+  // grid is skipped immediately (see the per-cell loop, which folds
+  // `priorSpend.totalUsd` into every comparison).
+  const overBudget = maxSpendUsd !== undefined && priorSpend.totalUsd + projection.usd > maxSpendUsd;
   if (maxSpendUsd !== undefined) {
-    log(`[max-spend] ceiling=$${maxSpendUsd} projected=$${projection.usd.toFixed(4)} ${overBudget ? "(over budget -- admission-controlling cells)" : "(within budget)"}`);
+    log(
+      `[max-spend] ceiling=$${maxSpendUsd} spent-to-date=$${priorSpend.totalUsd.toFixed(4)} projected=$${projection.usd.toFixed(4)} ` +
+        `${overBudget ? "(over budget -- admission-controlling cells)" : "(within budget)"}`,
+    );
   }
 
   // ── --max-spend-<provider>: the SAME fail-closed pre-flight, priced PER
@@ -341,10 +496,11 @@ export async function runSpec(spec, opts) {
       }
     }
     for (const [provider, ceiling] of Object.entries(maxSpendByProviderUsd)) {
+      const spentToDate = priorSpend.byProvider[provider] || 0;
       const projected = projectedByProvider[provider] || 0;
-      const providerOverBudget = projected > ceiling;
+      const providerOverBudget = spentToDate + projected > ceiling;
       log(
-        `[max-spend-${provider}] ceiling=$${ceiling} projected=$${projected.toFixed(4)} ` +
+        `[max-spend-${provider}] ceiling=$${ceiling} spent-to-date=$${spentToDate.toFixed(4)} projected=$${projected.toFixed(4)} ` +
           `${providerOverBudget ? `(over budget -- refusing to start ${provider} cells beyond the ceiling)` : "(within budget)"}`,
       );
     }
@@ -405,15 +561,28 @@ export async function runSpec(spec, opts) {
   // the pre-flight block above) -- used to decide, BEFORE a cell runs,
   // whether admitting it would cross a provider's ceiling.
   const providerByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.byProvider || {}]));
-  let runningTotal = 0;
-  // runningTotalByProvider: ACTUAL spend, tracked BETWEEN cells as they
-  // complete (issue #51 -- "not only in the pre-flight") -- seeded at 0 and
+  // runningTotal / runningTotalByProvider: ACTUAL spend from cells that
+  // complete/fail DURING THIS INVOCATION, tracked between cells as they
+  // finish (issue #51 -- "not only in the pre-flight") -- seeded at 0 and
   // updated below from each completed/failed cell's REAL `tokens_by_model`,
-  // never from the pre-run projection. A still-to-run cell's projected
-  // byProvider cost is added on TOP of this actual total only for the
-  // admission decision itself (below); the running total this variable holds
-  // is always what was actually spent so far.
+  // never from the pre-run projection. These deliberately stay
+  // THIS-INVOCATION-ONLY (see `summary.spendByProvider` at the bottom of
+  // this function, whose meaning existing callers depend on); every
+  // admission decision below adds `priorSpend`/`priorSpend.byProvider` -- the
+  // cumulative total reconstructed from the store BEFORE this invocation
+  // started (issue #64) -- on top of these, so the CEILING is enforced
+  // cumulatively even though these two counters are not.
+  let runningTotal = 0;
   const runningTotalByProvider = {};
+  // runningNonProviderTotal: ACTUAL this-invocation spend on a KNOWN
+  // non-provider model (issue #64 follow-up -- currently only reachable if a
+  // future cell's response ever carries embedder tokens through THIS loop,
+  // which is not how Phase 0/#69 records embedder spend today; kept for
+  // symmetry with runningTotalByProvider and so this total is never silently
+  // dropped if that ever changes). Mirrors `priceRowByProvider`'s
+  // `excludedNonProviderUsd` -- never folded into `runningTotalByProvider`,
+  // never thrown on.
+  let runningNonProviderTotal = 0;
 
   // Fold one cell's cost rows (real `tokens_by_model`, priced at read time
   // from `rateTable`) into `runningTotalByProvider`, grouped by provider --
@@ -438,7 +607,7 @@ export async function runSpec(spec, opts) {
   // priceRowByProvider's $0-and-continue default remains correct for it.
   function recordActualSpend(costRows) {
     for (const row of costRows) {
-      const { byProvider, hasMissingRate, missingRateModels } = priceRowByProvider(row, rateTable, { batch });
+      const { byProvider, hasMissingRate, missingRateModels, excludedNonProviderUsd } = priceRowByProvider(row, rateTable, { batch });
       if (maxSpendByProviderUsd && hasMissingRate) {
         throw new Error(
           `runSpec: cell '${row.cellKey || row.key}' recorded actual spend for model(s) with no RATE_TABLE entry ` +
@@ -449,6 +618,11 @@ export async function runSpec(spec, opts) {
       for (const [provider, usd] of Object.entries(byProvider)) {
         runningTotalByProvider[provider] = (runningTotalByProvider[provider] || 0) + usd;
       }
+      // A known non-provider model (e.g. the embedder) in a generation/judge
+      // cell's cost rows is NOT gated by any provider ceiling -- tracked here
+      // rather than silently dropped, never thrown on. See isNonProviderModel
+      // (lib/price.mjs) and spendToDate's own excludedNonProviderUsd.
+      runningNonProviderTotal += excludedNonProviderUsd;
     }
   }
 
@@ -485,7 +659,11 @@ export async function runSpec(spec, opts) {
       for (const [provider, projected] of Object.entries(cellByProvider)) {
         if (!(provider in maxSpendByProviderUsd) || !(projected > 0)) continue;
         const ceiling = maxSpendByProviderUsd[provider];
-        const already = runningTotalByProvider[provider] || 0;
+        // Cumulative (issue #64): spend-to-date reconstructed from the store
+        // BEFORE this invocation started, PLUS this invocation's real spend
+        // so far -- never just the latter, which is what let a resumed run
+        // restart its budget at zero.
+        const already = (priorSpend.byProvider[provider] || 0) + (runningTotalByProvider[provider] || 0);
         if (already + projected > ceiling) {
           trippedProvider = provider;
           break;
@@ -493,7 +671,7 @@ export async function runSpec(spec, opts) {
       }
     }
 
-    if (trippedProvider || (maxSpendUsd !== undefined && runningTotal + cellCost > maxSpendUsd)) {
+    if (trippedProvider || (maxSpendUsd !== undefined && priorSpend.totalUsd + runningTotal + cellCost > maxSpendUsd)) {
       // Budget-skipped: recorded via RunAccount as a classified skip, never
       // dropped from the plan (see reconcile()'s tally below and the AC's
       // own wording: "recorded skipped: budget_exceeded, never dropped").
@@ -584,21 +762,63 @@ export async function runSpec(spec, opts) {
   // derived from real tokens_by_model (issue #51) -- exposed on the summary
   // so a caller (report, next --max-spend-<provider> invocation) can see
   // what this session cost per provider, not just the pre-flight estimate.
-  //
-  // NOT cumulative across a resumed study (issue #62 MEDIUM):
-  // `runningTotalByProvider` is seeded at `{}` on every runSpec() call and
-  // never persisted or read back from the store -- a reused cell is
-  // acknowledged via account.complete()/account.fail() above but never
-  // repriced into it, and a budget-skipped cell is deliberately never
-  // written to the store at all (see the skip comment below), so it can
-  // never be repriced on a later invocation either. So `spendByProvider` on
-  // a fully-reused run is `{}` despite genuinely having cost money in an
-  // earlier session, and --max-spend-<provider> on a resumed run only ever
-  // gates THIS invocation's spend against the ceiling, not the study's
-  // cumulative spend across every invocation that has run so far. See
-  // docs/PREREGISTRATION.md §12 for the disclosed, not-fixed-here,
-  // implication.
+  // Deliberately kept THIS-INVOCATION-ONLY -- existing callers/tests read it
+  // that way (see runner.test.mjs's issue #62 BLOCKER 2 test, which asserts
+  // it against an independently-computed per-session expectation).
   summary.spendByProvider = runningTotalByProvider;
+  // cumulativeSpendByProvider / cumulativeSpendUsd / cumulativeNonProviderSpendUsd
+  // / cumulativeNonProviderModels (issue #64, revised per PR #72 review): the
+  // study's TOTAL spend to date -- every dollar the store's cost rows
+  // account for, across every configHash and every invocation that ever
+  // ran, PLUS this invocation's own actual spend -- reconstructed from
+  // durable data, not an in-memory counter. This is what a resumed run's
+  // ceiling is actually enforced against above (see `priorSpend` + the
+  // per-cell admission loop); these fields expose the same totals for a
+  // report or the next invocation, rather than making a caller re-derive
+  // them. See `spendToDate`'s own header comment for the full "what this
+  // measures given #68 and the resume blind spot" caveat -- it applies
+  // identically to these fields, since they are `priorSpend` plus this
+  // run's own real spend and nothing more.
+  //
+  // `null` when no ceiling was requested this invocation (`priorSpend` is
+  // `null` -- see its own comment above): the store's full history was
+  // deliberately never read, so there is nothing honest to report here.
+  // `null` here means "not computed", never "computed as zero" -- call
+  // `spendToDate(store)` directly for these figures outside a ceiling-gated
+  // run.
+  //
+  // BASIS (PR #72 review, HIGH -- previously two fields both called
+  // "cumulative spend" disagreed on whether non-provider/embedder spend
+  // counted): `--max-spend` has ALWAYS admission-controlled against
+  // `priorSpend.totalUsd` (see the per-cell loop above), which is
+  // `priceRows().totalUsd` -- ALL priced spend, embedder included, because
+  // a GLOBAL ceiling is a total-dollars backstop, not scoped to any one
+  // provider (this predates issue #64 and is unchanged here). So
+  // `cumulativeSpendUsd` below is defined to match that basis exactly:
+  // provider spend PLUS non-provider spend, the same total `--max-spend`
+  // gates on. `cumulativeSpendByProvider`/`cumulativeNonProviderSpendUsd`
+  // are its breakdown, on the SAME (provider-only vs. non-provider-only)
+  // split `--max-spend-<provider>` gates on -- so every reported figure now
+  // matches the admission control it corresponds to, and
+  // `cumulativeSpendUsd === sum(cumulativeSpendByProvider) + cumulativeNonProviderSpendUsd`
+  // always holds. See docs/PREREGISTRATION.md §12 for the same decision
+  // stated for an operator reading the CLI output, not the code.
+  if (priorSpend) {
+    const cumulativeSpendByProvider = { ...priorSpend.byProvider };
+    for (const [provider, usd] of Object.entries(runningTotalByProvider)) {
+      cumulativeSpendByProvider[provider] = (cumulativeSpendByProvider[provider] || 0) + usd;
+    }
+    const cumulativeNonProviderSpendUsd = priorSpend.excludedNonProviderUsd + runningNonProviderTotal;
+    summary.cumulativeSpendByProvider = cumulativeSpendByProvider;
+    summary.cumulativeNonProviderSpendUsd = cumulativeNonProviderSpendUsd;
+    summary.cumulativeNonProviderModels = [...new Set(priorSpend.excludedNonProviderModels)];
+    summary.cumulativeSpendUsd = Object.values(cumulativeSpendByProvider).reduce((a, b) => a + b, 0) + cumulativeNonProviderSpendUsd;
+  } else {
+    summary.cumulativeSpendByProvider = null;
+    summary.cumulativeNonProviderSpendUsd = null;
+    summary.cumulativeNonProviderModels = null;
+    summary.cumulativeSpendUsd = null;
+  }
   log(`[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
   return { summary, account };
 }
