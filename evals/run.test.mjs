@@ -15,6 +15,9 @@ import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
 import { AnthropicJudgeProvider, OpenAIJudgeProvider } from "./judge/score.mjs";
 import { AnthropicBatchProvider, DEFAULT_MAX_POLL_MS } from "./harness/provider.mjs";
+import { promptTemplateHash } from "./harness/prompts.mjs";
+import { configHash } from "../lib/manifest.mjs";
+import { createHash } from "node:crypto";
 import { CORPUS } from "./corpus/index.mjs";
 import armsConfigJson from "../arms.config.json" with { type: "json" };
 
@@ -123,6 +126,68 @@ test("main() wires --max-poll-minutes through to the real AnthropicBatchProvider
   const noFlag = spyRunSpec();
   await main(["--max-spend", "999"], { runSpecFn: noFlag, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
   assert.equal(noFlag.calls[0].opts.provider.maxPollMs, DEFAULT_MAX_POLL_MS, "an unset flag falls through to the provider's own default, not a second copy of the number in run.mjs");
+});
+
+// ── issue #99: promptHash is a real hash in the SPEC run.mjs builds ─────────
+//
+// evals/harness/reply-recovery.test.mjs already pins that promptTemplateHash()
+// itself reacts to a template edit. That is NOT the regression this guards:
+// the defect was a placeholder in run.mjs, so the test has to cover run.mjs's
+// own seam -- reading spec.config off a main() invocation. A test that only
+// re-checked prompts.mjs would stay green while run.mjs regressed.
+
+test("issue #99: main() sets spec.config.promptHash from promptTemplateHash(), never the literal 'unpinned'", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  const { spec } = runSpecFn.calls[0];
+  assert.notEqual(spec.config.promptHash, "unpinned", "a constant can never change, so a prompt edit would be invisible to the staleness machinery");
+  assert.equal(spec.config.promptHash, promptTemplateHash(), "and it must be THE generation-prompt hash, not some other stable-looking string");
+  assert.match(spec.config.promptHash, /^[0-9a-f]{12}$/);
+});
+
+test("issue #99: editing a generation prompt template moves the configHash of the spec run.mjs builds -- the actual regression guard", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  const { spec } = runSpecFn.calls[0];
+
+  // Recompute promptTemplateHash()'s documented payload with ONE template
+  // edited (an ESM export cannot be mutated in place), then feed that hash
+  // back through the config run.mjs actually built. If run.mjs ever reverts to
+  // a placeholder, spec.config.promptHash stops depending on the templates and
+  // these two hashes collapse to equal.
+  const prompts = await import("./harness/prompts.mjs");
+  const probe = {
+    context: { slug: "hash-probe", brief: "HASH PROBE BRIEF" },
+    persona: "hash_probe_persona",
+    stance: "HASH PROBE STANCE",
+    ideasPerAgent: 7,
+    seeds: [{ text: "hash probe seed" }],
+    buildOnDirective: "HASH PROBE DIRECTIVE",
+  };
+  const payload = {
+    round1: prompts.buildRound1Prompt(probe),
+    round2: prompts.buildRound2Prompt(probe),
+    round1Defaults: prompts.buildRound1Prompt(),
+    round2Defaults: prompts.buildRound2Prompt(),
+    tokensPerIdea: prompts.TOKENS_PER_IDEA,
+    maxTokensHeadroom: prompts.MAX_TOKENS_HEADROOM,
+    legacyMaxTokens: prompts.LEGACY_MAX_TOKENS,
+    salvageVersion: prompts.SALVAGE_VERSION,
+  };
+  const hashOf = (o) => createHash("sha256").update(JSON.stringify(o)).digest("hex").slice(0, 12);
+  assert.equal(hashOf(payload), spec.config.promptHash, "sanity: the spec's promptHash IS this payload's hash");
+
+  const editedTemplateHash = hashOf({ ...payload, round1: `${payload.round1}\nOne extra instruction line.` });
+  assert.notEqual(
+    configHash({ ...spec.config, promptHash: editedTemplateHash }),
+    configHash(spec.config),
+    "a one-line edit to a generation prompt must move configHash -- otherwise cells from before and after the edit share a cellKey and are pooled as comparable data",
+  );
+
+  // And the placeholder case, stated directly: pinning the hash is what makes
+  // the #8 smoke-study cells stale. That is the intended, priced consequence.
+  assert.notEqual(configHash({ ...spec.config, promptHash: "unpinned" }), configHash(spec.config));
 });
 
 test("--phase 0 REFUSES --max-poll-minutes rather than silently dropping it (issue #92)", async () => {

@@ -35,6 +35,7 @@ import { ResultsStore } from "../lib/store.mjs";
 import { runSpec } from "./harness/runner.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
+import { promptTemplateHash } from "./harness/prompts.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
 import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD } from "./metrics/voyage-calibration.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
@@ -451,7 +452,22 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     config: {
       harnessVersion: "0.0.1",
       engineSha,
-      promptHash: "unpinned",
+      // promptHash (issue #99): the REAL generation-prompt hash, not the
+      // literal "unpinned" this used to carry. A constant is a CONFIG_FIELDS
+      // entry that can never change, so a prompt edit was invisible to the
+      // staleness machinery built to catch exactly that -- #93 changed the
+      // generation prompts' token budget and added salvage, and cells from
+      // before and after that change hashed identically and would have been
+      // pooled as comparable data. promptTemplateHash() (evals/harness/prompts.mjs,
+      // sha256/12, mirroring judgePromptHash) covers both templates RENDERED,
+      // the token-sizing constants, and SALVAGE_VERSION.
+      //
+      // This moves configHash, and therefore every arm's cellKey, marking the
+      // whole #8 smoke-study dataset `stale`. That is correct and intended:
+      // #8's results are discarded from confirmatory analysis by construction,
+      // and absorbing the invalidation now costs a $3.32 smoke run rather than
+      // Phase 2's grid.
+      promptHash: promptTemplateHash(),
       embedderId,
       corpusHash: CORPUS_HASH,
     },
