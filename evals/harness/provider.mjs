@@ -387,6 +387,205 @@ export function classifyPoolFailure(diagnostics = [], { providerName = "provider
   return { kind, cause, detail };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE UNDERSIZED-POOL RULE (issue #102)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── The rule ────────────────────────────────────────────────────────────────
+// A cell whose pool was assembled from FEWER agents than its arm specifies does
+// not complete. It fails, with the most specific kind the evidence supports.
+// There is no threshold and no "complete but flagged" middle ground.
+//
+// ── Why, in one line ────────────────────────────────────────────────────────
+// #92 already established this exact rule one door over: a pool missing a whole
+// ROUND (round 1 returned, round 2 blew the poll ceiling) fails `timeout` rather
+// than storing a truncated pool, "because storing it would silently under-report
+// this cell's pool size." A pool missing three of five AGENTS in every round is
+// the same defect arriving through a different trigger. Completing it while
+// failing the other would be an inconsistency in what a `completed` cell means,
+// not a considered policy.
+//
+// ── Why not a completeness threshold ────────────────────────────────────────
+// A threshold ("fail below 4 of 5") is a tunable that has to be justified and
+// pre-registered, and any value for it still admits a biased pool -- it only
+// moves the size of the bias, and `distinct_k` scales with pool size, so the
+// residual bias stays arm-correlated. There is no principled place to put it.
+//
+// ── Why not "complete, but record the realized count" ───────────────────────
+// Nothing in evals/analysis/ reads such a field today, and an unread field is
+// the same as no field: the cell is still counted as data. The realized counts
+// ARE retained (see below and runner.mjs) -- but as diagnostics on a cell whose
+// state already tells the truth, never as the mechanism by which an undersized
+// pool is made safe.
+//
+// ── Why the loss this creates is acceptable ─────────────────────────────────
+// ideate-core tolerates individual agent failures BY DESIGN (`onAgentError`
+// resolves to `null` rather than throwing), so this rule fails cells the engine
+// considers healthy. That is the right trade for a measurement instrument
+// rather than a product: for an ENVIRONMENTAL cause (a 429, a 5xx, a timeout)
+// the kind is transient, so #90 keeps `cell.key` out of the store and the next
+// invocation re-plans the cell with its spend preserved -- the cost is a delay,
+// not a lost cell. Only an INTRINSIC cause makes the failure permanent, and
+// that case is a real observation about the arm (see the residual registered in
+// docs/PREREGISTRATION.md §10).
+//
+// ── What counts as "fewer agents than the arm specifies" ────────────────────
+// Either of two independent channels -- `meta.agentsFailed > 0`, or a reply
+// that came back and yielded nothing usable for a mechanical/refusal reason.
+// See classifyUndersizedPool's own doc for why ONE channel was not enough (the
+// partial-refusal / partial-parse_failure case the issue asked about can arrive
+// without ideate-core counting an agent as failed at all).
+//
+// The agent-level channel is `meta.agentsFailed > 0`, i.e. ideate-core's OWN
+// attempted count minus its own failed count. Deliberately NOT compared against
+// `arm.slots.length`: this repo
+// runs its whole test suite with an EMPTY node_modules (see this module's
+// header), so whether ideate-core@0.4.0 counts `agentsAttempted` per ROUND (5
+// for a panel) or per RUN (10 across two rounds) is not verifiable here. Under
+// per-run semantics a cell that lost all five agents in round 2 realizes 5,
+// and `5 < arm.slots.length` would MISS it. `agentsFailed > 0` is correct under
+// either semantics, and `resolveIdeateAgents` maps slots to agents 1:1, so "an
+// attempted agent that did not contribute" IS "fewer agents than the arm
+// specifies".
+
+/**
+ * Classify a NON-EMPTY pool that was assembled from fewer agents than the arm
+ * specifies -- the partial-round counterpart of `classifyPoolFailure` above.
+ *
+ * The two have deliberately different decision orders. `classifyPoolFailure`
+ * asks "the pool is empty; what emptied it?" and requires unanimity for
+ * `refusal` (`refused === replies`). This one asks "some agents dropped out;
+ * why?" -- so ANY refusal, truncation or unparseable reply among the replies
+ * that DID come back is enough to name the cause.
+ *
+ * ── TWO independent shortfall channels, because ONE was not enough ──────────
+ * The issue asked whether partial `refusal` / partial `parse_failure` share the
+ * rate-limit case's shape. They do, AND they can arrive without ideate-core
+ * counting an agent as failed at all, so a `meta.agentsFailed` test alone would
+ * have missed them:
+ *
+ *   1. AGENT-LEVEL. `meta.agentsFailed > 0` -- an agent whose `complete()` call
+ *      never produced a usable reply. This is the 429/5xx/timeout channel: the
+ *      request itself failed, so there is no reply and no diagnostic for it.
+ *
+ *   2. REPLY-LEVEL. An agent whose request SUCCEEDED and whose reply yielded no
+ *      usable candidates for a mechanical or refusal reason -- refused,
+ *      truncated with nothing salvageable, or complete-but-unparseable. Whether
+ *      ideate-core counts such a reply in `agentsFailed` is NOT verifiable from
+ *      this repo (empty node_modules -- see the module header; the two fake
+ *      `ideateImpl`s in this repo's own test suite disagree with each other on
+ *      exactly this point). So the shortfall is detected from the per-reply
+ *      diagnostics directly instead of being taken on trust from the engine.
+ *
+ * ── What is deliberately NOT a shortfall ────────────────────────────────
+ *   - A reply that contributed FEWER IDEAS than requested (a truncation from
+ *     which #93's salvage recovered 28 of 30). That is an idea-count axis, not
+ *     an agent-count one; #93 registered the salvage trade deliberately and
+ *     re-litigating it here would silently widen this issue.
+ *   - A reply that parsed cleanly and was legitimately EMPTY (`[]`). That is the
+ *     arm's own answer -- `classifyPoolFailure`'s `genuinely_empty` -- and it is
+ *     a measurement, not a lost one.
+ *
+ * Transport-level signals are NOT consulted here: the caller composes this with
+ * `pickFailureKind(classification, ...)`, which lets a 429/timeout/5xx win over
+ * whatever the surviving replies happen to look like -- the same composition
+ * every other failure path in this module uses.
+ *
+ * @param {object|null} ideateResult  the engine's own result, for its `meta`
+ * @param {Array} diagnostics  summarizeReply() records for the replies that DID
+ *   come back (an agent whose request failed contributes none, by construction).
+ * @param {object} o
+ *   @param {string} [o.providerName]
+ *   @param {number} o.candidateCount   the size of the pool that would be stored
+ * @returns {{kind: string, cause: string, detail: string} | null}  null when the
+ *   pool is NOT undersized -- i.e. when the cell may legitimately complete.
+ */
+export function classifyUndersizedPool(ideateResult, diagnostics = [], { providerName = "provider", candidateCount = 0 } = {}) {
+  const replies = diagnostics.length;
+  const truncated = diagnostics.filter((d) => d.truncated).length;
+  const refused = diagnostics.filter((d) => d.stopReason === "refusal").length;
+  const unparseable = diagnostics.filter((d) => !d.truncated && d.parse === "failed").length;
+  // Channel 2: a reply that came back and yielded NOTHING for a mechanical or
+  // refusal reason. `candidateCount === 0` is the load-bearing conjunct -- it is
+  // what keeps a partially-salvaged truncation (28 of 30 recovered) out of this
+  // set, per "what is deliberately NOT a shortfall" above.
+  const nonContributingReplies = diagnostics.filter(
+    (d) => d.candidateCount === 0 && (d.truncated || d.parse === "failed" || d.stopReason === "refusal"),
+  ).length;
+
+  const realized = realizedAgents(ideateResult);
+  const agentsFailed = realized ? realized.failed : 0;
+  if (agentsFailed === 0 && nonContributingReplies === 0) return null;
+
+  let kind;
+  let cause;
+  if (truncated > 0) {
+    // Same precedence classifyPoolFailure uses: a truncated reply is the most
+    // specific and most actionable signal there is (it names a max_tokens
+    // problem, not a model problem).
+    kind = "parse_failure";
+    cause = "partial_truncated";
+  } else if (refused > 0) {
+    // Refusal outranks `unparseable` here, and the order is load-bearing rather
+    // than arbitrary: a refusal reply is prose ("I can't help with that"), so it
+    // ALSO fails to parse as JSON and would otherwise be recorded as a
+    // parse_failure -- blaming our parser for the model's decision. `stop_reason`
+    // is the provider's own statement of why it stopped, which is the more
+    // authoritative signal. (classifyPoolFailure reaches the same conclusion by
+    // a different route: its unanimous-refusal test runs before its parse tests.)
+    kind = "refusal";
+    cause = "partial_refusal";
+  } else if (unparseable > 0) {
+    kind = "parse_failure";
+    cause = "partial_unparseable_complete";
+  } else {
+    // Agents dropped out leaving no reply diagnostic at all, and no transport
+    // signal was raised for them either (or the caller's pickFailureKind would
+    // have overridden this fallback). Nothing in the evidence explains the
+    // shortfall, which makes it OUR gap rather than a datum about the arm --
+    // `harness_error`, which is transient, so the cell is re-planned rather
+    // than recorded as a property of the arm on the strength of no evidence.
+    kind = "harness_error";
+    cause = "partial_unexplained";
+  }
+
+  const fields = [
+    `cause=${cause}`,
+    `kind=${kind}`,
+    `agents_attempted=${realized ? realized.attempted : "unreported"}`,
+    `agents_failed=${realized ? realized.failed : "unreported"}`,
+    `agents_realized=${realized ? realized.realized : "unreported"}`,
+    `non_contributing_replies=${nonContributingReplies}`,
+    `discarded_candidates=${candidateCount}`,
+    `replies=${replies}`,
+    `truncated=${truncated}`,
+    `unparseable=${unparseable}`,
+    `refused=${refused}`,
+  ];
+  const shortfall = Math.max(agentsFailed, nonContributingReplies);
+  let detail =
+    `${providerName}: discarding an UNDERSIZED pool of ${candidateCount} candidate(s) -- at least ${shortfall} agent(s) ` +
+    `did not contribute, so this pool is smaller than the arm specifies and storing it would silently under-report ` +
+    `this cell's pool size (issue #102) -- ${fields.join(" ")}`;
+  if (detail.length > MAX_DETAIL_CHARS) detail = `${detail.slice(0, MAX_DETAIL_CHARS - 3)}...`;
+  return { kind, cause, detail };
+}
+
+/**
+ * Read ideate-core's realized-agent bookkeeping off an ideateResult, normalized
+ * and validated. Returns `null` when the engine reported nothing usable, which
+ * is "cannot verify" and never "nothing failed" -- the two must not collapse.
+ */
+export function realizedAgents(ideateResult) {
+  const meta = ideateResult && ideateResult.meta;
+  if (!meta) return null;
+  const attempted = meta.agentsAttempted;
+  const failed = meta.agentsFailed;
+  if (!Number.isInteger(attempted) || !Number.isInteger(failed)) return null;
+  if (attempted < 0 || failed < 0 || failed > attempted) return null;
+  return { attempted, failed, realized: attempted - failed };
+}
+
 /**
  * The per-cell max_tokens ceiling: the largest any of this cell's agents could
  * need. Cells are homogeneous in ideasPerAgent today (solo: totalIdeasRequested;
@@ -737,6 +936,30 @@ export class AnthropicBatchProvider {
         detail: truncateDetail(abandonPrefix(classification, "AnthropicBatchProvider") + pool.detail),
         tokens: { tokens_by_model: tokensByModel },
         diagnostics,
+      };
+    }
+
+    // ── An UNDERSIZED pool is not a measurement (issue #102) ──────────────────
+    // See "THE UNDERSIZED-POOL RULE" above classifyUndersizedPool for the rule,
+    // its two detection channels, the alternatives rejected, and why the
+    // denominator is ideate-core's own counts rather than arm.slots.length.
+    //
+    // Placed AFTER the empty-pool branch on purpose: an all-agents-failed cell
+    // must keep reaching classifyPoolFailure's `allRefused` path, which is the
+    // pre-#93 `refusal` behaviour that branch's own comment says is preserved.
+    // This branch therefore only ever sees a pool that is non-empty and short.
+    const undersized = classifyUndersizedPool(ideateResult, diagnostics, {
+      providerName: "AnthropicBatchProvider",
+      candidateCount: candidates.length,
+    });
+    if (undersized) {
+      return {
+        terminalState: "failed",
+        failureKind: pickFailureKind(classification, undersized.kind),
+        detail: truncateDetail(abandonPrefix(classification, "AnthropicBatchProvider") + undersized.detail),
+        tokens: { tokens_by_model: tokensByModel },
+        diagnostics,
+        meta: ideateResult.meta,
       };
     }
 
@@ -1424,6 +1647,25 @@ export class OpenAIBatchProvider {
       const allRefused = !!(ideateResult && ideateResult.meta && ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted);
       const pool = classifyPoolFailure(diagnostics, { providerName: "OpenAIBatchProvider", allRefused });
       return { terminalState: "failed", failureKind: pickFailureKind(classification, pool.kind), detail: truncateDetail(abandonPrefix(classification, "OpenAIBatchProvider") + pool.detail), tokens: { tokens_by_model: tokensByModel }, diagnostics };
+    }
+    // An UNDERSIZED pool is not a measurement (issue #102) -- see the matching
+    // branch (and its full rationale, plus the guard-ordering reasoning) on the
+    // Anthropic path above. Arm H and arm G's OpenAI slots have exactly the same
+    // shape, so they get exactly the same rule rather than waiting to reproduce
+    // the bug on a second provider.
+    const undersized = classifyUndersizedPool(ideateResult, diagnostics, {
+      providerName: "OpenAIBatchProvider",
+      candidateCount: candidates.length,
+    });
+    if (undersized) {
+      return {
+        terminalState: "failed",
+        failureKind: pickFailureKind(classification, undersized.kind),
+        detail: truncateDetail(abandonPrefix(classification, "OpenAIBatchProvider") + undersized.detail),
+        tokens: { tokens_by_model: tokensByModel },
+        diagnostics,
+        meta: ideateResult.meta,
+      };
     }
 
     return { terminalState: "completed", result: { candidates, agents: ideateResult.agents, meta: ideateResult.meta }, tokens: { tokens_by_model: tokensByModel }, diagnostics };
