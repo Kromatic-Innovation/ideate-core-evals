@@ -1701,7 +1701,7 @@ export async function runSpec(spec, opts) {
     // runJudgeMatrix records that leg as `deferred`, never throws for it
     // (see evals/judge/score.mjs's own header: "NOT dropped -- H5's
     // self-preference bias term needs both legs").
-    const { results, deferred, costRows } = await runJudgeMatrix({
+    const { results, deferred, costRows, paymentSkipped } = await runJudgeMatrix({
       pools: [{ poolKey: cell.key, arm: armWithId, briefText, candidates }],
       judgeModels,
       providers: providersToCall,
@@ -1718,11 +1718,44 @@ export async function runSpec(spec, opts) {
     // it and can't tell "already scored" from "never had a provider").
     // Skip anything already accounted for above, or `judgeAccount.complete`/
     // `.skip` would throw "already terminal; refusing to overwrite".
+    //
+    // paymentSkippedLegs (issue #112): a leg the judge account short-circuited
+    // because that provider had ALREADY refused on billing appears in BOTH
+    // `results` (as a `failed`/`payment_required` row carrying
+    // `attempted: false`) and `paymentSkipped`. It is a SKIP, not a fail --
+    // it never made a call, so it did not fail on its own merits, and rolling
+    // it into the failure count inflates that count with legs that were never
+    // attempted (the same misreporting #88 fixed on the generation side).
+    //
+    // This is the one part of the change that is NOT purely additive:
+    // reconciliation is a one-terminal-state-per-leg gate, so the leg must be
+    // excluded from the `results` loop below or `skip()` lands on an
+    // already-terminal leg and throws. Deriving the exclusion set from
+    // `paymentSkipped` itself -- rather than testing `r.attempted === false`
+    // -- makes the partition true BY CONSTRUCTION: exactly the legs skipped
+    // here are the legs excluded there, with no dependence on two separately
+    // maintained signals in score.mjs staying in sync. Iterating the Set (not
+    // the array) dedupes for free, so a duplicated entry cannot double-skip.
+    const paymentSkippedLegs = new Map();
+    for (const p of paymentSkipped || []) {
+      if (alreadyJudged.has(p.judge_provider)) continue;
+      paymentSkippedLegs.set(judgeLegKey(p.poolKey, p.judge_provider), p.reason);
+    }
     for (const r of results) {
       if (alreadyJudged.has(r.judge_provider)) continue;
       const legKey = judgeLegKey(r.poolKey, r.judge_provider);
+      if (paymentSkippedLegs.has(legKey)) continue; // terminal below, as a skip
       if (r.state === "completed") judgeAccount.complete(legKey, { scores: r.scores });
       else judgeAccount.fail(legKey, r.failureKind, r.detail || "");
+    }
+    // The reason is already colon-prefixed `payment_required: ` by
+    // runJudgeMatrix, so reconcile()'s prefix collapse (lib/accounting.mjs)
+    // groups every one of these under a single `payment_required` category in
+    // `summary.judge.skippedByReason` -- distinct from
+    // `summary.judge.byKind.payment_required`, which now counts ONLY the legs
+    // that actually called and were actually refused.
+    for (const [legKey, reason] of paymentSkippedLegs) {
+      judgeAccount.skip(legKey, reason);
     }
     for (const d of deferred) {
       if (alreadyJudged.has(d.judge_provider)) continue;
@@ -2287,6 +2320,37 @@ export async function runSpec(spec, opts) {
   // `null` when judging was never enabled this invocation (opts.judgeModels
   // unset) -- `null` here means "not applicable", never "computed as zero".
   summary.judge = judgeAccount ? judgeAccount.reconcile() : null;
+  // judgePaymentAbort (issue #112): the judge-side analogue of
+  // `summary.paymentAbort` below, and the surface that makes the two
+  // billing outcomes legible SEPARATELY rather than leaving a reader to
+  // notice that one number lives in `byKind` and the other in
+  // `skippedByReason`. The distinction is operationally real:
+  //
+  //   refused -- legs that made a call and the account said no. Real
+  //              attempts; may have consumed tokens (a refused call that
+  //              burned input tokens still writes its cost row).
+  //   skipped -- legs never attempted, because the SAME provider had already
+  //              refused and every later leg on it would hit the identical
+  //              wall. Nothing called, nothing spent, nothing stored.
+  //
+  // Before #112 both landed in `byKind.payment_required` as failures, so the
+  // count could not say how it split -- which inflates the judge-side failure
+  // count with legs that never made a call. `null` means no judge-side
+  // billing refusal occurred this invocation, never "we did not check"; it is
+  // also `null` when judging was disabled, matching `summary.judge`.
+  const judgeRefused = (summary.judge && summary.judge.byKind && summary.judge.byKind.payment_required) || 0;
+  const judgeUnattempted =
+    (summary.judge && summary.judge.skippedByReason && summary.judge.skippedByReason.payment_required) || 0;
+  summary.judgePaymentAbort = judgeRefused || judgeUnattempted ? { refused: judgeRefused, skipped: judgeUnattempted } : null;
+  if (summary.judgePaymentAbort) {
+    log(
+      `[run] JUDGING ABORTED: a judge account refused on billing/credit. ${judgeRefused} judge leg(s) were ` +
+        `actually attempted and refused; a further ${judgeUnattempted} leg(s) were NOT attempted, because every ` +
+        `later leg on that same account would have hit the identical wall. Nothing was called or spent for the ` +
+        `unattempted ones. GENERATION was NOT stopped: those pools are stored, and the next invocation of the ` +
+        `same command judges them once the account is funded. Judge legs on any OTHER provider are unaffected.`,
+    );
+  }
   // spendByProvider: the ACTUAL per-provider total THIS INVOCATION spent,
   // derived from real tokens_by_model (issue #51) -- exposed on the summary
   // so a caller (report, next --max-spend-<provider> invocation) can see
