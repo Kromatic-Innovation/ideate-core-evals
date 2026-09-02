@@ -1,12 +1,29 @@
 // analysis.rarefaction.pipeline.test.mjs — issue #73: the PIPELINE-level
 // discriminating test. rarefaction.test.mjs already proves rarefyPools()
 // itself removes a pool-size confound on raw pools; this file proves the
-// same thing end to end through the ACTUAL analysis pipeline this study
-// runs — a real ResultsStore, frame.mjs's buildFrame(), rarefiedFrame.mjs's
+// same thing end to end through the modules a real analysis actually
+// composes — a real ResultsStore, frame.mjs's buildFrame(), rarefiedFrame.mjs's
 // buildRarefiedFrame(), fit.mjs's fitR2() (pure Node, no sidecar — this test
 // stays hermetic and un-skippable), and contrasts.mjs's evaluateContrast().
-// If the wiring between those modules were removed, this test — not
-// rarefaction.test.mjs's — is the one that would go red.
+//
+// CORRECTED CLAIM (issue #73 fix round — the review that caught this):
+// this file hand-composes buildFrame -> buildRarefiedFrame -> fitR2 ->
+// evaluateContrast itself (below); it never calls analysis.mjs's main().
+// It therefore proves the MODULES compose correctly — it does NOT prove
+// analysis.mjs's CLI orchestrator actually calls them. A previous version of
+// this comment claimed "if the wiring between those modules were removed,
+// this test is the one that would go red" — that was checked against
+// mutating rarefiedFrame.mjs's own wiring, but is FALSE as a claim about
+// analysis.mjs: deleting the rarefied lane from analysis.mjs's main() (or
+// making H1 read the full-pool fit unconditionally there, or broadening its
+// PoolsUnavailableError catch to swallow every error) leaves every test in
+// THIS file passing, because none of them touch main(). That coverage gap
+// is closed by analysis.main.test.mjs, which calls main() itself (with an
+// injected fake sidecar runner) and is the one that goes red for those three
+// mutations. Keep both: this file pins that rarefyPools() and the fit
+// machinery it composes with actually remove the pool-size confound;
+// analysis.main.test.mjs pins that analysis.mjs's main() actually calls
+// that machinery, rather than merely being ABLE to.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 

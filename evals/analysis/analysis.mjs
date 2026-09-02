@@ -7,12 +7,23 @@
 //
 // Usage:
 //   node evals/analysis/analysis.mjs --results-dir results --out-dir evals/analysis/out \
-//     --response distinct_k --reference-arm A --panel-arms A2,B,C,D,E,F,G,H
+//     --response distinct_k --reference-arm A --panel-arms A2,B,C,D,E,F,G,H \
+//     --cluster-distance-threshold 0.23141118234233987
+//
+// --cluster-distance-threshold (issue #73): REQUIRED to actually compute
+// H1's rarefied estimand (Appendix C) once stored cells carry embedded
+// pools (#8/Phase 2a) — this study's registered clusterDistanceThreshold
+// (lib/manifest.mjs CONFIG_FIELDS; docs/PREREGISTRATION.md's registered
+// value is 0.23141118234233987). Omitting it is safe TODAY (no cell has a
+// pool yet, so the rarefied lane reports H1 as not-computed regardless —
+// see main()'s PoolsUnavailableError handling) but will start hard-failing
+// runs the moment pools exist and this flag is still missing.
 //
 // Requires ANALYSIS_SIDECAR-independent setup: the sidecar venv must exist
 // at evals/analysis/sidecar/.venv (see sidecar/requirements.txt) — this CLI
 // always uses the real sidecar runner, never a fake one (fakes are for
-// fit.test.mjs only).
+// fit.test.mjs / analysis.main.test.mjs only — the latter injects one via
+// main()'s second argument, never used by the real CLI entrypoint below).
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -58,8 +69,18 @@ function parseArgs(argv) {
   return args;
 }
 
-export async function main(argv = process.argv.slice(2)) {
+/**
+ * @param {string[]} argv
+ * @param {object} [deps]
+ *   @param {(request: object) => Promise<object>} [deps.runner]  overrides
+ *     the sidecar runner BOTH ladders use (issue #73 fix round — the real
+ *     CLI entrypoint below never passes this; it exists so
+ *     analysis.main.test.mjs can exercise main() end-to-end, hermetically,
+ *     with a fake runner instead of the real spawned sidecar).
+ */
+export async function main(argv = process.argv.slice(2), deps = {}) {
   const args = parseArgs(argv);
+  const runner = deps.runner || makeSidecarRunner();
   mkdirSync(args.outDir, { recursive: true });
 
   const store = new ResultsStore(args.resultsDir);
@@ -80,7 +101,7 @@ export async function main(argv = process.argv.slice(2)) {
     rows: frame.rows.map((r) => ({ armId: r.armId, briefId: r.briefId, response: r.response })),
     armLevels: frame.armLevels,
     referenceArm: args.referenceArm,
-    runner: makeSidecarRunner(),
+    runner,
   });
 
   if (!ladder.fit) {
@@ -97,7 +118,16 @@ export async function main(argv = process.argv.slice(2)) {
   let rarefiedLadder = null;
   let rarefiedFrame = null;
   let rarefiedUnavailableReason = null;
-  if (RAREFACTION_TREATMENT[args.response] === "rarefied") {
+  // panelArms.length === 0 (issue #73 fix round): H1's contrast (mean(panel
+  // arms) - referenceArm) has no arms to mean over, so there is nothing for
+  // buildRarefiedFrame() to rarefy either — buildRegisteredFamily() below
+  // throws its own clear "opts.panelArms is required" error for this state
+  // regardless of rarefaction. Skip the attempt here rather than let
+  // buildRarefiedFrame()'s unrelated "must name at least two arms" guard
+  // fire first and obscure that this was never a rarefaction problem.
+  if (panelArms.length === 0) {
+    rarefiedUnavailableReason = "no panel arms present in this frame — H1 is undefined without at least one panel arm";
+  } else if (RAREFACTION_TREATMENT[args.response] === "rarefied") {
     try {
       rarefiedFrame = buildRarefiedFrame(frame, {
         armIds: [args.referenceArm, ...panelArms],
@@ -121,7 +151,7 @@ export async function main(argv = process.argv.slice(2)) {
         rows: rarefiedFrame.rows.map((r) => ({ armId: r.armId, briefId: r.briefId, response: r.response })),
         armLevels: rarefiedFrame.armLevels,
         referenceArm: args.referenceArm,
-        runner: makeSidecarRunner(),
+        runner,
       });
       if (!rarefiedLadder.fit) {
         // Sidecar-unavailable already propagated as SidecarUnavailableError
@@ -173,6 +203,20 @@ export async function main(argv = process.argv.slice(2)) {
 
   writeFileSync(join(args.outDir, "analysis-data.csv"), renderAnalysisDataCsv(frame));
   writeFileSync(join(args.outDir, "lme4-fit.R"), renderLme4FitR({ responseField: frame.responseField, armLevels: frame.armLevels, referenceArm: args.referenceArm }));
+  // Rarefied reproducibility artifacts (issue #73 fix round, BLOCKING 3):
+  // renderAnalysisDataCsv()/renderLme4FitR() are pure functions of a
+  // frame-shaped object (rows/responseField/armLevels) — rarefiedFrame has
+  // exactly that shape, so this is straight reuse, not a new renderer. A
+  // reviewer with R can therefore reproduce H1's rarefied fit the same way
+  // they reproduce H2-H4's, instead of `lme4-fit.R` only ever describing the
+  // full-pool fit while REPORT.md's headline hypothesis was fit elsewhere.
+  if (rarefiedFrame) {
+    writeFileSync(join(args.outDir, "analysis-data-rarefied.csv"), renderAnalysisDataCsv(rarefiedFrame));
+    writeFileSync(
+      join(args.outDir, "lme4-fit-rarefied.R"),
+      renderLme4FitR({ responseField: rarefiedFrame.responseField, armLevels: rarefiedFrame.armLevels, referenceArm: args.referenceArm }),
+    );
+  }
   writeFileSync(
     join(args.outDir, "fit.json"),
     JSON.stringify(

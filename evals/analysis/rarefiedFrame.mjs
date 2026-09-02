@@ -117,16 +117,13 @@ export class MixedPoolCoverageError extends Error {
 export function buildRarefiedFrame(frame, opts = {}) {
   const armIds = opts.armIds;
   const metric = opts.metric || "distinct_k";
-  const threshold = opts.threshold;
 
+  // ── Structural guards: always a caller bug, independent of pool
+  // availability -- these fire regardless of whether pools exist, because
+  // they describe a malformed CALL, not the (today, expected) state of the
+  // store. ─────────────────────────────────────────────────────────────────
   if (!Array.isArray(armIds) || armIds.length < 2) {
     throw new Error("buildRarefiedFrame: opts.armIds must name at least two arms (the contrast this rarefies)");
-  }
-  if (!Number.isFinite(threshold)) {
-    throw new Error(
-      "buildRarefiedFrame: opts.threshold (the registered clusterDistanceThreshold, lib/manifest.mjs CONFIG_FIELDS) is required — " +
-        "there is no default, because a wrong threshold would silently make the rarefied and full-pool numbers incommensurable",
-    );
   }
   const treatment = RAREFACTION_TREATMENT[metric];
   if (treatment !== "rarefied") {
@@ -141,6 +138,17 @@ export function buildRarefiedFrame(frame, opts = {}) {
     throw new Error(`buildRarefiedFrame: no rows in the frame belong to any of [${armIds.join(", ")}]`);
   }
 
+  // ── Pool-coverage check comes BEFORE the threshold requirement, on
+  // purpose (issue #73 fix round). Today, EVERY real store is pool-less
+  // (Appendix C item 5 -- #8/Phase 2a hasn't run) -- that is the expected,
+  // registered state, not a misconfiguration, and it needs no threshold at
+  // all: there is nothing to cluster. Requiring a valid threshold before
+  // even checking whether there's anything to rarefy would turn today's
+  // ordinary "not computed yet" case into an indistinguishable-from-a-bug
+  // thrown Error the moment a caller (analysis.mjs) forgets to pass
+  // --cluster-distance-threshold -- which is exactly the documented CLI
+  // invocation before this fix. A threshold is only demanded once there is
+  // real work to do with it, below. ──────────────────────────────────────
   const withPool = contrastRows.filter((r) => r.pool !== undefined);
   const withoutPool = contrastRows.filter((r) => r.pool === undefined);
 
@@ -152,6 +160,18 @@ export function buildRarefiedFrame(frame, opts = {}) {
       armIds,
       withPool.map((r) => r.cellKey),
       withoutPool.map((r) => r.cellKey),
+    );
+  }
+
+  // Pools ARE present -- there is real work to do, so a threshold is now
+  // required. Missing/invalid here is a genuine misconfiguration and must
+  // keep hard-failing (uncaught by analysis.mjs's narrow PoolsUnavailableError
+  // catch), never silently degrade to "not computed".
+  const threshold = opts.threshold;
+  if (!Number.isFinite(threshold)) {
+    throw new Error(
+      "buildRarefiedFrame: opts.threshold (the registered clusterDistanceThreshold, lib/manifest.mjs CONFIG_FIELDS) is required — " +
+        "there is no default, because a wrong threshold would silently make the rarefied and full-pool numbers incommensurable",
     );
   }
 
@@ -192,10 +212,25 @@ export function buildRarefiedFrame(frame, opts = {}) {
     };
   });
 
+  // Deliberately NOT `{...frame, rows, ...}`: `frame.excluded` /
+  // `failuresByArm` / `skippedByArm` describe the FULL base frame's whole
+  // population (every arm, every failure/skip tally), while `rows` here is
+  // a CONTRAST-SCOPED SUBSET. Spreading them in would silently attach
+  // full-frame tallies to a filtered frame — a latent trap for any future
+  // caller that reads `rarefiedFrame.excluded`/`.failuresByArm` expecting
+  // them to describe this contrast (issue #73 fix round). There is no
+  // contrast-scoped equivalent to compute (a contrast only ever sees
+  // completed cells to begin with — failures/skips never reach `frame.rows`
+  // in the first place), so those fields are omitted entirely rather than
+  // guessed at. A caller that needs the full population's failure/skip
+  // tallies reads them off the ORIGINAL base frame, not this one.
   return {
-    ...frame,
     rows,
     armLevels: frame.armLevels.filter((a) => armIds.includes(a)),
+    briefLevels: frame.briefLevels,
+    responseField: frame.responseField,
+    poolField: frame.poolField,
+    configHash: frame.configHash,
     rarefied: true,
     rarefiedMetric: metric,
     rarefiedArmIds: armIds,

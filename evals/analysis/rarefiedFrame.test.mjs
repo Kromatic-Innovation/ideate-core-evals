@@ -85,11 +85,35 @@ test("buildRarefiedFrame: some cells have a pool, some don't -> MixedPoolCoverag
   );
 });
 
-test("buildRarefiedFrame: threshold is required, no silent default", () => {
+test("buildRarefiedFrame: threshold is required WHEN pools are actually present, no silent default", () => {
   const poolA = makeCategoricalPool(50, 30, 1);
-  const rows = [row({ cellKey: "A|b1", armId: "A", briefId: "b1", pool: poolA })];
-  const frame = baseFrame(rows, ["A"]);
+  const poolP = makeCategoricalPool(50, 60, 2);
+  const rows = [
+    row({ cellKey: "A|b1", armId: "A", briefId: "b1", pool: poolA }),
+    row({ cellKey: "P|b1", armId: "P", briefId: "b1", pool: poolP }),
+  ];
+  const frame = baseFrame(rows, ["A", "P"]);
   assert.throws(() => buildRarefiedFrame(frame, { armIds: ["A", "P"] }), /threshold/);
+});
+
+test("buildRarefiedFrame: threshold guard ordering -- a pool-less contrast reaches PoolsUnavailableError even with NO threshold supplied (issue #73 fix round, BLOCKING 2)", () => {
+  // This is the exact shape of the documented CLI invocation before the fix
+  // round: --cluster-distance-threshold was never passed, and today EVERY
+  // real store is pool-less (#8/Phase 2a hasn't run). Requiring a valid
+  // threshold before checking pool availability would turn this ordinary,
+  // expected "not computed yet" state into an opaque, uncaught plain Error
+  // that aborts the whole analysis run with zero artifacts -- exactly the
+  // regression this test pins against.
+  const rows = [
+    row({ cellKey: "A|b1", armId: "A", briefId: "b1" }), // no pool
+    row({ cellKey: "P|b1", armId: "P", briefId: "b1" }), // no pool
+  ];
+  const frame = baseFrame(rows, ["A", "P"]);
+  assert.throws(
+    () => buildRarefiedFrame(frame, { armIds: ["A", "P"] }), // threshold OMITTED, matching the documented CLI
+    PoolsUnavailableError,
+    "a pool-less contrast must be diagnosed as PoolsUnavailableError, not an opaque 'threshold required' Error, regardless of whether a threshold was ever supplied",
+  );
 });
 
 test("buildRarefiedFrame: refuses a metric Appendix C excludes from Arm-A contrasts (poolFluency)", () => {
@@ -172,6 +196,23 @@ test("buildRarefiedFrame: preserves both values -- responseFullPool (unchanged) 
   // P's rarefied response must differ from its (larger-pool) full-pool value.
   assert.equal(aRow.response, aRow.responseFullPool);
   assert.notEqual(pRow.response, pRow.responseFullPool);
+});
+
+test("buildRarefiedFrame: never carries the base frame's excluded/failuresByArm/skippedByArm -- those describe the FULL frame, rows here are a contrast-scoped subset (issue #73 fix round, latent-trap fix)", () => {
+  const poolA = makeCategoricalPool(50, 30, 11);
+  const poolP = makeCategoricalPool(50, 60, 22);
+  const rows = [
+    row({ cellKey: "A|b1", armId: "A", briefId: "b1", pool: poolA }),
+    row({ cellKey: "P|b1", armId: "P", briefId: "b1", pool: poolP }),
+  ];
+  const frame = baseFrame(rows, ["A", "P"]);
+  frame.excluded = { failed: [{ key: "arm=B|brief=b1|rep=0|cfg=c" }], skipped: [], stale: [] };
+  frame.failuresByArm = { B: { parse_failure: 3 } };
+  frame.skippedByArm = { B: 1 };
+  const out = buildRarefiedFrame(frame, { armIds: ["A", "P"], threshold: THRESHOLD, rarefyOpts: { r: 100, seed: RAREFACTION_SEED } });
+  assert.ok(!("excluded" in out), "excluded must not be spread from the base frame onto a contrast-scoped subset");
+  assert.ok(!("failuresByArm" in out), "failuresByArm must not be spread from the base frame onto a contrast-scoped subset");
+  assert.ok(!("skippedByArm" in out), "skippedByArm must not be spread from the base frame onto a contrast-scoped subset");
 });
 
 test("buildRarefiedFrame: poolFlexibility is derived from distinct_k's own rarefaction, not independently recomputed", () => {

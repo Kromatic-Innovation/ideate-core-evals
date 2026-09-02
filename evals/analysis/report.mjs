@@ -73,10 +73,18 @@ export function renderReport(input) {
   lines.push("");
   lines.push(`Response: \`${frame.responseField}\`. configHash: \`${frame.configHash}\`. analysisHash: \`${analysisHash}\`.`);
   lines.push("");
-  lines.push(`Fitted at rung **${ladder.rung}**${ladder.rung === "R3" ? " — no confirmatory inference; descriptive only." : "."}`);
+  // Deliberately scoped to "full-pool lane" (issue #73 fix round): this rung
+  // is the FULL-POOL ladder's — the one H2-H5 (and the Pareto/cost lanes)
+  // are fit on. H1, when rarefied `distinct_k` is available, is fit on a
+  // SEPARATE ladder that can land on a different rung — printing this line
+  // as an unqualified global "Fitted at rung X" directly above the H1..H5
+  // table would misleadingly attribute H1's rung to this one too. The
+  // rarefied lane's own rung/history is printed in the Rarefaction section
+  // below, and any divergence between the two is flagged there explicitly.
+  lines.push(`Full-pool lane (H2-H5, Pareto, cost lane) fitted at rung **${ladder.rung}**${ladder.rung === "R3" ? " — no confirmatory inference; descriptive only." : "."}`);
   if (ladder.history && ladder.history.length) {
     lines.push("");
-    lines.push("Ladder history:");
+    lines.push("Full-pool ladder history:");
     for (const step of ladder.history) {
       lines.push(`- ${step.rung}: ${step.descended ? `descended (${step.reason})` : "held"}`);
     }
@@ -129,11 +137,35 @@ export function renderReport(input) {
   lines.push("## Rarefaction — H1's registered estimand (docs/PREREGISTRATION.md Appendix C)");
   lines.push("");
   if (rarefiedFrame) {
+    const rarefiedRung = rarefiedLadder ? rarefiedLadder.rung : "n/a";
     lines.push(
       `Every pool in H1's contrast rarefied to the minimum pool size actually present (rarefiedN, per row below), ` +
-        `Appendix C item 2. H1 above is evaluated against the RAREFIED value, fitted at rung **${rarefiedLadder ? rarefiedLadder.rung : "n/a"}**. ` +
+        `Appendix C item 2. H1 above is evaluated against the RAREFIED value, fitted on its OWN ladder at rung **${rarefiedRung}** ` +
+        "(a SEPARATE fit from the full-pool lane's rung reported above — H1's rung and H2-H5's rung are never the same statement). " +
         "Both values are reported (Appendix C item 5) — full-pool distinct_k is a secondary descriptive, never the registered estimand.",
     );
+    // Rung divergence is a real, silent risk of the two-ladder design (issue
+    // #73 fix round): cell inclusion cannot diverge (rarefiedFrame's rows
+    // are always a subset of the full-pool frame's, same cfg), but the RUNG
+    // each independently descends to can — H1 could be read off an R2
+    // pure-Node fit while H2-H5 come from R0, with no cross-check unless
+    // this is surfaced. Flag it plainly rather than let two different rungs
+    // sit in the same report unremarked.
+    if (rarefiedLadder && rarefiedRung !== ladder.rung) {
+      lines.push("");
+      lines.push(
+        `**Rung divergence:** the full-pool lane landed on **${ladder.rung}** while the rarefied lane landed on **${rarefiedRung}** — ` +
+          "H1 and H2-H5 were fit with different diagnostics-driven fallback behavior. Not necessarily wrong (each ladder descends " +
+          "independently per B7), but a reviewer reproducing H1 must use lme4-fit-rarefied.R / the rarefied rung, not the full-pool one above.",
+      );
+    }
+    if (rarefiedLadder && rarefiedLadder.history && rarefiedLadder.history.length) {
+      lines.push("");
+      lines.push("Rarefied ladder history:");
+      for (const step of rarefiedLadder.history) {
+        lines.push(`- ${step.rung}: ${step.descended ? `descended (${step.reason})` : "held"}`);
+      }
+    }
     lines.push("");
     lines.push("| Cell | Arm | Pool size | Rarefied N | Full-pool `distinct_k` | Rarefied `distinct_k` |");
     lines.push("|---|---|---|---|---|---|");
