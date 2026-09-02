@@ -18,8 +18,9 @@ import {
   judgeScoresKey,
   judgeScoresForAxis,
   computeJudgeHash,
+  MAX_JUDGE_TOKENS,
 } from "./score.mjs";
-import { JUDGE_AXES, judgePromptHash } from "./prompt.mjs";
+import { JUDGE_AXES, judgePromptHash, JUDGE_PROMPT } from "./prompt.mjs";
 import { validateJudge } from "./gate.mjs";
 import { configHash, cellKey } from "../../lib/manifest.mjs";
 import { makeTempStore } from "../../lib/store.mjs";
@@ -280,17 +281,34 @@ function openaiJudgeResultLine(custom_id, contentObj, usage = { prompt_tokens: 1
  * `cand-<i>`, a score whose originality encodes i — returned in REVERSED
  * order, so the test proves the provider keys by custom_id (not line
  * position) AND maps scores back to input order.
+ *
+ * `capture`, when supplied, is filled with what was ACTUALLY submitted over
+ * the wire: the upload form's `purpose` and per-line JSONL bodies (F1 fix —
+ * previously this fixture read only `custom_id` back out of the upload and
+ * never inspected the request body itself, so a corrupted prompt/model/
+ * maxTokens/purpose/endpoint could ship and every batch test stayed green).
  */
-function openaiJudgeBatchFetch({ usage } = {}) {
+function openaiJudgeBatchFetch({ usage, capture } = {}) {
   let submitted = [];
   return async (url, opts) => {
     const u = String(url);
     if (u === "https://api.openai.com/v1/files" && opts.method === "POST") {
       const text = await opts.body.get("file").text(); // FormData -> Blob -> JSONL
       submitted = text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      if (capture) {
+        capture.purpose = opts.body.get("purpose");
+        capture.uploadUrl = u;
+        capture.uploadMethod = opts.method;
+        capture.lines = submitted;
+      }
       return jsonResponse(200, { id: "ofile_1" });
     }
     if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") {
+      if (capture) {
+        capture.createBody = JSON.parse(opts.body);
+        capture.createUrl = u;
+        capture.createMethod = opts.method;
+      }
       return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
     }
     if (u.startsWith("https://api.openai.com/v1/batches/")) {
@@ -317,6 +335,43 @@ test("OpenAIJudgeProvider.score (batch) turns a pool into per-axis scores, un-pe
   resp.scores.forEach((s, i) => assert.equal(s.originality, i + 1, `score ${i} must be un-permuted back to input order`));
 });
 
+// ── F1 (review-round fix): the batch fixture above only ever read
+// `custom_id` back out of the upload — it never inspected WHAT was actually
+// submitted. That let a corrupted prompt/model/maxTokens/purpose/endpoint
+// ship silently (batch is the default mode and what the study runs). This
+// test pins every one of those fields on the request actually sent over the
+// wire, not on what score() merely returns.
+test("OpenAIJudgeProvider.score (batch) submits the real frozen rubric prompt, the exact judgeModel, MAX_JUDGE_TOKENS, and the correct purpose/url/method/endpoint", async () => {
+  const capture = {};
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: openaiJudgeBatchFetch({ capture }), sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 3 });
+  assert.equal(resp.terminalState, "completed");
+
+  // Upload leg: purpose must be "batch" (not e.g. "fine-tune"), hit the
+  // right URL with POST.
+  assert.equal(capture.purpose, "batch");
+  assert.equal(capture.uploadUrl, "https://api.openai.com/v1/files");
+  assert.equal(capture.uploadMethod, "POST");
+  assert.ok(capture.lines.length === 2, "one JSONL line per candidate");
+  for (const line of capture.lines) {
+    assert.equal(line.method, "POST");
+    assert.equal(line.url, "/v1/chat/completions");
+    // The REAL §5 rubric text must reach the judge -- not a substring so weak
+    // that the literal "score this" would pass. JUDGE_PROMPT.instructions is
+    // the frozen rubric's own wording (prompt.mjs), so this can only pass if
+    // buildJudgeScoringPrompt's actual output reached the wire.
+    assert.ok(line.body.messages[0].content.includes(JUDGE_PROMPT.instructions), "the submitted prompt must carry the frozen §5 rubric instructions verbatim");
+    assert.ok(line.body.messages[0].content.includes(JUDGE_PROMPT.outputFormat), "the submitted prompt must carry the frozen rubric's output-format text");
+    assert.equal(line.body.model, "gpt-5.6-terra", "the submitted request must use the exact judgeModel passed in, not a different/default model");
+    assert.equal(line.body.max_completion_tokens, MAX_JUDGE_TOKENS, "the submitted request must use MAX_JUDGE_TOKENS, not a default budget");
+  }
+
+  // Create-batch leg: correct endpoint, URL, method.
+  assert.equal(capture.createBody.endpoint, "/v1/chat/completions");
+  assert.equal(capture.createUrl, "https://api.openai.com/v1/batches");
+  assert.equal(capture.createMethod, "POST");
+});
+
 test("OpenAIJudgeProvider tokens are FLAT (model,input_tokens,output_tokens) — never tokens_by_model — and prompt_tokens/completion_tokens are TRANSLATED, never forwarded under their native names", async () => {
   const provider = new OpenAIJudgeProvider({
     apiKey: "k",
@@ -333,10 +388,12 @@ test("OpenAIJudgeProvider tokens are FLAT (model,input_tokens,output_tokens) —
   assert.ok(!("prompt_tokens" in resp.tokens) && !("completion_tokens" in resp.tokens), "OpenAI's native field names must never be forwarded verbatim");
 });
 
-test("OpenAIJudgeProvider score (single) hits /v1/chat/completions directly, not the Batches API", async () => {
+test("OpenAIJudgeProvider score (single) hits /v1/chat/completions directly, not the Batches API, and submits the real rubric prompt/model/maxTokens", async () => {
   const calledUrls = [];
-  const fetchImpl = async (url) => {
+  const capturedBodies = [];
+  const fetchImpl = async (url, opts) => {
     calledUrls.push(String(url));
+    capturedBodies.push(JSON.parse(opts.body));
     return jsonResponse(200, { choices: [{ message: { content: scoreJsonForIndex(0) } }], usage: { prompt_tokens: 7, completion_tokens: 3 } });
   };
   const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, logger: silentLogger });
@@ -345,6 +402,13 @@ test("OpenAIJudgeProvider score (single) hits /v1/chat/completions directly, not
   assert.deepEqual(calledUrls, ["https://api.openai.com/v1/chat/completions"]);
   assert.equal(resp.tokens.input_tokens, 7);
   assert.equal(resp.tokens.output_tokens, 3);
+  // F1: pin what was actually SUBMITTED, not just what score() returns — the
+  // real §5 rubric, the exact judgeModel, and MAX_JUDGE_TOKENS.
+  assert.equal(capturedBodies.length, 1);
+  assert.ok(capturedBodies[0].messages[0].content.includes(JUDGE_PROMPT.instructions), "single mode must submit the frozen §5 rubric instructions verbatim");
+  assert.ok(capturedBodies[0].messages[0].content.includes(JUDGE_PROMPT.outputFormat), "single mode must submit the frozen rubric's output-format text");
+  assert.equal(capturedBodies[0].model, "gpt-5.6-terra", "single mode must submit the exact judgeModel passed in");
+  assert.equal(capturedBodies[0].max_completion_tokens, MAX_JUDGE_TOKENS, "single mode must submit MAX_JUDGE_TOKENS, not a default budget");
 });
 
 test("no apiKey: OpenAIJudgeProvider.score() returns a classified harness_error rather than throwing", async () => {
@@ -420,6 +484,165 @@ test("OpenAIJudgeProvider: a failed leg that consumed tokens before failing stil
   assert.equal(resp.tokens.input_tokens, 20, "the succeeding call's real spend is still reported on a failed leg");
   assert.equal(resp.tokens.output_tokens, 10);
 });
+
+// ── F2 (review-round fix): batch result rows were accepted without real
+// validation -- an unknown custom_id could fall back to a positional match
+// (candidate X's score silently attached to candidate Y), and the row's
+// error/status_code fields could be ignored as long as `response.body` was
+// merely present. These tests pin both, plus the token-accounting
+// implication of a duplicate custom_id.
+
+test("OpenAIJudgeProvider batch: an unmatched custom_id in the output is dropped, never attributed to a real candidate by line position (F2)", async () => {
+  let submitted = [];
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") {
+      const text = await opts.body.get("file").text();
+      submitted = text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      return jsonResponse(200, { id: "ofile_1" });
+    }
+    if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u.startsWith("https://api.openai.com/v1/batches/")) return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u === "https://api.openai.com/v1/files/oout_1/content") {
+      const lines = submitted.map((r) => {
+        const i = Number(r.custom_id.replace("cand-", ""));
+        return openaiJudgeResultLine(r.custom_id, JSON.parse(scoreJsonForIndex(i)));
+      });
+      // An UNMATCHED custom_id, appended LAST -- under a positional-fallback
+      // bug (`req = requests[lineNo % requests.length]`), lineNo === requests.length
+      // wraps to index 0 and this line's 10/10 score would silently
+      // OVERWRITE whichever real candidate landed at requests[0].
+      lines.push(openaiJudgeResultLine("cand-does-not-exist", { originality: 10, feasibility: 10 }));
+      return textResponse(lines.map((l) => JSON.stringify(l)).join("\n"));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 3 });
+  assert.equal(resp.terminalState, "completed");
+  resp.scores.forEach((s, i) => assert.equal(s.originality, i + 1, `candidate ${i} must keep its OWN score, never the unmatched line's 10/10`));
+});
+
+test("OpenAIJudgeProvider batch: a result row carrying `error` is never treated as a success, even if `response.body` is well-formed (F2)", async () => {
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") return jsonResponse(200, { id: "ofile_1" });
+    if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u.startsWith("https://api.openai.com/v1/batches/")) return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u === "https://api.openai.com/v1/files/oout_1/content") {
+      const row = {
+        custom_id: "cand-0",
+        error: { message: "server-side error" },
+        response: { status_code: 200, body: { choices: [{ message: { content: scoreJsonForIndex(0) } }], usage: { prompt_tokens: 10, completion_tokens: 5 } } },
+      };
+      return textResponse(JSON.stringify(row));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed", "a row.error must never be masked by a well-formed response.body");
+  assert.equal(resp.failureKind, "transport_error");
+});
+
+test("OpenAIJudgeProvider batch: a non-2xx status_code is never treated as success, even when response.body is present (F2)", async () => {
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") return jsonResponse(200, { id: "ofile_1" });
+    if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u.startsWith("https://api.openai.com/v1/batches/")) return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u === "https://api.openai.com/v1/files/oout_1/content") {
+      const row = {
+        custom_id: "cand-0",
+        error: null,
+        response: { status_code: 500, body: { choices: [{ message: { content: scoreJsonForIndex(0) } }], usage: { prompt_tokens: 10, completion_tokens: 5 } } },
+      };
+      return textResponse(JSON.stringify(row));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed", "a non-2xx status_code must never be treated as success merely because response.body exists");
+  assert.equal(resp.failureKind, "transport_error");
+});
+
+test("OpenAIJudgeProvider batch: a duplicate custom_id in the output still meters ALL matched lines' usage, even though the pool fails from too few distinct replies (F2)", async () => {
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") return jsonResponse(200, { id: "ofile_1" });
+    if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u.startsWith("https://api.openai.com/v1/batches/")) return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    if (u === "https://api.openai.com/v1/files/oout_1/content") {
+      // Only 2 distinct custom_ids reply for a 3-candidate pool; cand-0 is
+      // DUPLICATED. The pool must still fail (a genuine missing reply for
+      // the 3rd candidate), but tokens actually consumed by BOTH cand-0
+      // lines are real spend and must both be metered -- not deduplicated.
+      const lines = [
+        openaiJudgeResultLine("cand-0", { originality: 1, feasibility: 3 }),
+        openaiJudgeResultLine("cand-0", { originality: 1, feasibility: 3 }), // duplicate reply
+        openaiJudgeResultLine("cand-1", { originality: 2, feasibility: 3 }),
+      ];
+      return textResponse(lines.map((l) => JSON.stringify(l)).join("\n"));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b", "c") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed", "only 2/3 distinct candidates replied -- the pool must fail (partial-reply guard)");
+  assert.equal(resp.failureKind, "transport_error");
+  assert.equal(resp.tokens.input_tokens, 30, "BOTH cand-0 lines' usage is metered even though one is a duplicate reply -- real tokens were spent");
+  assert.equal(resp.tokens.output_tokens, 15);
+});
+
+// ── F3 (review-round fix): the OpenAI batch poll loop was never exercised --
+// every other batch test's fetchImpl returns "completed" straight from
+// CREATE, so the `while (batchStatus.status !== "completed")` body never
+// ran, and the terminal `failed | expired | cancelled` branch had no test
+// covering it at all. These tests pin the normal submit -> in_progress ->
+// completed lifecycle, and each terminal failure state.
+
+test("OpenAIJudgeProvider batch: the normal lifecycle actually polls (submit in_progress -> poll in_progress -> poll completed) (F3)", async () => {
+  let pollCount = 0;
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") return jsonResponse(200, { id: "ofile_1" });
+    if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") return jsonResponse(200, { id: "obatch_1", status: "in_progress" });
+    if (u.startsWith("https://api.openai.com/v1/batches/")) {
+      pollCount++;
+      if (pollCount < 2) return jsonResponse(200, { id: "obatch_1", status: "in_progress" });
+      return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    }
+    if (u === "https://api.openai.com/v1/files/oout_1/content") {
+      return textResponse(JSON.stringify(openaiJudgeResultLine("cand-0", JSON.parse(scoreJsonForIndex(0)))));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "completed");
+  assert.ok(pollCount >= 2, "the poll loop must actually run more than once before reaching completed -- proves poll results are genuinely read, not shortcut to completed on the first check");
+});
+
+for (const terminalState of ["failed", "expired", "cancelled"]) {
+  test(`OpenAIJudgeProvider batch: a batch that reaches OpenAI terminal state "${terminalState}" classifies as transport_error, never hangs or silently succeeds (F3)`, async () => {
+    const fetchImpl = async (url, opts) => {
+      const u = String(url);
+      if (u === "https://api.openai.com/v1/files" && opts.method === "POST") return jsonResponse(200, { id: "ofile_1" });
+      if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") return jsonResponse(200, { id: "obatch_1", status: "in_progress" });
+      if (u.startsWith("https://api.openai.com/v1/batches/")) return jsonResponse(200, { id: "obatch_1", status: terminalState });
+      throw new Error(`unexpected URL ${u}`);
+    };
+    // maxPollMs is bounded so that a mutation deleting the terminal-state
+    // branch (which would otherwise hot-spin on Date.now() > deadline against
+    // the LIVE 15-minute default) fails this test in ~1s via a classified
+    // "timeout" instead of hanging the suite for 15 real minutes.
+    const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxPollMs: 1000, logger: silentLogger });
+    const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+    assert.equal(resp.terminalState, "failed");
+    assert.equal(resp.failureKind, "transport_error", `a batch reaching OpenAI's "${terminalState}" state must be classified, not treated as completed or left to poll forever`);
+  });
+}
 
 // ── AC3: the cross-judge matrix schedule is actually EXECUTED, and
 //    assertEvaluatorDistinct is enforced at CALL time ─────────────────────────
@@ -595,6 +818,38 @@ test("runJudgeMatrix still meters (and returns a costRow for) a judge leg that F
   assert.equal(failedLeg.state, "failed");
   const failedRow = costRows.find((r) => r.model === "claude-sonnet-5");
   assert.ok(failedRow, "a failed judge call that consumed tokens still contributes a costRow — spend is real regardless of the outcome");
+});
+
+// ── F5 (review-round fix): the failure-path metering test above uses
+// MockJudgeProvider for BOTH legs, and always fails the ANTHROPIC leg -- so
+// a mutation that gates the meter-on-failure branch to skip the openai
+// provider specifically (`row.judge_provider !== "openai" && resp.tokens...`)
+// would stay green there. This test uses a REAL OpenAIJudgeProvider whose
+// OPENAI leg fails after consuming real tokens, run through runJudgeMatrix,
+// and pins that it still meters.
+
+test("runJudgeMatrix meters a REAL OpenAIJudgeProvider leg that FAILS after consuming tokens -- metering is not provider-conditional (F5)", async () => {
+  const store = makeTempStore("judge-openai-fail-meters-");
+  const anthropic = new MockJudgeProvider();
+  const fetchImpl = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    if (body.messages[0].content.includes("fail-me")) return jsonResponse(500, {});
+    return jsonResponse(200, { choices: [{ message: { content: scoreJsonForIndex(0) } }], usage: { prompt_tokens: 20, completion_tokens: 10 } });
+  };
+  const openai = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 0, logger: silentLogger });
+  const poolKey = "arm=B|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "B", "succeeds fine", "fail-me please")];
+  const { results, costRows } = await runJudgeMatrix({ pools, judgeModels: JUDGE_MODELS, providers: { anthropic, openai }, store, seed: 1, mode: "single", timestamp: "2026-08-02T00:00:00Z" });
+
+  const openaiResult = results.find((r) => r.judge_provider === "openai");
+  assert.equal(openaiResult.state, "failed");
+  const openaiRow = costRows.find((r) => r.model === openaiResult.judge_model);
+  assert.ok(openaiRow, "a failed OpenAI leg that consumed real tokens must still contribute a costRow -- metering must not be conditional on judge_provider");
+  assert.ok(openaiRow.input_tokens > 0 || openaiRow.output_tokens > 0, "the costRow must carry the real tokens actually consumed before the leg failed");
+  // The persisted store row must carry the same real spend.
+  const stored = store.get(`judge-call|cell=${poolKey}|judge=${openaiResult.judge_model}|attempt=0`);
+  assert.ok(stored, "a judge-call cost record must exist for the failed openai leg");
+  assert.equal(stored.costRows[0].input_tokens, openaiRow.input_tokens);
 });
 
 // ── issue #77's specific trap: a REAL OpenAIJudgeProvider run through
