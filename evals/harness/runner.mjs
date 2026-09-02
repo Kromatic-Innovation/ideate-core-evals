@@ -52,6 +52,18 @@ import { assertValidProviderResponse } from "./provider.mjs";
 // reconstruct spend-to-date from the store's own cost rows before this
 // invocation's admission control runs -- see `spendToDate` below.
 import { providerOf, priceRowByProvider, priceRows, priceRowsByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
+// runJudgeMatrix/judgeScoresKey (issue #68): judging has a non-test caller
+// here -- runSpec() invokes runJudgeMatrix per completed pool (one generation
+// cell IS a pool -- poolKey === cell.key, see evals/judge/matrix.mjs's own
+// header) so a single CLI run goes generation -> metrics -> judge -> ledger
+// with no manual step. buildJudgeMatrix is imported separately (not only via
+// runJudgeMatrix) so this module can check, BEFORE calling anything, which of
+// a pool's two judge legs the store already holds a judge-scores record for
+// (issue #68 AC4: a resumed run must judge an already-generated-but-unjudged
+// pool, and must NOT re-call a leg that's already scored -- meterJudgeCall's
+// store.put() would throw on a same-key row with a different timestamp).
+import { runJudgeMatrix, judgeScoresKey } from "../judge/score.mjs";
+import { buildJudgeMatrix } from "../judge/matrix.mjs";
 
 // ── Interim pricing estimator -- INTERIM, superseded by lib/price.mjs in #7 ──
 // A minimal per-model token-estimate table so --max-spend/--dry-run have
@@ -377,6 +389,24 @@ export function planAndPrice(spec, { store, armsConfig, priceGrid = interimPrice
  *   @param {number}   [opts.replicates] --replicates override
  *   @param {(msg: string) => void} [opts.log]  defaults to console.log; tests
  *     inject a silent logger to keep test output clean.
+ *   @param {{anthropic?: string[], openai?: string[]}} [opts.judgeModels]
+ *     candidate judge models per provider (evals/judge/matrix.mjs's
+ *     buildJudgeMatrix shape). THE SWITCH THAT ENABLES JUDGING (issue #68):
+ *     when omitted, runSpec() behaves exactly as before -- generation only,
+ *     no judge account, `summary.judge` is `null`. A real CLI invocation
+ *     (evals/run.mjs) always supplies this, so a genuine run always judges;
+ *     tests that only care about generation stay unaffected by omitting it.
+ *   @param {{anthropic?: object, openai?: object}} [opts.judgeProviders] a
+ *     JudgeProvider (`.score()`) per provider, same shape runJudgeMatrix
+ *     takes. A leg with no wired provider is recorded as a deferred SKIP
+ *     (`judge_deferred:<provider>:...`), never dropped -- see the per-pool
+ *     judging helper below. Only meaningful when `judgeModels` is set.
+ *   @param {Array<{id:string, text:string}>} [opts.corpus] the study's
+ *     briefs, so a pool's judge call can look up its brief text by
+ *     `cell.briefId`. Required whenever `judgeModels` is set.
+ *   @param {number} [opts.judgeSeed=1] base integer seed forwarded to
+ *     runJudgeMatrix per pool (it derives a distinct, replayable per-leg seed
+ *     from this base + the pool key -- see score.mjs).
  * @returns {Promise<{summary: object, dryRun?: object}>}
  */
 export async function runSpec(spec, opts) {
@@ -394,11 +424,23 @@ export async function runSpec(spec, opts) {
     briefIds,
     replicates,
     log = (msg) => console.log(msg),
+    judgeModels,
+    judgeProviders,
+    corpus,
+    judgeSeed = 1,
   } = opts || {};
 
   if (!store) throw new Error("runSpec: store is required");
   if (!armsConfig || !armsConfig.arms) throw new Error("runSpec: armsConfig is required");
   if (!dryRun && !provider) throw new Error("runSpec: provider is required unless dryRun is true");
+  // Judging is opt-in via judgeModels (see the opts doc above), but once
+  // opted in it needs the brief text every pool judges against -- fail loud
+  // at the top of the function rather than discovering the gap mid-run after
+  // real generation spend has already happened.
+  const judgingEnabled = !!judgeModels;
+  if (judgingEnabled && !Array.isArray(corpus)) {
+    throw new Error("runSpec: judgeModels was supplied but opts.corpus (array of { id, text } briefs) was not -- judging needs each pool's brief text");
+  }
 
   const effectiveSpec = subsetSpec(spec, { arms: armIds, briefs: briefIds, replicates });
   const { plan, projection } = planAndPrice(effectiveSpec, { store, armsConfig, priceGrid, batch });
@@ -509,6 +551,212 @@ export async function runSpec(spec, opts) {
   const plannedKeys = [...plan.reuse.map((c) => c.key), ...plan.todo.map((c) => c.key)];
   const account = new RunAccount(plannedKeys);
 
+  // runningTotal / runningTotalByProvider: ACTUAL spend from cells that
+  // complete/fail DURING THIS INVOCATION, tracked between cells as they
+  // finish (issue #51 -- "not only in the pre-flight") -- seeded at 0 and
+  // updated below from each completed/failed cell's REAL `tokens_by_model`,
+  // never from the pre-run projection. These deliberately stay
+  // THIS-INVOCATION-ONLY (see `summary.spendByProvider` at the bottom of
+  // this function, whose meaning existing callers depend on); every
+  // admission decision below adds `priorSpend`/`priorSpend.byProvider` -- the
+  // cumulative total reconstructed from the store BEFORE this invocation
+  // started (issue #64) -- on top of these, so the CEILING is enforced
+  // cumulatively even though these two counters are not.
+  //
+  // Declared HERE (before the reuse loop and the judging block below), not
+  // next to `priceByKey`/`providerByKey` further down: issue #68's judging
+  // pass can run from WITHIN the reuse loop (a generated-but-unjudged pool
+  // from a prior session, see judgePoolIfEnabled below), and it routes judge
+  // cost rows through `recordActualSpend` -- which closes over these. A
+  // `const`/`let` referenced before its own declaration line has executed is
+  // a ReferenceError (TDZ) regardless of function-declaration hoisting, so
+  // these must exist before the FIRST possible call, not merely before the
+  // todo loop that historically was the only caller.
+  let runningTotal = 0;
+  const runningTotalByProvider = {};
+  // runningNonProviderTotal: ACTUAL this-invocation spend on a KNOWN
+  // non-provider model (issue #64 follow-up -- currently only reachable if a
+  // future cell's response ever carries embedder tokens through THIS loop,
+  // which is not how Phase 0/#69 records embedder spend today; kept for
+  // symmetry with runningTotalByProvider and so this total is never silently
+  // dropped if that ever changes). Mirrors `priceRowByProvider`'s
+  // `excludedNonProviderUsd` -- never folded into `runningTotalByProvider`,
+  // never thrown on.
+  let runningNonProviderTotal = 0;
+
+  // Fold one cell's cost rows (real `tokens_by_model`, priced at read time
+  // from `rateTable`) into `runningTotalByProvider`, grouped by provider --
+  // NEVER a flat per-cell/per-run assignment. This is what makes arm G's
+  // actual spend land correctly split across Anthropic and OpenAI instead of
+  // wholly on whichever model happens to be listed first in the row.
+  //
+  // Fail loud on a missing rate WHEN per-provider spend-gating is active
+  // (issue #62 MEDIUM): runnerPriceGrid's fail-loud-on-missing-rate guard
+  // (extended to judge legs too as of issue #63) only ever runs at PLAN
+  // time, against the PROJECTED grid -- it never sees a judge row's ACTUAL
+  // tokens_by_model. A judge call now DOES reach this function (issue #68
+  // wires runJudgeMatrix's costRows through the SAME recordActualSpend every
+  // generation cell uses -- see judgePoolIfEnabled below), so this guard is
+  // exactly what makes a rate-less judge model fail loud instead of silently
+  // contributing $0 to `runningTotalByProvider` (priceRowByProvider's
+  // documented, otherwise-correct default for re-pricing a recorded row),
+  // quietly undercounting real spend against the very ceiling this admission
+  // control exists to enforce. Only enforced when maxSpendByProviderUsd is
+  // supplied -- a run with no per-provider ceiling has nothing to gate, and
+  // priceRowByProvider's $0-and-continue default remains correct for it.
+  function recordActualSpend(costRows) {
+    for (const row of costRows) {
+      const { byProvider, hasMissingRate, missingRateModels, excludedNonProviderUsd } = priceRowByProvider(row, rateTable, { batch });
+      if (maxSpendByProviderUsd && hasMissingRate) {
+        throw new Error(
+          `runSpec: cell '${row.cellKey || row.key}' recorded actual spend for model(s) with no RATE_TABLE entry ` +
+            `(${missingRateModels.join(", ")}) -- per-provider --max-spend cannot gate spend it cannot price. ` +
+            `Add the missing model(s) to lib/price.mjs's RATE_TABLE.`,
+        );
+      }
+      for (const [provider, usd] of Object.entries(byProvider)) {
+        runningTotalByProvider[provider] = (runningTotalByProvider[provider] || 0) + usd;
+      }
+      // A known non-provider model (e.g. the embedder) in a generation/judge
+      // cell's cost rows is NOT gated by any provider ceiling -- tracked here
+      // rather than silently dropped, never thrown on. See isNonProviderModel
+      // (lib/price.mjs) and spendToDate's own excludedNonProviderUsd.
+      runningNonProviderTotal += excludedNonProviderUsd;
+    }
+  }
+
+  // ── Judging (issue #68) ──────────────────────────────────────────────────
+  // A SEPARATE RunAccount for judge legs, deliberately not folded into
+  // `account` above: `account`'s planned set is fixed at construction from
+  // the generation plan (todo+reuse) and existing tests/callers read
+  // `summary.planned/completed/failed/skipped` as GENERATION-cell counts
+  // (e.g. runner.test.mjs's "issue #62 BLOCKER 2" and every `summary.planned
+  // === N` assertion across the suite). Judge legs aren't known until a
+  // cell's generation result exists (a leg's identity depends on
+  // buildJudgeMatrix's arm-based judge selection), so they're planned
+  // INCREMENTALLY into `judgeAccount.planned` as each pool is judged, below.
+  // `judgeAccount.reconcile()` is called at the very end alongside
+  // `account.reconcile()` -- if ANY judge leg never reaches a terminal state,
+  // THAT throws too, so the run as a whole still fails on an unjudged pool
+  // (AC5: "reconcile() treats an unjudged pool as a non-terminal cell rather
+  // than silently passing it") without redefining what `account`'s own
+  // summary counts have always meant.
+  const judgeAccount = judgingEnabled ? new RunAccount([]) : null;
+  const resolvedJudgeProviders = judgeProviders || {};
+  const briefTextByBriefId = judgingEnabled ? new Map(corpus.map((b) => [b.id, b.text])) : null;
+  // Snapshot of what the store already holds BEFORE this invocation judges
+  // anything -- store.keys() is index-only (cheap; see lib/store.mjs), unlike
+  // spendToDate's whole-body read. Used ONLY to detect "this leg was already
+  // scored in a prior session" (issue #68 AC4, the resume blind spot) so a
+  // resumed run never re-calls a leg meterJudgeCall already wrote -- a
+  // second store.put() under the same judge-call key with a fresh timestamp
+  // would throw (lib/store.mjs's byte-identical-or-throw contract). A leg
+  // this SAME invocation just scored is never re-checked against this stale
+  // snapshot because each pool is judged exactly once per run.
+  const existingStoreKeysForJudging = judgingEnabled ? new Set(store.keys()) : null;
+
+  /** Reserved, namespaced RunAccount key for one pool's one judge leg --
+   *  in-memory bookkeeping only (never a store key; compare judgeScoresKey/
+   *  meterJudgeCall's own store-key namespaces in evals/judge/score.mjs and
+   *  gate.mjs, which this deliberately does not collide with). */
+  function judgeLegKey(poolKey, judgeProvider) {
+    return `judge|pool=${poolKey}|provider=${judgeProvider}`;
+  }
+
+  /**
+   * Judge one completed generation cell as a pool (poolKey === cell.key --
+   * see evals/judge/matrix.mjs's header). No-op when judging is disabled.
+   * Idempotent across sessions: a leg the store already holds a judge-scores
+   * record for is acknowledged as already-terminal, never re-called.
+   */
+  async function judgePoolIfEnabled(cell, arm, result) {
+    if (!judgingEnabled) return;
+    if (!arm) throw new Error(`runSpec: judging cell '${cell.key}' -- unknown arm '${cell.armId}'`);
+    const briefText = briefTextByBriefId.get(cell.briefId);
+    if (!briefText) {
+      throw new Error(`runSpec: judging cell '${cell.key}' -- no corpus brief found for briefId '${cell.briefId}'`);
+    }
+    const candidates = result && result.candidates;
+    if (!Array.isArray(candidates)) {
+      throw new Error(`runSpec: judging cell '${cell.key}' -- completed result has no .candidates array to judge`);
+    }
+    const armWithId = { id: cell.armId, ...arm };
+    // buildJudgeMatrix is deterministic given (poolKey, arm, judgeModels) --
+    // calling it here (before deciding what to run) and again inside
+    // runJudgeMatrix below is cheap and lets this function know each leg's
+    // resolved judge_model up front, which is what the store-key resume
+    // check needs (judgeScoresKey is keyed by MODEL, not provider).
+    const rows = buildJudgeMatrix([{ poolKey: cell.key, arm: armWithId }], { judgeModels });
+    for (const row of rows) judgeAccount.planned.add(judgeLegKey(row.poolKey, row.judge_provider));
+
+    const providersToCall = {};
+    const alreadyJudged = new Set();
+    for (const row of rows) {
+      const scoresKey = judgeScoresKey({ poolKey: row.poolKey, judgeModel: row.judge_model });
+      if (existingStoreKeysForJudging.has(scoresKey)) {
+        alreadyJudged.add(row.judge_provider);
+      } else if (resolvedJudgeProviders[row.judge_provider]) {
+        providersToCall[row.judge_provider] = resolvedJudgeProviders[row.judge_provider];
+      }
+    }
+    for (const providerName of alreadyJudged) {
+      judgeAccount.complete(judgeLegKey(cell.key, providerName), { reused: true });
+    }
+    if (alreadyJudged.size === rows.length) return; // every leg already scored in a prior session
+
+    const timestamp = new Date().toISOString();
+    // providersToCall omits any provider not wired (opts.judgeProviders) --
+    // runJudgeMatrix records that leg as `deferred`, never throws for it
+    // (see evals/judge/score.mjs's own header: "NOT dropped -- H5's
+    // self-preference bias term needs both legs").
+    const { results, deferred, costRows } = await runJudgeMatrix({
+      pools: [{ poolKey: cell.key, arm: armWithId, briefText, candidates }],
+      judgeModels,
+      providers: providersToCall,
+      store,
+      seed: judgeSeed,
+      mode: batch ? "batch" : "single",
+      timestamp,
+    });
+
+    // buildJudgeMatrix (inside runJudgeMatrix) always returns BOTH provider
+    // rows for this pool, regardless of `providersToCall` -- a row whose
+    // provider we deliberately excluded above (because it's `alreadyJudged`)
+    // comes back in `deferred` too (runJudgeMatrix sees no provider wired for
+    // it and can't tell "already scored" from "never had a provider").
+    // Skip anything already accounted for above, or `judgeAccount.complete`/
+    // `.skip` would throw "already terminal; refusing to overwrite".
+    for (const r of results) {
+      if (alreadyJudged.has(r.judge_provider)) continue;
+      const legKey = judgeLegKey(r.poolKey, r.judge_provider);
+      if (r.state === "completed") judgeAccount.complete(legKey, { scores: r.scores });
+      else judgeAccount.fail(legKey, r.failureKind, r.detail || "");
+    }
+    for (const d of deferred) {
+      if (alreadyJudged.has(d.judge_provider)) continue;
+      const legKey = judgeLegKey(d.poolKey, d.judge_provider);
+      // A deferred leg (no provider wired for it) is a legitimate, terminal
+      // outcome -- `skip()`, never `fail()`: FAILURE_KINDS has no entry that
+      // honestly describes "no provider wired", and `harness_error` would be
+      // a lie that pollutes summary.byKind. Distinct detail prefix
+      // (`judge_deferred:`) keeps it visibly different from a budget skip.
+      judgeAccount.skip(legKey, `judge_deferred:${d.judge_provider}:${d.reason}`);
+    }
+
+    // Route every judge costRow to the SAME accounting this cell's
+    // generation spend uses (issue #68 requirement 2: "judge cost rows reach
+    // recordActualSpend, so real judge spend counts against
+    // runningTotalByProvider and can trip a per-provider ceiling"). Each row
+    // is built EXACTLY ONCE by meterJudgeCall (inside runJudgeMatrix) and
+    // already durably stored under its own `judge-call|...` key by the time
+    // this line runs -- addCost()/recordActualSpend() never call store.put()
+    // themselves, so this can never double-persist the same row under a
+    // second store key (the exact double-count meterJudgeCall's own header
+    // comment guards against).
+    for (const row of costRows) account.addCost(row);
+    recordActualSpend(costRows);
+  }
+
   // Reused cells already reached SOME terminal state in a prior session --
   // completed, failed, or (rarer) skipped. They still must appear in this
   // run's account so reconcile() sees a complete picture of "every cell this
@@ -532,6 +780,14 @@ export async function runSpec(spec, opts) {
       // once a study runs across multiple sessions, the entire point of the
       // additive/resume design.
       account.complete(cell.key, priorRecord.result);
+      // issue #68 AC4 -- the resume blind spot: a cell generated in a PRIOR
+      // session (reused here for free) may not have been judged yet (either
+      // because that session predates #68, or was interrupted before
+      // judging ran). Judge it NOW, on this invocation, rather than leaving
+      // it a silent $0/no-op forever. Only a cell whose PRIOR generation
+      // actually completed has candidates to judge -- a reused `failed`
+      // cell below is deliberately excluded.
+      await judgePoolIfEnabled(cell, armsConfig.arms[cell.armId], priorRecord.result);
     } else if (priorState.state === "failed") {
       account.fail(cell.key, priorState.kind, priorState.detail || "");
     } else if (priorState.state === "skipped") {
@@ -561,70 +817,6 @@ export async function runSpec(spec, opts) {
   // the pre-flight block above) -- used to decide, BEFORE a cell runs,
   // whether admitting it would cross a provider's ceiling.
   const providerByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.byProvider || {}]));
-  // runningTotal / runningTotalByProvider: ACTUAL spend from cells that
-  // complete/fail DURING THIS INVOCATION, tracked between cells as they
-  // finish (issue #51 -- "not only in the pre-flight") -- seeded at 0 and
-  // updated below from each completed/failed cell's REAL `tokens_by_model`,
-  // never from the pre-run projection. These deliberately stay
-  // THIS-INVOCATION-ONLY (see `summary.spendByProvider` at the bottom of
-  // this function, whose meaning existing callers depend on); every
-  // admission decision below adds `priorSpend`/`priorSpend.byProvider` -- the
-  // cumulative total reconstructed from the store BEFORE this invocation
-  // started (issue #64) -- on top of these, so the CEILING is enforced
-  // cumulatively even though these two counters are not.
-  let runningTotal = 0;
-  const runningTotalByProvider = {};
-  // runningNonProviderTotal: ACTUAL this-invocation spend on a KNOWN
-  // non-provider model (issue #64 follow-up -- currently only reachable if a
-  // future cell's response ever carries embedder tokens through THIS loop,
-  // which is not how Phase 0/#69 records embedder spend today; kept for
-  // symmetry with runningTotalByProvider and so this total is never silently
-  // dropped if that ever changes). Mirrors `priceRowByProvider`'s
-  // `excludedNonProviderUsd` -- never folded into `runningTotalByProvider`,
-  // never thrown on.
-  let runningNonProviderTotal = 0;
-
-  // Fold one cell's cost rows (real `tokens_by_model`, priced at read time
-  // from `rateTable`) into `runningTotalByProvider`, grouped by provider --
-  // NEVER a flat per-cell/per-run assignment. This is what makes arm G's
-  // actual spend land correctly split across Anthropic and OpenAI instead of
-  // wholly on whichever model happens to be listed first in the row.
-  //
-  // Fail loud on a missing rate WHEN per-provider spend-gating is active
-  // (issue #62 MEDIUM): runnerPriceGrid's fail-loud-on-missing-rate guard
-  // (extended to judge legs too as of issue #63) only ever runs at PLAN
-  // time, against the PROJECTED grid -- it never sees a judge row's ACTUAL
-  // tokens_by_model, because runJudgeMatrix (evals/judge/score.mjs) is not
-  // itself invoked from this runSpec() path (see that module's own
-  // disclosure). So a rate-less judge model reaching THIS function's actual-
-  // spend accounting still has no upstream guard to rely on. Without this
-  // check, a rate-less model would
-  // silently contribute $0 to `runningTotalByProvider` (priceRowByProvider's
-  // documented, otherwise-correct default for re-pricing a recorded row),
-  // quietly undercounting real spend against the very ceiling this admission
-  // control exists to enforce. Only enforced when maxSpendByProviderUsd is
-  // supplied -- a run with no per-provider ceiling has nothing to gate, and
-  // priceRowByProvider's $0-and-continue default remains correct for it.
-  function recordActualSpend(costRows) {
-    for (const row of costRows) {
-      const { byProvider, hasMissingRate, missingRateModels, excludedNonProviderUsd } = priceRowByProvider(row, rateTable, { batch });
-      if (maxSpendByProviderUsd && hasMissingRate) {
-        throw new Error(
-          `runSpec: cell '${row.cellKey || row.key}' recorded actual spend for model(s) with no RATE_TABLE entry ` +
-            `(${missingRateModels.join(", ")}) -- per-provider --max-spend cannot gate spend it cannot price. ` +
-            `Add the missing model(s) to lib/price.mjs's RATE_TABLE.`,
-        );
-      }
-      for (const [provider, usd] of Object.entries(byProvider)) {
-        runningTotalByProvider[provider] = (runningTotalByProvider[provider] || 0) + usd;
-      }
-      // A known non-provider model (e.g. the embedder) in a generation/judge
-      // cell's cost rows is NOT gated by any provider ceiling -- tracked here
-      // rather than silently dropped, never thrown on. See isNonProviderModel
-      // (lib/price.mjs) and spendToDate's own excludedNonProviderUsd.
-      runningNonProviderTotal += excludedNonProviderUsd;
-    }
-  }
 
   for (const cell of plan.todo) {
     // `priceByKey.get(cell.key) || 0` would mask two distinct situations as
@@ -720,7 +912,18 @@ export async function runSpec(spec, opts) {
       account.complete(cell.key, response.result);
       const costRows = costRowsFor(cell.key, response.tokens, timestamp);
       for (const row of costRows) account.addCost(row);
-      recordActualSpend(costRows);
+      // issue #74 -- store.put() BEFORE recordActualSpend(): the API call
+      // already succeeded and spent real money by this point, so the result
+      // and its cost row must be durably written BEFORE the fail-loud
+      // missing-rate guard (issue #62 MEDIUM) gets a chance to throw.
+      // Previously recordActualSpend() ran first, so a rate-table gap
+      // discarded an already-paid-for cell's entire record (never reaching
+      // store.put()) and aborted the rest of the run -- silently
+      // under-counting real spend against the very ceiling meant to bound
+      // it. The ordering is the fix, per the issue's own "suggested fix
+      // direction": the throw-and-abort behavior on a missing rate is
+      // UNCHANGED (still fails loud, still aborts this invocation) -- only
+      // WHEN it can fire relative to persistence moved.
       store.put({
         key: cell.key,
         armId: cell.armId,
@@ -732,13 +935,22 @@ export async function runSpec(spec, opts) {
         accounting: { state: "completed" },
         costRows,
       });
+      recordActualSpend(costRows);
+      // issue #68 -- judge this pool now, per cell, so a per-provider
+      // ceiling stays responsive to judge spend for the NEXT cell's
+      // admission decision (see the per-cell loop's projected-vs-actual
+      // comparison above, which reads runningTotalByProvider between cells).
+      await judgePoolIfEnabled(cell, arm, response.result);
     } else {
       // response.terminalState === "failed" -- a classified provider
       // failure surfaces as a `failed` cell, never a missing one.
       account.fail(cell.key, response.failureKind, response.detail || "");
       const costRows = costRowsFor(cell.key, response.tokens, timestamp);
       for (const row of costRows) account.addCost(row);
-      recordActualSpend(costRows);
+      // issue #74 -- same store.put()-before-recordActualSpend reordering
+      // as the completed branch above: a FAILED cell can still have
+      // consumed real tokens (see costRowsFor's caller comment), and those
+      // must survive even if recordActualSpend then throws.
       store.put({
         key: cell.key,
         armId: cell.armId,
@@ -750,6 +962,8 @@ export async function runSpec(spec, opts) {
         accounting: { state: "failed", kind: response.failureKind, detail: response.detail || "" },
         costRows,
       });
+      recordActualSpend(costRows);
+      // No candidates on a failed generation cell -- nothing to judge.
     }
   }
 
@@ -758,6 +972,15 @@ export async function runSpec(spec, opts) {
   // none computed in this module, but the summary below is derived from
   // reconcile()'s own tally, so it is definitionally post-gate.
   const summary = account.reconcile();
+  // judge (issue #68 AC5): a SEPARATE reconcile() over the judge-leg
+  // account. If any planned judge leg never reached a terminal state, THIS
+  // throws -- exactly like the generation `account.reconcile()` above -- so
+  // the run as a whole still fails on an unjudged pool rather than silently
+  // passing (see the judgeAccount construction comment above for why this is
+  // a second account rather than folded into `summary.planned/completed/...`).
+  // `null` when judging was never enabled this invocation (opts.judgeModels
+  // unset) -- `null` here means "not applicable", never "computed as zero".
+  summary.judge = judgeAccount ? judgeAccount.reconcile() : null;
   // spendByProvider: the ACTUAL per-provider total THIS INVOCATION spent,
   // derived from real tokens_by_model (issue #51) -- exposed on the summary
   // so a caller (report, next --max-spend-<provider> invocation) can see
