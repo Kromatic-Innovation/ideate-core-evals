@@ -14,6 +14,7 @@ import {
   buildJudgeScoringPrompt,
   parseAxisScores,
   runJudgeMatrix,
+  judgePaymentRefusal,
   recordJudgeScores,
   judgeScoresKey,
   judgeScoresForAxis,
@@ -1120,4 +1121,255 @@ test("recordJudgeScores refuses to store a collapsed/averaged score", () => {
     () => recordJudgeScores(store, { poolKey: "arm=B|brief=x|rep=0|cfg=x", judgeModel: "claude-sonnet-5", scores: [{ overallScore: 5 }] }),
     /originality|feasibility|distinct/,
   );
+});
+
+// ── issue #106: a payment refusal on a JUDGE leg ──────────────────────────
+//
+// PART 1 — DETECTION. The issue was filed believing a judge leg already
+// classified `payment_required` and merely failed to stop anything. It did
+// not: both judge providers called classifyTransportOutcome WITHOUT the
+// `errorBody` the fetch helpers return, and isBillingRefusal keys on the
+// BODY (never on status alone — 400 and 429 are far too overloaded). So
+// `paymentRequired` was unreachable on every judge leg, and #88's abort had
+// nothing to fire on. Every test below is RED before this change: the
+// anthropic ones classified `transport_error`, the openai ones
+// `rate_limited` — both TRANSIENT, i.e. "re-run me", which is the worst
+// possible answer to an unfunded account.
+//
+// Bodies are the ones evals/harness/provider.mjs's isBillingRefusal actually
+// documents: the Anthropic one is capture-verified there; the OpenAI one is
+// its documented `insufficient_quota` on a 429.
+
+const ANTHROPIC_BILLING_BODY = {
+  type: "error",
+  error: {
+    type: "invalid_request_error",
+    message: "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+  },
+};
+const OPENAI_QUOTA_BODY = {
+  error: {
+    message: "You exceeded your current quota, please check your plan and billing details.",
+    type: "insufficient_quota",
+    code: "insufficient_quota",
+  },
+};
+
+test("issue #106: an Anthropic judge leg (single) classifies a credit-balance refusal as payment_required, not transport_error", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    return jsonResponse(400, ANTHROPIC_BILLING_BODY);
+  };
+  const provider = new AnthropicJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 3, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "claude-sonnet-5", mode: "single", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "payment_required", "the judge provider must forward errorBody to the classifier -- without it this is an untyped transport_error");
+  assert.equal(calls, 1, "a billing refusal is not retried -- burning the backoff ladder against an account that cannot pay is the futile retry #88 fixed");
+});
+
+test("issue #106: an Anthropic judge leg (batch) classifies a per-request credit refusal in the RESULT ROWS as payment_required", async () => {
+  let submitted;
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u.endsWith("/v1/messages/batches")) {
+      submitted = JSON.parse(opts.body);
+      return jsonResponse(200, { id: "jb1", processing_status: "ended", results_url: "https://fake/jresults" });
+    }
+    if (u === "https://fake/jresults") {
+      const lines = submitted.requests.map((r) => ({ custom_id: r.custom_id, result: { type: "errored", error: ANTHROPIC_BILLING_BODY.error } }));
+      return textResponse(lines.map((l) => JSON.stringify(l)).join("\n"));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+  const provider = new AnthropicJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 0, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b") }, { judgeModel: "claude-sonnet-5", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "payment_required", "an errored batch ROW carrying a credit refusal is a payment failure, not an undifferentiated transport_error");
+});
+
+test("issue #106: an OpenAI judge leg (single) classifies a 429/insufficient_quota as payment_required, NOT rate_limited", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    return jsonResponse(429, OPENAI_QUOTA_BODY);
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 3, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "single", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(
+    resp.failureKind,
+    "payment_required",
+    "OpenAI delivers quota exhaustion as a 429 -- classifying it `rate_limited` (transient) is what marched every remaining pool into the same wall",
+  );
+  assert.equal(calls, 1, "not retried: the body says the account cannot pay, so the 429 retry ladder is futile");
+});
+
+test("issue #106: an OpenAI judge leg (batch) classifies an insufficient_quota OUTPUT ROW as payment_required, NOT rate_limited", async () => {
+  let submitted = [];
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") {
+      const text = await opts.body.get("file").text();
+      submitted = text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      return jsonResponse(200, { id: "ofile_1" });
+    }
+    if (u === "https://api.openai.com/v1/batches") return jsonResponse(200, { id: "ob_1", status: "completed", output_file_id: "ofile_out" });
+    if (u === "https://api.openai.com/v1/files/ofile_out/content") {
+      const lines = submitted.map((l) => ({ custom_id: l.custom_id, response: { status_code: 429, body: OPENAI_QUOTA_BODY } }));
+      return textResponse(lines.map((l) => JSON.stringify(l)).join("\n"));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 0, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "payment_required", "the 429 branch must not swallow a body that says insufficient_quota");
+});
+
+// PART 2 — THE ABORT. runSpec() calls runJudgeMatrix once per completed pool,
+// so the loop below (one call per pool, the SAME provider instances
+// throughout) is the shape a real run has. The whole point of the issue is
+// what happens on calls 2..N.
+
+const PAYMENT_FAIL_OPENAI = new Map(JUDGE_MODELS.openai.map((m) => [m, { failureKind: "payment_required" }]));
+
+test("issue #106: after ONE judge-leg payment refusal, the refusing provider is never called again -- across pools, not just within one call", async () => {
+  const store = makeTempStore("judge-payment-abort-");
+  const anthropic = new MockJudgeProvider();
+  const openai = new MockJudgeProvider({ failFor: PAYMENT_FAIL_OPENAI });
+  const poolKeys = ["arm=B|brief=biz-01|rep=0|cfg=x", "arm=B|brief=biz-02|rep=0|cfg=x", "arm=B|brief=biz-03|rep=0|cfg=x"];
+  const runs = [];
+  for (const poolKey of poolKeys) {
+    runs.push(
+      await runJudgeMatrix({
+        pools: [poolEntry(poolKey, "B", "b idea 1", "b idea 2")],
+        judgeModels: JUDGE_MODELS,
+        providers: { anthropic, openai },
+        store,
+        seed: 1,
+        timestamp: "2026-08-02T00:00:00Z",
+      }),
+    );
+  }
+
+  // THE bug: without the abort this is 3 -- one pointless, correctly-classified
+  // refusal per pool, a few hundred of them on the real ~200-cell grid.
+  assert.equal(openai.calls.length, 1, "the openai judge is called for the FIRST pool only; every later leg is short-circuited before the call");
+  assert.equal(anthropic.calls.length, 3, "a refusal on the OPENAI account must not stop ANTHROPIC judging -- two vendors, two balances");
+
+  // Pool 1: an attempted leg that was refused.
+  const first = runs[0].results.find((r) => r.judge_provider === "openai");
+  assert.equal(first.state, "failed");
+  assert.equal(first.failureKind, "payment_required");
+  assert.equal(first.attempted, true, "the leg that SET the sticky flag really was called");
+  assert.equal(runs[0].paymentSkipped.length, 0, "nothing was short-circuited yet on the first pool");
+
+  // Pools 2-3: unattempted, but NOT silently absent -- one terminal record each.
+  for (const run of runs.slice(1)) {
+    assert.equal(run.results.length, 2, "both legs of the pool are still reported -- an unattempted leg that vanishes is the hole a reconciliation gate exists to catch");
+    const skippedLeg = run.results.find((r) => r.judge_provider === "openai");
+    assert.equal(skippedLeg.state, "failed");
+    assert.equal(skippedLeg.failureKind, "payment_required", "one category for the whole abort, so a summary groups it as payment_required=N");
+    assert.equal(skippedLeg.attempted, false, "self-describing: this leg was never called");
+    assert.match(skippedLeg.detail, /^payment_required: /, "the reason carries the #88-style colon-prefix category");
+    assert.match(skippedLeg.detail, /NOT attempted/);
+    assert.equal(run.paymentSkipped.length, 1, "the short-circuited legs are also listed separately, for a caller that wants to record them as a skip");
+    assert.equal(run.paymentSkipped[0].judge_provider, "openai");
+    assert.equal(run.results.find((r) => r.judge_provider === "anthropic").state, "completed");
+  }
+
+  // The sticky record is per PROVIDER INSTANCE and names where it happened.
+  const refusal = judgePaymentRefusal(openai);
+  assert.ok(refusal, "the refusal is recorded against the openai provider instance");
+  assert.equal(refusal.poolKey, poolKeys[0], "it names the pool where the account first refused");
+  assert.equal(judgePaymentRefusal(anthropic), null, "the anthropic instance is untouched -- the abort is per provider, never global");
+  assert.deepEqual(Object.keys(runs[2].paymentRefusals), ["openai"], "the return surfaces the abort so a caller can log it without re-deriving it");
+});
+
+test("issue #106: spend already incurred survives the abort, and a short-circuited leg spends (and stores) nothing", async () => {
+  const store = makeTempStore("judge-payment-spend-");
+  const anthropic = new MockJudgeProvider();
+  const openai = new MockJudgeProvider({ failFor: PAYMENT_FAIL_OPENAI });
+  const poolKeys = ["arm=B|brief=biz-01|rep=0|cfg=x", "arm=B|brief=biz-02|rep=0|cfg=x"];
+  const runs = [];
+  for (const poolKey of poolKeys) {
+    runs.push(
+      await runJudgeMatrix({
+        pools: [poolEntry(poolKey, "B", "b idea 1", "b idea 2")],
+        judgeModels: JUDGE_MODELS,
+        providers: { anthropic, openai },
+        store,
+        seed: 1,
+        timestamp: "2026-08-02T00:00:00Z",
+      }),
+    );
+  }
+
+  // The REFUSED call consumed tokens before being refused -- that is real
+  // money and meterJudgeCall's attempt-scoped row must exist for it.
+  const refusedLeg = runs[0].results.find((r) => r.judge_provider === "openai");
+  const refusedRow = runs[0].costRows.find((r) => r.model === refusedLeg.judge_model);
+  assert.ok(refusedRow, "a refused judge call that consumed tokens still contributes a costRow -- spend is real regardless of the outcome");
+  assert.ok(store.get(`judge-call|cell=${poolKeys[0]}|judge=${refusedLeg.judge_model}|attempt=0`), "and it is durably stored");
+
+  // The SHORT-CIRCUITED leg never called anything, so it must produce no cost
+  // row and no store record -- a $0 row for a call that never happened would
+  // be a fabricated datum, and a second row under the same key would trip
+  // lib/store.mjs's byte-identical-or-throw guard.
+  const skippedLeg = runs[1].results.find((r) => r.judge_provider === "openai");
+  assert.equal(skippedLeg.attempted, false);
+  assert.equal(
+    runs[1].costRows.filter((r) => r.model === skippedLeg.judge_model).length,
+    0,
+    "a leg that was never called contributes no cost row -- not even a $0 one",
+  );
+  assert.ok(
+    !store.keys().includes(`judge-call|cell=${poolKeys[1]}|judge=${skippedLeg.judge_model}|attempt=0`),
+    "and nothing is written under its judge-call key",
+  );
+  // The anthropic leg of the SAME pool judged and metered normally.
+  const anthropicLeg = runs[1].results.find((r) => r.judge_provider === "anthropic");
+  assert.equal(anthropicLeg.state, "completed");
+  assert.ok(runs[1].costRows.find((r) => r.model === anthropicLeg.judge_model), "the unaffected provider's spend is unaffected");
+});
+
+// The two abort tests above drive the refusing leg with MockJudgeProvider.
+// This file's own F5 comment (above) records why that is not always enough:
+// a defect conditional on the real provider stays green under the Mock. The
+// sticky-set reads only `resp.failureKind`, so the risk is small — but the
+// end-to-end path (real transport → real classification → abort) is the one
+// an operator actually runs, so pin it once with a REAL OpenAIJudgeProvider.
+
+test("issue #106: a REAL OpenAIJudgeProvider quota refusal sets the abort and short-circuits the next pool -- not just the Mock", async () => {
+  const store = makeTempStore("judge-payment-real-");
+  const anthropic = new MockJudgeProvider();
+  let openaiHttpCalls = 0;
+  const fetchImpl = async () => {
+    openaiHttpCalls++;
+    return jsonResponse(429, OPENAI_QUOTA_BODY);
+  };
+  const openai = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 0, logger: silentLogger });
+  const poolKeys = ["arm=B|brief=biz-01|rep=0|cfg=x", "arm=B|brief=biz-02|rep=0|cfg=x"];
+  const runs = [];
+  for (const poolKey of poolKeys) {
+    runs.push(
+      await runJudgeMatrix({
+        pools: [poolEntry(poolKey, "B", "b idea 1")],
+        judgeModels: JUDGE_MODELS,
+        providers: { anthropic, openai },
+        store,
+        seed: 1,
+        mode: "single",
+        timestamp: "2026-08-02T00:00:00Z",
+      }),
+    );
+  }
+
+  assert.equal(runs[0].results.find((r) => r.judge_provider === "openai").failureKind, "payment_required");
+  assert.equal(openaiHttpCalls, 1, "the second pool's openai leg makes NO HTTP request at all -- the abort happens before the transport");
+  const second = runs[1].results.find((r) => r.judge_provider === "openai");
+  assert.equal(second.failureKind, "payment_required");
+  assert.equal(second.attempted, false);
+  assert.equal(runs[1].results.find((r) => r.judge_provider === "anthropic").state, "completed", "the anthropic leg of the same pool still judged");
 });

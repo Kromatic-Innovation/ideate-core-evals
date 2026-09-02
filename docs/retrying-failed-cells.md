@@ -32,6 +32,47 @@ credit refusal as an HTTP **400** and OpenAI returns quota exhaustion as a
 the second as an ordinary rate limit. Both are transient classes, and both
 would march a ~200-cell grid into an account that cannot pay for any of it.
 
+### Judging aborts separately, and does not stop generation (issue #106)
+
+The table above is about **generation**. Judging has its own account, its own
+abort, and deliberately different consequences.
+
+Until issue #106, a judge leg could not classify `payment_required` at all:
+`evals/judge/score.mjs`'s two judge providers called the shared classifier
+without the response body, and the detector keys on the body — never on status
+alone. So an Anthropic judge credit refusal was filed `transport_error` and an
+OpenAI judge quota exhaustion `rate_limited`. Both transient, i.e. "re-run
+me" — the worst possible answer to an account that cannot pay, and the one
+most likely to be given, because judge spend is this study's dominant OpenAI
+cost driver (PREREGISTRATION §12). #106 forwards the body at every judge
+transport site, including the per-request error rows inside a batch result.
+
+With detection working, the abort is:
+
+| | Behaviour |
+| --- | --- |
+| Judge legs on the **refusing provider** | stop — every later pool's leg for that provider is reported terminal with `payment_required` and **is never called** |
+| Judge legs on the **other provider** | continue — two vendors, two balances |
+| **Generation** | continues, unaffected |
+
+Generation continuing is a decision, not an oversight. Symmetry with #88 would
+throw away work that is still good: a pool generated now is judged on a later
+invocation once the account is funded (`runSpec()` already judges an
+already-generated-but-unjudged pool on resume — issue #68 AC4), and issue #90
+keeps transient generation failures retryable in the meantime. The accounts
+are also usually at different vendors — a dry OpenAI judge balance says
+nothing about the Anthropic generation balance — so stopping generation would
+be acting on evidence that does not bear on it. Per-provider granularity
+follows for the same reason, and is finer than #88's generation-side abort can
+manage: a generation cell can span several models from several vendors, so
+#88 cannot always tell which slot refused; a judge leg is single-model by
+construction, so it always can.
+
+Money already spent survives either way. A judge call that consumed tokens
+before being refused still writes its attempt-scoped `judge-call|…` cost row
+(`meterJudgeCall`); a leg that was short-circuited was never called, so it
+writes nothing at all — not even a $0 row for a call that never happened.
+
 Why it has to work this way: `planRun(spec, storedKeys)` receives **only
 keys**. It cannot see `accounting.state`, so it cannot tell a completed cell
 from a failed one — and nothing a _run_ does removes a record from the store.

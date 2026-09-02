@@ -102,6 +102,67 @@ test("runSpec invokes judging for each completed pool -- a single call goes gene
   assert.equal(openaiJudge.calls.length, 4, "the openai judge was actually called once per pool");
 });
 
+// ── issue #106: a payment refusal on a judge leg aborts JUDGING (only) ──────
+//
+// #88 gave a `payment_required` classification the power to abort the
+// remaining GENERATION plan. Judging had no counterpart: runSpec() calls
+// runJudgeMatrix once per completed pool, so a dry judge account was refused
+// once per pool for the rest of the grid.
+//
+// This is the mid-run test the issue asks for, at the runSpec level -- it
+// pins all three halves at once: judging stops, generation does NOT, and
+// judgeAccount.reconcile() still passes (runSpec would THROW here otherwise,
+// so simply returning a summary is the reconciliation assertion).
+
+test("issue #106: a judge-leg payment refusal stops further judging on THAT provider -- and does not stop generation", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+  const openaiJudge = new MockJudgeProvider({ failFor: new Map(JUDGE_MODELS.openai.map((m) => [m, { failureKind: "payment_required" }])) });
+
+  const { summary } = await runSpec(SPEC, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge, openai: openaiJudge },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+
+  // THE bug: without the abort the openai judge is called 4 times -- once per
+  // pool, refused every time, stopping nothing.
+  assert.equal(openaiJudge.calls.length, 1, "the refusing judge account is called ONCE; the remaining pools' openai legs are never attempted");
+  assert.equal(anthropicJudge.calls.length, 4, "the anthropic judge account is unaffected -- a different vendor's balance says nothing about this one");
+
+  // GENERATION IS NOT STOPPED. This is the issue's central open question and
+  // the answer this PR records: continuing to generate is value-preserving,
+  // because the pools it produces are judged on a later invocation once the
+  // account is funded (the resume tests below), and #90 keeps transient
+  // generation failures retryable meanwhile.
+  assert.equal(summary.completed, 4, "every generation cell still ran -- a judge-side refusal must not abort generation");
+  assert.equal(summary.skipped, 0, "no generation cell was skipped");
+  assert.equal(summary.paymentAbort, null, "#88's GENERATION-side payment abort was not triggered by a judge-side refusal");
+
+  // Reconciliation: every planned judge leg reached exactly one terminal
+  // state, including the ones never attempted. (runSpec() throws out of
+  // judgeAccount.reconcile() if any leg is missing, so reaching this line at
+  // all is the gate passing.)
+  assert.equal(summary.judge.planned, 8, "4 pools x 2 legs -- unattempted legs are still PLANNED and still accounted");
+  assert.equal(summary.judge.completed, 4, "the four anthropic legs");
+  assert.equal(summary.judge.failed, 4, "the four openai legs: one refused, three never attempted");
+  assert.deepEqual(
+    summary.judge.byKind,
+    { payment_required: 4 },
+    "one category for the whole abort -- an operator reads `payment_required=4`, not an undifferentiated failure count",
+  );
+
+  // Every one of the four pools has its anthropic scores durably stored --
+  // the half of the matrix that COULD be paid for is not thrown away.
+  const scored = store.keys().filter((k) => k.startsWith("judge-scores|") && k.includes(JUDGE_MODELS.anthropic[0]));
+  assert.equal(scored.length, 4, "the payable leg of every pool was still scored and stored");
+});
+
 test("runSpec does NOT invoke judging when judgeModels is omitted -- generation-only callers/tests are unaffected", async (t) => {
   const store = new ResultsStore(tempDir(t));
   const provider = new MockProvider();
