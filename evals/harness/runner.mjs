@@ -254,7 +254,11 @@ function subsetSpec(spec, { arms, briefs, replicates } = {}) {
  *   (matches the `batch` flag `runSpec()`/`runnerPriceGrid` price the plan
  *   under -- this study is batch-first by default, see the module header)
  * @returns {{ totalUsd: number, byProvider: Object<string, number>,
- *   hasMissingRate: boolean, missingRateModels: string[] }}
+ *   hasMissingRate: boolean, missingRateModels: string[],
+ *   excludedNonProviderUsd: number, excludedNonProviderModels: string[] }}
+ *   `totalUsd` includes excluded non-provider spend (e.g. the embedder);
+ *   `byProvider` never does -- see the excludedNonProviderUsd/Models fields
+ *   for that money, tracked separately rather than silently dropped.
  */
 export function spendToDate(store, rateTable = DEFAULT_RATE_TABLE, { batch = true } = {}) {
   if (!store) throw new Error("spendToDate: store is required");
@@ -270,6 +274,18 @@ export function spendToDate(store, rateTable = DEFAULT_RATE_TABLE, { batch = tru
     byProvider: byProviderTotals.byProvider,
     hasMissingRate: totals.hasMissingRate || byProviderTotals.hasMissingRate,
     missingRateModels: [...new Set([...totals.missingRateModels, ...byProviderTotals.missingRateModels])],
+    // excludedNonProviderUsd/Models (issue #64 follow-up, cwc PR #72 review):
+    // KNOWN non-provider spend (currently just the embedder, `voyage-*` --
+    // Phase 0/#69 writes real `voyage-4-lite` cost rows to this SAME store)
+    // -- priced and counted in `totalUsd` above (priceRows() prices every
+    // row regardless of provider), but deliberately excluded from
+    // `byProvider`, so a per-provider ceiling is never gated by spend that
+    // isn't Anthropic or OpenAI spend, and `lib/price.mjs`'s `providerOf`
+    // is never asked to classify a model it correctly has no provider
+    // bucket for. Surfaced here -- not silently dropped -- so a caller can
+    // see embedder spend is tracked, just outside the provider ceilings.
+    excludedNonProviderUsd: byProviderTotals.excludedNonProviderUsd,
+    excludedNonProviderModels: byProviderTotals.excludedNonProviderModels,
   };
 }
 
@@ -527,6 +543,15 @@ export async function runSpec(spec, opts) {
   // cumulatively even though these two counters are not.
   let runningTotal = 0;
   const runningTotalByProvider = {};
+  // runningNonProviderTotal: ACTUAL this-invocation spend on a KNOWN
+  // non-provider model (issue #64 follow-up -- currently only reachable if a
+  // future cell's response ever carries embedder tokens through THIS loop,
+  // which is not how Phase 0/#69 records embedder spend today; kept for
+  // symmetry with runningTotalByProvider and so this total is never silently
+  // dropped if that ever changes). Mirrors `priceRowByProvider`'s
+  // `excludedNonProviderUsd` -- never folded into `runningTotalByProvider`,
+  // never thrown on.
+  let runningNonProviderTotal = 0;
 
   // Fold one cell's cost rows (real `tokens_by_model`, priced at read time
   // from `rateTable`) into `runningTotalByProvider`, grouped by provider --
@@ -551,7 +576,7 @@ export async function runSpec(spec, opts) {
   // priceRowByProvider's $0-and-continue default remains correct for it.
   function recordActualSpend(costRows) {
     for (const row of costRows) {
-      const { byProvider, hasMissingRate, missingRateModels } = priceRowByProvider(row, rateTable, { batch });
+      const { byProvider, hasMissingRate, missingRateModels, excludedNonProviderUsd } = priceRowByProvider(row, rateTable, { batch });
       if (maxSpendByProviderUsd && hasMissingRate) {
         throw new Error(
           `runSpec: cell '${row.cellKey || row.key}' recorded actual spend for model(s) with no RATE_TABLE entry ` +
@@ -562,6 +587,11 @@ export async function runSpec(spec, opts) {
       for (const [provider, usd] of Object.entries(byProvider)) {
         runningTotalByProvider[provider] = (runningTotalByProvider[provider] || 0) + usd;
       }
+      // A known non-provider model (e.g. the embedder) in a generation/judge
+      // cell's cost rows is NOT gated by any provider ceiling -- tracked here
+      // rather than silently dropped, never thrown on. See isNonProviderModel
+      // (lib/price.mjs) and spendToDate's own excludedNonProviderUsd.
+      runningNonProviderTotal += excludedNonProviderUsd;
     }
   }
 
@@ -735,6 +765,16 @@ export async function runSpec(spec, opts) {
   // `cumulativeSpendByProvider` instead keeps this field on the ACTUAL basis
   // throughout, matching `spendByProvider`'s own meaning.
   summary.cumulativeSpendUsd = Object.values(cumulativeSpendByProvider).reduce((a, b) => a + b, 0);
+  // cumulativeNonProviderSpendUsd/Models: KNOWN non-provider spend (the
+  // embedder, currently) tracked SEPARATELY from cumulativeSpendUsd/
+  // spendByProvider -- real money (Voyage is free-tier only as of this
+  // table's rate `date`, per RATE_TABLE's notes -- it is not free forever),
+  // deliberately NOT counted toward any per-provider ceiling and NOT folded
+  // into cumulativeSpendUsd, so that field stays a pure "what would trip
+  // --max-spend-anthropic/-openai" figure. Visible here rather than
+  // vanishing between spendToDate's exclusion and this summary.
+  summary.cumulativeNonProviderSpendUsd = priorSpend.excludedNonProviderUsd + runningNonProviderTotal;
+  summary.cumulativeNonProviderModels = [...new Set([...priorSpend.excludedNonProviderModels])];
   log(`[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
   return { summary, account };
 }

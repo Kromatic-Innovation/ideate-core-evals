@@ -836,6 +836,118 @@ test("issue #64: an empty store's spend-to-date is exactly zero, both globally a
   assert.equal(result.hasMissingRate, false);
 });
 
+// ── issue #64 follow-up (cwc PR #72 review): Phase 0 (#69) writes real
+// `voyage-4-lite` cost rows to the SAME store a spend ceiling reads. Before
+// this fix, `spendToDate` (via `priceRowsByProvider` -> `priceRowByProvider`
+// -> `providerOf`) would THROW on a correctly-written embedder row, hard-
+// failing a resumed study on exactly the path whose job is to stop an
+// unbounded bill. ──
+
+/** Seed a store with a cost row shaped EXACTLY like evals/metrics/phase0.mjs
+ *  writes one -- `costRow({ cellKey, timestamp, billing_mode: "api", model,
+ *  input_tokens })`, single `model` field (not `tokens_by_model`), no
+ *  `output_tokens` at all (embeddings have none). Deliberately a SEPARATE
+ *  helper from `seedSpentRow` above (which always uses `tokens_by_model`) so
+ *  this test exercises the real shape the reviewer named, not an
+ *  approximation of it. */
+function seedPhase0Row(store, { key, cfg, model = "voyage-4-lite", inputTokens, briefId = "phase0" }) {
+  store.put({
+    key,
+    briefId,
+    cfg,
+    result: { threshold: 0.23, provenance: { embedderId: model } },
+    resolvedModels: { embedder: model },
+    accounting: { state: "completed" },
+    costRows: [
+      costRow({
+        cellKey: key,
+        timestamp: "2026-09-01T12:00:00.000Z",
+        billing_mode: "api",
+        model,
+        input_tokens: inputTokens,
+      }),
+    ],
+  });
+}
+
+test("issue #64: spendToDate does NOT throw on a real Phase 0-shaped voyage-4-lite row -- it is cleanly excluded from byProvider, counted in totalUsd, and surfaced via excludedNonProviderUsd/Models", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  seedPhase0Row(store, { key: "phase0/dat-replication", cfg: "phase0-cfg", inputTokens: 50_000 });
+
+  const result = spendToDate(store, undefined, { batch: true });
+
+  assert.ok(result.totalUsd > 0, "the embedder spend is real, priced money -- it must show up in the grand total");
+  assert.deepEqual(result.byProvider, {}, "voyage-4-lite must not land in anthropic or openai's bucket");
+  assert.equal(result.hasMissingRate, false, "voyage-4-lite has a real RATE_TABLE entry -- excluding it from byProvider is not the same as failing to price it");
+  assert.ok(result.excludedNonProviderUsd > 0, "the excluded spend is surfaced, not silently dropped");
+  assert.deepEqual(result.excludedNonProviderModels, ["voyage-4-lite"]);
+  assert.equal(result.totalUsd, result.excludedNonProviderUsd, "with ONLY an embedder row in the store, the grand total and the excluded-non-provider total must be identical");
+});
+
+test("issue #64: a store containing BOTH Phase 0 (embedder) rows AND generation rows prices cleanly end-to-end -- the embedder rows never trip, block, or get miscounted into a per-provider ceiling", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+
+  // The exact shape Phase 0 produces per invocation: TWO embedder rows
+  // (dat-replication + negative-controls), per evals/metrics/phase0.mjs.
+  seedPhase0Row(store1, { key: "phase0/dat-replication", cfg: "phase0-cfg", inputTokens: 40_000, briefId: "dat" });
+  seedPhase0Row(store1, { key: "phase0/negative-controls", cfg: "phase0-cfg", inputTokens: 25_000, briefId: "controls" });
+
+  // A real generation cell runs NEXT, in the SAME store, under an ACTIVE
+  // per-provider ceiling -- exactly the state the repo will be in once
+  // Phase 0 has run and a resumed study invocation sets --max-spend-*.
+  const provider = new MockProvider();
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store: store1,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2"], // Anthropic-only
+    maxSpendByProviderUsd: { anthropic: 1000, openai: 1000 }, // generous -- this test is about NOT THROWING and NOT MISATTRIBUTING, not about tripping the ceiling
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 1, "the generation cell ran normally -- Phase 0's embedder rows in the same store did not block it");
+  assert.ok(summary.cumulativeNonProviderSpendUsd > 0, "the embedder spend from Phase 0 is visible on the summary");
+  assert.deepEqual(summary.cumulativeNonProviderModels, ["voyage-4-lite"]);
+  // The embedder spend must NOT have leaked into either provider's
+  // cumulative bucket -- only the one Anthropic generation cell's real spend
+  // should appear there.
+  assert.equal(Object.keys(summary.cumulativeSpendByProvider).length, 1);
+  assert.ok(summary.cumulativeSpendByProvider.anthropic > 0);
+  assert.equal(summary.cumulativeSpendByProvider.openai, undefined, "no openai spend at all -- neither from generation (H2 is Anthropic-only) nor misattributed embedder spend");
+});
+
+test("issue #64: embedder spend recorded in the store does NOT count against a per-provider ceiling -- a cell that would otherwise fit is NOT wrongly skipped", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+
+  // Seed a LARGE embedder spend -- larger than the ceiling we're about to set
+  // for Anthropic. If embedder spend were ever wrongly folded into a
+  // provider's cumulative total (the exact regression this test guards
+  // against), this alone would push the Anthropic "already spent" figure
+  // over the ceiling and wrongly skip the cell below.
+  seedPhase0Row(store1, { key: "phase0/dat-replication", cfg: "phase0-cfg", inputTokens: 50_000_000 });
+  const embedderOnly = spendToDate(store1, undefined, { batch: true });
+  assert.ok(embedderOnly.excludedNonProviderUsd > 0.05, "sanity: the seeded embedder spend is not trivially small");
+
+  const store2 = new ResultsStore(dir);
+  const provider = new MockProvider();
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store: store2,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2"],
+    // A ceiling ABOVE what the single H2 cell will actually cost, but BELOW
+    // the embedder spend seeded above -- only passes if embedder spend is
+    // correctly excluded from the anthropic bucket.
+    maxSpendByProviderUsd: { anthropic: embedderOnly.excludedNonProviderUsd / 2 },
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 1, "the Anthropic cell must be admitted -- embedder spend is not Anthropic spend, however large");
+  assert.equal(summary.skipped, 0);
+});
+
 test("issue #64: a per-provider ceiling is enforced against spend already recorded by an EARLIER invocation of the same store, not reset to zero", async (t) => {
   const dir = tempDir(t);
   const store1 = new ResultsStore(dir);
