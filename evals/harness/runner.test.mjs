@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { ResultsStore } from "../../lib/store.mjs";
-import { configHash, cellKey } from "../../lib/manifest.mjs";
+import { configHash, cellKey, planRun } from "../../lib/manifest.mjs";
 import { costRow } from "../../lib/accounting.mjs";
 import { priceRowByProvider, priceRowsByProvider } from "../../lib/price.mjs";
 import { runSpec, planAndPrice, interimPriceGrid, spendToDate } from "./runner.mjs";
@@ -1512,8 +1512,22 @@ test("issue #85: a failed generation cell has no candidates and is never embedde
   assert.equal(record.result.distinct_k, undefined);
 });
 
-test("issue #85: a metrics-computation failure (embedder throws) is stored as a classified failure, never a completed cell missing distinct_k -- and the tokens it did consume are still metered", async (t) => {
-  const store = new ResultsStore(tempDir(t));
+// ── PR #86 review fix round ──────────────────────────────────────────────────
+// The original approach stored a `failed` record under cell.key on a metrics
+// failure. lib/manifest.mjs's planRun receives only KEYS -- it cannot tell a
+// completed cell from a failed one -- so once cell.key existed in the store
+// AT ALL, every future invocation classified it `reuse` forever (append-only,
+// no delete). A transient Voyage 429 would permanently destroy an already-paid
+// cell with no way to retry it, and the loss would correlate with arm size
+// (bigger pools embed more tokens -> more 429s -> panel arms lose cells
+// preferentially), confounding H1. The fix: leave cell.key OUT of the store
+// on a metrics failure so planRun keeps it `todo`; preserve the already-spent
+// money under an attempt-scoped key instead (mirrors evals/judge/gate.mjs's
+// meterJudgeCall fix for the identical shape of bug in the judge path, #76).
+
+test("issue #85 fix round: a metrics-computation failure leaves the cell ABSENT from the store, and a subsequent planRun classifies it todo, not reuse", async (t) => {
+  const dir = tempDir(t);
+  const store = new ResultsStore(dir);
   const provider = new MockProvider();
   const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
   const embedder = new MockEmbedder({
@@ -1526,20 +1540,94 @@ test("issue #85: a metrics-computation failure (embedder throws) is stored as a 
   const { summary } = await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, embedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
 
   assert.equal(summary.completed, 0, "generation succeeded but metrics did not -- this cell must NOT reconcile as completed");
-  assert.equal(summary.failed, 1);
-  assert.equal(summary.byKind.harness_error, 1);
+  assert.equal(summary.skipped, 1, "a metrics failure is a SKIP (retryable), never a stored failure");
+  assert.equal(summary.failed, 0, "the generation itself did not fail -- only metrics did, and that must not surface as a generation failure");
 
-  const record = store.get(key);
-  assert.equal(record.accounting.state, "failed");
-  assert.equal(record.result.failed, true, "no candidates survive a metrics-failed cell -- never a completed cell silently missing distinct_k");
-  assert.equal(record.result.distinct_k, undefined);
-  const embedderRow = record.costRows.find((r) => r.model === "voyage-4-lite");
+  assert.throws(() => store.get(key), /no stored record/, "cell.key must be completely absent from the store -- nothing to read back");
+
+  // The real assertion this test exists for: planRun's ACTUAL output over a
+  // FRESH store instance (re-reading index.jsonl from disk, exactly like a
+  // real resumed session would), not an intermediate like store.has(key).
+  const store2 = new ResultsStore(dir);
+  const plan = planRun(oneCellSpec, store2.keys());
+  assert.deepEqual(plan.todo.map((c) => c.key), [key], "the cell must be planned as todo");
+  assert.deepEqual(plan.reuse, [], "the cell must NOT be classified reuse -- planRun has no accounting-state visibility and would treat any stored key as a completed reuse");
+});
+
+test("issue #85 fix round: the generation cost row survives a metrics failure under an attempt-scoped key, and is not double-counted when the retry succeeds", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // First invocation: metrics fails. Money must survive under an
+  // attempt-scoped key, never under cell.key.
+  const store1 = new ResultsStore(dir);
+  const failingEmbedder = new MockEmbedder({
+    vectorFor: orthogonalVectorFor,
+    failOnText: new Set([`mock-idea-1-${key}`, `mock-idea-2-${key}`]),
+    partialTokensBeforeFail: 5,
+  });
+  await runSpec(oneCellSpec, { store: store1, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: failingEmbedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  const attemptKey = `metrics-attempt|cell=${key}|attempt=0`;
+  const attemptRecord = store1.get(attemptKey);
+  assert.equal(attemptRecord.accounting.state, "failed");
+  const embedderRow = attemptRecord.costRows.find((r) => r.model === "voyage-4-lite");
   assert.ok(embedderRow, "tokens the embedder actually consumed before failing are still durably metered");
   assert.equal(embedderRow.input_tokens, 5);
-  // The generation costRow (real money already spent on generation) must
-  // also still be present -- this is the money-first guarantee the whole
-  // wiring exists to preserve.
-  assert.ok(record.costRows.some((r) => r.model !== "voyage-4-lite"), "the generation cost row survives a metrics failure");
+  assert.ok(attemptRecord.costRows.some((r) => r.model !== "voyage-4-lite"), "the generation cost row (real money already spent) survives under the attempt-scoped key");
+
+  const spendAfterFailure = spendToDate(store1);
+  const spentAfterFailure = spendAfterFailure.totalUsd;
+  assert.ok(spentAfterFailure > 0, "spend from the failed attempt is real and priced");
+
+  // Second invocation over the SAME store/spec, this time with a working
+  // embedder: the cell is retried (todo again -- see the companion test
+  // above), spending a SECOND real generation cost. The first attempt's
+  // spend must still be there, undisturbed -- not double-counted, not
+  // dropped.
+  const store2 = new ResultsStore(dir);
+  const workingEmbedder = new MockEmbedder({ vectorFor: orthogonalVectorFor });
+  const { summary } = await runSpec(oneCellSpec, { store: store2, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: workingEmbedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+  assert.equal(summary.completed, 1, "the retry succeeds");
+
+  // The first attempt's record must be untouched (append-only store; a
+  // second attempt gets attempt=1, never overwrites attempt=0).
+  const attemptRecordAfterRetry = store2.get(attemptKey);
+  assert.deepEqual(attemptRecordAfterRetry, attemptRecord, "the first failed attempt's record is never mutated by a later successful retry");
+
+  const spendAfterRetry = spendToDate(store2).totalUsd;
+  assert.ok(spendAfterRetry > spentAfterFailure, "the retry's own real spend (generation + embedder) is ADDED on top of the first attempt's preserved spend, never replacing or double-counting it");
+});
+
+test("issue #85 fix round: a retry after a metrics failure produces a complete, correctly-metered cell", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const store1 = new ResultsStore(dir);
+  const failingEmbedder = new MockEmbedder({
+    vectorFor: orthogonalVectorFor,
+    failOnText: new Set([`mock-idea-1-${key}`, `mock-idea-2-${key}`]),
+    partialTokensBeforeFail: 5,
+  });
+  await runSpec(oneCellSpec, { store: store1, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: failingEmbedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  const store2 = new ResultsStore(dir);
+  const workingEmbedder = new MockEmbedder({ vectorFor: orthogonalVectorFor, tokensPerText: 7 });
+  const { summary } = await runSpec(oneCellSpec, { store: store2, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: workingEmbedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  assert.equal(summary.completed, 1);
+  assert.equal(summary.skipped, 0, "only the FIRST invocation records a skip -- the retry, run as its own invocation, has nothing to skip");
+  assert.equal(workingEmbedder.calls.length, 1, "the retry actually re-embeds -- a fresh generation call, genuinely re-spending, exactly as intended");
+
+  const record = store2.get(key);
+  assert.equal(record.accounting.state, "completed");
+  assert.equal(record.result.distinct_k, 2, "the retried cell carries real, complete metrics");
+  assert.ok(Array.isArray(record.result.pool) && record.result.pool.length === 2);
+  const embedderRow = record.costRows.find((r) => r.model === "voyage-4-lite");
+  assert.ok(embedderRow, "the retry's own embedder call is metered on the cell's own record");
+  assert.equal(embedderRow.input_tokens, 14, "2 candidates x 7 tokens -- this retry's own delta, unaffected by the first attempt's partial 5 tokens");
 });
 
 test("issue #85: resuming a run does not recompute metrics for an already-completed cell -- no re-embed, no double-meter", async (t) => {

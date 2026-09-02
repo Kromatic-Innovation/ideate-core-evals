@@ -203,6 +203,62 @@ function costRowsFor(cellKey, tokens, timestamp) {
   return [];
 }
 
+/**
+ * Persist a failed metrics attempt's cost rows under an attempt-scoped key
+ * (issue #85 fix round -- PR #86 review) so a transient Voyage failure
+ * during pool metrics can never brick the store the way a fixed judge-call
+ * key did before #76's fix (mirrors evals/judge/gate.mjs's meterJudgeCall
+ * exactly, same attempt-count-from-store-keys discriminator). The CELL
+ * ITSELF must stay OUT of the store on a metrics failure -- see the per-cell
+ * loop's metrics-failure branch for the full reasoning (lib/manifest.mjs's
+ * planRun sees only keys, so a stored `failed` record under cell.key would
+ * be permanently unretryable and would correlate cell loss with arm size,
+ * confounding H1). This function exists ONLY to make sure the money already
+ * spent -- real generation tokens, plus whatever the embedder actually
+ * consumed before failing -- is not lost just because the cell itself isn't
+ * stored. `store.keys()` is index-only (cheap; lib/store.mjs) and reflects
+ * every attempt already durably recorded for this exact cell, including
+ * ones from a PRIOR session, so the next attempt number is always correct
+ * regardless of process/session boundaries -- exactly meterJudgeCall's own
+ * contract.
+ *
+ * @param {object} store  a lib/store.mjs ResultsStore
+ * @param {object} o
+ *   @param {{key: string, cfg: string}} o.cell
+ *   @param {Array} o.costRows   every costRow() for this attempt (generation
+ *     tokens, plus any embedder tokens actually consumed before failing)
+ *   @param {string} o.detail    why metrics computation failed
+ *   @param {string} o.timestamp ISO 8601 (unused directly here -- costRows
+ *     already carry their own timestamps; kept in the signature for symmetry
+ *     with the rest of this module's helpers and in case a future caller
+ *     needs it for the attempt record itself)
+ */
+function recordMetricsAttemptFailure(store, { cell, costRows, detail }) {
+  const keyPrefix = `metrics-attempt|cell=${cell.key}|attempt=`;
+  const attempt = store.keys().filter((k) => k.startsWith(keyPrefix)).length;
+  const key = `${keyPrefix}${attempt}`;
+  // Self-describing model list, derived from the cost rows themselves
+  // rather than requiring a caller to pass resolvedModels separately --
+  // this is a side ledger record, not a planned cell, so there is no arm
+  // slot config to resolve against.
+  const models = new Set();
+  for (const row of costRows) {
+    if (row.model) models.add(row.model);
+    if (row.tokens_by_model) for (const m of Object.keys(row.tokens_by_model)) models.add(m);
+  }
+  return store.put({
+    key,
+    armId: "__metrics-attempt__",
+    briefId: cell.key,
+    replicate: 0,
+    cfg: cell.cfg,
+    result: { kind: "metrics-attempt", cellKey: cell.key, attempt, detail },
+    resolvedModels: { models: [...models] },
+    accounting: { state: "failed", kind: "harness_error", detail },
+    costRows,
+  });
+}
+
 /** A candidate is either a bare string or an object carrying `.text` (same
  *  convention evals/judge/deidentify.mjs's deidentifyPool already uses). */
 function candidateText(candidate) {
@@ -1118,33 +1174,47 @@ export async function runSpec(spec, opts) {
       const costRows = metrics ? [...genCostRows, ...metrics.costRows] : genCostRows;
 
       if (metrics && !metrics.ok) {
-        // A completed generation whose metrics could not be computed must
-        // NEVER be stored as `completed` without distinct_k -- frame.mjs
-        // hard-throws on that (buildFrame's own contract), and the
-        // append-only store could never repair it afterward. Classified
-        // as a failure instead, exactly like a generation-level failure --
-        // no candidates survive into the stored record (AC: "never a cell
-        // with silently-zero metrics"), but the tokens the embedder
-        // actually consumed (metrics.costRows) are still recorded, and the
-        // generation candidates remain recoverable from... nowhere further
-        // (this is the accepted cost of a metrics failure: the generation
-        // spend is preserved in the ledger, the candidates are not, same
-        // as any other classified failure).
-        account.fail(cell.key, "harness_error", metrics.detail);
-        for (const row of costRows) account.addCost(row);
-        store.put({
-          key: cell.key,
-          armId: cell.armId,
-          briefId: cell.briefId,
-          replicate: cell.replicate,
-          cfg: cell.cfg,
-          result: { failed: true, failureKind: "harness_error" },
-          resolvedModels: resolvedModelsFor(arm),
-          accounting: { state: "failed", kind: "harness_error", detail: metrics.detail },
-          costRows,
-        });
+        // ── PR #86 review fix round -- do NOT store this cell under
+        // cell.key at all ────────────────────────────────────────────────
+        // The original approach here stored a `failed` record under
+        // cell.key on a metrics failure. That is WRONG: lib/manifest.mjs's
+        // planRun(spec, storedKeys) receives ONLY keys -- it has no access
+        // to accounting.state and structurally cannot tell a completed cell
+        // from a failed one. Once cell.key exists in the store AT ALL, every
+        // future invocation classifies it `reuse`, forever (the store is
+        // append-only -- there is no delete, and put() throws on
+        // same-key/different-content). A transient Voyage 429 during
+        // metrics would therefore PERMANENTLY destroy a cell whose
+        // generation was already paid for, with no way to ever retry it --
+        // not by re-running, not by resuming. Worse: the loss is correlated
+        // with arm (bigger pools embed more tokens -> higher 429
+        // probability -> panel arms lose cells preferentially), which
+        // confounds exactly the panel-vs-solo comparison H1 tests. This is
+        // the same shape of bug #76 fixed for judge retries (a fixed judge-
+        // call key collided on retry and bricked the store) -- see
+        // meterJudgeCall's attempt-scoped key in evals/judge/gate.mjs.
+        //
+        // The fix: leave cell.key OUT of the store entirely, so the next
+        // invocation's planRun still sees it as `todo` and retries it (a
+        // fresh generation call -- genuinely re-spending, which is correct
+        // and honest, exactly the principle already established for judge
+        // retries). The money already spent -- this cell's real generation
+        // tokens, plus whatever the embedder actually consumed before
+        // failing -- is preserved under its OWN attempt-scoped key
+        // (recordMetricsAttemptFailure, mirroring meterJudgeCall exactly),
+        // never lost and never double-counted against a later successful
+        // retry (each attempt gets a new, non-colliding key).
+        recordMetricsAttemptFailure(store, { cell, costRows, detail: metrics.detail, timestamp });
         recordActualSpend(costRows);
-        continue; // no candidates to judge
+        // Skipped, not failed: RunAccount.skip() is a legitimate terminal
+        // state for THIS invocation's reconcile() (every planned cell must
+        // still reach exactly one terminal state -- this cell is not
+        // silently dropped from the run's own accounting), but -- exactly
+        // like the pre-existing `budget_exceeded` skip below -- writes
+        // NOTHING under cell.key, so the store-level retryability described
+        // above holds regardless of what this invocation's summary reports.
+        account.skip(cell.key, `metrics_failed: ${metrics.detail}`);
+        continue; // no candidates survive to judge -- nothing was ever stored
       }
 
       const finalResult = metrics ? { ...response.result, ...metrics.resultPatch } : response.result;
