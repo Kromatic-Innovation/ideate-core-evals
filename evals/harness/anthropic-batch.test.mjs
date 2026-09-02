@@ -16,11 +16,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
 import {
   AnthropicBatchProvider,
   resolveIdeateAgents,
   buildAnthropicMessageParams,
+  DEFAULT_MAX_POLL_MS,
 } from "./provider.mjs";
+import { runSpec } from "./runner.mjs";
+import { ResultsStore } from "../../lib/store.mjs";
+import { cellKey, configHash, planRun } from "../../lib/manifest.mjs";
 
 const armsConfigJson = JSON.parse(
   await (await import("node:fs")).promises.readFile(new URL("../../arms.config.json", import.meta.url), "utf8"),
@@ -460,7 +468,223 @@ test("no apiKey: generate() returns a classified failure rather than throwing", 
   assert.equal(resp.failureKind, "harness_error");
 });
 
+// ── issue #92: the batch poll ceiling ───────────────────────────────────────
+//
+// Everything below is hermetic: `stuckBatchFetch` models a batch that never
+// leaves `in_progress`, and `maxPollMs: -1` puts the deadline in the past so
+// the ceiling fires on the first check. No timers wait, no network is touched.
+
+test("#92: the live default poll ceiling is 60 minutes (DEFAULT_MAX_POLL_MS), not the old 15", () => {
+  assert.equal(DEFAULT_MAX_POLL_MS, 60 * 60 * 1000);
+  const provider = new AnthropicBatchProvider({ apiKey: "test-key", logger: silentLogger });
+  assert.equal(provider.maxPollMs, DEFAULT_MAX_POLL_MS, "the constructor default must BE the constant, not a second hardcoded number");
+  assert.notEqual(provider.maxPollMs, 15 * 60 * 1000, "15 minutes is shorter than observed batch latency -- issue #92");
+});
+
+test("#92: a non-finite maxPollMs is rejected at construction -- a NaN ceiling would never expire, hanging the poll loop forever", () => {
+  assert.throws(() => new AnthropicBatchProvider({ apiKey: "k", maxPollMs: NaN }), /maxPollMs must be a finite number/);
+  assert.throws(() => new AnthropicBatchProvider({ apiKey: "k", maxPollMs: undefined_but_string() }), /maxPollMs must be a finite number/);
+  // An explicit zero/negative ceiling is a legitimate "give up immediately"
+  // (the tests below rely on it) and must NOT be rejected.
+  assert.equal(new AnthropicBatchProvider({ apiKey: "k", maxPollMs: -1 }).maxPollMs, -1);
+});
+function undefined_but_string() {
+  return "not-a-number";
+}
+
+test("#92: a batch that outruns the ceiling fails as `timeout` and the ledger detail says POLL_CEILING_REACHED with the abandoned handle", async () => {
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    maxPollMs: -1,
+    fetchImpl: stuckBatchFetch(),
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch" });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "timeout");
+  // THE discriminator the issue asks for: an operator reading the ledger must
+  // be able to tell "we gave up waiting" from "the API failed". Both would be
+  // `timeout`-shaped without this token, and a transport failure carries no
+  // batch handle to recover from.
+  assert.match(resp.detail, /POLL_CEILING_REACHED/);
+  assert.match(resp.detail, /gave up waiting; the API did NOT fail/);
+  assert.match(resp.detail, /batch_stuck/, "the durable batch handle is in the ledger, so the operator can re-poll or cancel it by hand");
+  assert.match(resp.detail, /"max_poll_ms":-1/);
+  assert.match(resp.detail, /"last_status":"in_progress"/);
+});
+
+test("#92: abandoning a batch CANCELS it (POST .../cancel) so it cannot bill unattended, and records the cancel outcome", async () => {
+  const cancels = [];
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    maxPollMs: -1,
+    fetchImpl: stuckBatchFetch({ onCancel: (u) => cancels.push(u) }),
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch" });
+  assert.deepEqual(cancels, ["https://api.anthropic.com/v1/messages/batches/batch_stuck/cancel"]);
+  assert.match(resp.detail, /"cancelled":true/);
+});
+
+test("#92: cancelOnAbandon: false leaves the handle live for a manual re-poll and records cancelled: null", async () => {
+  const cancels = [];
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    maxPollMs: -1,
+    cancelOnAbandon: false,
+    fetchImpl: stuckBatchFetch({ onCancel: (u) => cancels.push(u) }),
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch" });
+  assert.deepEqual(cancels, [], "no cancel is issued when the operator opted out");
+  assert.equal(resp.failureKind, "timeout");
+  assert.match(resp.detail, /"cancelled":null/);
+});
+
+test("#92: a cancel that FAILS never changes the failure kind, and says so in the ledger so the operator knows a batch may still bill", async () => {
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    maxPollMs: -1,
+    fetchImpl: stuckBatchFetch({ cancelStatus: 500 }),
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch" });
+  assert.equal(resp.failureKind, "timeout", "a failed cancel is not a different failure -- the cell still timed out");
+  assert.match(resp.detail, /"cancelled":false/);
+});
+
+test("#92: a PARTIAL pool whose later round outran the ceiling is FAILED, never stored as a completed (silently truncated) pool", async () => {
+  // Panel arms run panel.maxRounds (2) rounds. Round 1's batch ends normally;
+  // round 2's never does. Without the guard this test pins, ideate-core
+  // resolves with round 1's candidates and the cell stores as `completed`
+  // carrying half a pool -- an arm-correlated under-count of distinct_k on
+  // exactly the panel arms H1 compares against solo.
+  let batchSeq = 0;
+  let round1CustomIds = [];
+  const fetchImpl = async (url, opts) => {
+    const u = String(url);
+    if (u.endsWith("/v1/messages/batches")) {
+      batchSeq += 1;
+      if (batchSeq === 1) {
+        round1CustomIds = JSON.parse(opts.body).requests.map((r) => r.custom_id);
+        return jsonResponse(200, { id: "batch_round1", processing_status: "ended", results_url: "https://fake/results" });
+      }
+      return jsonResponse(200, { id: "batch_stuck", processing_status: "in_progress" });
+    }
+    if (u.includes("/v1/messages/batches/")) return jsonResponse(200, { id: "batch_stuck", processing_status: "in_progress" });
+    if (u === "https://fake/results") {
+      return textResponse(round1CustomIds.map((id) => JSON.stringify(resultLine(id, textResult('[{"text":"round-1 idea"}]')))).join("\n"));
+    }
+    throw new Error(`unexpected URL ${u}`);
+  };
+
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    maxPollMs: -1,
+    fetchImpl,
+    // A two-round engine: round 1 resolves, round 2 is abandoned at the
+    // ceiling, and the engine (like the real one) still returns round 1's work.
+    ideateImpl: async (input, deps) => {
+      const agent = deps.agents[0];
+      const r1 = await deps.complete({ model: agent.model, prompt: "round 1", persona: agent.persona });
+      await deps.complete({ model: agent.model, prompt: "round 2", persona: agent.persona });
+      const candidates = r1 && r1.ok ? [{ text: "round-1 idea", model: agent.model }] : [];
+      return { candidates, agents: deps.agents, meta: { agentsAttempted: 1, agentsFailed: 0 } };
+    },
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch" });
+  assert.equal(resp.terminalState, "failed", "a pool assembled while a paid-for batch was still outstanding is not a measurement");
+  assert.equal(resp.failureKind, "timeout");
+  assert.match(resp.detail, /POLL_CEILING_REACHED/);
+  assert.match(resp.detail, /discarding a PARTIAL pool of 1 candidate/);
+});
+
+test("#92 + #90 END TO END: a cell lost to the poll ceiling is NOT stored under cell.key and is re-planned todo on the next invocation", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ideate-poll-ceiling-test-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const cfg = { harnessVersion: "0.0.1", engineSha: "test-sha", promptHash: "test-prompt" };
+  const spec = { arms: [{ id: "A" }], briefs: [{ id: "brief-1" }], replicates: 1, config: cfg };
+  const key = cellKey({ armId: "A", briefId: "brief-1", replicate: 0, cfg: configHash(cfg) });
+
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    maxPollMs: -1,
+    fetchImpl: stuckBatchFetch(),
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const store = new ResultsStore(dir);
+  const { summary } = await runSpec(spec, { store, armsConfig: armsConfigFor("A"), provider, log: () => {} });
+  assert.equal(summary.failed, 1);
+  assert.deepEqual(summary.byKind, { timeout: 1 });
+
+  // The #90 property, verified against the REAL ceiling path rather than
+  // assumed from `timeout` being in TRANSIENT_FAILURE_KINDS: nothing under
+  // cell.key, so planRun re-plans it instead of classifying it `reuse` forever.
+  assert.equal(store.has(key), false, "the ceiling must not permanently consume the cell");
+  const store2 = new ResultsStore(dir);
+  assert.deepEqual(planRun(spec, store2.keys()).todo.map((c) => c.key), [key], "the next invocation re-plans it todo");
+
+  // And the reason is durable: the attempt record carries the kind AND the
+  // abandoned batch handle, so "why is this cell todo again?" is answerable
+  // from the store alone.
+  const attempt = store2.get(`generation-attempt|cell=${key}|attempt=0`);
+  assert.equal(attempt.accounting.kind, "timeout");
+  assert.match(attempt.accounting.detail, /POLL_CEILING_REACHED/);
+  assert.match(attempt.accounting.detail, /batch_stuck/);
+});
+
 // ── test fixtures/helpers ────────────────────────────────────────────────────
+
+/**
+ * A batch that submits fine and then never leaves `in_progress` -- the exact
+ * shape `msgbatch_01F9QXDpNptrrGfD4z3RzpGX` had when the #8 smoke run was
+ * killed. `onCancel` records the cancel URL; `cancelStatus` forces the cancel
+ * call to fail so the "cancel failed" path is exercised.
+ */
+function stuckBatchFetch({ onCancel, cancelStatus = 200 } = {}) {
+  return async (url) => {
+    const u = String(url);
+    if (u.endsWith("/cancel")) {
+      if (onCancel) onCancel(u);
+      return jsonResponse(cancelStatus, { id: "batch_stuck", processing_status: "canceling" });
+    }
+    if (u.endsWith("/v1/messages/batches")) return jsonResponse(200, { id: "batch_stuck", processing_status: "in_progress" });
+    if (u.includes("/v1/messages/batches/")) return jsonResponse(200, { id: "batch_stuck", processing_status: "in_progress" });
+    throw new Error(`stuckBatchFetch: unexpected URL ${u}`);
+  };
+}
+
 
 function jsonResponse(status, obj) {
   return {

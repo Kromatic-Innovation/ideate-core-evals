@@ -14,6 +14,7 @@ import { runnerPriceGrid } from "../lib/price.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
 import { AnthropicJudgeProvider, OpenAIJudgeProvider } from "./judge/score.mjs";
+import { AnthropicBatchProvider, DEFAULT_MAX_POLL_MS } from "./harness/provider.mjs";
 import { CORPUS } from "./corpus/index.mjs";
 import armsConfigJson from "../arms.config.json" with { type: "json" };
 
@@ -86,6 +87,46 @@ test("parseArgs rejects an unrecognized flag", () => {
 test("parseArgs supports --no-batch as a boolean flag with no value", () => {
   const args = parseArgs(["--no-batch"]);
   assert.equal(args.noBatch, true);
+});
+
+// ── issue #92: the batch poll ceiling is settable from the CLI ─────────────
+
+test("parseArgs accepts --max-poll-minutes and rejects the values that would break the poll loop", () => {
+  assert.equal(parseArgs(["--max-poll-minutes", "90"]).maxPollMinutes, 90);
+  // NaN is the dangerous one: `Date.now() > NaN` is always false, so a NaN
+  // ceiling would make the poll loop spin forever rather than expire.
+  assert.throws(() => parseArgs(["--max-poll-minutes", "abc"]), /--max-poll-minutes requires a numeric argument/);
+  assert.throws(() => parseArgs(["--max-poll-minutes"]), /--max-poll-minutes requires a numeric argument/);
+  assert.throws(() => parseArgs(["--max-poll-minutes", "0"]), /must be greater than 0/);
+  assert.throws(() => parseArgs(["--max-poll-minutes", "-5"]), /must be greater than 0/);
+});
+
+test("main() wires --max-poll-minutes through to the real AnthropicBatchProvider, and the DEFAULT is the provider's 60-minute constant when the flag is absent (issue #92)", async (t) => {
+  const priorKey = process.env.ANTHROPIC_API_KEY;
+  const priorVoyageKey = process.env.VOYAGE_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "test-key-not-real";
+  process.env.VOYAGE_API_KEY = "test-voyage-key-not-real";
+  t.after(() => {
+    if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = priorKey;
+    if (priorVoyageKey === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = priorVoyageKey;
+  });
+
+  // Not --dry-run: dry-run constructs no provider at all, so the wiring under
+  // test would not exist. runSpecFn is a spy, so nothing reaches the network.
+  const withFlag = spyRunSpec();
+  await main(["--max-spend", "999", "--max-poll-minutes", "90"], { runSpecFn: withFlag, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.ok(withFlag.calls[0].opts.provider instanceof AnthropicBatchProvider);
+  assert.equal(withFlag.calls[0].opts.provider.maxPollMs, 90 * 60 * 1000, "minutes on the CLI, milliseconds on the provider");
+
+  const noFlag = spyRunSpec();
+  await main(["--max-spend", "999"], { runSpecFn: noFlag, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(noFlag.calls[0].opts.provider.maxPollMs, DEFAULT_MAX_POLL_MS, "an unset flag falls through to the provider's own default, not a second copy of the number in run.mjs");
+});
+
+test("--phase 0 REFUSES --max-poll-minutes rather than silently dropping it (issue #92)", async () => {
+  await assert.rejects(() => main(["--phase", "0", "--max-poll-minutes", "90"], { store: FAKE_STORE }), /--phase 0 does not accept .*--max-poll-minutes/);
 });
 
 // ── issue #62 BLOCKER 2: exercise main()'s WIRING, not just parseArgs ───────

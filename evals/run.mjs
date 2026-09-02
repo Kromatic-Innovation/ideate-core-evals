@@ -6,6 +6,7 @@
 //   node evals/run.mjs --max-spend 50 --arms A,B --briefs biz-01,biz-02 --replicates 2
 //   node evals/run.mjs --max-spend-anthropic 300 --max-spend-openai 150
 //   node evals/run.mjs --phase 0
+//   node evals/run.mjs --max-poll-minutes 90   # batch poll ceiling (issue #92)
 //
 // This file is intentionally thin: it parses argv, loads the corpus + arm
 // config + a results store rooted at `results/` (gitignored, per-deployment --
@@ -142,6 +143,21 @@ export function parseArgs(argv) {
         break;
       case "--no-batch":
         args.noBatch = true;
+        break;
+      case "--max-poll-minutes":
+        // Issue #92: the batch poll ceiling, in MINUTES because that is the
+        // unit an operator reasons about batch latency in (the provider takes
+        // milliseconds). Validated the same way as --max-spend, and for a
+        // sharper reason: a NaN ceiling does not merely disable a gate, it
+        // makes `Date.now() > deadline` permanently false, so the poll loop
+        // would never exit at all. A non-positive value is rejected here too
+        // -- at the CLI, "wait zero minutes" is always a typo, even though
+        // AnthropicBatchProvider accepts it directly so tests can force the
+        // ceiling without waiting.
+        args.maxPollMinutes = parseRequiredNumber(argv, ++i, "--max-poll-minutes");
+        if (!(args.maxPollMinutes > 0)) {
+          throw new Error(`run.mjs: --max-poll-minutes must be greater than 0, got ${args.maxPollMinutes}`);
+        }
         break;
       default:
         throw new Error(`run.mjs: unrecognized flag '${a}'`);
@@ -333,6 +349,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (args.briefs !== undefined) ignoredFlags.push("--briefs");
     if (args.replicates !== undefined) ignoredFlags.push("--replicates");
     if (args.noBatch) ignoredFlags.push("--no-batch");
+    // --max-poll-minutes (issue #92) is a batch-mode flag; Phase 0 makes no
+    // batch calls at all. Listed here for the same reason every other flag is:
+    // silently dropping a flag on a live code path is the pattern this branch
+    // exists to refuse.
+    if (args.maxPollMinutes !== undefined) ignoredFlags.push("--max-poll-minutes");
     if (ignoredFlags.length > 0) {
       throw new Error(
         `run.mjs: --phase 0 does not accept ${ignoredFlags.join(", ")} -- Phase 0 is a fixed three-control run ` +
@@ -459,7 +480,17 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
           "run without calling anything.",
       );
     }
-    provider = new AnthropicBatchProvider({ apiKey, corpus: CORPUS, armsConfig });
+    // maxPollMs (issue #92): passed only when the operator actually set
+    // --max-poll-minutes, so an unset flag falls through to the provider's own
+    // DEFAULT_MAX_POLL_MS rather than being re-specified (and able to drift)
+    // here. `undefined` would trigger the same default, but passing the key
+    // explicitly-as-undefined hides which layer owns the number.
+    provider = new AnthropicBatchProvider({
+      apiKey,
+      corpus: CORPUS,
+      armsConfig,
+      ...(args.maxPollMinutes !== undefined ? { maxPollMs: args.maxPollMinutes * 60 * 1000 } : {}),
+    });
   }
 
   // judgeProviders (issue #68 anthropic leg, issue #77 openai leg): the real
