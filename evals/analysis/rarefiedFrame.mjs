@@ -224,11 +224,20 @@ export function buildRarefiedFrame(frame, opts = {}) {
   // in the first place), so those fields are omitted entirely rather than
   // guessed at. A caller that needs the full population's failure/skip
   // tallies reads them off the ORIGINAL base frame, not this one.
+  // responseField is named `<metric>_rarefied`, NOT `frame.responseField`
+  // verbatim (issue #73 fix round, non-blocking rider): the values under it
+  // are RAREFIED MEANS (an average over RAREFACTION_R subsamples), not the
+  // raw integer counts `frame.responseField` (e.g. "distinct_k") names
+  // elsewhere. Reusing the same column name would leave a rarefied mean
+  // sitting under a count's label in analysis-data-rarefied.csv and
+  // lme4-fit-rarefied.R -- both consume this field directly (reproducibility.mjs
+  // is metric-name-agnostic; it just needs SOME field name, this one says
+  // what the numbers under it actually are).
   return {
     rows,
     armLevels: frame.armLevels.filter((a) => armIds.includes(a)),
     briefLevels: frame.briefLevels,
-    responseField: frame.responseField,
+    responseField: `${metric}_rarefied`,
     poolField: frame.poolField,
     configHash: frame.configHash,
     rarefied: true,

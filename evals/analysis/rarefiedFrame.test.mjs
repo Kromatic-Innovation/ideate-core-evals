@@ -251,6 +251,19 @@ test("buildRarefiedFrame: with NO opts.rarefyOpts, uses the REGISTERED RAREFACTI
   assert.equal(pRow.response, expected["P|b1"].distinctKRarefied, "omitting rarefyOpts must use RAREFACTION_R/RAREFACTION_SEED exactly, not a smaller/faster override");
 });
 
+test("buildRarefiedFrame: responseField is named distinctly from the base frame's -- a rarefied MEAN must never sit under a raw count's column label (issue #73 fix round, non-blocking rider)", () => {
+  const poolA = makeCategoricalPool(50, 30, 11);
+  const poolP = makeCategoricalPool(50, 60, 22);
+  const rows = [
+    row({ cellKey: "A|b1", armId: "A", briefId: "b1", pool: poolA }),
+    row({ cellKey: "P|b1", armId: "P", briefId: "b1", pool: poolP }),
+  ];
+  const frame = baseFrame(rows, ["A", "P"]); // frame.responseField === "distinct_k"
+  const out = buildRarefiedFrame(frame, { armIds: ["A", "P"], threshold: THRESHOLD, rarefyOpts: { r: 100, seed: RAREFACTION_SEED } });
+  assert.notEqual(out.responseField, frame.responseField, "the rarefied frame's responseField must differ from the base frame's -- reusing it would mislabel a rarefied mean as the raw count");
+  assert.equal(out.responseField, "distinct_k_rarefied");
+});
+
 test("buildRarefiedFrame: poolFlexibility is derived from distinct_k's own rarefaction, not independently recomputed", () => {
   // poolFlexibility(k) === k identically (operational.mjs) -- there is no
   // separate clustering pass for it. Store the SAME distinctK count under

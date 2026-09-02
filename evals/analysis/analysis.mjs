@@ -242,7 +242,17 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     writeFileSync(join(args.outDir, "analysis-data-rarefied.csv"), renderAnalysisDataCsv(rarefiedFrame));
     writeFileSync(
       join(args.outDir, "lme4-fit-rarefied.R"),
-      renderLme4FitR({ responseField: rarefiedFrame.responseField, armLevels: rarefiedFrame.armLevels, referenceArm: args.referenceArm }),
+      // dataFile MUST be the rarefied CSV (issue #73 fix round, BLOCKING) --
+      // omitting it here is exactly the bug that shipped a rarefied-lane R
+      // script hardcoded to `read.csv("analysis-data.csv")`, reproducing the
+      // full-pool fit under H1's label. See reproducibility.test.mjs and
+      // analysis.main.test.mjs for the regression tests pinning this.
+      renderLme4FitR({
+        responseField: rarefiedFrame.responseField,
+        armLevels: rarefiedFrame.armLevels,
+        referenceArm: args.referenceArm,
+        dataFile: "analysis-data-rarefied.csv",
+      }),
     );
   }
   writeFileSync(

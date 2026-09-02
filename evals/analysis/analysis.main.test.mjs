@@ -217,6 +217,26 @@ test("main(): wires the rarefied lane end to end -- H1 is fit on a DIFFERENT fit
     assert.ok(existsSync(join(outDir, "analysis-data-rarefied.csv")), "rarefied reproducibility CSV must be written");
     assert.ok(existsSync(join(outDir, "lme4-fit-rarefied.R")), "rarefied reproducibility R script must be written");
 
+    // CONTENT, not just presence (issue #73 fix round, BLOCKING) -- the prior
+    // round's existsSync-only assertions could not see that lme4-fit-rarefied.R
+    // was byte-identical to lme4-fit.R and hardcoded to read the full-pool
+    // CSV under H1's label. Read both artifacts and pin what they say.
+    const fullCsv = readFileSync(join(outDir, "analysis-data.csv"), "utf8");
+    const rarefiedCsv = readFileSync(join(outDir, "analysis-data-rarefied.csv"), "utf8");
+    assert.notEqual(fullCsv, rarefiedCsv, "the rarefied CSV must not be byte-identical to the full-pool CSV");
+    assert.match(
+      rarefiedCsv.split("\n")[0],
+      /distinct_k_rarefied/,
+      "the rarefied CSV's response column must be named distinctly from the full-pool count column (non-blocking rider)",
+    );
+
+    const fullR = readFileSync(join(outDir, "lme4-fit.R"), "utf8");
+    const rarefiedR = readFileSync(join(outDir, "lme4-fit-rarefied.R"), "utf8");
+    assert.notEqual(fullR, rarefiedR, "lme4-fit-rarefied.R must not be byte-identical to lme4-fit.R -- that was the shipped bug");
+    assert.match(rarefiedR, /read\.csv\("analysis-data-rarefied\.csv"\)/, "the rarefied script must read the RAREFIED csv");
+    assert.doesNotMatch(rarefiedR, /read\.csv\("analysis-data\.csv"\)/, "the rarefied script must never read the full-pool csv");
+    assert.match(fullR, /read\.csv\("analysis-data\.csv"\)/, "the full-pool script must still read the full-pool csv, unchanged");
+
     const fitJson = JSON.parse(readFileSync(join(outDir, "fit.json"), "utf8"));
     assert.ok(fitJson.rarefied && fitJson.rarefied.fit, "fit.json must carry the rarefied lane's own fit");
   } finally {
