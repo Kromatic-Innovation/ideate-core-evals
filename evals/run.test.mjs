@@ -16,7 +16,9 @@ import { judgeLegsFor } from "./judge/matrix.mjs";
 import { AnthropicJudgeProvider, OpenAIJudgeProvider } from "./judge/score.mjs";
 import { AnthropicBatchProvider, DEFAULT_MAX_POLL_MS } from "./harness/provider.mjs";
 import { promptTemplateHash } from "./harness/prompts.mjs";
-import { configHash } from "../lib/manifest.mjs";
+import { CONFIG_FIELDS, armsConfigHash, configHash } from "../lib/manifest.mjs";
+import { computeJudgeHash } from "./judge/score.mjs";
+import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD } from "./metrics/voyage-calibration.mjs";
 import { createHash } from "node:crypto";
 import { CORPUS } from "./corpus/index.mjs";
 import armsConfigJson from "../arms.config.json" with { type: "json" };
@@ -793,4 +795,140 @@ test("formatPrunePlan surfaces an unfolded compaction group and says why", () =>
   assert.ok(lines.some((l) => l.includes("kept UNFOLDED")), lines.join("\n"));
   assert.ok(lines.some((l) => l.includes("COMPACT removed")), lines.join("\n"));
   assert.equal(lines.some((l) => l.includes("DRY RUN")), false);
+});
+
+// ── issue #101: the four absent CONFIG_FIELDS, and the arms.config.json gap ──
+//
+// lib/manifest.test.mjs pins that armsConfigHash() itself reacts to a model
+// edit. That is NOT the regression these guard: the defect lived in run.mjs,
+// which declared nine CONFIG_FIELDS and populated five. So these cover
+// run.mjs's own seam -- reading spec.config off a main() invocation -- the
+// same way the #99 tests above do. A test that only re-checked
+// lib/manifest.mjs would stay green while run.mjs regressed.
+
+test("issue #101: main() stamps every CONFIG_FIELDS entry -- no field is declared-but-never-set", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  const { spec } = runSpecFn.calls[0];
+  // The census this issue was filed over: five of nine set. A field that is
+  // `undefined` is SKIPPED by configHash(), so it never participates in the
+  // hash while still reading, in CONFIG_FIELDS, as though it were covered.
+  const absent = CONFIG_FIELDS.filter((f) => spec.config[f] === undefined);
+  assert.deepEqual(absent, [], `every declared CONFIG_FIELDS entry must be populated; absent: ${absent.join(", ")}`);
+  // And nothing extra: a key in spec.config that CONFIG_FIELDS does not
+  // declare is silently dropped from the hash, which is the same lie.
+  const undeclared = Object.keys(spec.config).filter((k) => !CONFIG_FIELDS.includes(k));
+  assert.deepEqual(undeclared, [], `spec.config carries keys configHash ignores: ${undeclared.join(", ")}`);
+});
+
+test("issue #101: THE regression guard -- changing an arm's model assignment moves the configHash of the spec run.mjs builds", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  const { spec } = runSpecFn.calls[0];
+
+  assert.equal(spec.config.armsConfigHash, armsConfigHash(armsConfigJson), "the spec must carry the REAL arms.config.json hash");
+
+  // The issue's worked example: arm C, homogeneous Sonnet, promoted to Opus.
+  // Before #101 this produced an IDENTICAL configHash, so planRun classified
+  // the new cells `reuse` and the frame pooled two different experiments.
+  const edited = JSON.parse(JSON.stringify(armsConfigJson));
+  edited.arms.C.slots[0].model = "claude-opus-5";
+  assert.notEqual(
+    configHash({ ...spec.config, armsConfigHash: armsConfigHash(edited) }),
+    configHash(spec.config),
+    "editing an arm's model assignment MUST move the configHash run.mjs stamps -- the single variable this study manipulates",
+  );
+
+  // And the negative half, which is what makes the design legible: a
+  // documentation-only edit must NOT invalidate the dataset.
+  const proseEdited = JSON.parse(JSON.stringify(armsConfigJson));
+  proseEdited._comment += " (typo fixed)";
+  proseEdited.arms.C.label = "Homogeneous Sonnet 5 (mid tier)";
+  assert.equal(
+    configHash({ ...spec.config, armsConfigHash: armsConfigHash(proseEdited) }),
+    configHash(spec.config),
+    "a prose edit changes what a reader is told, not what was measured",
+  );
+});
+
+test("issue #101: judgeHash is populated from computeJudgeHash over the REGISTERED judge roster", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  const { spec } = runSpecFn.calls[0];
+
+  // Populated, not removed: docs/PREREGISTRATION.md Appendix B item 3
+  // registers IN ADVANCE that judgeHash is a CONFIG_FIELDS entry and that
+  // judgeHash -> configHash -> cellKey is "correct and intended".
+  assert.match(spec.config.judgeHash, /^[0-9a-f]{12}$/);
+  assert.equal(
+    spec.config.judgeHash,
+    computeJudgeHash({ judgeModels: JUDGE_MODELS }),
+    "the SAME roster the pre-flight prices and the matrix judges against -- what is hashed and what judges can never diverge",
+  );
+
+  // The consequence that matters: swapping a judge model moves configHash.
+  const swapped = computeJudgeHash({ judgeModels: { ...JUDGE_MODELS, anthropic: ["claude-haiku-4-5"] } });
+  assert.notEqual(swapped, spec.config.judgeHash, "sanity: the swapped roster hashes differently");
+  assert.notEqual(
+    configHash({ ...spec.config, judgeHash: swapped }),
+    configHash(spec.config),
+    "a changed judge roster must change configHash",
+  );
+});
+
+test("issue #101: clusterDistanceThreshold is stamped into spec.config, unconditionally", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  const { spec } = runSpecFn.calls[0];
+
+  // It was already passed as a runSpec() OPTION but never into spec.config,
+  // so the CONFIG_FIELDS entry Appendix B item 8 registers never reached the
+  // hash. Since #85 wired pool metrics into runSpec, distinct_k -- a stored
+  // GENERATION artifact -- is a direct function of this threshold.
+  assert.equal(spec.config.clusterDistanceThreshold, VOYAGE_CLUSTER_DISTANCE_THRESHOLD);
+  assert.notEqual(
+    configHash({ ...spec.config, clusterDistanceThreshold: 0.5 }),
+    configHash(spec.config),
+    "a threshold change must change configHash",
+  );
+
+  // Unconditional on purpose. This is a --dry-run, which wires no embedder at
+  // all; had the field been gated on the embedder's presence, --dry-run would
+  // project a different configHash than the real run it exists to project.
+  assert.equal(runSpecFn.calls[0].opts.embedder, undefined, "sanity: --dry-run wires no embedder");
+});
+
+test("issue #101: --arms scoping does NOT move armsConfigHash -- the hash is over the FILE, not over spec.arms", async () => {
+  // The reassuring half of the whole-file hash, and what makes its costly
+  // half tolerable (adding an arm invalidates EVERY arm's cells -- registered
+  // as Appendix D item 1, pinned in lib/manifest.test.mjs): running a SUBSET
+  // of arms is not a config change, so a scoped run's cells stay comparable
+  // to an unscoped run's. Were the hash taken over the arms a spec happens to
+  // run, arm A's cells from `--arms A,B` would be incomparable to arm A's
+  // cells from `--arms A,C` -- which would break the additive design far more
+  // severely than over-invalidation does.
+  const unscoped = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn: unscoped, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  const scoped = spyRunSpec();
+  await main(["--dry-run", "--arms", "A,B"], { runSpecFn: scoped, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  // Sanity, and worth naming because it is not the obvious seam: `--arms`
+  // never narrows `spec.arms` (which is always every arm in the file). It is
+  // a runSpec() OPTION, applied downstream. So arm scoping cannot reach
+  // configHash by that route either -- the two independent reasons the hash
+  // is unmoved happen to agree.
+  assert.deepEqual(scoped.calls[0].opts.armIds, ["A", "B"], "sanity: the scoped run really did narrow the arms runSpec will execute");
+  assert.equal(unscoped.calls[0].opts.armIds, undefined, "sanity: the unscoped run narrows nothing");
+  assert.equal(
+    scoped.calls[0].spec.config.armsConfigHash,
+    unscoped.calls[0].spec.config.armsConfigHash,
+    "arm scoping is not a config change",
+  );
+  assert.equal(
+    configHash(scoped.calls[0].spec.config),
+    configHash(unscoped.calls[0].spec.config),
+    "and so the whole configHash is unmoved -- a scoped run's cells remain comparable to a full run's",
+  );
 });
