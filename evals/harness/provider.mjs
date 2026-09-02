@@ -38,7 +38,225 @@
 // distinguishable from a genuine harness defect.
 
 import { FAILURE_KINDS } from "../../lib/accounting.mjs";
-import { buildRound1Prompt, buildRound2Prompt } from "./prompts.mjs";
+import {
+  buildRound1Prompt,
+  buildRound2Prompt,
+  maxTokensForIdeas,
+  salvageCandidateArray,
+} from "./prompts.mjs";
+
+// ── Reply diagnostics (issue #93) ──────────────────────────────────
+//
+// The #8 smoke study's 9 lost arm-A cells all landed in ONE bucket
+// (`empty_pool`) with ONE detail string, and the run log carried no agent
+// error at all -- `complete()` had returned `ok: true` with text, and
+// extraction then recovered nothing. "The model returned nothing", "the reply
+// was cut off", and "the reply was complete but unparseable" were structurally
+// indistinguishable after the fact, which is why diagnosing this at all
+// required a fresh PAID probe of the live API. That indistinguishability is
+// the most expensive part of the bug, so it is fixed first-class here.
+//
+// Every model reply now produces a `summarizeReply` record -- stop_reason,
+// output tokens, text length, what parsing did, and a bounded head/tail of the
+// raw text -- accumulated per cell. On failure `classifyPoolFailure` turns
+// those records into (a) the most specific FAILURE_KINDS value available and
+// (b) a `detail` string.
+//
+// ── Why everything goes in `detail` ─────────────────────────────────────────
+// `detail` is the ONLY channel that reaches the ledger. runner.mjs rebuilds
+// the stored `result` for a failed cell itself (`{ failed: true, failureKind }`),
+// so any structured field hung on a failed provider response is discarded --
+// only `response.failureKind` and `response.detail` survive. So `detail` leads
+// with machine-greppable `key=value` pairs (`cause=truncated replies=1
+// truncated=1 ...`) before any human-readable tail, and every embedded raw
+// snippet is JSON.stringify'd, because model text contains newlines and quotes
+// that would otherwise break both a one-line detail and any line-oriented
+// grep over the ledger. `response.diagnostics` is ALSO returned, structured,
+// for a future runner that chooses to persist it.
+//
+// ── Why `parse_failure` and not a new kind ──────────────────────────────────
+// lib/accounting.mjs's FAILURE_KINDS already carries `parse_failure` ("model
+// replied, extractCandidates recovered nothing"), which is exactly what both
+// the truncated and the complete-but-unparseable shapes are, and it is a
+// strictly better classification than `empty_pool` for either. Splitting them
+// further into `truncated` / `unparseable` is genuinely desirable but requires
+// editing FAILURE_KINDS, which is owned by the parallel issue-#90 lane -- so
+// this adapter emits `parse_failure` and puts the discriminator in `detail`
+// (`cause=truncated` vs `cause=unparseable_complete`), which means the split
+// can be made later from the ledger alone, with no re-run.
+
+/** How much of a failed reply's raw text to retain at each end. Bounded: the
+ *  detail string goes in the ledger for every failed cell, and an unbounded
+ *  raw reply there would be both unreadable and unbounded on disk. */
+export const RAW_SNIPPET_CHARS = 240;
+
+/** Hard ceiling on a generated detail string, so one pathological reply cannot
+ *  produce a multi-kilobyte ledger row. */
+export const MAX_DETAIL_CHARS = 1400;
+
+/**
+ * Build the per-reply diagnostic record. Provider-agnostic: callers normalize
+ * their provider's stop-reason vocabulary to Anthropic's before calling (see
+ * `normalizeOpenAIFinishReason`) so downstream classification reads ONE
+ * vocabulary.
+ *
+ * @param {object} o
+ *   @param {string} [o.model]
+ *   @param {string} [o.stopReason]  normalized: "end_turn" | "max_tokens" | "refusal" | ...
+ *   @param {object} [o.usage]       provider usage object
+ *   @param {string} [o.text]        the raw reply text
+ *   @param {object} [o.salvage]     the salvageCandidateArray() result, if run
+ */
+export function summarizeReply({ model, stopReason, usage, text, salvage } = {}) {
+  const outputTokens = usage ? usage.output_tokens ?? usage.completion_tokens ?? 0 : 0;
+  let parse = "unparsed";
+  if (salvage) {
+    if (salvage.parsedDirectly) parse = "ok";
+    else if (salvage.objects.length > 0) parse = "salvaged";
+    else parse = "failed";
+  }
+  const t = typeof text === "string" ? text : "";
+  return {
+    model: model || null,
+    stopReason: stopReason || null,
+    // The truncation discriminator. Anthropic reports it directly; the OpenAI
+    // path normalizes finish_reason "length" to "max_tokens" so this one test
+    // covers both providers.
+    truncated: stopReason === "max_tokens",
+    outputTokens,
+    textLength: t.length,
+    parse,
+    parseError: (salvage && salvage.error) || null,
+    candidateCount: salvage ? salvage.objects.length : 0,
+    droppedCount: salvage ? salvage.dropped : 0,
+    textHead: t.slice(0, RAW_SNIPPET_CHARS),
+    textTail: t.length > RAW_SNIPPET_CHARS ? t.slice(-RAW_SNIPPET_CHARS) : "",
+  };
+}
+
+/**
+ * Run salvage over a reply, record its diagnostics, and return the
+ * `complete()` payload ideate-core expects.
+ *
+ * A reply that parsed cleanly is handed through BYTE-FOR-BYTE -- the happy
+ * path is not perturbed. A reply that needed repair is re-serialized from the
+ * objects that survived, so ideate-core's extractCandidates (which parses the
+ * reply as one JSON document) sees valid JSON and keeps the 29 good ideas
+ * instead of discarding all 30. A reply from which nothing at all could be
+ * recovered is passed through unchanged, so behaviour in the genuinely-hopeless
+ * case is exactly what it was before.
+ */
+export function handleReplyText({ model, stopReason, usage, text, diagnostics }) {
+  const salvage = salvageCandidateArray(text);
+  if (Array.isArray(diagnostics)) {
+    diagnostics.push(summarizeReply({ model, stopReason, usage, text, salvage }));
+  }
+  if (salvage.parsedDirectly || salvage.objects.length === 0) return { ok: true, text };
+  return { ok: true, text: JSON.stringify(salvage.objects) };
+}
+
+/**
+ * Turn a cell's reply diagnostics into a FAILURE_KINDS value plus a greppable
+ * detail string, for the case where the candidate pool came back empty.
+ *
+ * @param {Array} diagnostics  summarizeReply() records, in call order.
+ * @param {object} [o]
+ *   @param {string} [o.providerName]  prefix for the detail string.
+ *   @param {boolean} [o.allRefused]   ideate-core's own agentsFailed === agentsAttempted signal.
+ * @returns {{kind: string, cause: string, detail: string}}
+ */
+export function classifyPoolFailure(diagnostics = [], { providerName = "provider", allRefused = false } = {}) {
+  const replies = diagnostics.length;
+  const truncated = diagnostics.filter((d) => d.truncated).length;
+  const refused = diagnostics.filter((d) => d.stopReason === "refusal").length;
+  const unparseable = diagnostics.filter((d) => !d.truncated && d.parse === "failed").length;
+  const salvaged = diagnostics.filter((d) => d.parse === "salvaged").length;
+  const emptyValid = diagnostics.filter((d) => d.parse === "ok" && d.candidateCount === 0).length;
+
+  const stopReasons = {};
+  for (const d of diagnostics) {
+    const k = d.stopReason || "unknown";
+    stopReasons[k] = (stopReasons[k] || 0) + 1;
+  }
+
+  let kind;
+  let cause;
+  if (replies > 0 && refused === replies) {
+    kind = "refusal";
+    cause = "refusal";
+  } else if (truncated > 0) {
+    kind = "parse_failure";
+    cause = "truncated";
+  } else if (unparseable > 0) {
+    kind = "parse_failure";
+    cause = "unparseable_complete";
+  } else if (allRefused) {
+    // ideate-core's own "every agent failed" signal. Checked AFTER the
+    // reply-level causes (which are strictly more specific and more
+    // actionable) but BEFORE the empty_pool fallbacks, which preserves the
+    // pre-#93 behaviour: agentsFailed === agentsAttempted classified refusal.
+    kind = "refusal";
+    cause = "agents_all_failed";
+  } else if (replies === 0) {
+    // No reply was ever recorded -- the model was never successfully reached.
+    // Nothing here is more specific than the caller's own transport signals.
+    kind = "empty_pool";
+    cause = "no_replies";
+  } else {
+    // Every reply parsed and every reply was legitimately empty -- the model
+    // really did return nothing usable. THIS is what `empty_pool` was always
+    // supposed to mean.
+    kind = "empty_pool";
+    cause = "genuinely_empty";
+  }
+
+  // Pick the most diagnostic single reply to quote: a truncated one first,
+  // then an unparseable one, then whatever came back.
+  const sample =
+    diagnostics.find((d) => d.truncated) || diagnostics.find((d) => d.parse === "failed") || diagnostics[0] || null;
+
+  const fields = [
+    `cause=${cause}`,
+    `kind=${kind}`,
+    `replies=${replies}`,
+    `truncated=${truncated}`,
+    `unparseable=${unparseable}`,
+    `salvaged=${salvaged}`,
+    `refused=${refused}`,
+    `empty_valid=${emptyValid}`,
+    `stop_reasons=${JSON.stringify(stopReasons)}`,
+  ];
+  if (sample) {
+    fields.push(
+      `sample_model=${sample.model}`,
+      `sample_stop_reason=${sample.stopReason}`,
+      `sample_output_tokens=${sample.outputTokens}`,
+      `sample_text_len=${sample.textLength}`,
+      `sample_parse=${sample.parse}`,
+      `sample_dropped=${sample.droppedCount}`,
+      `sample_parse_error=${JSON.stringify(sample.parseError)}`,
+      `sample_head=${JSON.stringify(sample.textHead)}`,
+      `sample_tail=${JSON.stringify(sample.textTail)}`,
+    );
+  }
+
+  let detail = `${providerName}: ideateCore returned an empty candidate pool -- ${fields.join(" ")}`;
+  if (detail.length > MAX_DETAIL_CHARS) detail = `${detail.slice(0, MAX_DETAIL_CHARS - 3)}...`;
+  return { kind, cause, detail };
+}
+
+/**
+ * The per-cell max_tokens ceiling: the largest any of this cell's agents could
+ * need. Cells are homogeneous in ideasPerAgent today (solo: totalIdeasRequested;
+ * panel: panel.ideasPerAgent for every slot), so this is just "what this arm
+ * asks for" -- taking the max keeps it correct if that ever stops holding.
+ * Guards the empty-agents case explicitly: `Math.max(...[])` is -Infinity.
+ */
+export function maxTokensForCell(agents) {
+  const list = Array.isArray(agents) ? agents.filter(Boolean) : [];
+  if (list.length === 0) return maxTokensForIdeas(undefined);
+  return Math.max(...list.map((a) => maxTokensForIdeas(a.ideasPerAgent)));
+}
 
 /**
  * Validate a provider's return shape against the interface contract above.
@@ -271,10 +489,20 @@ export class AnthropicBatchProvider {
     // value -- see the bottom of this method.
     const classification = { transportError: false, rateLimited: false, timedOut: false };
 
-    const complete =
-      mode === "single"
-        ? (req) => this.#completeSingle(req, { addUsage, classification })
-        : (req) => this.#completeBatched(req, { addUsage, classification });
+    // Per-cell reply diagnostics (issue #93). One record per model reply --
+    // stop_reason, output tokens, what parsing did, a bounded raw snippet --
+    // so a failed cell can say WHICH of "nothing came back" / "cut off" /
+    // "complete but unparseable" happened. See the module header.
+    const diagnostics = [];
+
+    // max_tokens sized from what this arm actually asks for (issue #93 cause
+    // 1). Arm A asks for 30 ideas in one call and was riding the old flat
+    // 2048 cap; panel arms ask for 6 and compute below the retained 2048
+    // floor, so their requests are unchanged. See prompts.mjs.
+    const cellMaxTokens = maxTokensForCell(agents);
+
+    const ctx = { addUsage, classification, diagnostics, cellMaxTokens };
+    const complete = mode === "single" ? (req) => this.#completeSingle(req, ctx) : (req) => this.#completeBatched(req, ctx);
 
     let ideateResult;
     try {
@@ -302,23 +530,31 @@ export class AnthropicBatchProvider {
         failureKind: pickFailureKind(classification, "transport_error"),
         detail: `AnthropicBatchProvider: ideateImpl threw: ${err && err.message}`,
         tokens: { tokens_by_model: tokensByModel },
+        diagnostics,
       };
     }
 
     const candidates = (ideateResult && ideateResult.candidates) || [];
     if (candidates.length === 0) {
       // IC-08 silent mode: ideateCore resolved cleanly (no throw) but the
-      // pool is empty. Distinguish "everyone refused" from "everyone
-      // errored/timed out/rate-limited" using whatever the complete() calls
-      // observed; empty_pool is the correct default per spec when nothing
-      // more specific was detected.
-      const allRefused =
-        ideateResult && ideateResult.meta && ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted;
+      // pool is empty. Since #93 this is no longer one undifferentiated
+      // bucket: classifyPoolFailure reads the per-reply diagnostics and
+      // distinguishes truncated / unparseable-but-complete / refused /
+      // genuinely-empty, emitting the discriminator in `detail` (the only
+      // field that reaches the ledger for a failed cell). Transport-level
+      // signals still win over all of it via pickFailureKind.
+      const allRefused = !!(
+        ideateResult &&
+        ideateResult.meta &&
+        ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted
+      );
+      const pool = classifyPoolFailure(diagnostics, { providerName: "AnthropicBatchProvider", allRefused });
       return {
         terminalState: "failed",
-        failureKind: pickFailureKind(classification, allRefused ? "refusal" : "empty_pool"),
-        detail: "AnthropicBatchProvider: ideateCore returned an empty candidate pool",
+        failureKind: pickFailureKind(classification, pool.kind),
+        detail: pool.detail,
         tokens: { tokens_by_model: tokensByModel },
+        diagnostics,
       };
     }
 
@@ -326,12 +562,13 @@ export class AnthropicBatchProvider {
       terminalState: "completed",
       result: { candidates, agents: ideateResult.agents, meta: ideateResult.meta },
       tokens: { tokens_by_model: tokensByModel },
+      diagnostics,
     };
   }
 
   // ── single mode: POST /v1/messages directly, resolve immediately ─────────
-  async #completeSingle(req, { addUsage, classification }) {
-    const params = buildAnthropicMessageParams(req);
+  async #completeSingle(req, { addUsage, classification, diagnostics, cellMaxTokens }) {
+    const params = buildAnthropicMessageParams(withCellMaxTokens(req, cellMaxTokens));
     const { ok, status, json, error } = await anthropicFetchWithRetry(
       this.fetchImpl,
       "https://api.anthropic.com/v1/messages",
@@ -344,7 +581,13 @@ export class AnthropicBatchProvider {
       return { ok: false };
     }
     addUsage(req.model, json.usage);
-    return { ok: true, text: extractAnthropicText(json) };
+    return handleReplyText({
+      model: req.model,
+      stopReason: json && json.stop_reason,
+      usage: json && json.usage,
+      text: extractAnthropicText(json),
+      diagnostics,
+    });
   }
 
   // ── batch mode: buffer this call; flush the whole round as one batch ─────
@@ -371,7 +614,7 @@ export class AnthropicBatchProvider {
 
     const requests = batch.map((entry, i) => ({
       custom_id: `req-${i}-${Math.random().toString(36).slice(2, 8)}`,
-      params: buildAnthropicMessageParams(entry.req),
+      params: buildAnthropicMessageParams(withCellMaxTokens(entry.req, entry.ctx.cellMaxTokens)),
     }));
     const byCustomId = new Map(requests.map((r, i) => [r.custom_id, batch[i]]));
 
@@ -460,7 +703,15 @@ export class AnthropicBatchProvider {
       if (row.result && row.result.type === "succeeded") {
         const message = row.result.message;
         entry.ctx.addUsage(entry.req.model, message && message.usage);
-        entry.resolve({ ok: true, text: extractAnthropicText(message) });
+        entry.resolve(
+          handleReplyText({
+            model: entry.req.model,
+            stopReason: message && message.stop_reason,
+            usage: message && message.usage,
+            text: extractAnthropicText(message),
+            diagnostics: entry.ctx.diagnostics,
+          }),
+        );
       } else if (row.result && row.result.type === "errored") {
         const err = row.result.error || {};
         if (err.type === "rate_limit_error") entry.ctx.classification.rateLimited = true;
@@ -513,6 +764,24 @@ export function resolveIdeateAgents(arm, armsConfig) {
     })),
     maxRounds: panel.maxRounds,
   };
+}
+
+/**
+ * Apply the cell's computed max_tokens floor to a request ideate-core built
+ * (issue #93). ideate-core does not supply a `maxTokens` today -- which is why
+ * every #8 call went out at `?? 2048` -- but if a future version does, the
+ * LARGER of the two wins, so this floor can never silently shrink a request
+ * the engine deliberately sized.
+ *
+ * Deliberately applied HERE, at the call site, rather than inside
+ * buildAnthropicMessageParams / buildOpenAIChatParams: those two builders keep
+ * their existing contract ("an explicit req.maxTokens is honoured verbatim"),
+ * which is what makes their force-strip allowlist easy to audit against
+ * docs/PREREGISTRATION.md §3.3.
+ */
+export function withCellMaxTokens(req, cellMaxTokens) {
+  if (!Number.isFinite(cellMaxTokens) || cellMaxTokens <= 0) return req;
+  return { ...req, maxTokens: Math.max(req && Number.isFinite(req.maxTokens) ? req.maxTokens : 0, cellMaxTokens) };
 }
 
 // ── Force-strip sampling params BY CONSTRUCTION (docs/PREREGISTRATION.md
@@ -735,11 +1004,16 @@ export class OpenAIBatchProvider {
       row.output_tokens += usage.completion_tokens || usage.output_tokens || 0;
     };
     const classification = { transportError: false, rateLimited: false, timedOut: false };
+    // Issue #93, mirrored from the Anthropic path above -- same diagnostics,
+    // same max_tokens sizing. Arm H (homogeneous OpenAI) and arm G's OpenAI
+    // slots were never exercised by the #8 smoke study, but they have exactly
+    // the same shape, so they get exactly the same fix rather than waiting to
+    // reproduce the bug on a second provider.
+    const diagnostics = [];
+    const cellMaxTokens = maxTokensForCell(agents);
+    const ctx = { addUsage, classification, diagnostics, cellMaxTokens };
 
-    const complete =
-      mode === "single"
-        ? (req) => this.#completeSingle(req, { addUsage, classification })
-        : (req) => this.#completeBatched(req, { addUsage, classification });
+    const complete = mode === "single" ? (req) => this.#completeSingle(req, ctx) : (req) => this.#completeBatched(req, ctx);
 
     let ideateResult;
     try {
@@ -757,21 +1031,22 @@ export class OpenAIBatchProvider {
         },
       );
     } catch (err) {
-      return { terminalState: "failed", failureKind: pickFailureKind(classification, "transport_error"), detail: `OpenAIBatchProvider: ideateImpl threw: ${err && err.message}`, tokens: { tokens_by_model: tokensByModel } };
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, "transport_error"), detail: `OpenAIBatchProvider: ideateImpl threw: ${err && err.message}`, tokens: { tokens_by_model: tokensByModel }, diagnostics };
     }
 
     const candidates = (ideateResult && ideateResult.candidates) || [];
     if (candidates.length === 0) {
-      const allRefused = ideateResult && ideateResult.meta && ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted;
-      return { terminalState: "failed", failureKind: pickFailureKind(classification, allRefused ? "refusal" : "empty_pool"), detail: "OpenAIBatchProvider: ideateCore returned an empty candidate pool", tokens: { tokens_by_model: tokensByModel } };
+      const allRefused = !!(ideateResult && ideateResult.meta && ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted);
+      const pool = classifyPoolFailure(diagnostics, { providerName: "OpenAIBatchProvider", allRefused });
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, pool.kind), detail: pool.detail, tokens: { tokens_by_model: tokensByModel }, diagnostics };
     }
 
-    return { terminalState: "completed", result: { candidates, agents: ideateResult.agents, meta: ideateResult.meta }, tokens: { tokens_by_model: tokensByModel } };
+    return { terminalState: "completed", result: { candidates, agents: ideateResult.agents, meta: ideateResult.meta }, tokens: { tokens_by_model: tokensByModel }, diagnostics };
   }
 
   // ── single mode: POST /v1/chat/completions directly ──────────────────────
-  async #completeSingle(req, { addUsage, classification }) {
-    const params = buildOpenAIChatParams(req);
+  async #completeSingle(req, { addUsage, classification, diagnostics, cellMaxTokens }) {
+    const params = buildOpenAIChatParams(withCellMaxTokens(req, cellMaxTokens));
     const { ok, status, json, error } = await openaiFetchWithRetry(
       this.fetchImpl,
       "https://api.openai.com/v1/chat/completions",
@@ -784,7 +1059,13 @@ export class OpenAIBatchProvider {
       return { ok: false };
     }
     addUsage(req.model, json.usage);
-    return { ok: true, text: extractOpenAIText(json) };
+    return handleReplyText({
+      model: req.model,
+      stopReason: normalizeOpenAIFinishReason(json),
+      usage: json && json.usage,
+      text: extractOpenAIText(json),
+      diagnostics,
+    });
   }
 
   // ── batch mode: buffer this call; flush the round as one OpenAI Batch ─────
@@ -808,7 +1089,7 @@ export class OpenAIBatchProvider {
       custom_id: `req-${i}-${Math.random().toString(36).slice(2, 8)}`,
       method: "POST",
       url: "/v1/chat/completions",
-      body: buildOpenAIChatParams(entry.req),
+      body: buildOpenAIChatParams(withCellMaxTokens(entry.req, entry.ctx.cellMaxTokens)),
     }));
     const byCustomId = new Map(lines.map((l, i) => [l.custom_id, batch[i]]));
     const jsonl = lines.map((l) => JSON.stringify(l)).join("\n");
@@ -918,7 +1199,15 @@ export class OpenAIBatchProvider {
       const resp = row.response;
       if (!row.error && resp && resp.status_code >= 200 && resp.status_code < 300 && resp.body) {
         entry.ctx.addUsage(entry.req.model, resp.body.usage);
-        entry.resolve({ ok: true, text: extractOpenAIText(resp.body) });
+        entry.resolve(
+          handleReplyText({
+            model: entry.req.model,
+            stopReason: normalizeOpenAIFinishReason(resp.body),
+            usage: resp.body.usage,
+            text: extractOpenAIText(resp.body),
+            diagnostics: entry.ctx.diagnostics,
+          }),
+        );
       } else if (resp && resp.status_code === 429) {
         entry.ctx.classification.rateLimited = true;
         entry.resolve({ ok: false, __failureKind: "rate_limited" });
@@ -968,6 +1257,31 @@ export function openaiHeaders(apiKey) {
  *  NOT set content-type here or the boundary is lost. */
 export function openaiAuthOnlyHeaders(apiKey) {
   return { authorization: `Bearer ${apiKey}` };
+}
+
+/**
+ * Normalize OpenAI's `finish_reason` to the Anthropic `stop_reason` vocabulary
+ * (issue #93). Without this the truncation check -- `stopReason ===
+ * "max_tokens"` -- would silently never fire on the OpenAI path, because
+ * OpenAI signals truncation as `choices[0].finish_reason === "length"`, on the
+ * response body rather than anywhere `extractOpenAIText` looks. The mirrored
+ * fix would have LOOKED complete while detecting nothing.
+ *
+ *   length         -> max_tokens   (truncated: the exact arm-A failure shape)
+ *   content_filter -> refusal      (nearest FAILURE_KINDS-aligned meaning)
+ *   stop           -> end_turn     (the model finished on its own)
+ *
+ * Anything else (e.g. tool_calls, or a value OpenAI adds later) is passed
+ * through verbatim so it shows up in the ledger's stop_reasons histogram
+ * rather than being flattened into "unknown".
+ */
+export function normalizeOpenAIFinishReason(body) {
+  const choice = body && Array.isArray(body.choices) ? body.choices[0] : undefined;
+  const finishReason = choice && choice.finish_reason;
+  if (finishReason === "length") return "max_tokens";
+  if (finishReason === "content_filter") return "refusal";
+  if (finishReason === "stop") return "end_turn";
+  return finishReason || null;
 }
 
 /** choices[0].message.content of an OpenAI chat completion, or "". */
