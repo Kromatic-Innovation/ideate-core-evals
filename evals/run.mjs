@@ -57,6 +57,12 @@ import { judgeLegsFor } from "./judge/matrix.mjs";
 // below, so a fully-wired arm produces zero deferrals.
 import { AnthropicJudgeProvider, OpenAIJudgeProvider } from "./judge/score.mjs";
 import { runPhase0 } from "./metrics/phase0.mjs";
+// armsConfigHash / computeJudgeHash (issue #101): the two CONFIG_FIELDS
+// entries this file now populates. Kept on their own import lines rather than
+// folded into the judge-provider import above so the two concerns stay
+// separable in a diff.
+import { armsConfigHash } from "../lib/manifest.mjs";
+import { computeJudgeHash } from "./judge/score.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -686,8 +692,66 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       // and absorbing the invalidation now costs a $3.32 smoke run rather than
       // Phase 2's grid.
       promptHash: promptTemplateHash(),
+      // judgeHash (issue #101): populated at last, with the SAME
+      // computeJudgeHash() evals/judge/score.mjs has exported since #21 --
+      // it folds judgePromptHash() and the registered judge model roster
+      // into one 12-hex value. Nothing here invents a hash; the mechanism
+      // already existed and simply had no caller on the run path.
+      //
+      // #101 asked whether to populate this field or delete it, on the
+      // grounds that a declared-but-never-set CONFIG_FIELDS entry reads as
+      // covered and is worse than an absent one. Deleting it is not
+      // available: docs/PREREGISTRATION.md §11 names "judge hash" among the
+      // things configHash covers, and Appendix B item 3 registers IN ADVANCE
+      // that judgeHash is a CONFIG_FIELDS entry and that a rubric change
+      // flowing judgeHash -> configHash -> cellKey is "correct and
+      // intended". Removing it would be a pre-registration deviation
+      // requiring its own registered justification, not a code cleanup.
+      //
+      // Note what this deliberately costs: swapping a JUDGE now invalidates
+      // GENERATION cells, which must be re-generated rather than merely
+      // re-scored. That is the registered trade, and it is the conservative
+      // direction -- §5.3/§11 treat a cell's result as comparable only if
+      // the judge that could score it is identical too.
+      judgeHash: computeJudgeHash({ judgeModels: JUDGE_MODELS }),
       embedderId,
       corpusHash: CORPUS_HASH,
+      // armsConfigHash (issue #101): THE headline fix. arms.config.json was
+      // hashed nowhere, so the single variable this entire study manipulates
+      // -- "the ONLY thing varying between arms is model assignment", per the
+      // file's own header -- was invisible to configHash. Editing arm C from
+      // claude-sonnet-5 to claude-opus-5 produced cells carrying the SAME
+      // configHash as the old ones; planRun classified them `reuse` and the
+      // frame pooled two different experiments with no `stale` warning.
+      //
+      // This also subsumes the `ideasPerAgent` / `maxRounds` CONFIG_FIELDS
+      // entries, now removed -- see lib/manifest.mjs for why a per-spec slot
+      // could never honestly hold those per-arm values.
+      armsConfigHash: armsConfigHash(armsConfig),
+      // clusterDistanceThreshold (issue #101): stamped HERE, on the
+      // generation side, settling the ownership question #101 left open.
+      //
+      // It is a CONFIG_FIELDS entry registered by docs/PREREGISTRATION.md
+      // Appendix B item 8, but until now run.mjs passed it only as a
+      // runSpec() OPTION (see runSpecOpts below) and never into spec.config,
+      // so it never reached the hash. Since #85 wired pool metrics into
+      // runSpec, the threshold shapes a stored GENERATION artifact --
+      // distinct_k is a direct function of it -- which is precisely what
+      // makes it comparability-relevant and this file's to stamp.
+      //
+      // evals/analysis/ is NOT the owner and is untouched: post-#91 the
+      // analysis side computes no hash at all, it reads the store's own cfg
+      // (evals/analysis/storeConfig.mjs). Its --cluster-distance-threshold
+      // flag survives as a RECOMPUTATION parameter for the rarefied lane,
+      // where a value disagreeing with what generation used already fails
+      // loudly -- buildRarefiedFrame recomputes full-pool distinct_k and
+      // throws on a mismatch with the stored scalar (rarefiedFrame.mjs).
+      //
+      // Set UNCONDITIONALLY, never gated on whether `embedder` got wired
+      // below: a config whose hash depended on the presence of a
+      // VOYAGE_API_KEY would make --dry-run project a different configHash
+      // than the real run it is supposed to be projecting.
+      clusterDistanceThreshold: VOYAGE_CLUSTER_DISTANCE_THRESHOLD,
     },
   };
 
