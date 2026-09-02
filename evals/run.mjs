@@ -35,6 +35,7 @@ import { runSpec } from "./harness/runner.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
+import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD } from "./metrics/voyage-calibration.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
 // AnthropicJudgeProvider (issue #68) + OpenAIJudgeProvider (issue #77): the
@@ -480,6 +481,33 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         openai: new OpenAIJudgeProvider({ apiKey: process.env.OPENAI_API_KEY }),
       };
 
+  // embedder (issue #85): the wiring that makes pool metrics (distinct_k,
+  // diversity, collapse rate, embedded pools) reachable from a real CLI run
+  // at all -- before this, evals/metrics/operational.mjs's
+  // poolMetricsSummary had zero non-test callers (the same "registered
+  // stage, no caller" shape #68/#77 fixed for judging). Constructed only
+  // for a real (non-dry-run) invocation, mirroring `provider`/
+  // `judgeProviders` immediately above -- runSpec()'s dry-run branch never
+  // reaches the metrics pass either way. VOYAGE_API_KEY is checked here, at
+  // the CLI boundary, so a misconfigured real run fails loudly before any
+  // generation spend happens (runSpec()'s own pre-flight assertion catches
+  // a missing clusterDistanceThreshold the same way; this catches a missing
+  // credential one layer up, at construction, mirroring the
+  // ANTHROPIC_API_KEY check above).
+  let embedder;
+  if (!args.dryRun) {
+    const voyageApiKey = process.env.VOYAGE_API_KEY;
+    if (!voyageApiKey) {
+      throw new Error(
+        "run.mjs: VOYAGE_API_KEY is not set. A real (non-dry-run) invocation embeds every completed pool via the " +
+          "live Voyage API (pool-level metrics -- distinct_k, diversity, collapse rate -- issue #85) and requires " +
+          "a real API key -- this harness never invents or defaults one. Set VOYAGE_API_KEY in the environment, " +
+          "or pass --dry-run to plan the run without calling anything.",
+      );
+    }
+    embedder = voyageEmbedder({ apiKey: voyageApiKey });
+  }
+
   const runSpecOpts = {
     store,
     armsConfig,
@@ -496,6 +524,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     judgeModels: JUDGE_MODELS,
     judgeProviders,
     corpus: CORPUS,
+    // embedder/clusterDistanceThreshold (issue #85): opt-in switch that
+    // makes runSpec() compute pool metrics for every completed cell -- see
+    // the `embedder` construction above and runner.mjs's own opts doc.
+    // VOYAGE_CLUSTER_DISTANCE_THRESHOLD is the Voyage-4-lite-calibrated
+    // threshold (issue #42) -- the live embedder built above always
+    // produces vectors in THAT space, never the hermetic MiniLM fixture
+    // space calibration.mjs's CLUSTER_DISTANCE_THRESHOLD is valid for.
+    embedder,
+    clusterDistanceThreshold: VOYAGE_CLUSTER_DISTANCE_THRESHOLD,
     // --max-spend-anthropic/--max-spend-openai (issue #51) need real,
     // pinned-rate-table pricing to be meaningful pre-flight -- the interim
     // estimator runSpec() falls back to when no priceGrid is injected has no

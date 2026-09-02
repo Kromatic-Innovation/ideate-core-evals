@@ -155,13 +155,21 @@ test("main() wires a REAL AnthropicJudgeProvider + OpenAIJudgeProvider + the reg
   const runSpecFn = spyRunSpec();
   const priorKey = process.env.ANTHROPIC_API_KEY;
   const priorOpenaiKey = process.env.OPENAI_API_KEY;
+  const priorVoyageKey = process.env.VOYAGE_API_KEY;
   process.env.ANTHROPIC_API_KEY = "test-key-not-real";
   process.env.OPENAI_API_KEY = "test-openai-key-not-real";
+  // issue #85: a genuine (non-dry-run) invocation now also constructs a real
+  // embedder, which requires VOYAGE_API_KEY -- set here so this test still
+  // exercises the judge-wiring assertions below without tripping that
+  // unrelated pre-flight guard.
+  process.env.VOYAGE_API_KEY = "test-voyage-key-not-real";
   t.after(() => {
     if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = priorKey;
     if (priorOpenaiKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = priorOpenaiKey;
+    if (priorVoyageKey === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = priorVoyageKey;
   });
 
   // Deliberately NOT --dry-run: dry-run's early return in runSpec() never

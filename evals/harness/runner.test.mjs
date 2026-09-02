@@ -1376,3 +1376,215 @@ test("issue #64: summary exposes BOTH this-invocation spend (spendByProvider, un
   assert.equal(second.cumulativeNonProviderSpendUsd, 0, "no embedder rows in this store");
   assert.deepEqual(second.cumulativeNonProviderModels, []);
 });
+
+// ── issue #85: pool metrics wiring ──────────────────────────────────────────
+// runSpec() had NO caller of evals/metrics/operational.mjs's
+// poolMetricsSummary -- generation -> store -> judge -> store, with no
+// distinct_k/embeddings ever computed for a real cell. These tests assert
+// against a REAL ResultsStore (not a spy), reading `store.get(key).result`
+// back the same way evals/analysis/frame.mjs does, so a test that passes
+// with the wiring deleted is structurally impossible.
+
+/** A hermetic embedder double matching evals/metrics/embedder.mjs's
+ *  interface (embed/modelId/usage), including voyageEmbedder's CUMULATIVE
+ *  `usage.total_tokens` contract -- a test asserting per-cell metering must
+ *  see the same shape the real embedder exposes, or it would pass against a
+ *  double that doesn't actually exercise the delta-metering logic. */
+class MockEmbedder {
+  constructor({ vectorFor = () => [1, 0], tokensPerText = 10, failOnText = new Set(), partialTokensBeforeFail = 0 } = {}) {
+    this.modelId = "voyage-4-lite";
+    this.usage = { total_tokens: 0 };
+    this.vectorFor = vectorFor;
+    this.tokensPerText = tokensPerText;
+    this.failOnText = failOnText;
+    this.partialTokensBeforeFail = partialTokensBeforeFail;
+    this.calls = [];
+  }
+  async embed(texts) {
+    this.calls.push(texts);
+    if (texts.some((t) => this.failOnText.has(t))) {
+      // Mirrors voyageEmbedder's per-chunk usage accounting: tokens already
+      // consumed by chunks that succeeded BEFORE the failing one still land
+      // on `.usage.total_tokens`, even though embed() itself throws.
+      this.usage.total_tokens += this.partialTokensBeforeFail;
+      throw new Error("MockEmbedder: forced failure");
+    }
+    this.usage.total_tokens += texts.length * this.tokensPerText;
+    return texts.map((t) => this.vectorFor(t));
+  }
+}
+
+// Orthogonal unit vectors: cosine distance 1 between any two distinct texts,
+// 0 between identical texts -- deterministic clustering under threshold 0.5
+// with no dependency on a real calibrated constant.
+const ORTHOGONAL_BASIS = { "idea-1": [1, 0], "idea-2": [0, 1] };
+function orthogonalVectorFor(text) {
+  // MockProvider's default candidates are "mock-idea-1-<key>"/"mock-idea-2-<key>".
+  if (text.includes("idea-1")) return ORTHOGONAL_BASIS["idea-1"];
+  if (text.includes("idea-2")) return ORTHOGONAL_BASIS["idea-2"];
+  return [1, 1];
+}
+const METRICS_THRESHOLD = 0.5;
+
+test("issue #85: runSpec computes and persists pool metrics for a completed cell when opts.embedder is supplied", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const embedder = new MockEmbedder({ vectorFor: orthogonalVectorFor });
+
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  await runSpec(oneCellSpec, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider,
+    embedder,
+    clusterDistanceThreshold: METRICS_THRESHOLD,
+    log: silentLog,
+  });
+
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const record = store.get(key);
+  assert.equal(record.accounting.state, "completed");
+  // Exactly what evals/analysis/frame.mjs reads: getPath(body.result, "distinct_k")
+  // and (when poolField is supplied) getPath(body.result, "pool").
+  assert.equal(record.result.distinct_k, 2, "two orthogonal candidates under threshold 0.5 never merge");
+  assert.ok(Array.isArray(record.result.pool) && record.result.pool.length === 2, "result.pool is the embedded pool, one vector per candidate");
+  assert.deepEqual(record.result.pool[0], [1, 0]);
+  assert.deepEqual(record.result.pool[1], [0, 1]);
+  assert.equal(record.result.rawCandidateCount, 2);
+  assert.equal(record.result.postDedupPoolSize, 2);
+  assert.equal(record.result.collapseRate, 0, "no collapse -- every candidate is its own equivalence class");
+  assert.equal(record.result.poolDiversity, 1, "mean pairwise cosine distance between orthogonal unit vectors is 1");
+  assert.equal(record.result.fluency, 2);
+  assert.equal(record.result.flexibility, 2);
+  assert.equal(embedder.calls.length, 1, "exactly one embed() call for this one completed cell");
+});
+
+test("issue #85: the embedder call is metered as a non-provider costRow (voyage-4-lite), excluded from byProvider, counted in totalUsd", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const embedder = new MockEmbedder({ vectorFor: orthogonalVectorFor, tokensPerText: 7 });
+
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, embedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const record = store.get(key);
+  const embedderRow = record.costRows.find((r) => r.model === "voyage-4-lite");
+  assert.ok(embedderRow, "a voyage-4-lite costRow is stored alongside the generation costRow");
+  assert.equal(embedderRow.input_tokens, 14, "2 candidates x 7 tokens each -- the DELTA of this one embed() call, not a cumulative total");
+
+  const spend = spendToDate(store);
+  assert.ok(spend.excludedNonProviderUsd > 0, "embedder spend is priced and surfaced via excludedNonProviderUsd");
+  assert.deepEqual(Object.keys(spend.byProvider).includes("voyage"), false, "embedder spend never lands in byProvider -- issue #72's basis split");
+});
+
+test("issue #85: embedder metering is DELTA, not cumulative -- a second cell's costRow is not inflated by the first cell's tokens", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const embedder = new MockEmbedder({ vectorFor: orthogonalVectorFor, tokensPerText: 10 });
+
+  const twoCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }], replicates: 1, config: CFG };
+  await runSpec(twoCellSpec, { store, armsConfig: ARMS_CONFIG, provider, embedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  const key1 = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const key2 = cellKey({ armId: "A", briefId: "b2", replicate: 0, cfg: CFG_HASH });
+  const row1 = store.get(key1).costRows.find((r) => r.model === "voyage-4-lite");
+  const row2 = store.get(key2).costRows.find((r) => r.model === "voyage-4-lite");
+  assert.equal(row1.input_tokens, 20, "cell 1: 2 candidates x 10 tokens");
+  assert.equal(row2.input_tokens, 20, "cell 2 must NOT include cell 1's tokens too -- delta metering, not the embedder's running total");
+  assert.equal(embedder.usage.total_tokens, 40, "the embedder's own cumulative counter is the sum of both cells, confirming the double's shape matches voyageEmbedder's contract");
+});
+
+test("issue #85: a failed generation cell has no candidates and is never embedded -- zero embedder calls, no distinct_k", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const overrides = new Map([[key, { terminalState: "failed", failureKind: "empty_pool", detail: "candidates: []" }]]);
+  const provider = new MockProvider({ overrides });
+  const embedder = new MockEmbedder({ vectorFor: orthogonalVectorFor });
+
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const { summary } = await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, embedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  assert.equal(summary.failed, 1);
+  assert.equal(embedder.calls.length, 0, "a classified generation failure is never embedded");
+  const record = store.get(key);
+  assert.equal(record.result.failed, true);
+  assert.equal(record.result.distinct_k, undefined);
+});
+
+test("issue #85: a metrics-computation failure (embedder throws) is stored as a classified failure, never a completed cell missing distinct_k -- and the tokens it did consume are still metered", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const embedder = new MockEmbedder({
+    vectorFor: orthogonalVectorFor,
+    failOnText: new Set([`mock-idea-1-${key}`, `mock-idea-2-${key}`]),
+    partialTokensBeforeFail: 5,
+  });
+
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const { summary } = await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, embedder, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  assert.equal(summary.completed, 0, "generation succeeded but metrics did not -- this cell must NOT reconcile as completed");
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.byKind.harness_error, 1);
+
+  const record = store.get(key);
+  assert.equal(record.accounting.state, "failed");
+  assert.equal(record.result.failed, true, "no candidates survive a metrics-failed cell -- never a completed cell silently missing distinct_k");
+  assert.equal(record.result.distinct_k, undefined);
+  const embedderRow = record.costRows.find((r) => r.model === "voyage-4-lite");
+  assert.ok(embedderRow, "tokens the embedder actually consumed before failing are still durably metered");
+  assert.equal(embedderRow.input_tokens, 5);
+  // The generation costRow (real money already spent on generation) must
+  // also still be present -- this is the money-first guarantee the whole
+  // wiring exists to preserve.
+  assert.ok(record.costRows.some((r) => r.model !== "voyage-4-lite"), "the generation cost row survives a metrics failure");
+});
+
+test("issue #85: resuming a run does not recompute metrics for an already-completed cell -- no re-embed, no double-meter", async (t) => {
+  const dir = tempDir(t);
+  const embedder1 = new MockEmbedder({ vectorFor: orthogonalVectorFor });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const store1 = new ResultsStore(dir);
+  await runSpec(oneCellSpec, { store: store1, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: embedder1, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+  assert.equal(embedder1.calls.length, 1);
+
+  // A second invocation over the SAME store/spec: the cell is now `reuse`,
+  // not `todo` -- metrics must not be recomputed (the stored record is
+  // append-only and already carries them).
+  const store2 = new ResultsStore(dir);
+  const embedder2 = new MockEmbedder({ vectorFor: orthogonalVectorFor });
+  const { summary } = await runSpec(oneCellSpec, { store: store2, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: embedder2, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  assert.equal(summary.completed, 1, "the reused cell still reconciles as completed");
+  assert.equal(embedder2.calls.length, 0, "no embed() call on the resumed invocation -- the cell was reused, not re-run");
+});
+
+test("issue #85: opts.embedder without opts.clusterDistanceThreshold fails loud before any provider call", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const embedder = new MockEmbedder({ vectorFor: orthogonalVectorFor });
+
+  await assert.rejects(
+    () => runSpec(SPEC, { store, armsConfig: ARMS_CONFIG, provider, embedder, log: silentLog }),
+    /clusterDistanceThreshold/,
+  );
+  assert.deepEqual(provider.calls, [], "the pre-flight assertion fires before any generation spend");
+});
+
+test("issue #85: omitting opts.embedder leaves runSpec's behavior byte-for-byte unchanged -- no distinct_k, no pool, no embedder costRow", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, log: silentLog });
+
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const record = store.get(key);
+  assert.equal(record.accounting.state, "completed");
+  assert.equal(record.result.distinct_k, undefined);
+  assert.equal(record.result.pool, undefined);
+  assert.deepEqual(record.costRows.filter((r) => r.model === "voyage-4-lite"), []);
+});
