@@ -142,7 +142,7 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   // assertion stay green even when metering silently drops calls, since it's
   // comparing the implementation to itself). N is the fixture's own known,
   // independently-computed idea count.
-  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
+  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}|attempt=0`);
   assert.ok(costRecord, "a judge-call cost record must be written for the validation run's judge call");
   assert.equal(costRecord.costRows.length, 1);
   assert.equal(costRecord.costRows[0].model, JUDGE_MODEL);
@@ -175,7 +175,7 @@ test("runJudgeValidation — a failed judge run still meters whatever tokens the
   );
 
   const sliceId = judgeValidationSliceId({ axis: JUDGE_VALIDATION_AXIS, expertScoreField: SI_ET_AL_EXPERT_SCORE_FIELD });
-  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
+  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}|attempt=0`);
   assert.ok(costRecord, "tokens consumed by a failed validation judge call must still be metered");
   assert.equal(costRecord.costRows[0].input_tokens, N * 10);
   assert.equal(costRecord.costRows[0].output_tokens, N * 5);
@@ -367,8 +367,8 @@ test("runJudgeValidation — metering: each topic-group judge call is metered un
   // every topic-group call collided on `judge-call|cell=${sliceId}|judge=...`
   // and store.put's byte-identical-or-throw rule either silently dropped
   // every group after the first or threw outright (the #56 x #61 bug).
-  const biasRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
-  const codingRecord = store.get(`judge-call|cell=${sliceId}|topic=coding|judge=${JUDGE_MODEL}`);
+  const biasRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}|attempt=0`);
+  const codingRecord = store.get(`judge-call|cell=${sliceId}|topic=coding|judge=${JUDGE_MODEL}|attempt=0`);
   assert.ok(biasRecord, "the 'bias' topic group's judge call must be metered under its own key");
   assert.ok(codingRecord, "the 'coding' topic group's judge call must be metered under its own key");
 
