@@ -154,9 +154,10 @@ export function parseArgs(argv) {
 // genuine CLI invocation (`main()`, no args) is unchanged.
 // Phase 0 (docs/PREREGISTRATION.md §8.3, issue #48): negative controls + DAT
 // replication against the live Voyage embedder. Pure formatter for
-// runPhase0()'s summary, separated from console.log the same way
-// live-validation.mjs's renderRandomPoolReport is -- so the report content
-// is hermetically testable without a live embedder (see run.test.mjs).
+// runPhase0()'s summary, separated from console.log the same way the
+// now-deleted live-validation.mjs's renderRandomPoolReport was -- so the
+// report content is hermetically testable without a live embedder (see
+// run.test.mjs).
 //
 // Deliberately reports on THREE controls only (duplicate pool, random-text
 // pool, DAT replication) -- the fourth control in §4.4's table (judge
@@ -165,14 +166,17 @@ export function parseArgs(argv) {
 // today; see phase0.mjs's header for the full reasoning. This formatter
 // never claims "all controls" passed -- only the three it actually names.
 export function formatPhase0Report(summary) {
-  const { dat, controls, duplicatePassed, randomVerdict, allPassed, embedderId, totalTokens, threshold } = summary;
+  const { dat, controls, duplicatePassed, randomVerdict, allPassed, embedderId, totalTokens, threshold, runId, gitSha, datKey, controlsKey } = summary;
   const fmt = (n) => (Number.isFinite(n) ? n.toFixed(4) : String(n));
   const lines = [];
   lines.push(`[phase0] embedder: ${embedderId} (live Voyage API)`);
   lines.push(`[phase0] Voyage-calibrated clustering threshold: ${threshold} (issue #42 / Appendix B item 8)`);
+  if (runId) lines.push(`[phase0] run: ${runId}${gitSha ? ` (git ${gitSha})` : ""}`);
+  if (datKey) lines.push(`[phase0] stored keys: ${datKey}, ${controlsKey}`);
   lines.push("");
   lines.push("[phase0] DAT replication:");
-  lines.push(`  low=${fmt(dat.low)} average=${fmt(dat.average)} high=${fmt(dat.high)} margin=${fmt(dat.margin)}`);
+  lines.push(`  low=${fmt(dat.low)} average=${fmt(dat.average)} high=${fmt(dat.high)}`);
+  lines.push(`  margin (high-low, DESCRIPTIVE ONLY -- not compared against any registered bound)=${fmt(dat.margin)}`);
   lines.push(dat.orderingHolds ? "  PASS: ordering low < average < high holds" : "  FAIL: published ordering did not hold");
   lines.push("");
   lines.push("[phase0] duplicate pool (30 copies):");
@@ -241,6 +245,28 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       throw new Error(
         "run.mjs: --dry-run is not supported with --phase 0 -- Phase 0 has no arms/briefs cost projection to " +
           "dry-run; it makes real (free-tier) Voyage embedding calls. Run `node evals/run.mjs --phase 0` directly.",
+      );
+    }
+    // Phase 0 is a fixed, embeddings-only run (three controls, no arms/briefs
+    // grid, no batching, effectively free) -- every other flag parseArgs
+    // accepts is meaningless here. REJECT them explicitly rather than
+    // silently ignoring them (as a prior version of this branch did, simply
+    // by returning before reading them): a budget-safety flag
+    // (--max-spend[-anthropic|-openai]) silently dropped on a live code path
+    // is the wrong pattern to leave in place on the branch phases 1-3 (which
+    // DO spend real money) will land on.
+    const ignoredFlags = [];
+    if (args.maxSpendUsd !== undefined) ignoredFlags.push("--max-spend");
+    if (args.maxSpendByProviderUsd !== undefined) ignoredFlags.push("--max-spend-anthropic/--max-spend-openai");
+    if (args.arms !== undefined) ignoredFlags.push("--arms");
+    if (args.briefs !== undefined) ignoredFlags.push("--briefs");
+    if (args.replicates !== undefined) ignoredFlags.push("--replicates");
+    if (args.noBatch) ignoredFlags.push("--no-batch");
+    if (ignoredFlags.length > 0) {
+      throw new Error(
+        `run.mjs: --phase 0 does not accept ${ignoredFlags.join(", ")} -- Phase 0 is a fixed three-control run ` +
+          "with no arms/briefs grid and no spend ceiling to enforce (embeddings only, covered by Voyage's free-token " +
+          "allocation). Run `node evals/run.mjs --phase 0` with no other flags.",
       );
     }
     const apiKey = process.env.VOYAGE_API_KEY;

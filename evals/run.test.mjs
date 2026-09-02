@@ -166,11 +166,16 @@ const PASSING_PHASE0_SUMMARY = {
     random: { distinctK: 30, diversity: 0.5, collapseRate: 0 },
   },
   duplicatePassed: true,
+  dupVerdict: { distinctKPass: true, diversityPass: true, passed: true },
   randomVerdict: { distinctKPass: true, floorVerdict: "pass", failed: false },
   allPassed: true,
   embedderId: "voyage-4-lite",
   totalTokens: 42,
   threshold: 0.23141118234233987,
+  runId: "2026-09-02T01:43:26.641Z-abcd1234",
+  datKey: "phase0/dat-replication@2026-09-02T01:43:26.641Z-abcd1234",
+  controlsKey: "phase0/negative-controls@2026-09-02T01:43:26.641Z-abcd1234",
+  gitSha: "deadbeef",
 };
 
 test("main() --phase 0 requires VOYAGE_API_KEY and never invents one", async () => {
@@ -262,4 +267,54 @@ test("formatPhase0Report reports the failing outcome honestly when allPassed is 
   const { lines, allPassed } = formatPhase0Report({ ...PASSING_PHASE0_SUMMARY, allPassed: false });
   assert.equal(allPassed, false);
   assert.match(lines.join("\n"), /AT LEAST ONE FAILED/);
+});
+
+test("formatPhase0Report labels margin as descriptive only, not a gating result", () => {
+  const { lines } = formatPhase0Report(PASSING_PHASE0_SUMMARY);
+  assert.match(lines.join("\n"), /margin.*DESCRIPTIVE ONLY/i);
+});
+
+// ── --phase 0 rejects every other flag (Quine smaller item, PR #69) ────────
+test("main() --phase 0 rejects --max-spend instead of silently ignoring it", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key";
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--phase", "0", "--max-spend", "50"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --max-spend/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+  }
+});
+
+test("main() --phase 0 rejects --arms/--briefs/--replicates/--no-batch the same way", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key";
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--phase", "0", "--arms", "A"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --arms/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--briefs", "b1"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --briefs/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--replicates", "2"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --replicates/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--no-batch"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --no-batch/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+  }
 });

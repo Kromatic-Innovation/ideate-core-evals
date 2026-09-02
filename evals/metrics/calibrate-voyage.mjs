@@ -10,8 +10,8 @@
 //      (threshold-selection.mjs selectThreshold), and writes the result as a
 //      durable, machine-readable JSON record.
 //
-// Mirrors live-validation.mjs's own contract: never imported by a test file,
-// never runs under `node --test`, makes real billed calls to
+// Mirrors phase0.mjs's own contract: never imported by a test file with a
+// real key, never runs under `node --test`, makes real billed calls to
 // api.voyageai.com, requires VOYAGE_API_KEY (never invented/defaulted), and
 // reports findings honestly — a threshold that fails to transfer, or a
 // calibration set with a low achievable balanced accuracy, is reported as

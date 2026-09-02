@@ -1,24 +1,27 @@
 // phase0.test.mjs — hermetic tests for phase0.mjs's orchestration/store-write
 // wiring. No network: every dependency (embedder, datReplicationFn,
-// negativeControlsFn) is injected, mirroring evals/run.mjs main()'s own
-// deps-injection pattern (runSpecFn/store/getEngineVersion) and
-// live-validation.test.mjs's rationale for why the SHIPPED wiring, not just
-// the pure math underneath it, needs direct coverage.
+// negativeControlsFn, getGitSha) is injected, mirroring evals/run.mjs
+// main()'s own deps-injection pattern (runSpecFn/store/getEngineVersion).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { runPhase0, DAT_REPLICATION_KEY, NEGATIVE_CONTROLS_KEY } from "./phase0.mjs";
+import { runPhase0, DAT_REPLICATION_KEY_PREFIX, NEGATIVE_CONTROLS_KEY_PREFIX, phase0Key } from "./phase0.mjs";
 import { makeTempStore } from "../../lib/store.mjs";
-import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD } from "./voyage-calibration.mjs";
+import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD, VOYAGE_CALIBRATION_RECORD } from "./voyage-calibration.mjs";
 import { CLUSTER_DISTANCE_THRESHOLD } from "./calibration.mjs";
+
+const STUB_GIT_SHA = () => "stub-sha";
 
 // A minimal fake embedder: usage.total_tokens increments by 1 per text
 // embedded, so tests can assert an exact, predictable token split between
-// the two stored cost rows without any real network call.
-function fakeEmbedder({ apiKey } = {}) {
+// the two stored cost rows without any real network call. modelId defaults
+// to the REAL registered calibration record's embedderId so ordinary
+// happy-path tests pass phase0.mjs's embedder/threshold-provenance check —
+// see the dedicated mismatch test below for the case where it doesn't.
+function fakeEmbedder({ apiKey, modelId = VOYAGE_CALIBRATION_RECORD.embedderId } = {}) {
   if (!apiKey) throw new Error("fakeEmbedder: apiKey required (mirrors the real voyageEmbedder contract)");
   return {
-    modelId: "fake-voyage-4-lite",
+    modelId,
     usage: { total_tokens: 0 },
     async embed(texts) {
       this.usage.total_tokens += texts.length;
@@ -45,55 +48,83 @@ function passingControlsFn(capturedOpts) {
   };
 }
 
-test("runPhase0 requires apiKey and store", async () => {
-  await assert.rejects(() => runPhase0({ store: makeTempStore() }), /apiKey is required/);
-  await assert.rejects(() => runPhase0({ apiKey: "k" }), /store .* is required/);
+const BASE_DEPS = () => ({
+  apiKey: "test-key",
+  store: makeTempStore(),
+  embedderFactory: fakeEmbedder,
+  getGitSha: STUB_GIT_SHA,
 });
 
-test("runPhase0 stores both controls under the documented keys, with token-based costRows and no cost_usd", async () => {
-  const store = makeTempStore();
+test("runPhase0 requires apiKey and store", async () => {
+  await assert.rejects(() => runPhase0({ store: makeTempStore(), getGitSha: STUB_GIT_SHA }), /apiKey is required/);
+  await assert.rejects(() => runPhase0({ apiKey: "k", getGitSha: STUB_GIT_SHA }), /store .* is required/);
+});
+
+test("runPhase0 refuses to run when the embedder's modelId does not match the calibration record's embedderId", async () => {
+  const capturedOpts = [];
+  await assert.rejects(
+    () =>
+      runPhase0({
+        ...BASE_DEPS(),
+        embedderFactory: (opts) => fakeEmbedder({ ...opts, modelId: "some-other-embedder" }),
+        datReplicationFn: passingDatFn(),
+        negativeControlsFn: passingControlsFn(capturedOpts),
+      }),
+    /does not match the embedder the registered threshold was calibrated against/,
+  );
+});
+
+test("runPhase0 stores both controls under run-discriminated keys, with token-based costRows, cfg.passed, and no cost_usd", async () => {
+  const deps = BASE_DEPS();
   const capturedOpts = [];
   const summary = await runPhase0({
-    apiKey: "test-key",
-    store,
-    embedderFactory: fakeEmbedder,
+    ...deps,
     datReplicationFn: passingDatFn(),
     negativeControlsFn: passingControlsFn(capturedOpts),
   });
 
-  assert.equal(summary.embedderId, "fake-voyage-4-lite");
+  assert.equal(summary.embedderId, VOYAGE_CALIBRATION_RECORD.embedderId);
   assert.equal(summary.allPassed, true);
   assert.equal(summary.totalTokens, 5); // 2 (dat) + 3 (controls)
+  assert.equal(summary.gitSha, "stub-sha");
+  assert.equal(summary.datKey, phase0Key(DAT_REPLICATION_KEY_PREFIX, summary.runId));
+  assert.equal(summary.controlsKey, phase0Key(NEGATIVE_CONTROLS_KEY_PREFIX, summary.runId));
 
-  assert.equal(store.has(DAT_REPLICATION_KEY), true);
-  assert.equal(store.has(NEGATIVE_CONTROLS_KEY), true);
+  const store = deps.store;
+  assert.equal(store.has(summary.datKey), true);
+  assert.equal(store.has(summary.controlsKey), true);
 
-  const datRecord = store.get(DAT_REPLICATION_KEY);
-  assert.deepEqual(datRecord.result, { low: 0.1, average: 0.2, high: 0.3, orderingHolds: true, margin: 0.2 });
+  const datRecord = store.get(summary.datKey);
+  assert.equal(datRecord.result.low, 0.1);
+  assert.equal(datRecord.result.marginIsDescriptiveOnly, true);
   assert.equal(datRecord.accounting.state, "completed");
   assert.equal(datRecord.costRows.length, 1);
-  assert.equal(datRecord.costRows[0].model, "fake-voyage-4-lite");
+  assert.equal(datRecord.costRows[0].model, VOYAGE_CALIBRATION_RECORD.embedderId);
+  assert.equal(datRecord.costRows[0].billing_mode, "api");
   assert.equal(datRecord.costRows[0].input_tokens, 2);
   assert.equal("cost_usd" in datRecord.costRows[0], false);
 
-  const controlsRecord = store.get(NEGATIVE_CONTROLS_KEY);
+  // cfg is INDEX-visible metadata (lib/store.mjs put()) -- a reader must be
+  // able to see pass/fail by scanning list() alone, without opening a body.
+  const listEntry = store.list().find((e) => e.key === summary.datKey);
+  assert.equal(listEntry.cfg.passed, true);
+  assert.equal(listEntry.cfg.runId, summary.runId);
+
+  const controlsRecord = store.get(summary.controlsKey);
   assert.equal(controlsRecord.result.duplicate.passed, true);
   assert.equal(controlsRecord.result.random.verdict.failed, false);
   assert.equal(controlsRecord.costRows[0].input_tokens, 3);
+  assert.equal(controlsRecord.costRows[0].billing_mode, "api");
   assert.equal(controlsRecord.result.threshold, VOYAGE_CLUSTER_DISTANCE_THRESHOLD);
+  assert.equal(controlsRecord.result.thresholdProvenance.pairSetHash, VOYAGE_CALIBRATION_RECORD.pairSetHash);
+  assert.equal(controlsRecord.result.provenance.gitSha, "stub-sha");
+
+  const controlsListEntry = store.list().find((e) => e.key === summary.controlsKey);
+  assert.equal(controlsListEntry.cfg.passed, true);
 });
 
 // ── The discriminating test: the VOYAGE threshold must reach negativeControls,
 // not its MiniLM-space default ──────────────────────────────────────────────
-// negativeControls() (./validation.mjs) defaults its `threshold` param to
-// CLUSTER_DISTANCE_THRESHOLD (MiniLM-space) when the caller omits it — the
-// correct default ONLY for the hermetic fixture-embedder call sites. If
-// phase0.mjs ever stopped passing { threshold: VOYAGE_CLUSTER_DISTANCE_THRESHOLD }
-// explicitly (e.g. a refactor that forwards `opts` incompletely), a live
-// Phase 0 run would silently validate the study's diversity metric against
-// the WRONG cut -- exactly the defect issue #48 calls out by name ("running
-// against the MiniLM threshold would validate a cut the study will not
-// use"). This test fails loudly if that wiring regresses.
 test("runPhase0 passes the Voyage-calibrated threshold to negativeControls, not the MiniLM default", async () => {
   assert.notEqual(
     VOYAGE_CLUSTER_DISTANCE_THRESHOLD,
@@ -101,15 +132,9 @@ test("runPhase0 passes the Voyage-calibrated threshold to negativeControls, not 
     "the two calibrated thresholds must actually differ for this test to be meaningful",
   );
 
-  const store = makeTempStore();
+  const deps = BASE_DEPS();
   const capturedOpts = [];
-  await runPhase0({
-    apiKey: "test-key",
-    store,
-    embedderFactory: fakeEmbedder,
-    datReplicationFn: passingDatFn(),
-    negativeControlsFn: passingControlsFn(capturedOpts),
-  });
+  await runPhase0({ ...deps, datReplicationFn: passingDatFn(), negativeControlsFn: passingControlsFn(capturedOpts) });
 
   assert.equal(capturedOpts.length, 1);
   assert.equal(capturedOpts[0].threshold, VOYAGE_CLUSTER_DISTANCE_THRESHOLD);
@@ -117,63 +142,201 @@ test("runPhase0 passes the Voyage-calibrated threshold to negativeControls, not 
 });
 
 test("runPhase0 reports allPassed=false when DAT ordering does not hold, even if the negative controls look fine", async () => {
-  const store = makeTempStore();
+  const deps = BASE_DEPS();
   const capturedOpts = [];
   const failingDatFn = async (embedder) => {
     await embedder.embed(["x"]);
     return { low: 0.3, average: 0.2, high: 0.1, orderingHolds: false, margin: -0.2 };
   };
 
-  const summary = await runPhase0({
-    apiKey: "test-key",
-    store,
-    embedderFactory: fakeEmbedder,
-    datReplicationFn: failingDatFn,
-    negativeControlsFn: passingControlsFn(capturedOpts),
-  });
+  const summary = await runPhase0({ ...deps, datReplicationFn: failingDatFn, negativeControlsFn: passingControlsFn(capturedOpts) });
 
   assert.equal(summary.dat.orderingHolds, false);
   assert.equal(summary.allPassed, false, "a broken DAT ordering must fail Phase 0 as a whole, per §4.4's control table");
+  const listEntry = deps.store.list().find((e) => e.key === summary.datKey);
+  assert.equal(listEntry.cfg.passed, false);
 });
 
-test("runPhase0 reports allPassed=false when the duplicate pool does not collapse to distinct_k=1", async () => {
-  const store = makeTempStore();
-  const notCollapsingControlsFn = async (embedder, opts) => {
+// ── BLOCKING 2 (Quine, PR #69): the random-pool control must actually gate ──
+// Prior to this fix, `allPassed` had no dependency on `randomVerdict.failed`
+// reachable by a test in this file -- randomPoolVerdict itself was well
+// covered (validation.test.mjs), but nothing drove a FAILING random pool
+// through runPhase0 end-to-end. This closes that gap directly.
+test("runPhase0 reports allPassed=false when the random-text pool fails its verdict, even with a passing DAT and duplicate pool", async () => {
+  const deps = BASE_DEPS();
+  const failingRandomControlsFn = async (embedder) => {
     await embedder.embed(["dup"]);
     return {
-      duplicate: { distinctK: 3, diversity: 0.1, collapseRate: 0.9 }, // did NOT collapse to 1
+      duplicate: { distinctK: 1, diversity: 0, collapseRate: 1 }, // passes
+      random: { distinctK: 10, diversity: 0.1, collapseRate: 0.7 }, // well below the 90% bound and the DAT-high floor
+    };
+  };
+
+  const summary = await runPhase0({ ...deps, datReplicationFn: passingDatFn(), negativeControlsFn: failingRandomControlsFn });
+
+  assert.equal(summary.duplicatePassed, true);
+  assert.equal(summary.randomVerdict.failed, true);
+  assert.equal(summary.allPassed, false, "a failing random-pool verdict must fail Phase 0 even when every other control passes");
+});
+
+// ── Duplicate-pool gate: BOTH conjuncts must be exercised independently ────
+test("runPhase0 fails when distinct_k != 1, even with near-zero diversity", async () => {
+  const deps = BASE_DEPS();
+  const notCollapsingControlsFn = async (embedder) => {
+    await embedder.embed(["dup"]);
+    return {
+      duplicate: { distinctK: 3, diversity: 0.01, collapseRate: 0.9 }, // diversity looks fine, distinctK does not
       random: { distinctK: 30, diversity: 0.5, collapseRate: 0.0 },
     };
   };
 
-  const summary = await runPhase0({
-    apiKey: "test-key",
-    store,
-    embedderFactory: fakeEmbedder,
-    datReplicationFn: passingDatFn(),
-    negativeControlsFn: notCollapsingControlsFn,
-  });
+  const summary = await runPhase0({ ...deps, datReplicationFn: passingDatFn(), negativeControlsFn: notCollapsingControlsFn });
 
+  assert.equal(summary.dupVerdict.distinctKPass, false);
+  assert.equal(summary.dupVerdict.diversityPass, true);
   assert.equal(summary.duplicatePassed, false);
   assert.equal(summary.allPassed, false);
 });
 
-test("runPhase0's stored records are byte-identical no-ops on a second call with the same inputs (store append-only contract)", async () => {
-  const store = makeTempStore();
+test("runPhase0 fails when diversity is >= the 0.05 bound, even with distinct_k exactly 1 (pins the diversity conjunct, not just distinct_k)", async () => {
+  const deps = BASE_DEPS();
+  const highDiversityControlsFn = async (embedder) => {
+    await embedder.embed(["dup"]);
+    return {
+      duplicate: { distinctK: 1, diversity: 0.06, collapseRate: 1 }, // distinctK is exactly 1, diversity is over the bound
+      random: { distinctK: 30, diversity: 0.5, collapseRate: 0.0 },
+    };
+  };
+
+  const summary = await runPhase0({ ...deps, datReplicationFn: passingDatFn(), negativeControlsFn: highDiversityControlsFn });
+
+  assert.equal(summary.dupVerdict.distinctKPass, true);
+  assert.equal(summary.dupVerdict.diversityPass, false);
+  assert.equal(summary.duplicatePassed, false);
+  assert.equal(summary.allPassed, false);
+
+  const controlsRecord = deps.store.get(summary.controlsKey);
+  assert.equal(controlsRecord.result.duplicate.passed, false, "the STORED passed field must reflect the real verdict, not a hardcoded true");
+});
+
+// ── poolSize must be the REAL random-pool size, not a stand-in ─────────────
+// distinctK=26 is < Math.ceil(30 * 0.9) = 27 (the real bound), so it must
+// FAIL. If poolSize were ever hardcoded to something small (e.g. 1),
+// Math.ceil(1 * 0.9) = 1 and 26 >= 1 would wrongly PASS -- this test
+// distinguishes the two.
+test("runPhase0 evaluates the random-pool distinct_k bound against the real 30-item pool size, not a stand-in", async () => {
+  const deps = BASE_DEPS();
   const capturedOpts = [];
-  const deps = {
+  const nearMissControlsFn = async (embedder) => {
+    await embedder.embed(["dup"]);
+    return {
+      duplicate: { distinctK: 1, diversity: 0, collapseRate: 1 },
+      random: { distinctK: 26, diversity: 0.9, collapseRate: 0.1 },
+    };
+  };
+
+  const summary = await runPhase0({ ...deps, datReplicationFn: passingDatFn(), negativeControlsFn: nearMissControlsFn });
+
+  assert.equal(summary.randomVerdict.distinctKPass, false, "26 < ceil(30*0.9)=27 must fail against the real pool size");
+  assert.equal(summary.allPassed, false);
+});
+
+// ── Provenance ───────────────────────────────────────────────────────────
+test("runPhase0 records calibration pair-set hash and git SHA provenance on the negative-controls row", async () => {
+  const deps = BASE_DEPS();
+  const capturedOpts = [];
+  const summary = await runPhase0({ ...deps, datReplicationFn: passingDatFn(), negativeControlsFn: passingControlsFn(capturedOpts) });
+
+  const controlsRecord = deps.store.get(summary.controlsKey);
+  assert.equal(controlsRecord.result.thresholdProvenance.pairSetHash, VOYAGE_CALIBRATION_RECORD.pairSetHash);
+  assert.equal(controlsRecord.result.thresholdProvenance.embedderId, VOYAGE_CALIBRATION_RECORD.embedderId);
+
+  const datRecord = deps.store.get(summary.datKey);
+  assert.equal(datRecord.result.provenance.gitSha, "stub-sha");
+  assert.equal(datRecord.result.provenance.embedderId, VOYAGE_CALIBRATION_RECORD.embedderId);
+});
+
+// ── Re-run / retry safety (BLOCKING 1, Quine, PR #69) ───────────────────────
+// These tests exercise the SHIPPED default `now` (no injection) -- a prior
+// version of this test suite only ever exercised a fixed injected `now`,
+// which papered over a real collision in the shipped path. Confirmed red
+// against the pre-fix phase0.mjs by hand before landing this fix.
+
+test("runPhase0 with the SHIPPED default `now` (no override): two independent full runs against the same store never collide", async () => {
+  const store = makeTempStore();
+  const capturedOpts1 = [];
+  const capturedOpts2 = [];
+
+  const summary1 = await runPhase0({
     apiKey: "test-key",
     store,
     embedderFactory: fakeEmbedder,
+    getGitSha: STUB_GIT_SHA,
     datReplicationFn: passingDatFn(),
-    negativeControlsFn: passingControlsFn(capturedOpts),
-    now: () => "2026-09-02T00:00:00.000Z",
+    negativeControlsFn: passingControlsFn(capturedOpts1),
+  });
+
+  let summary2;
+  await assert.doesNotReject(async () => {
+    summary2 = await runPhase0({
+      apiKey: "test-key",
+      store,
+      embedderFactory: fakeEmbedder,
+      getGitSha: STUB_GIT_SHA,
+      datReplicationFn: passingDatFn(),
+      negativeControlsFn: passingControlsFn(capturedOpts2),
+    });
+  });
+
+  assert.notEqual(summary1.runId, summary2.runId, "two separate invocations must get distinct run discriminators");
+  assert.notEqual(summary1.datKey, summary2.datKey);
+  assert.notEqual(summary1.controlsKey, summary2.controlsKey);
+  assert.equal(store.has(summary1.datKey), true, "the first run's rows must still be present, not overwritten");
+  assert.equal(store.has(summary2.datKey), true);
+});
+
+test("runPhase0 retries cleanly after a PARTIAL failure (DAT stored, negativeControls throws), using the shipped default `now`", async () => {
+  const store = makeTempStore();
+  const capturedOpts = [];
+
+  const throwingControlsFn = async () => {
+    throw new Error("simulated Voyage 429 during negativeControls");
   };
 
-  await runPhase0(deps);
-  // Second call with a fresh fake embedder (fresh usage counters) but the
-  // same fixed `now`, dat, and controls results -- store.put() must accept
-  // this as a verified no-op, not throw "already exists with DIFFERENT
-  // content" (see lib/store.mjs put()).
-  await assert.doesNotReject(() => runPhase0(deps));
+  const failedRun = await assert.rejects(() =>
+    runPhase0({
+      apiKey: "test-key",
+      store,
+      embedderFactory: fakeEmbedder,
+      getGitSha: STUB_GIT_SHA,
+      datReplicationFn: passingDatFn(),
+      negativeControlsFn: throwingControlsFn,
+    }),
+    /simulated Voyage 429/,
+  );
+
+  // The DAT row landed (it's written before negativeControls runs); the
+  // controls row does not exist -- a legible, orphaned partial run, not a
+  // silent loss.
+  const keysAfterPartialRun = store.keys();
+  assert.equal(keysAfterPartialRun.length, 1);
+  assert.ok(keysAfterPartialRun[0].startsWith("phase0/dat-replication@"));
+
+  // Retry: a FRESH invocation, no `now` override -- must succeed cleanly,
+  // never throw a "different content" collision against the orphaned row.
+  const retrySummary = await runPhase0({
+    apiKey: "test-key",
+    store,
+    embedderFactory: fakeEmbedder,
+    getGitSha: STUB_GIT_SHA,
+    datReplicationFn: passingDatFn(),
+    negativeControlsFn: passingControlsFn(capturedOpts),
+  });
+
+  assert.equal(retrySummary.allPassed, true);
+  assert.equal(store.has(retrySummary.datKey), true);
+  assert.equal(store.has(retrySummary.controlsKey), true);
+  // The retry's DAT key must differ from the orphaned partial run's DAT key
+  // -- a fresh runId, not a collision.
+  assert.notEqual(retrySummary.datKey, keysAfterPartialRun[0]);
 });
