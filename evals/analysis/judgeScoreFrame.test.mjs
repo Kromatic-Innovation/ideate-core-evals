@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { makeTempStore } from "../../lib/store.mjs";
 import { recordJudgeScores } from "../judge/score.mjs";
-import { buildJudgeScoreFrame, JudgeScoresUnavailableError, JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
+import { buildJudgeScoreFrame, JudgeScoresUnavailableError, JudgeScoreBiasNotIdentifiableError, JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
 
 function seedPool(store, { poolKey, judgeModel, judgeProvider, scores }) {
   recordJudgeScores(store, { poolKey, judgeModel, judgeProvider, scores });
@@ -141,6 +141,66 @@ test("buildJudgeScoreFrame: only one distinct judge_provider level present -- th
     { poolKey: poolB, armId: "H", generatorProviders: ["openai"] },
   ];
   assert.throws(() => buildJudgeScoreFrame(store, { pools }), JudgeScoresUnavailableError);
+});
+
+// ── Issue #97: H5's bias term over an ARM SUBSET ─────────────────────────
+// Two judge_provider levels is NECESSARY but not SUFFICIENT: `sameProvider`
+// must also vary within a level, or the bias column is collinear with the
+// judge-provider dummies. Observed against the #8 smoke store (arms A/B),
+// where the sidecar failed the fit as `Singular matrix` and -- routed
+// through SidecarUnavailableError -- aborted the ENTIRE analysis run.
+
+test("#97: all-same-provider generators (an arm subset without a mixed arm) -- the frame REPORTS the bias term as not identifiable", () => {
+  const store = makeTempStore();
+  const poolA = "arm=A|brief=b1|rep=0|cfg=c1";
+  const poolB = "arm=B|brief=b1|rep=0|cfg=c1";
+  // Both judge legs present, so the judgeProviderLevels < 2 guard does NOT
+  // fire -- this must be caught by the identifiability guard specifically.
+  for (const poolKey of [poolA, poolB]) {
+    seedPool(store, { poolKey, judgeModel: "claude-sonnet-5", judgeProvider: "anthropic", scores: threeCandidateScores(5) });
+    seedPool(store, { poolKey, judgeModel: "gpt-5.6-terra", judgeProvider: "openai", scores: threeCandidateScores(4) });
+  }
+  // The #8 smoke study's shape: every generator is Anthropic.
+  const pools = [
+    { poolKey: poolA, armId: "A", generatorProviders: ["anthropic"] },
+    { poolKey: poolB, armId: "B", generatorProviders: ["anthropic"] },
+  ];
+  // The frame still BUILDS -- it is a valid frame whose bias term happens
+  // not to be identifiable. The caller decides what that means for H5.
+  const frame = buildJudgeScoreFrame(store, { pools });
+  assert.equal(frame.rows.length, 4);
+  assert.equal(frame.biasTermIdentifiable, false);
+  assert.match(frame.biasTermNotIdentifiableReason, /\[A, B\]/, "names the arms");
+  assert.match(frame.biasTermNotIdentifiableReason, /\[anthropic\]/, "names the generator providers that made it unidentifiable");
+
+  // And the error analysis.mjs raises from that flag says the rest.
+  const err = new JudgeScoreBiasNotIdentifiableError(frame.biasTermNotIdentifiableReason);
+  assert.ok(!(err instanceof JudgeScoresUnavailableError), "must be distinguishable from 'judging has not run yet'");
+  assert.match(err.message, /NOT IDENTIFIABLE/);
+  assert.match(err.message, /arm G/, "points at what a run would need to estimate H5");
+  assert.doesNotMatch(err.message, /Singular matrix/, "names the CAUSE, not the sidecar's symptom");
+});
+
+test("#97: a provider-MIXED arm (G) present -- H5's bias term IS identifiable and the frame builds", () => {
+  const store = makeTempStore();
+  const homo = "arm=B|brief=b1|rep=0|cfg=c1";
+  const mixed = "arm=G|brief=b1|rep=0|cfg=c1";
+  for (const poolKey of [homo, mixed]) {
+    seedPool(store, { poolKey, judgeModel: "claude-sonnet-5", judgeProvider: "anthropic", scores: threeCandidateScores(5) });
+    seedPool(store, { poolKey, judgeModel: "gpt-5.6-terra", judgeProvider: "openai", scores: threeCandidateScores(4) });
+  }
+  const pools = [
+    { poolKey: homo, armId: "B", generatorProviders: ["anthropic"] },
+    { poolKey: mixed, armId: "G", generatorProviders: ["anthropic", "openai"] },
+  ];
+  const frame = buildJudgeScoreFrame(store, { pools });
+  assert.equal(frame.rows.length, 4);
+  assert.equal(frame.biasTermIdentifiable, true);
+  assert.equal(frame.biasTermNotIdentifiableReason, null);
+  // The OpenAI judge leg is same-provider on G and not on B -- that variation
+  // within a single judge_provider level is exactly what identifies the term.
+  const openaiLegs = frame.rows.filter((r) => r.judgeProvider === "openai");
+  assert.deepEqual(openaiLegs.map((r) => r.sameProvider).sort(), [false, true]);
 });
 
 test("JUDGE_SCORE_BIAS_COEFFICIENT is the exact string contrasts.mjs/fit.mjs target", () => {

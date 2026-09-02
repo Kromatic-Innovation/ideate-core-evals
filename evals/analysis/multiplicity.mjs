@@ -18,6 +18,25 @@
 // caller got the count right. Exploratory contrasts (per-arm-vs-A
 // breakdowns, etc.) get their own, separately-sized BH family — see
 // benjaminiHochberg().
+//
+// ── Arm-subset runs (issue #97) ─────────────────────────────────────────────
+// The same rule covers a run over an arm SUBSET (the #8 smoke study, a
+// pilot, a partial-store re-analysis), where a registered contrast can name
+// an arm the store does not hold. Such an entry is recorded NOT ESTIMABLE by
+// contrasts.mjs's buildRegisteredFamily() and keeps its slot with p=1, so
+// `familySize` is STILL 5 and this function's assertion still holds.
+//
+// Do NOT "fix" this by shrinking the family to the number of contrasts
+// actually estimated. Two reasons, both load-bearing:
+//   1. It is the ANTI-CONSERVATIVE direction. Holm's first step multiplies
+//      the smallest p by m, so m=5 adjusts every real p-value UPWARD
+//      relative to m=2 (5*p >= 2*p, 4*p >= 1*p). Keeping the registered m
+//      loses power; it cannot inflate FWER. Shrinking m does the reverse.
+//   2. It would make the family size a function of which cells happened to
+//      arrive -- a data-dependent family definition, which is precisely what
+//      docs/PREREGISTRATION.md §11 (optional stopping) forbids.
+// contrasts.mjs's familyEstimability() reports how many slots were actually
+// estimable so the power loss is visible in REPORT.md; it never feeds this.
 
 /**
  * Holm-Bonferroni step-down correction. Returns ADJUSTED p-values in the
