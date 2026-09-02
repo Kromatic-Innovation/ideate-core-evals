@@ -37,7 +37,16 @@
 // silently dropped from the plan.
 
 import { planRun } from "../../lib/manifest.mjs";
-import { RunAccount, costRow, TERMINAL_STATES, isTransientFailure, isPaymentFailure } from "../../lib/accounting.mjs";
+import {
+  RunAccount,
+  costRow,
+  TERMINAL_STATES,
+  FAILURE_KINDS,
+  TRANSIENT_FAILURE_KINDS,
+  PAYMENT_FAILURE_KINDS,
+  isTransientFailure,
+  isPaymentFailure,
+} from "../../lib/accounting.mjs";
 import { assertValidProviderResponse } from "./provider.mjs";
 // providerOf/priceRowByProvider (issue #51, per-provider --max-spend): pure
 // data-shape utilities, not the interim estimator this module owns -- see
@@ -234,9 +243,11 @@ function costRowsFor(cellKey, tokens, timestamp) {
  *     needs it for the attempt record itself)
  */
 function recordMetricsAttemptFailure(store, { cell, costRows, detail }) {
-  const keyPrefix = `metrics-attempt|cell=${cell.key}|attempt=`;
-  const attempt = store.keys().filter((k) => k.startsWith(keyPrefix)).length;
-  const key = `${keyPrefix}${attempt}`;
+  // nextAttemptNumber, not a startsWith(...).length count (issue #98): once
+  // compaction folds attempts 0..4 into one record, a count answers "1" and
+  // collides with the retained attempt 5. See nextAttemptNumber's own doc.
+  const attempt = nextAttemptNumber(store, "metrics-attempt", cell.key);
+  const key = `metrics-attempt|cell=${cell.key}|attempt=${attempt}`;
   // Self-describing model list, derived from the cost rows themselves
   // rather than requiring a caller to pass resolvedModels separately --
   // this is a side ledger record, not a planned cell, so there is no arm
@@ -269,7 +280,9 @@ function recordMetricsAttemptFailure(store, { cell, costRows, detail }) {
  * generation failed on an ENVIRONMENTAL fault (a 429, a 5xx, a timeout, a
  * zero credit balance, our own bug) must not be written under `cell.key`,
  * because `planRun(spec, storedKeys)` sees only keys and would classify it
- * `reuse` forever after. The store is append-only; there is no delete. And
+ * `reuse` forever after. The store is append-only, and its ONE removal path
+ * (`remove()`, issue #98) is reachable only from an explicitly-invoked
+ * `--prune`, never from a run. And
  * because a panel arm issues ~5x the generation calls per cell, the loss
  * lands preferentially on panel arms -- an arm-correlated hole in the data
  * that confounds exactly the panel-vs-solo comparison H1 tests.
@@ -295,9 +308,10 @@ function recordMetricsAttemptFailure(store, { cell, costRows, detail }) {
  *   @param {object} o.resolvedModels  resolvedModelsFor(arm) -- what actually ran
  */
 function recordGenerationAttemptFailure(store, { cell, costRows, kind, detail, resolvedModels }) {
-  const keyPrefix = `generation-attempt|cell=${cell.key}|attempt=`;
-  const attempt = store.keys().filter((k) => k.startsWith(keyPrefix)).length;
-  const key = `${keyPrefix}${attempt}`;
+  // nextAttemptNumber, not a startsWith(...).length count (issue #98) -- see
+  // recordMetricsAttemptFailure above and nextAttemptNumber's own doc.
+  const attempt = nextAttemptNumber(store, "generation-attempt", cell.key);
+  const key = `generation-attempt|cell=${cell.key}|attempt=${attempt}`;
   return store.put({
     key,
     // A sentinel armId, exactly like recordMetricsAttemptFailure's -- this is
@@ -314,6 +328,677 @@ function recordGenerationAttemptFailure(store, { cell, costRows, kind, detail, r
     accounting: { state: "failed", kind, detail },
     costRows,
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRUNE + ATTEMPT RETENTION (issue #98)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Two loose ends from #90, and they are the same missing capability: nothing
+// could take a record OUT of the store. `lib/store.mjs` now has exactly one
+// removal path (`remove()`, see its header); everything below is the policy
+// layer that decides WHAT to remove and, far more importantly, guarantees the
+// money never goes with it.
+//
+// ── The one invariant ───────────────────────────────────────────────────────
+// A prune must never make the study look cheaper than it was. `spendToDate()`
+// sums the `costRows` of every stored body, so removing a body removes its
+// money unless something else already carries it. Both operations below are
+// built around that:
+//
+//   EVICT   — a cell record leaves the store so `planRun` plans it `todo`
+//             again. Its cost rows are first RE-HOMED under a
+//             `pruned-cell|cell=…|pruned=N` record, which is exactly what
+//             #90 does for a live transient failure, applied retroactively.
+//             A legacy store is thereby not merely repaired, it is brought
+//             to the shape #90 would have written in the first place.
+//   COMPACT — several attempt records for one cell are folded into ONE
+//             record whose cost rows are the per-(cell, billing mode, model)
+//             SUM of theirs. Count falls; money is identical.
+//
+// ── Why compaction, and not a count cap ─────────────────────────────────────
+// The obvious bounded policy — "keep the newest 5 attempts, drop the rest" —
+// is wrong here for a reason specific to what an attempt record IS. The
+// record exists BECAUSE its spend must outlive the cell; dropping the oldest
+// drops real money and under-reports the study. Folding keeps every token,
+// under the same model and billing mode, in one row per (cell, mode, model)
+// — so the record count per cell is bounded by the retention window and the
+// ROW count per compacted record is bounded by the arm's model set, both
+// constant rather than linear in the number of bad nights.
+//
+// ── Why folding is verified, not assumed ────────────────────────────────────
+// Pricing is linear in tokens for a fixed (model, timestamp, billing mode),
+// so summing-then-pricing normally equals pricing-then-summing. "Normally":
+// `lib/price.mjs`'s `resolveBaseRate` picks an INTRO rate for rows stamped
+// at or before a model's `introUntil`, so a group whose rows straddle that
+// boundary would reprice differently under any single collapsed timestamp.
+// Rather than teach this module the rate table's internal shape, `foldCostRows`
+// PRICES BOTH FORMS and only returns the folded rows if the totals match.
+// A group that would reprice differently is passed through unfolded — the
+// bound degrades, the ledger never does.
+//
+// ── Why removal is never on the run path ────────────────────────────────────
+// `runSpec()` does not call any of this. It WARNS (see the retention warning
+// near the end of the run) and names the command. Deletion stays an
+// explicitly-invoked operator action — `node evals/run.mjs --prune --apply`,
+// dry-run by default — because a mutation that a normal invocation can reach
+// is a mutation that will eventually happen when nobody meant it to.
+
+/** Attempt-record families this module compacts. `judge-call` records
+ *  (evals/judge/gate.mjs) have the same shape and the same unbounded-growth
+ *  property, but their attempt numbering lives in that module and derives
+ *  from a raw `startsWith(...).length` count that compaction would break —
+ *  bringing them in means changing gate.mjs, which is deliberately out of
+ *  scope here. Noted in docs/retrying-failed-cells.md as a known follow-up. */
+export const ATTEMPT_FAMILIES = ["generation-attempt", "metrics-attempt"];
+
+/** Family carrying cost rows salvaged off a cell record the prune evicted. */
+const PRUNED_CELL_FAMILY = "pruned-cell";
+
+/** Default retention window: how many attempt records per cell per family
+ *  survive a compaction un-folded. 5 is "enough to read the last few bad
+ *  nights out of the store by hand" — the diagnostic value of an individual
+ *  attempt record decays fast, while its money does not decay at all. */
+export const DEFAULT_ATTEMPT_RETENTION = 5;
+
+/** The exact `cellKey()` grammar from lib/manifest.mjs. Selection MUST go
+ *  through this and never through `entry.cfg`: a real store's `cfg` is not
+ *  always a config hash (a judge-call record's `cfg` is the JUDGE MODEL ID,
+ *  a phase0 record's is an object — both observed on the #8 smoke store, see
+ *  evals/analysis/storeConfig.mjs). Matching the key grammar makes every
+ *  non-cell record structurally unselectable by a cell prune, rather than
+ *  relying on a downstream guard to catch it. */
+const CELL_KEY_RE = /^arm=([^|]+)\|brief=([^|]+)\|rep=(\d+)\|cfg=([^|]+)$/;
+
+/** Parse a stored key as a study cell, or null if it is anything else. */
+export function parseCellKey(key) {
+  const m = CELL_KEY_RE.exec(key);
+  if (!m) return null;
+  return { armId: m[1], briefId: m[2], replicate: Number(m[3]), cfg: m[4] };
+}
+
+/**
+ * Parse a stored key as an attempt record of one of ATTEMPT_FAMILIES, raw or
+ * compacted. Returns `{ family, cellKey, through, compacted }` or null.
+ *
+ * `through` is the HIGHEST attempt number the record accounts for — the
+ * attempt number itself for a raw record, the fold's upper bound for a
+ * compacted one. That single field is what makes ordering, next-number
+ * derivation and crash recovery all work off one comparison.
+ *
+ * Parsed by suffix position, never by a greedy regex: the cell key sits in
+ * the MIDDLE of these keys and itself contains `|` and `=`.
+ */
+export function parseAttemptKey(key) {
+  for (const family of ATTEMPT_FAMILIES) {
+    const rawPrefix = `${family}|cell=`;
+    if (key.startsWith(rawPrefix)) {
+      const at = key.lastIndexOf("|attempt=");
+      if (at <= rawPrefix.length - 1) return null;
+      const n = Number(key.slice(at + "|attempt=".length));
+      if (!Number.isInteger(n) || n < 0) return null;
+      return { family, cellKey: key.slice(rawPrefix.length, at), through: n, compacted: false };
+    }
+    const compactedPrefix = `${family}-compacted|cell=`;
+    if (key.startsWith(compactedPrefix)) {
+      const at = key.lastIndexOf("|through=");
+      if (at <= compactedPrefix.length - 1) return null;
+      const n = Number(key.slice(at + "|through=".length));
+      if (!Number.isInteger(n) || n < 0) return null;
+      return { family, cellKey: key.slice(compactedPrefix.length, at), through: n, compacted: true };
+    }
+  }
+  return null;
+}
+
+/**
+ * The next attempt number for `cellKey` in `family`: one past the highest
+ * attempt any stored record accounts for, across BOTH the raw and compacted
+ * shapes.
+ *
+ * This replaces the pre-#98 `store.keys().filter(startsWith).length` count,
+ * and the replacement is required rather than cosmetic: once compaction
+ * folds attempts 0..4 into a single record, a COUNT says "1 record, so the
+ * next attempt is 1" — colliding with the retained attempt 5. Deriving from
+ * the maximum is correct under every mix of folded and unfolded records, and
+ * is identical to the old count for the un-compacted 0..n-1 case.
+ *
+ * `store.keys()` is index-only (cheap; lib/store.mjs) and reflects every
+ * attempt durably recorded for this cell INCLUDING ones from a prior
+ * session, so the number is correct across process boundaries.
+ */
+export function nextAttemptNumber(store, family, cellKey) {
+  let max = -1;
+  for (const key of store.keys()) {
+    const parsed = parseAttemptKey(key);
+    if (!parsed || parsed.family !== family || parsed.cellKey !== cellKey) continue;
+    if (parsed.through > max) max = parsed.through;
+  }
+  return max + 1;
+}
+
+const FOLDABLE_TOKEN_FIELDS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+];
+
+/** True if every present token field on `tokens` is a finite number. A null
+ *  is MEANINGFUL in this ledger ("this producer had no tokens to report" is
+ *  not "zero tokens were used" — see costRow()'s own comment), so a row
+ *  carrying one is never folded; it passes through untouched. */
+function foldableTokens(tokens) {
+  for (const f of FOLDABLE_TOKEN_FIELDS) {
+    if (!(f in tokens)) continue;
+    if (typeof tokens[f] !== "number" || !Number.isFinite(tokens[f])) return false;
+  }
+  return true;
+}
+
+function sumTokensInto(target, tokens) {
+  for (const f of FOLDABLE_TOKEN_FIELDS) {
+    if (!(f in tokens)) continue;
+    target[f] = (target[f] || 0) + tokens[f];
+  }
+}
+
+/**
+ * Fold cost rows so the record count stops growing with the number of
+ * attempts, WITHOUT changing what the ledger prices.
+ *
+ * Rows are grouped by the tuple that pricing is a linear function of —
+ * `(cellKey, billing_mode, model)` for a single-model row, and
+ * `(cellKey, billing_mode, <the exact model key-set>)` for a `tokens_by_model`
+ * row. A `tokens_by_model` row is never reshaped into N single-model rows:
+ * that would be an untested assumption about how `priceRow` treats the two
+ * shapes, and this function's whole job is to not assume.
+ *
+ * The folded set is then PRICED and compared against the original. If the
+ * two disagree by more than floating-point noise — the `introUntil` boundary
+ * case described in this section's header — the ORIGINAL rows are returned
+ * unchanged. The bound is best-effort; the ledger is not.
+ *
+ * @returns {{rows: Array, folded: boolean, reason?: string}}
+ */
+export function foldCostRows(rows, rateTable = DEFAULT_RATE_TABLE, { batch = true } = {}) {
+  if (!Array.isArray(rows) || rows.length < 2) return { rows: rows || [], folded: false, reason: "nothing to fold" };
+
+  const groups = new Map(); // groupKey -> { row, timestamp }
+  const passthrough = [];
+  for (const row of rows) {
+    const { cellKey, timestamp, billing_mode, model, tokens_by_model, ...tokens } = row;
+    if (model && !tokens_by_model && foldableTokens(tokens)) {
+      const gk = JSON.stringify(["model", cellKey, billing_mode, model]);
+      let g = groups.get(gk);
+      if (!g) groups.set(gk, (g = { cellKey, billing_mode, model, timestamp, tokens: {} }));
+      if (timestamp > g.timestamp) g.timestamp = timestamp;
+      sumTokensInto(g.tokens, tokens);
+      continue;
+    }
+    if (tokens_by_model && !model && Object.values(tokens_by_model).every((t) => t && typeof t === "object" && foldableTokens(t))) {
+      const models = Object.keys(tokens_by_model).sort();
+      const gk = JSON.stringify(["by_model", cellKey, billing_mode, models]);
+      let g = groups.get(gk);
+      if (!g) groups.set(gk, (g = { cellKey, billing_mode, tokens_by_model: {}, timestamp }));
+      if (timestamp > g.timestamp) g.timestamp = timestamp;
+      for (const [m, t] of Object.entries(tokens_by_model)) {
+        g.tokens_by_model[m] = g.tokens_by_model[m] || {};
+        sumTokensInto(g.tokens_by_model[m], t);
+      }
+      continue;
+    }
+    // A null token count, a row carrying BOTH model and tokens_by_model, a
+    // shape this function does not recognise: never guessed at, never
+    // dropped — carried through verbatim.
+    passthrough.push(row);
+  }
+
+  const foldedRows = [...passthrough];
+  for (const g of groups.values()) {
+    foldedRows.push(
+      g.tokens_by_model
+        ? costRow({ cellKey: g.cellKey, timestamp: g.timestamp, billing_mode: g.billing_mode, tokens_by_model: g.tokens_by_model })
+        : costRow({ cellKey: g.cellKey, timestamp: g.timestamp, billing_mode: g.billing_mode, model: g.model, ...g.tokens }),
+    );
+  }
+  if (foldedRows.length >= rows.length) return { rows, folded: false, reason: "fold would not reduce the row count" };
+
+  // ── Verify, then commit ───────────────────────────────────────────────────
+  const before = priceRows(rows, rateTable, { batch });
+  const after = priceRows(foldedRows, rateTable, { batch });
+  const beforeByProvider = priceRowsByProvider(rows, rateTable, { batch });
+  const afterByProvider = priceRowsByProvider(foldedRows, rateTable, { batch });
+  const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+  const providers = new Set([...Object.keys(beforeByProvider.byProvider), ...Object.keys(afterByProvider.byProvider)]);
+  const priceHolds =
+    close(before.totalUsd, after.totalUsd) &&
+    close(before.totalNotionalUsd, after.totalNotionalUsd) &&
+    close(beforeByProvider.excludedNonProviderUsd, afterByProvider.excludedNonProviderUsd) &&
+    [...providers].every((p) => close(beforeByProvider.byProvider[p] || 0, afterByProvider.byProvider[p] || 0));
+  if (!priceHolds) {
+    return {
+      rows,
+      folded: false,
+      reason:
+        "folding these rows would reprice them (a group straddles a dated rate change, e.g. lib/price.mjs's introUntil) " +
+        "-- kept unfolded rather than altering the ledger",
+    };
+  }
+  return { rows: foldedRows, folded: true };
+}
+
+/** Sorted-key JSON, matching how lib/store.mjs canonicalizes a body before
+ *  writing it — so a record built here compares equal to its own stored
+ *  form regardless of property insertion order. */
+function canonicalJson(value) {
+  return JSON.stringify(value, (_k, v) => {
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const out = {};
+      for (const k of Object.keys(v).sort()) out[k] = v[k];
+      return out;
+    }
+    return v;
+  });
+}
+
+/** Sort cost rows into a canonical order so a compacted record's body is a
+ *  pure function of what it accounts for. Without this, re-running a prune
+ *  over an already-compacted record could produce the same rows in a
+ *  different array order, which `put()` (its canonical JSON sorts OBJECT
+ *  keys, never ARRAY order) would correctly reject as different content. */
+function sortRowsCanonically(rows) {
+  return [...rows].sort((a, b) => {
+    const sa = JSON.stringify(a);
+    const sb = JSON.stringify(b);
+    return sa < sb ? -1 : sa > sb ? 1 : 0;
+  });
+}
+
+/**
+ * Plan a prune. Reads the store; writes nothing. This IS the dry-run — the
+ * `--prune` CLI reports exactly this object and `pruneStore()` applies
+ * exactly this object, so what an operator is shown and what actually
+ * happens cannot drift apart.
+ *
+ * @param {object} store  a lib/store.mjs ResultsStore
+ * @param {object} [opts]
+ *   @param {string}   [opts.configHash] select cells under this cfg only
+ *   @param {string[]} [opts.armIds]     select cells for these arms only
+ *   @param {string[]} [opts.briefIds]   select cells for these briefs only
+ *   @param {string[]} [opts.kinds]      select FAILED cells whose stored
+ *     `accounting.kind` is one of these (requires reading those bodies — the
+ *     index carries `state`, not `kind`). DEFAULTS to the store-absent sets
+ *     (`TRANSIENT_FAILURE_KINDS` + `PAYMENT_FAILURE_KINDS`), so an intrinsic
+ *     observation is never evicted unless it is asked for by name — see the
+ *     `kindFilter` comment in the body.
+ *   @param {string[]} [opts.states=["failed"]] select cells in these terminal
+ *     states. Defaults to `failed` ALONE: the eviction case this exists for
+ *     is a legacy transient failure, and a default that could reach a
+ *     completed cell is the wrong default for a delete.
+ *   @param {boolean}  [opts.allowCompleted=false] permit evicting a completed
+ *     cell. Off by default; lib/store.mjs's remove() refuses independently.
+ *   @param {number|null} [opts.keepAttempts=DEFAULT_ATTEMPT_RETENTION] how
+ *     many attempt records per (cell, family) survive un-folded. `null`
+ *     disables compaction entirely.
+ * @returns {{evictions: Array, refused: Array, compactions: Array,
+ *   keysBefore: number, keysAfter: number, selectorsGiven: boolean}}
+ */
+export function planPrune(store, opts = {}) {
+  const {
+    configHash,
+    armIds,
+    briefIds,
+    kinds,
+    states,
+    allowCompleted = false,
+    keepAttempts = DEFAULT_ATTEMPT_RETENTION,
+  } = opts;
+
+  const selectorsGiven = Boolean(configHash || armIds || briefIds || kinds || states);
+  const wantStates = states || ["failed"];
+  // The DEFAULT kind filter is the store-absent sets — exactly the failures
+  // #90 and #88 would have kept out of the store in the first place. It is a
+  // default and not merely a convenience, for the same reason `completed` is
+  // protected: an INTRINSIC failure (`parse_failure`, `empty_pool`,
+  // `refusal`) is a real, paid-for observation about the arm, and IC-08's
+  // silent mode (`empty_pool`) is one of the behaviours the study exists to
+  // measure. `--prune --cfg <hash> --apply` is the most natural "repair my
+  // legacy store" invocation there is; without this default it would evict
+  // every intrinsic failure under that hash, and the arm's real failure rate
+  // would be re-rolled toward zero on the next run — precisely the silent
+  // bias lib/accounting.mjs's own header warns about. Reaching one requires
+  // typing `--kinds intrinsic` (or the literal kind), which is the explicit
+  // act the salvage cannot substitute for: the spend survives an eviction,
+  // the OBSERVATION does not.
+  const kindFilter = kinds || [...TRANSIENT_FAILURE_KINDS, ...PAYMENT_FAILURE_KINDS];
+  const entries = store.list();
+
+  // ── Eviction: cell records that should leave so planRun re-plans them ────
+  const evictions = [];
+  const refused = [];
+  if (selectorsGiven) {
+    for (const entry of entries) {
+      // Key grammar, NOT entry.cfg — see CELL_KEY_RE's comment. A judge-call
+      // record whose `cfg` happens to be a judge model id, or a phase0
+      // record whose `cfg` is an object, is not a cell and can never be
+      // selected here.
+      const cell = parseCellKey(entry.key);
+      if (!cell) continue;
+      if (configHash && cell.cfg !== configHash) continue;
+      if (armIds && !armIds.includes(cell.armId)) continue;
+      if (briefIds && !briefIds.includes(cell.briefId)) continue;
+      if (!wantStates.includes(entry.state)) continue;
+
+      let body = store.get(entry.key);
+      if (entry.state === "failed") {
+        if (!kindFilter.includes(body.accounting && body.accounting.kind)) continue;
+      } else if (kinds) {
+        // An explicit kind filter cannot match a record that carries no
+        // failure kind at all (a `completed` cell). Excluded rather than
+        // waved through: someone who asked for `--kinds rate_limited` did
+        // not ask for a completed cell.
+        continue;
+      }
+
+      const record = {
+        key: entry.key,
+        state: entry.state,
+        kind: (body.accounting && body.accounting.kind) || null,
+        detail: (body.accounting && body.accounting.detail) || "",
+        cfg: cell.cfg,
+        armId: cell.armId,
+        briefId: cell.briefId,
+        replicate: cell.replicate,
+        // storedAt identifies this PHYSICAL record, and that is what makes
+        // the salvage idempotent without being wrong -- see
+        // salvageEvictedCellSpend's own doc for why content alone cannot
+        // distinguish a crash-retry from a genuine re-run.
+        storedAt: entry.storedAt,
+        costRows: body.costRows || [],
+        resolvedModels: body.resolvedModels || {},
+      };
+      if (entry.state === "completed" && !allowCompleted) {
+        // Reported, never silently skipped and never silently deleted. A
+        // completed cell is paid-for data; the operator has to say so.
+        refused.push({ ...record, reason: "completed — pass --allow-completed to evict paid-for data" });
+        continue;
+      }
+      evictions.push(record);
+    }
+  }
+
+  // ── Compaction: bound the attempt records per (cell, family) ─────────────
+  const compactions = [];
+  if (keepAttempts !== null && keepAttempts !== undefined) {
+    if (!Number.isInteger(keepAttempts) || keepAttempts < 1) {
+      throw new Error(`planPrune: keepAttempts must be a positive integer (or null to disable compaction), got ${keepAttempts}`);
+    }
+    const byCellFamily = new Map();
+    for (const entry of entries) {
+      const parsed = parseAttemptKey(entry.key);
+      if (!parsed) continue;
+      const gk = `${parsed.family} ${parsed.cellKey}`;
+      if (!byCellFamily.has(gk)) byCellFamily.set(gk, []);
+      byCellFamily.get(gk).push({ ...parsed, key: entry.key });
+    }
+    for (const records of byCellFamily.values()) {
+      if (records.length <= keepAttempts) continue;
+      // Ordered by what each record accounts for. A compacted record always
+      // folds FROM zero, so ties (a crash-interrupted prune leaving both a
+      // compacted `through=4` and a raw `attempt=4`) sort the compacted one
+      // first: it subsumes the raw, and the raw contributes no rows below.
+      records.sort((a, b) => a.through - b.through || (a.compacted === b.compacted ? 0 : a.compacted ? -1 : 1));
+      const foldSet = records.slice(0, records.length - keepAttempts);
+      const through = Math.max(...foldSet.map((r) => r.through));
+      const family = foldSet[0].family;
+      const cellKey = foldSet[0].cellKey;
+      const newKey = `${family}-compacted|cell=${cellKey}|through=${through}`;
+
+      // Row selection, and the crash-recovery rule in one line: a compacted
+      // record covers [0..through], so any RAW record at or below the
+      // highest compacted `through` in the fold set has already had its
+      // money counted. Include it in the removal, exclude it from the rows.
+      // Only the highest compacted record contributes rows — a lower one is
+      // a subset of it by construction.
+      const compactedInFold = foldSet.filter((r) => r.compacted);
+      const topCompacted = compactedInFold.length ? compactedInFold[compactedInFold.length - 1] : null;
+      const covered = topCompacted ? topCompacted.through : -1;
+      const contributors = foldSet.filter((r) => (r.compacted ? r === topCompacted : r.through > covered));
+
+      const rawRows = [];
+      const models = new Set();
+      let cfg;
+      for (const r of contributors) {
+        const body = store.get(r.key);
+        if (Array.isArray(body.costRows)) rawRows.push(...body.costRows);
+        for (const m of Object.values(body.resolvedModels || {})) {
+          if (typeof m === "string") models.add(m);
+          else if (Array.isArray(m)) for (const x of m) models.add(x);
+        }
+      }
+      for (const entry of entries) {
+        if (entry.key === contributors[0].key) cfg = entry.cfg;
+      }
+      const fold = foldCostRows(rawRows, DEFAULT_RATE_TABLE, { batch: true });
+      const removeKeys = foldSet.map((r) => r.key).filter((k) => k !== newKey);
+      if (removeKeys.length === 0) continue; // nothing would actually go away
+
+      compactions.push({
+        family,
+        cellKey,
+        through,
+        newKey,
+        cfg,
+        removeKeys,
+        keptKeys: records.slice(records.length - keepAttempts).map((r) => r.key),
+        rows: sortRowsCanonically(fold.rows),
+        rowsBefore: rawRows.length,
+        rowsFolded: fold.folded,
+        foldSkippedReason: fold.folded ? null : fold.reason,
+        models: [...models].sort(),
+      });
+    }
+  }
+
+  const netRemoved =
+    evictions.length +
+    compactions.reduce((n, c) => n + c.removeKeys.length - (store.has(c.newKey) ? 0 : 1), 0);
+  return {
+    evictions,
+    refused,
+    compactions,
+    keysBefore: entries.length,
+    // Eviction adds one salvage record per evicted cell that carried money.
+    keysAfter: entries.length - netRemoved + evictions.filter((e) => e.costRows.length > 0).length,
+    selectorsGiven,
+  };
+}
+
+/**
+ * Apply a prune. THE only production caller of `ResultsStore.remove()`.
+ *
+ * Every removal is money-first, mirroring the ordering evals/judge/gate.mjs
+ * already uses for a metered judge call: the record that CARRIES the spend
+ * is written before the record that HELD it is removed. A crash in the
+ * window over-reports (the same money is briefly in two places) and never
+ * under-reports, and re-running the prune converges — the salvage key is
+ * derived from the cell's own content, and a re-compaction folds a
+ * crash-orphaned raw record's rows out rather than in (see planPrune's
+ * `covered` rule). Under-reporting would be permanent and invisible, which
+ * is why the ordering is not a matter of taste.
+ *
+ * After applying, `spendToDate()` is recomputed and compared against the
+ * pre-prune figure. A mismatch throws: it means this module has a fold bug,
+ * and the operator finds out from the prune rather than from a study that
+ * quietly claims to have cost less than it did.
+ *
+ * @param {object} store  a lib/store.mjs ResultsStore
+ * @param {object} [opts] planPrune()'s options, plus:
+ *   @param {(msg: string) => void} [opts.log]
+ * @returns {{plan: object, spendBefore: object, spendAfter: object,
+ *   removed: string[], written: string[], duplicateSpendUsd: number}}
+ */
+export function pruneStore(store, opts = {}) {
+  const { log = () => {} } = opts;
+  const plan = planPrune(store, opts);
+  const spendBefore = spendToDate(store);
+
+  const removed = [];
+  const written = [];
+  // Rows this prune knowingly removes as a DUPLICATE rather than as spend:
+  // the crash-window repair, where a salvage record for this exact cell
+  // record already exists because a previous prune died after writing it and
+  // before removing the cell. Both copies were being counted; taking one
+  // away is the repair, not a loss. Tracked explicitly so the verification
+  // below can still be an equality check on everything else — "spend may go
+  // down a bit sometimes" is not an invariant worth having.
+  const knownDuplicateRows = [];
+
+  // ── 1. Evict cells, salvaging their spend first ─────────────────────────
+  for (const evicted of plan.evictions) {
+    if (evicted.costRows.length > 0) {
+      const salvage = salvageEvictedCellSpend(store, evicted);
+      written.push(salvage.key);
+      if (salvage.reused) knownDuplicateRows.push(...evicted.costRows);
+    }
+    store.remove([evicted.key], { allowCompleted: opts.allowCompleted === true });
+    removed.push(evicted.key);
+    log(`[prune] evicted ${evicted.key} (${evicted.state}${evicted.kind ? `/${evicted.kind}` : ""})`);
+  }
+
+  // ── 2. Compact attempt records ──────────────────────────────────────────
+  for (const c of plan.compactions) {
+    store.put({
+      key: c.newKey,
+      // Sentinel armId, exactly like the attempt recorders' own — this is a
+      // side ledger record, not a planned cell. Invisible to planRun (whose
+      // key regex requires a leading `arm=`) and visible to spendToDate
+      // (which sums costRows across every stored body, unfiltered).
+      armId: `__${c.family}-compacted__`,
+      briefId: c.cellKey,
+      replicate: 0,
+      cfg: c.cfg,
+      result: { kind: `${c.family}-compacted`, cellKey: c.cellKey, through: c.through },
+      resolvedModels: { models: c.models },
+      accounting: {
+        state: "failed",
+        kind: "harness_error",
+        detail: `compacted ${c.family} records for cell '${c.cellKey}' through attempt ${c.through} (issue #98 retention)`,
+      },
+      costRows: c.rows,
+    });
+    written.push(c.newKey);
+    store.remove(c.removeKeys);
+    removed.push(...c.removeKeys);
+    log(`[prune] compacted ${c.removeKeys.length} ${c.family} record(s) for '${c.cellKey}' into ${c.newKey} (${c.rowsBefore} -> ${c.rows.length} cost row(s))`);
+  }
+
+  // ── 3. Prove the money survived ─────────────────────────────────────────
+  // The last line of defence, and the only one that runs in production: a
+  // fold bug or a lost salvage shows up here, on the operator's terminal,
+  // rather than three weeks later in a cost figure nobody can reconcile.
+  const spendAfter = spendToDate(store);
+  const duplicates = priceRows(knownDuplicateRows, DEFAULT_RATE_TABLE, { batch: true });
+  const duplicatesByProvider = priceRowsByProvider(knownDuplicateRows, DEFAULT_RATE_TABLE, { batch: true });
+  const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+  const providers = new Set([...Object.keys(spendBefore.byProvider), ...Object.keys(spendAfter.byProvider)]);
+  const expectedTotal = spendBefore.totalUsd - duplicates.totalUsd;
+  const drifted =
+    !close(expectedTotal, spendAfter.totalUsd) ||
+    [...providers].some((p) => !close((spendBefore.byProvider[p] || 0) - (duplicatesByProvider.byProvider[p] || 0), spendAfter.byProvider[p] || 0));
+  if (drifted) {
+    throw new Error(
+      `pruneStore: spend-to-date changed across the prune -- $${spendBefore.totalUsd} before, $${spendAfter.totalUsd} after, ` +
+        `$${expectedTotal} expected (${knownDuplicateRows.length} row(s) were a recognised crash-window duplicate, worth $${duplicates.totalUsd}). ` +
+        `A prune must never make the study look cheaper (or dearer) than it was; this is a bug in the fold/salvage path, ` +
+        `not an operator error. The store has already been modified -- restore it from a copy before running anything else.`,
+    );
+  }
+  return { plan, spendBefore, spendAfter, removed, written, duplicateSpendUsd: duplicates.totalUsd };
+}
+
+/**
+ * Re-home an evicted cell's cost rows under a `pruned-cell|cell=…|pruned=N`
+ * record, so the money the cell paid for survives the cell.
+ *
+ * This is #90's own mechanism applied retroactively: a transient generation
+ * failure written before #90 lives under `cell.key`, where it is permanently
+ * `reuse`; after this it lives under an attempt-scoped key exactly as #90
+ * would have written it, and the cell plans `todo` again.
+ *
+ * The `pruned=N` suffix is chosen so the operation is IDEMPOTENT rather than
+ * merely unique: N is the lowest index at which either nothing is stored, or
+ * what is stored is a salvage of THIS PHYSICAL cell record. So a prune
+ * interrupted between the salvage write and the cell removal, then re-run,
+ * reuses the record it already wrote instead of writing a second copy of the
+ * same money.
+ *
+ * "This physical record" is the load-bearing phrase, and identity here is the
+ * index entry's `storedAt`, never the body's content. Content cannot tell the
+ * two cases apart, and they need opposite answers:
+ *
+ *   - CRASH: salvage written, process died before the cell was removed. The
+ *     cell and the salvage hold the SAME money. A re-run must reuse.
+ *   - RE-RUN: the cell was pruned, re-attempted, failed the same way, and
+ *     was stored again — byte-identical content, but a SECOND real spend.
+ *     A re-prune must write a second salvage.
+ *
+ * A `storedAt` collision would need two stores of the same cell key inside
+ * one millisecond with a prune in between; the failure it would cause is an
+ * under-count of one attempt, which is why the whole prune re-verifies
+ * `spendToDate()` afterwards and throws rather than trusting this.
+ */
+function salvageEvictedCellSpend(store, evicted) {
+  const body = {
+    // A salvage record is not a measurement — it exists only to carry money.
+    // It reports the failure kind the cell carried when the kind is a real
+    // FAILURE_KINDS value, so "why is this cell todo again?" still has a
+    // durable answer; a salvaged COMPLETED cell has no failure kind at all,
+    // and `harness_error` is the honest stand-in (an operator deleted a
+    // paid-for measurement, which is exactly the thing worth flagging).
+    armId: `__${PRUNED_CELL_FAMILY}__`,
+    briefId: evicted.key,
+    replicate: 0,
+    cfg: evicted.cfg,
+    result: {
+      kind: PRUNED_CELL_FAMILY,
+      cellKey: evicted.key,
+      prunedFromState: evicted.state,
+      prunedFromKind: evicted.kind,
+      // The identity of the cell record this salvages. See the doc above.
+      prunedFromStoredAt: evicted.storedAt,
+    },
+    resolvedModels: evicted.resolvedModels,
+    accounting: {
+      state: "failed",
+      kind: FAILURE_KINDS.includes(evicted.kind) ? evicted.kind : "harness_error",
+      detail: `spend salvaged from pruned cell '${evicted.key}' (state=${evicted.state}, kind=${evicted.kind || "n/a"}); issue #98`,
+    },
+    costRows: evicted.costRows,
+  };
+  for (let n = 0; n < 1000; n++) {
+    const key = `${PRUNED_CELL_FAMILY}|cell=${evicted.key}|pruned=${n}`;
+    if (store.has(key)) {
+      const prior = store.get(key);
+      // Sorted-key comparison, not a bare JSON.stringify: what comes BACK
+      // from the store was canonicalized on write (lib/store.mjs sorts
+      // object keys), so a literal stringify of the record we are about to
+      // write compares unequal to its own stored form purely on property
+      // order. `result` carries `prunedFromStoredAt`, so this compares
+      // RECORD IDENTITY and not merely equal content.
+      if (canonicalJson(prior.result) === canonicalJson(body.result) && canonicalJson(prior.costRows) === canonicalJson(body.costRows)) {
+        // Already salvaged by an interrupted earlier prune. The caller needs
+        // to know, because removing the cell now takes away a DUPLICATE of
+        // money that is already recorded, not money.
+        return { key, reused: true };
+      }
+      continue;
+    }
+    store.put({ key, ...body });
+    return { key, reused: false };
+  }
+  throw new Error(`salvageEvictedCellSpend: 1000 salvage records already exist for cell '${evicted.key}' -- refusing to write another`);
 }
 
 /** A candidate is either a bare string or an object carrying `.text` (same
@@ -1084,15 +1769,18 @@ export async function runSpec(spec, opts) {
       // A stored TRANSIENT failure can only be a LEGACY record -- written
       // before issue #90's fix, when every classified generation failure
       // went into the store under cell.key. Nothing this runner writes can
-      // produce one any more. It is permanently unretryable (append-only
-      // store, no delete) and it is silently dragging an environmental
-      // fault forward as though it were a measurement, so say so out loud
-      // rather than letting a plausible-looking `failed=N` hide it.
+      // produce one any more. This RUN cannot re-attempt it -- nothing on
+      // the run path removes a record -- and it is silently dragging an
+      // environmental fault forward as though it were a measurement, so say
+      // so out loud rather than letting a plausible-looking `failed=N` hide
+      // it. As of issue #98 the remedy is a real command rather than a
+      // hand-edit, so the warning names it.
       if (isTransientFailure(priorState.kind)) {
         log(
           `[run] WARNING: reused cell '${cell.key}' is a stored '${priorState.kind}' failure -- an environmental ` +
-            `fault recorded before issue #90's fix, which this run cannot re-attempt. See ` +
-            `docs/retrying-failed-cells.md for the one-time remediation.`,
+            `fault recorded before issue #90's fix, which this run cannot re-attempt. Clear it (its spend is ` +
+            `preserved) with: node evals/run.mjs --prune --kinds transient --cfg ${cell.cfg} --apply   ` +
+            `-- see docs/retrying-failed-cells.md.`,
         );
       }
     } else if (priorState.state === "skipped") {
@@ -1608,6 +2296,29 @@ export async function runSpec(spec, opts) {
       `[run] ${n} of those failure(s) were environmental (${retryable.map(([k, c]) => `${k}=${c}`).join(", ")}) ` +
         `and were NOT stored under their cell keys -- re-run the same command to re-attempt them ` +
         `(spend already incurred is preserved; see docs/retrying-failed-cells.md).`,
+    );
+  }
+  // Attempt-record retention notice (issue #98). A DELIBERATE non-mutation:
+  // the run reports that a cell is over the retention bound and names the
+  // command, but never prunes. Compaction removes records, and a removal
+  // that every ordinary invocation can reach is a removal that eventually
+  // happens when nobody meant it to -- the store's one delete path stays
+  // behind an explicit operator command. `store.keys()` is index-only
+  // (lib/store.mjs) and was already read to plan this run, so the check
+  // costs nothing on top.
+  const attemptCounts = new Map();
+  for (const key of store.keys()) {
+    const parsed = parseAttemptKey(key);
+    if (!parsed) continue;
+    const gk = `${parsed.family} ${parsed.cellKey}`;
+    attemptCounts.set(gk, (attemptCounts.get(gk) || 0) + 1);
+  }
+  const overRetention = [...attemptCounts.values()].filter((n) => n > DEFAULT_ATTEMPT_RETENTION).length;
+  if (overRetention) {
+    log(
+      `[run] NOTE: ${overRetention} cell(s) hold more than ${DEFAULT_ATTEMPT_RETENTION} attempt records each. Their spend is ` +
+        `counted correctly, but spendToDate() parses every stored body, so the pile slows every ceiling-gated run. ` +
+        `Fold them (money preserved, verified) with: node evals/run.mjs --prune   (add --apply to commit).`,
     );
   }
   return { summary, account };

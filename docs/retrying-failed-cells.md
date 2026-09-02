@@ -34,11 +34,14 @@ would march a ~200-cell grid into an account that cannot pay for any of it.
 
 Why it has to work this way: `planRun(spec, storedKeys)` receives **only
 keys**. It cannot see `accounting.state`, so it cannot tell a completed cell
-from a failed one — and the store is append-only, with no delete. Once
-`cell.key` exists at all, every future invocation classifies it `reuse`,
-forever. Keeping a transient failure out of the store is therefore the only
-mechanism that makes it retryable; keeping an intrinsic failure in it is what
-stops the study from resampling an arm until it happens to look good.
+from a failed one — and nothing a _run_ does removes a record from the store.
+(Issue #98 added exactly one removal path, `ResultsStore.remove()`, reachable
+only from the explicitly-invoked `--prune` below; `put()` still never rewrites
+a key's content.) Once `cell.key` exists at all, every future _run_ classifies
+it `reuse`. Keeping a transient failure out of the store is therefore the only
+mechanism that makes it retryable without operator intervention; keeping an
+intrinsic failure in it is what stops the study from resampling an arm until it
+happens to look good.
 
 ## What you will see
 
@@ -78,6 +81,92 @@ identical failures would be noise. Fund the account, then re-run the same
 command — the 162 skipped cells and the one that hit the wall all come back as
 `todo`, and the 37 that completed stay `reuse`.
 
+## Exception: a store written before this change
+
+Stores created before issue #90's fix wrote **every** classified generation
+failure under `cell.key`, including transient ones. Nothing a _run_ does can
+re-attempt those — no run path removes a record — so a run that reuses one
+warns and names the command that fixes it:
+
+```
+[run] WARNING: reused cell 'arm=A|brief=biz-01|rep=0|cfg=5ce5478956e5' is a
+      stored 'rate_limited' failure -- an environmental fault recorded before
+      issue #90's fix, which this run cannot re-attempt. Clear it (its spend
+      is preserved) with: node evals/run.mjs --prune --kinds transient --cfg
+      5ce5478956e5 --apply -- see docs/retrying-failed-cells.md.
+```
+
+### The prune (issue #98)
+
+`--prune` is the supported repair. It is **dry-run by default**: it prints
+exactly what it would remove and changes nothing until you add `--apply`.
+
+```
+$ node evals/run.mjs --prune --kinds transient --cfg 5ce5478956e5
+[prune] store holds 56 record(s)
+[prune] EVICT would remove cell arm=A|brief=biz-01|rep=0|cfg=5ce5478956e5
+        state=failed kind=rate_limited  (1 cost row(s) re-homed under
+        pruned-cell|cell=arm=A|brief=biz-01|rep=0|cfg=5ce5478956e5|pruned=N
+        — the money stays)
+[prune] store would hold 56 record(s)
+[prune] DRY RUN — nothing was modified. Re-run with --apply to commit.
+```
+
+Read it, then re-run with `--apply`. The affected cells come back as `todo`
+on the next run.
+
+| Flag                | What it selects                                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `--cfg <hash>`      | cells under one `configHash`                                                                                                   |
+| `--arms A,B`        | cells for those arms                                                                                                           |
+| `--briefs biz-01`   | cells for those briefs                                                                                                         |
+| `--kinds …`         | failed cells whose stored `accounting.kind` matches. Accepts literal kinds, or the set names `transient` / `intrinsic` / `payment`. **Defaults to `transient` + `payment`** |
+| `--states …`        | cells in those terminal states. **Defaults to `failed` alone**                                                                 |
+| `--allow-completed` | permits evicting a `completed` cell (see below)                                                                                |
+| `--keep-attempts N` | attempt-record retention window (default 5)                                                                                    |
+| `--apply`           | actually do it                                                                                                                 |
+
+With **no** selector at all, `--prune` evicts nothing — it only compacts
+attempt records. There is no all-or-nothing wipe.
+
+### It will not touch an intrinsic failure unless you name one
+
+The default `--kinds` is the two **store-absent** sets, `transient` +
+`payment` — exactly the failures #90 and #88 would have kept out of the store
+in the first place. So `--prune --cfg <hash> --apply`, the most natural
+"repair my legacy store" invocation, clears the environmental faults and
+leaves `parse_failure`, `empty_pool` and `refusal` alone.
+
+That default is a guard, not a convenience. An intrinsic failure is a real,
+paid-for observation about the arm — `empty_pool` is IC-08's silent mode, one
+of the behaviours this study exists to measure. Evicting one makes the next
+run re-roll it, and an arm that genuinely returns nothing gets resampled until
+it happens not to. The salvage preserves the spend; it cannot preserve the
+measurement. Reaching one takes `--kinds intrinsic` (or the literal kind),
+which is the explicit act.
+
+### It refuses to delete a completed cell
+
+A `completed` cell is a paid-for measurement. The default `--states failed`
+never reaches one, and naming one explicitly is reported and refused:
+
+```
+[prune] REFUSED arm=A|brief=biz-04|rep=1|cfg=5ce5478956e5 — completed —
+        pass --allow-completed to evict paid-for data
+```
+
+`--allow-completed` overrides it. Its spend is preserved like any other
+eviction's, but the measurement itself is gone and will cost real money to
+reproduce.
+
+### Bumping the config is still available, and still coarser
+
+Any change to a `CONFIG_FIELDS` value (see `lib/manifest.mjs`) yields a new
+`configHash`, so affected cells get fresh keys and plan `todo` while the old
+records survive under their own hash and surface as `stale`. Correct, and
+nothing is destroyed — but it re-plans _every_ cell under the new config, not
+just the broken ones. Prefer `--prune` when you mean "these cells".
+
 ## The money you already spent is not lost
 
 A failed generation call can still have burned real tokens. Those cost rows
@@ -96,37 +185,60 @@ cell key>|attempt=<n>` — rather than under the cell key, so:
 These records are invisible to `planRun` (its key regex requires a leading
 `arm=`), so they never masquerade as cells.
 
-## Exception: a store written before this change
+**A prune never destroys spend either.** Evicting a cell first re-homes its
+cost rows under `pruned-cell|cell=<the cell key>|pruned=<n>` — the same shape
+issue #90 writes for a live transient failure, applied retroactively — and
+only then removes the cell. After an `--apply`, the command recomputes
+`spendToDate()` and **throws if the figure moved**, so a bug in this path
+surfaces on your terminal rather than in a cost total nobody can reconcile
+three weeks later.
 
-Stores created before issue #90's fix wrote **every** classified generation
-failure under `cell.key`, including transient ones. Those records are
-permanently `reuse` — nothing in the harness can re-attempt them, because
-the store has no delete. A run that reuses one warns:
+### Attempt records are bounded, not unbounded
+
+A deterministic transient cause — a real harness bug, a persistently dry
+account, a model that always times out — re-spends every invocation and
+appends another attempt record each time. `spendToDate()` parses every stored
+body, so an unbounded pile slows every ceiling-gated run. A run that is over
+the bound says so:
 
 ```
-[run] WARNING: reused cell 'arm=A|brief=biz-01|rep=0|cfg=5ce5478956e5' is a
-      stored 'rate_limited' failure -- an environmental fault recorded before
-      issue #90's fix, which this run cannot re-attempt.
+[run] NOTE: 3 cell(s) hold more than 5 attempt records each. Their spend is
+      counted correctly, but spendToDate() parses every stored body, so the
+      pile slows every ceiling-gated run. Fold them (money preserved,
+      verified) with: node evals/run.mjs --prune   (add --apply to commit).
 ```
 
-Two one-time remedies, in order of preference:
+`--prune` folds a cell's older attempt records into ONE
+`generation-attempt-compacted|cell=…|through=<n>` record whose cost rows are
+the per-(cell, billing mode, model) **sum** of theirs. The newest
+`--keep-attempts` records (default 5) are left alone.
 
-1. **Bump the config.** Any change to a `CONFIG_FIELDS` value (see
-   `lib/manifest.mjs`) yields a new `configHash`, so the affected cells get
-   fresh keys and are planned `todo`. The old records survive under their own
-   hash and surface as `stale` — nothing is destroyed, nothing is silently
-   pooled. Correct, but it re-plans _every_ cell under the new config, not
-   just the broken ones.
-2. **Prune the legacy records.** `results/` is gitignored and per-deployment,
-   so there is no shared state to migrate — but back it up first, then remove
-   the offending `index.jsonl` lines and their `bodies/<hash>.json` files.
-   Identify them by reading each body's `accounting.kind` and matching it
-   against `TRANSIENT_FAILURE_KINDS`.
+Folding rather than dropping is the point: an attempt record exists _because_
+its money must outlive the cell, so a policy that discarded the oldest would
+discard real spend and under-report the study. The fold is also **priced both
+ways and abandoned if the two disagree** — `lib/price.mjs` resolves an
+introductory rate by row timestamp, so a group straddling a dated rate change
+is left unfolded rather than repriced. The bound is best-effort; the ledger is
+not.
 
-A supported prune command belongs on the CLI (`evals/run.mjs`) and does not
-exist yet. Until it does, option 2 is a manual operation — which is precisely
-why option 1 exists, and why new transient failures are never written under a
-cell key in the first place.
+Not yet compacted: `judge-call` records (`evals/judge/gate.mjs`), which have
+the same shape and the same growth property. Their attempt numbering is
+derived from a raw key count in that module, which compaction would break, so
+bringing them in is a follow-up rather than part of #98.
+
+## The store's append-only contract, precisely
+
+`put()` never rewrites a key's content — that is unchanged and absolute, and
+it is what makes `planRun`'s `stale` path work. What #98 added is
+`ResultsStore.remove()`, the one and only removal path in the codebase. It
+takes explicit keys (no predicates, no globs), refuses a `completed` record
+without `{ allowCompleted: true }`, refuses a key the index does not hold,
+validates the whole batch before writing anything, and rewrites `index.jsonl`
+before unlinking bodies so a crash leaves an orphaned body rather than an
+index line pointing at nothing.
+
+Nothing on the run path calls it. `runSpec()` warns; `node evals/run.mjs
+--prune --apply` is the only thing that deletes.
 
 ## What this page is not
 

@@ -7,6 +7,8 @@
 //   node evals/run.mjs --max-spend-anthropic 300 --max-spend-openai 150
 //   node evals/run.mjs --phase 0
 //   node evals/run.mjs --max-poll-minutes 90   # batch poll ceiling (issue #92)
+//   node evals/run.mjs --prune                 # what WOULD be removed (issue #98)
+//   node evals/run.mjs --prune --kinds transient --cfg 5ce5478956e5 --apply
 //
 // This file is intentionally thin: it parses argv, loads the corpus + arm
 // config + a results store rooted at `results/` (gitignored, per-deployment --
@@ -32,7 +34,13 @@ import { createRequire } from "node:module";
 
 import { CORPUS, CORPUS_HASH } from "./corpus/index.mjs";
 import { ResultsStore } from "../lib/store.mjs";
-import { runSpec } from "./harness/runner.mjs";
+import { runSpec, planPrune, pruneStore, DEFAULT_ATTEMPT_RETENTION } from "./harness/runner.mjs";
+import {
+  FAILURE_KINDS,
+  TRANSIENT_FAILURE_KINDS,
+  INTRINSIC_FAILURE_KINDS,
+  PAYMENT_FAILURE_KINDS,
+} from "../lib/accounting.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { promptTemplateHash } from "./harness/prompts.mjs";
@@ -106,6 +114,98 @@ function parseRequiredNumber(argv, i, name) {
   return value;
 }
 
+// ── Prune selectors (issue #98) ─────────────────────────────────────────────
+// `--kinds` accepts literal FAILURE_KINDS values AND the names of the three
+// sets lib/accounting.mjs already defines. The aliases are the point: an
+// operator repairing a legacy store wants "the environmental ones", and the
+// consequence of mistyping or forgetting one of the five transient kinds is
+// not an error message — it is a cell that stays bricked, which is exactly
+// the failure this command exists to end.
+const KIND_ALIASES = {
+  transient: TRANSIENT_FAILURE_KINDS,
+  intrinsic: INTRINSIC_FAILURE_KINDS,
+  payment: PAYMENT_FAILURE_KINDS,
+};
+
+export function expandKindSelectors(raw) {
+  const tokens = (raw || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!tokens.length) {
+    throw new Error(
+      `run.mjs: --kinds requires a comma-separated list. Accepts any of ${FAILURE_KINDS.join(", ")}, ` +
+        `or a set name: ${Object.keys(KIND_ALIASES).join(", ")}.`,
+    );
+  }
+  const out = new Set();
+  for (const token of tokens) {
+    if (KIND_ALIASES[token]) {
+      for (const k of KIND_ALIASES[token]) out.add(k);
+      continue;
+    }
+    if (!FAILURE_KINDS.includes(token)) {
+      throw new Error(
+        `run.mjs: --kinds got '${token}', which is neither a failure kind (${FAILURE_KINDS.join(", ")}) ` +
+          `nor a set name (${Object.keys(KIND_ALIASES).join(", ")}). Refusing to guess — a kind this command ` +
+          `silently ignores is a cell that stays unretryable.`,
+      );
+    }
+    out.add(token);
+  }
+  return [...out];
+}
+
+/**
+ * Render a prune plan as operator-facing lines. Pure formatter, tested
+ * hermetically — the same reason formatSpendSummary and formatPhase0Report
+ * are separated from console.log.
+ *
+ * @param {object} plan   planPrune()'s return
+ * @param {object} [o]
+ *   @param {boolean} [o.applied=false] whether this describes work already
+ *     done (`--apply`) or work that WOULD be done (the default dry run)
+ */
+export function formatPrunePlan(plan, { applied = false } = {}) {
+  const verb = applied ? "removed" : "would remove";
+  const lines = [];
+  lines.push(`[prune] store holds ${plan.keysBefore} record(s)`);
+
+  if (!plan.selectorsGiven) {
+    lines.push("[prune] no cell selector given (--cfg / --arms / --briefs / --kinds / --states) — compaction only, no cell was considered for eviction");
+  }
+  if (plan.evictions.length === 0 && plan.selectorsGiven) {
+    lines.push("[prune] no cell matched the selectors");
+  }
+  for (const e of plan.evictions) {
+    lines.push(
+      `[prune] EVICT ${verb} cell ${e.key}  state=${e.state}${e.kind ? ` kind=${e.kind}` : ""}  ` +
+        (e.costRows.length
+          ? `(${e.costRows.length} cost row(s) re-homed under pruned-cell|cell=${e.key}|pruned=N — the money stays)`
+          : "(no cost rows to preserve)"),
+    );
+  }
+  for (const r of plan.refused) {
+    lines.push(`[prune] REFUSED ${r.key} — ${r.reason}`);
+  }
+
+  if (plan.compactions.length === 0) {
+    lines.push("[prune] no cell exceeds the attempt-retention bound — nothing to compact");
+  }
+  for (const c of plan.compactions) {
+    lines.push(
+      `[prune] COMPACT ${verb} ${c.removeKeys.length} ${c.family} record(s) for cell ${c.cellKey} ` +
+        `-> ${c.newKey} (${c.rowsBefore} cost row(s) folded to ${c.rows.length}; keeping ${c.keptKeys.length} newest)`,
+    );
+    if (!c.rowsFolded && c.rowsBefore > 1) {
+      lines.push(`[prune]   note: rows kept UNFOLDED — ${c.foldSkippedReason}`);
+    }
+  }
+
+  lines.push(`[prune] ${applied ? "store now holds" : "store would hold"} ${plan.keysAfter} record(s)`);
+  if (!applied) {
+    lines.push("[prune] DRY RUN — nothing was modified. Re-run with --apply to commit.");
+  }
+  return lines;
+}
+
 export function parseArgs(argv) {
   const args = { dryRun: false };
   for (let i = 0; i < argv.length; i++) {
@@ -158,6 +258,52 @@ export function parseArgs(argv) {
         args.maxPollMinutes = parseRequiredNumber(argv, ++i, "--max-poll-minutes");
         if (!(args.maxPollMinutes > 0)) {
           throw new Error(`run.mjs: --max-poll-minutes must be greater than 0, got ${args.maxPollMinutes}`);
+        }
+        break;
+      // ── --prune and its selectors (issue #98) ───────────────────────────
+      // `--prune` is a MODE, not a flag on a run: it never generates, never
+      // judges, never calls a provider. It is DRY-RUN BY DEFAULT and needs
+      // `--apply` to touch anything, which is what makes it safe to put the
+      // only delete path in this repo behind it. A dry run that reports
+      // exactly what an apply would do is worth more than any amount of
+      // "are you sure? [y/N]" — the operator can read it, diff it, re-run it.
+      case "--prune":
+        args.prune = true;
+        break;
+      case "--apply":
+        args.apply = true;
+        break;
+      case "--cfg":
+        // Scope by configHash. Named --cfg to match the `cfg=` segment of
+        // the cell key the operator is reading this out of.
+        args.cfg = argv[++i];
+        if (!args.cfg) throw new Error("run.mjs: --cfg requires a configHash argument");
+        break;
+      case "--kinds":
+        // Failure kinds, or one of the three set names lib/accounting.mjs
+        // already defines (`transient`, `intrinsic`, `payment`). The aliases
+        // exist because the operator's real question is "clear the
+        // environmental faults", and making them retype five kind names
+        // invites getting one wrong — and a MISSING kind here silently
+        // leaves a bricked cell bricked.
+        args.kinds = expandKindSelectors(argv[++i]);
+        break;
+      case "--states":
+        args.states = (argv[++i] || "").split(",").map((s) => s.trim()).filter(Boolean);
+        if (!args.states.length) throw new Error("run.mjs: --states requires a comma-separated list (completed, failed, skipped)");
+        for (const s of args.states) {
+          if (!["completed", "failed", "skipped"].includes(s)) {
+            throw new Error(`run.mjs: --states got '${s}' — valid terminal states are completed, failed, skipped (lib/accounting.mjs TERMINAL_STATES)`);
+          }
+        }
+        break;
+      case "--allow-completed":
+        args.allowCompleted = true;
+        break;
+      case "--keep-attempts":
+        args.keepAttempts = parseRequiredNumber(argv, ++i, "--keep-attempts");
+        if (!Number.isInteger(args.keepAttempts) || args.keepAttempts < 1) {
+          throw new Error(`run.mjs: --keep-attempts must be a positive integer, got ${args.keepAttempts}`);
         }
         break;
       default:
@@ -314,6 +460,78 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     runPhase0Fn = runPhase0,
   } = deps;
   const args = parseArgs(argv);
+
+  // ── --prune (issue #98) ───────────────────────────────────────────────
+  // Handled FIRST, and returning before anything else: a prune reads and
+  // rewrites a store, and that is all it does. It must not resolve
+  // ideate-core's version, must not read arms.config.json, must not build a
+  // provider or an embedder, and must not require VOYAGE_API_KEY — a repair
+  // command that cannot run on a machine missing a dependency it will never
+  // call is a repair command that is unavailable exactly when it is needed.
+  if (args.prune) {
+    const runOnlyFlags = [];
+    if (args.maxSpendUsd !== undefined) runOnlyFlags.push("--max-spend");
+    if (args.maxSpendByProviderUsd !== undefined) runOnlyFlags.push("--max-spend-anthropic/--max-spend-openai");
+    if (args.replicates !== undefined) runOnlyFlags.push("--replicates");
+    if (args.noBatch) runOnlyFlags.push("--no-batch");
+    if (args.maxPollMinutes !== undefined) runOnlyFlags.push("--max-poll-minutes");
+    if (args.phase !== undefined) runOnlyFlags.push("--phase");
+    if (runOnlyFlags.length) {
+      // Same non-negotiable --phase 0 applies: a flag silently ignored on a
+      // live code path is the wrong pattern to leave in place, and here the
+      // live code path DELETES.
+      throw new Error(
+        `run.mjs: --prune does not accept ${runOnlyFlags.join(", ")} — a prune runs no cells, calls no provider, ` +
+          "and has no spend ceiling to enforce. Scope it with --cfg/--arms/--briefs/--kinds/--states instead.",
+      );
+    }
+    if (args.dryRun && args.apply) {
+      throw new Error("run.mjs: --dry-run and --apply contradict each other. --prune is dry-run by default; pass --apply only when you mean to modify the store.");
+    }
+    const store = injectedStore || new ResultsStore(join(REPO_ROOT, "results"));
+    const pruneOpts = {
+      configHash: args.cfg,
+      armIds: args.arms,
+      briefIds: args.briefs,
+      kinds: args.kinds,
+      states: args.states,
+      allowCompleted: args.allowCompleted === true,
+      keepAttempts: args.keepAttempts === undefined ? DEFAULT_ATTEMPT_RETENTION : args.keepAttempts,
+    };
+    if (!args.apply) {
+      for (const line of formatPrunePlan(planPrune(store, pruneOpts), { applied: false })) log(line);
+      return;
+    }
+    const result = pruneStore(store, pruneOpts);
+    for (const line of formatPrunePlan(result.plan, { applied: true })) log(line);
+    // The spend figures are printed even though pruneStore() already THREW
+    // on any drift: the invariant this whole command is built around is
+    // "the money survived", and an operator who just deleted records should
+    // see the number, not merely be told no error occurred.
+    log(`[prune] spend-to-date before: $${result.spendBefore.totalUsd.toFixed(6)}`);
+    log(`[prune] spend-to-date after:  $${result.spendAfter.totalUsd.toFixed(6)}  (verified unchanged — a prune never makes the study look cheaper than it was)`);
+    return result;
+  }
+
+  // The mirror image of the --prune branch's own rejection above, and of
+  // --phase 0's: a prune-only flag on a REAL run is silently meaningless
+  // today, and the run is the code path that spends money. The concrete
+  // hazard is an edit, not a typo -- an operator runs
+  // `--prune --cfg X --kinds transient --apply`, deletes the `--prune`, and
+  // gets a full unscoped run under flags that read exactly like scoping.
+  const pruneOnlyFlags = [];
+  if (args.apply) pruneOnlyFlags.push("--apply");
+  if (args.cfg !== undefined) pruneOnlyFlags.push("--cfg");
+  if (args.kinds !== undefined) pruneOnlyFlags.push("--kinds");
+  if (args.states !== undefined) pruneOnlyFlags.push("--states");
+  if (args.allowCompleted) pruneOnlyFlags.push("--allow-completed");
+  if (args.keepAttempts !== undefined) pruneOnlyFlags.push("--keep-attempts");
+  if (pruneOnlyFlags.length) {
+    throw new Error(
+      `run.mjs: ${pruneOnlyFlags.join(", ")} ${pruneOnlyFlags.length === 1 ? "is" : "are"} only meaningful with --prune, ` +
+        "and this invocation would run real cells. Add --prune if you meant to repair the store; remove the flag(s) if you meant to run.",
+    );
+  }
 
   // --phase is accepted (per §12's flag table). Phase 0 (docs/PREREGISTRATION.md
   // §8.3: negative controls + DAT replication, issue #48) is now REAL --
