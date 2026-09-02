@@ -64,6 +64,17 @@ import { providerOf, priceRowByProvider, priceRows, priceRowsByProvider, RATE_TA
 // store.put() would throw on a same-key row with a different timestamp).
 import { runJudgeMatrix, judgeScoresKey } from "../judge/score.mjs";
 import { buildJudgeMatrix } from "../judge/matrix.mjs";
+// clusterByThreshold/poolDiversity/collapseRate/poolMetricsSummary (issue
+// #85): pool-level metrics have a non-test caller here -- see
+// `computeCellMetrics` below for the money-first-safe wiring into runSpec()'s
+// per-cell loop, mirroring how judging (issue #68, see runJudgeMatrix above)
+// was wired in. Embedding, clustering, diversity, and the LiveIdeaBench
+// fluency/flexibility bundle are ALL computed from ONE clustering call per
+// completed cell (never recomputed independently -- see each module's own
+// header for why that discipline matters).
+import { clusterByThreshold } from "../metrics/clustering.mjs";
+import { poolDiversity, collapseRate } from "../metrics/diversity.mjs";
+import { poolMetricsSummary } from "../metrics/operational.mjs";
 
 // ── Interim pricing estimator -- INTERIM, superseded by lib/price.mjs in #7 ──
 // A minimal per-model token-estimate table so --max-spend/--dry-run have
@@ -190,6 +201,70 @@ function costRowsFor(cellKey, tokens, timestamp) {
     return [costRow({ cellKey, timestamp, billing_mode, ...tokens })];
   }
   return [];
+}
+
+/**
+ * Persist a failed metrics attempt's cost rows under an attempt-scoped key
+ * (issue #85 fix round -- PR #86 review) so a transient Voyage failure
+ * during pool metrics can never brick the store the way a fixed judge-call
+ * key did before #76's fix (mirrors evals/judge/gate.mjs's meterJudgeCall
+ * exactly, same attempt-count-from-store-keys discriminator). The CELL
+ * ITSELF must stay OUT of the store on a metrics failure -- see the per-cell
+ * loop's metrics-failure branch for the full reasoning (lib/manifest.mjs's
+ * planRun sees only keys, so a stored `failed` record under cell.key would
+ * be permanently unretryable and would correlate cell loss with arm size,
+ * confounding H1). This function exists ONLY to make sure the money already
+ * spent -- real generation tokens, plus whatever the embedder actually
+ * consumed before failing -- is not lost just because the cell itself isn't
+ * stored. `store.keys()` is index-only (cheap; lib/store.mjs) and reflects
+ * every attempt already durably recorded for this exact cell, including
+ * ones from a PRIOR session, so the next attempt number is always correct
+ * regardless of process/session boundaries -- exactly meterJudgeCall's own
+ * contract.
+ *
+ * @param {object} store  a lib/store.mjs ResultsStore
+ * @param {object} o
+ *   @param {{key: string, cfg: string}} o.cell
+ *   @param {Array} o.costRows   every costRow() for this attempt (generation
+ *     tokens, plus any embedder tokens actually consumed before failing)
+ *   @param {string} o.detail    why metrics computation failed
+ *   @param {string} o.timestamp ISO 8601 (unused directly here -- costRows
+ *     already carry their own timestamps; kept in the signature for symmetry
+ *     with the rest of this module's helpers and in case a future caller
+ *     needs it for the attempt record itself)
+ */
+function recordMetricsAttemptFailure(store, { cell, costRows, detail }) {
+  const keyPrefix = `metrics-attempt|cell=${cell.key}|attempt=`;
+  const attempt = store.keys().filter((k) => k.startsWith(keyPrefix)).length;
+  const key = `${keyPrefix}${attempt}`;
+  // Self-describing model list, derived from the cost rows themselves
+  // rather than requiring a caller to pass resolvedModels separately --
+  // this is a side ledger record, not a planned cell, so there is no arm
+  // slot config to resolve against.
+  const models = new Set();
+  for (const row of costRows) {
+    if (row.model) models.add(row.model);
+    if (row.tokens_by_model) for (const m of Object.keys(row.tokens_by_model)) models.add(m);
+  }
+  return store.put({
+    key,
+    armId: "__metrics-attempt__",
+    briefId: cell.key,
+    replicate: 0,
+    cfg: cell.cfg,
+    result: { kind: "metrics-attempt", cellKey: cell.key, attempt, detail },
+    resolvedModels: { models: [...models] },
+    accounting: { state: "failed", kind: "harness_error", detail },
+    costRows,
+  });
+}
+
+/** A candidate is either a bare string or an object carrying `.text` (same
+ *  convention evals/judge/deidentify.mjs's deidentifyPool already uses). */
+function candidateText(candidate) {
+  if (typeof candidate === "string") return candidate;
+  if (candidate && typeof candidate.text === "string") return candidate.text;
+  throw new Error(`computeCellMetrics: candidate must be a string or an object with a .text field, got ${JSON.stringify(candidate)}`);
 }
 
 /**
@@ -411,6 +486,23 @@ export function planAndPrice(spec, { store, armsConfig, priceGrid = interimPrice
  *   @param {number} [opts.judgeSeed=1] base integer seed forwarded to
  *     runJudgeMatrix per pool (it derives a distinct, replayable per-leg seed
  *     from this base + the pool key -- see score.mjs).
+ *   @param {{embed: (texts: string[]) => Promise<number[][]>, modelId: string,
+ *     usage?: {total_tokens: number}}} [opts.embedder] THE SWITCH THAT ENABLES
+ *     POOL METRICS (issue #85): when omitted, runSpec() behaves exactly as
+ *     before -- no distinct_k/pool/diversity/collapseRate ever computed or
+ *     stored. A real CLI invocation (evals/run.mjs) always supplies this
+ *     (evals/metrics/embedder.mjs's voyageEmbedder), so a genuine run always
+ *     measures pool metrics. `usage.total_tokens`, when present, is read as a
+ *     CUMULATIVE counter (voyageEmbedder's own contract) -- this function
+ *     meters the DELTA across one embed() call, never the running total, so
+ *     an embedder shared across many cells in one invocation is never
+ *     double-metered.
+ *   @param {number} [opts.clusterDistanceThreshold] the calibrated clustering
+ *     distance threshold for whichever embedding space `opts.embedder`
+ *     produces (VOYAGE_CLUSTER_DISTANCE_THRESHOLD for the live embedder,
+ *     CLUSTER_DISTANCE_THRESHOLD for the hermetic MiniLM fixture embedder --
+ *     see evals/metrics/clustering.mjs's header for why the two spaces need
+ *     different thresholds). Required whenever `opts.embedder` is set.
  * @returns {Promise<{summary: object, dryRun?: object}>}
  */
 export async function runSpec(spec, opts) {
@@ -432,6 +524,8 @@ export async function runSpec(spec, opts) {
     judgeProviders,
     corpus,
     judgeSeed = 1,
+    embedder,
+    clusterDistanceThreshold,
   } = opts || {};
 
   if (!store) throw new Error("runSpec: store is required");
@@ -444,6 +538,25 @@ export async function runSpec(spec, opts) {
   const judgingEnabled = !!judgeModels;
   if (judgingEnabled && !Array.isArray(corpus)) {
     throw new Error("runSpec: judgeModels was supplied but opts.corpus (array of { id, text } briefs) was not -- judging needs each pool's brief text");
+  }
+  // Pool metrics (issue #85) are opt-in via opts.embedder, exactly like
+  // judging's opts.judgeModels switch above: omitted, runSpec() behaves
+  // exactly as before (generation only, no distinct_k/pool ever computed).
+  // A real CLI invocation (evals/run.mjs) always supplies both opts.embedder
+  // and opts.clusterDistanceThreshold, so a genuine run always measures
+  // pool metrics -- the same "always wired for a real invocation" shape
+  // issue #68/#76 established for judging. Checked up front, before any
+  // provider spend happens, so a misconfigured metrics pass fails at the
+  // moment you'd expect rather than after burning generation money on the
+  // first cell.
+  const metricsEnabled = !!embedder;
+  if (metricsEnabled && !Number.isFinite(clusterDistanceThreshold)) {
+    throw new Error(
+      "runSpec: opts.embedder was supplied but opts.clusterDistanceThreshold is missing/invalid -- pool metrics " +
+        "need the calibrated clustering distance threshold for whichever embedding space opts.embedder produces " +
+        "(evals/metrics/voyage-calibration.mjs's VOYAGE_CLUSTER_DISTANCE_THRESHOLD for the live Voyage embedder, " +
+        "or evals/metrics/calibration.mjs's CLUSTER_DISTANCE_THRESHOLD for the hermetic MiniLM fixture embedder).",
+    );
   }
 
   const effectiveSpec = subsetSpec(spec, { arms: armIds, briefs: briefIds, replicates });
@@ -687,6 +800,88 @@ export async function runSpec(spec, opts) {
    *  gate.mjs, which this deliberately does not collide with). */
   function judgeLegKey(poolKey, judgeProvider) {
     return `judge|pool=${poolKey}|provider=${judgeProvider}`;
+  }
+
+  /**
+   * Compute pool-level metrics (issue #85) for one completed generation
+   * cell's candidates -- distinct_k, the embedded pool itself, diversity,
+   * collapse rate, and the LiveIdeaBench fluency/flexibility bundle -- from
+   * exactly ONE clustering call, per clustering.mjs/diversity.mjs's own
+   * "never recomputed independently" discipline. No-op (returns null) when
+   * metrics are disabled (opts.embedder was never supplied).
+   *
+   * ── Never throws -- classifies instead (mirrors judge/score.mjs's
+   * providers) ──────────────────────────────────────────────────────────
+   * The embedder is a real network call (evals/metrics/embedder.mjs's
+   * voyageEmbedder) and CAN fail (missing credential, transient transport
+   * failure exhausted its own retry budget, a malformed response). Letting
+   * that exception propagate here would land BETWEEN this cell's already-
+   * spent generation money and the single store.put() that is the only
+   * place that money can be durably recorded (lib/store.mjs is append-only
+   * -- there is no second write to add metrics to an already-stored cell).
+   * So this function catches everything and returns a classified outcome;
+   * the caller (the per-cell loop below) decides what to do with it. This
+   * is the SAME "provider never throws, caller classifies" shape
+   * evals/judge/score.mjs's AnthropicJudgeProvider/OpenAIJudgeProvider
+   * already use, applied to the embedder instead of a judge model.
+   *
+   * ── Metering the embedder's DELTA, not its running total ────────────────
+   * `embedder.usage.total_tokens` (voyageEmbedder's own contract) is
+   * CUMULATIVE across every embed() call made on that one embedder
+   * instance -- and one embedder instance is shared across every cell in a
+   * single runSpec() invocation. Snapshotting before/after and metering
+   * only the delta is what keeps a later cell from being charged for an
+   * earlier cell's tokens too. Read in a `finally` block so a partially
+   * successful embed() call (some chunks succeeded before a later chunk
+   * threw -- see embedder.mjs's per-chunk usage accounting) still meters
+   * the tokens it actually consumed, mirroring runJudgeMatrix's own "tokens
+   * consumed by a failed call are still spend" rule.
+   *
+   * @param {{key: string}} cell
+   * @param {Array} candidates  the completed cell's result.candidates
+   * @param {string} timestamp  ISO 8601, caller-supplied (costRow requires it)
+   * @returns {Promise<{ok: true, resultPatch: object, costRows: Array} | {ok: false, detail: string, costRows: Array}>}
+   */
+  async function computeCellMetrics(cell, candidates, timestamp) {
+    let beforeTokens = (embedder.usage && embedder.usage.total_tokens) || 0;
+    let costRows = [];
+    try {
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        throw new Error("completed result has no candidates to embed");
+      }
+      const texts = candidates.map(candidateText);
+      const vectors = await embedder.embed(texts);
+      const { k: distinctK } = clusterByThreshold(vectors, clusterDistanceThreshold);
+      const rawCandidateCount = candidates.length;
+      const resultPatch = {
+        distinct_k: distinctK,
+        pool: vectors,
+        // Post-dedup pool size (Appendix C item 5) IS distinct_k -- one
+        // survivor per occupied semantic equivalence class (see
+        // diversity.mjs collapseRate's own header). Named explicitly,
+        // alongside the raw pre-dedup count already recoverable as
+        // candidates.length, so both halves of Appendix C's per-arm pool
+        // accounting are self-describing on the stored record.
+        postDedupPoolSize: distinctK,
+        rawCandidateCount,
+        // poolDiversity needs >= 2 embedded items (diversity.mjs); a
+        // singleton pool has no pairwise distance to average, which is a
+        // real, legitimate state (not an error) -- reported as `null`
+        // ("not computable"), never a fabricated 0.
+        poolDiversity: vectors.length >= 2 ? poolDiversity(vectors) : null,
+        collapseRate: collapseRate(distinctK, rawCandidateCount),
+        ...poolMetricsSummary({ pool: candidates, distinctKCount: distinctK }),
+      };
+      return { ok: true, resultPatch, costRows };
+    } catch (err) {
+      return { ok: false, detail: `pool metrics failed for cell '${cell.key}': ${err && err.message}`, costRows };
+    } finally {
+      const afterTokens = (embedder.usage && embedder.usage.total_tokens) || 0;
+      const delta = afterTokens - beforeTokens;
+      if (delta > 0) {
+        costRows.push(costRow({ cellKey: cell.key, timestamp, billing_mode: "api", model: embedder.modelId, input_tokens: delta }));
+      }
+    }
   }
 
   /**
@@ -959,8 +1154,71 @@ export async function runSpec(spec, opts) {
     }
 
     if (response.terminalState === "completed") {
-      account.complete(cell.key, response.result);
-      const costRows = costRowsFor(cell.key, response.tokens, timestamp);
+      const genCostRows = costRowsFor(cell.key, response.tokens, timestamp);
+
+      // ── Pool metrics (issue #85), computed BEFORE the single store.put()
+      // for this cell -- lib/store.mjs is append-only, so distinct_k/pool
+      // must already be part of `result` at the moment this cell is FIRST
+      // (and only ever) written; there is no second write to add them
+      // later. Money safety is instead guaranteed by computeCellMetrics()
+      // NEVER THROWING (it classifies failure and returns it -- see that
+      // function's own header) and by metering the embedder's actual token
+      // delta in a `finally` regardless of outcome, so a metrics failure
+      // can never lose the record of what the embedder call itself
+      // consumed. Skipped entirely when metrics are disabled
+      // (opts.embedder unset) -- unchanged from pre-#85 behavior.
+      let metrics = null;
+      if (metricsEnabled) {
+        metrics = await computeCellMetrics(cell, response.result && response.result.candidates, timestamp);
+      }
+      const costRows = metrics ? [...genCostRows, ...metrics.costRows] : genCostRows;
+
+      if (metrics && !metrics.ok) {
+        // ── PR #86 review fix round -- do NOT store this cell under
+        // cell.key at all ────────────────────────────────────────────────
+        // The original approach here stored a `failed` record under
+        // cell.key on a metrics failure. That is WRONG: lib/manifest.mjs's
+        // planRun(spec, storedKeys) receives ONLY keys -- it has no access
+        // to accounting.state and structurally cannot tell a completed cell
+        // from a failed one. Once cell.key exists in the store AT ALL, every
+        // future invocation classifies it `reuse`, forever (the store is
+        // append-only -- there is no delete, and put() throws on
+        // same-key/different-content). A transient Voyage 429 during
+        // metrics would therefore PERMANENTLY destroy a cell whose
+        // generation was already paid for, with no way to ever retry it --
+        // not by re-running, not by resuming. Worse: the loss is correlated
+        // with arm (bigger pools embed more tokens -> higher 429
+        // probability -> panel arms lose cells preferentially), which
+        // confounds exactly the panel-vs-solo comparison H1 tests. This is
+        // the same shape of bug #76 fixed for judge retries (a fixed judge-
+        // call key collided on retry and bricked the store) -- see
+        // meterJudgeCall's attempt-scoped key in evals/judge/gate.mjs.
+        //
+        // The fix: leave cell.key OUT of the store entirely, so the next
+        // invocation's planRun still sees it as `todo` and retries it (a
+        // fresh generation call -- genuinely re-spending, which is correct
+        // and honest, exactly the principle already established for judge
+        // retries). The money already spent -- this cell's real generation
+        // tokens, plus whatever the embedder actually consumed before
+        // failing -- is preserved under its OWN attempt-scoped key
+        // (recordMetricsAttemptFailure, mirroring meterJudgeCall exactly),
+        // never lost and never double-counted against a later successful
+        // retry (each attempt gets a new, non-colliding key).
+        recordMetricsAttemptFailure(store, { cell, costRows, detail: metrics.detail, timestamp });
+        recordActualSpend(costRows);
+        // Skipped, not failed: RunAccount.skip() is a legitimate terminal
+        // state for THIS invocation's reconcile() (every planned cell must
+        // still reach exactly one terminal state -- this cell is not
+        // silently dropped from the run's own accounting), but -- exactly
+        // like the pre-existing `budget_exceeded` skip below -- writes
+        // NOTHING under cell.key, so the store-level retryability described
+        // above holds regardless of what this invocation's summary reports.
+        account.skip(cell.key, `metrics_failed: ${metrics.detail}`);
+        continue; // no candidates survive to judge -- nothing was ever stored
+      }
+
+      const finalResult = metrics ? { ...response.result, ...metrics.resultPatch } : response.result;
+      account.complete(cell.key, finalResult);
       for (const row of costRows) account.addCost(row);
       // issue #74 -- store.put() BEFORE recordActualSpend(): the API call
       // already succeeded and spent real money by this point, so the result
@@ -973,14 +1231,18 @@ export async function runSpec(spec, opts) {
       // it. The ordering is the fix, per the issue's own "suggested fix
       // direction": the throw-and-abort behavior on a missing rate is
       // UNCHANGED (still fails loud, still aborts this invocation) -- only
-      // WHEN it can fire relative to persistence moved.
+      // WHEN it can fire relative to persistence moved. issue #85 extends
+      // this SAME ordering to metrics: this store.put() already carries
+      // distinct_k/pool (computed above, before this write) and every
+      // costRow (generation AND embedder), so a missing-rate throw below
+      // still can never discard an already-paid-for, already-measured cell.
       store.put({
         key: cell.key,
         armId: cell.armId,
         briefId: cell.briefId,
         replicate: cell.replicate,
         cfg: cell.cfg,
-        result: response.result,
+        result: finalResult,
         resolvedModels: resolvedModelsFor(arm),
         accounting: { state: "completed" },
         costRows,
@@ -990,7 +1252,7 @@ export async function runSpec(spec, opts) {
       // ceiling stays responsive to judge spend for the NEXT cell's
       // admission decision (see the per-cell loop's projected-vs-actual
       // comparison above, which reads runningTotalByProvider between cells).
-      await judgePoolIfEnabled(cell, arm, response.result);
+      await judgePoolIfEnabled(cell, arm, finalResult);
     } else {
       // response.terminalState === "failed" -- a classified provider
       // failure surfaces as a `failed` cell, never a missing one.
@@ -1092,6 +1354,19 @@ export async function runSpec(spec, opts) {
     summary.cumulativeNonProviderModels = null;
     summary.cumulativeSpendUsd = null;
   }
-  log(`[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
+  // Skip-reason breakdown (PR #86 review): summary.skippedByReason (from
+  // RunAccount.reconcile(), see lib/accounting.mjs) already distinguishes
+  // `budget_exceeded` from `metrics_failed` from any other skip reason --
+  // this just surfaces it in the same log line the bare `skipped=N` count
+  // was already printed on, so a run reporting `skipped=30` is never
+  // ambiguous between "you hit your ceiling" and "the embedder is failing"
+  // at exactly the moment (#8/Phase 2a's go/no-go) that distinction matters.
+  const skipBreakdown = Object.entries(summary.skippedByReason)
+    .map(([reason, n]) => `${reason}=${n}`)
+    .join(", ");
+  log(
+    `[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}` +
+      (skipBreakdown ? ` (${skipBreakdown})` : ""),
+  );
   return { summary, account };
 }
