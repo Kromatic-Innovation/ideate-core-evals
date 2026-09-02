@@ -54,11 +54,19 @@ const N_A = 30;
 const N_PANEL = 60;
 const BRIEFS = ["b1", "b2", "b3", "b4"];
 
-// analysis.mjs's CLI has no flag to set harnessVersion/engineSha/promptHash
-// (a pre-existing gap, independent of this issue) -- args.config is always
-// `{}` except for whatever --cluster-distance-threshold adds. The store
-// fixture's cfg must match EXACTLY what buildFrame() will compute from
-// that same args.config, or every seeded row reads back as `stale`.
+// The fixture config. As of issue #91 its CONTENT no longer has to match
+// anything the CLI computes: analysis.mjs derives the configHash from the
+// store itself (evals/analysis/storeConfig.mjs), so any config produces a
+// store the CLI can read, and --cluster-distance-threshold no longer
+// influences selection at all. Both variants are kept because the fixtures
+// below still exercise the threshold's OTHER (real) effect -- rarefaction.
+//
+// Before #91 this helper was load-bearing in the opposite direction: the
+// CLI had a flag for exactly ONE of lib/manifest.mjs's nine CONFIG_FIELDS,
+// so a fixture cfg had to be hand-matched to `{}`-plus-maybe-the-threshold
+// or every seeded row read back as `stale`. That constraint is what made
+// the CLI unable to select evals/run.mjs's real cells; see
+// storeConfig.test.mjs for the round trip that now pins it.
 function configFor(withThreshold) {
   return withThreshold ? { clusterDistanceThreshold: THRESHOLD } : {};
 }
@@ -480,6 +488,134 @@ test("main(): H5 is COMPUTED end to end when judge-score records cover every poo
 
     const reportMd = readFileSync(join(outDir, "REPORT.md"), "utf8");
     assert.doesNotMatch(reportMd, /\| H5 \|.*unimplemented \|/);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+// ── issue #91: the CLI boundary itself ──────────────────────────────────
+//
+// storeConfig.test.mjs pins the run -> analysis round trip at the module
+// level. These pin it where it actually broke: main()'s own argv handling.
+// Before #91, main() computed its configHash from a config it had one flag
+// for, so a store written under evals/run.mjs's five-field config was
+// entirely invisible to it — every cell `stale`, `armLevels []`, and a
+// downstream complaint about --reference-arm.
+
+/** evals/run.mjs's real spec.config shape (the five CONFIG_FIELDS it sets).
+ *  Values are placeholders; the point is the FIELD SET — none of which the
+ *  CLI has, or should need, a flag for. */
+const RUNNER_CONFIG = {
+  harnessVersion: "0.0.1",
+  engineSha: "ideate-core@0.4.0",
+  promptHash: "unpinned",
+  embedderId: "voyage-4-lite",
+  corpusHash: "55e05c2811a7",
+};
+
+test("main(): selects cells written under evals/run.mjs's OWN config, with no config flag passed at all (issue #91)", async () => {
+  const resultsDir = seedStore(RUNNER_CONFIG, { withPools: false });
+  const outDir = tmpOutDir();
+  try {
+    const result = await main(["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A"], {
+      runner: fakeSidecarRunner,
+    });
+    assert.equal(result.frame.configHash, configHash(RUNNER_CONFIG));
+    assert.equal(result.frame.rows.length, BRIEFS.length * ARMS.length);
+    assert.deepEqual(result.frame.armLevels, ARMS.slice().sort());
+    assert.equal(result.frame.excluded.stale.length, 0);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test("main(): --cluster-distance-threshold does not change WHICH cells are selected (issue #91's second-order trap)", async () => {
+  // run.mjs passes clusterDistanceThreshold as a runSpec() option, never into
+  // spec.config, so it is absent from every stored cell's cfg. The CLI used
+  // to fold it into the hash — meaning that after adding the five missing
+  // flags, passing this one would have reintroduced the very mismatch #91 is
+  // about. It now feeds rarefaction only.
+  const resultsDir = seedStore(RUNNER_CONFIG, { withPools: false });
+  const outDir = tmpOutDir();
+  try {
+    const result = await main(
+      ["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A", "--cluster-distance-threshold", String(THRESHOLD)],
+      { runner: fakeSidecarRunner },
+    );
+    assert.equal(result.frame.configHash, configHash(RUNNER_CONFIG));
+    assert.notEqual(result.frame.configHash, configHash({ ...RUNNER_CONFIG, clusterDistanceThreshold: THRESHOLD }));
+    assert.equal(result.frame.rows.length, BRIEFS.length * ARMS.length);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test("main(): a store holding two configHashes is refused by name, and --config-hash resolves it (issue #91)", async () => {
+  // Two incomparable experiments in one store. Picking between them is the
+  // silent-pooling judgment call lib/manifest.mjs exists to forbid, so the
+  // CLI refuses — and says which hashes it found.
+  const resultsDir = seedStore(RUNNER_CONFIG, { withPools: false });
+  const outDir = tmpOutDir();
+  const otherConfig = { ...RUNNER_CONFIG, engineSha: "ideate-core@0.5.0" };
+  try {
+    const store = new ResultsStore(resultsDir);
+    const otherCfg = configHash(otherConfig);
+    store.put({
+      key: cellKey({ armId: "A", briefId: BRIEFS[0], replicate: 0, cfg: otherCfg }),
+      armId: "A",
+      briefId: BRIEFS[0],
+      replicate: 0,
+      cfg: otherCfg,
+      result: { distinct_k: 3 },
+      resolvedModels: { proposer: "claude-haiku-4-5" },
+      accounting: { state: "completed" },
+      costRows: [],
+    });
+
+    await assert.rejects(
+      () => main(["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A"], { runner: fakeSidecarRunner }),
+      (err) => {
+        assert.equal(err.name, "AmbiguousStoredConfigError");
+        assert.match(err.message, new RegExp(configHash(RUNNER_CONFIG)));
+        assert.match(err.message, new RegExp(otherCfg));
+        assert.match(err.message, /--config-hash/);
+        return true;
+      },
+    );
+
+    const result = await main(
+      ["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A", "--config-hash", configHash(RUNNER_CONFIG)],
+      { runner: fakeSidecarRunner },
+    );
+    assert.equal(result.frame.configHash, configHash(RUNNER_CONFIG));
+    assert.equal(result.frame.rows.length, BRIEFS.length * ARMS.length);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test("main(): a --config-hash the store does not hold is reported as the exclusion it is, not as armLevels [] (issue #91)", async () => {
+  const resultsDir = seedStore(RUNNER_CONFIG, { withPools: false });
+  const outDir = tmpOutDir();
+  try {
+    await assert.rejects(
+      () =>
+        main(["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A", "--config-hash", "560d764366bc"], {
+          runner: fakeSidecarRunner,
+        }),
+      (err) => {
+        assert.equal(err.name, "UnknownStoredConfigError");
+        assert.match(err.message, /expected cfg 560d764366bc/);
+        assert.match(err.message, new RegExp(`holds ${configHash(RUNNER_CONFIG)}`));
+        // The symptom this replaces.
+        assert.doesNotMatch(err.message, /armLevels/);
+        return true;
+      },
+    );
   } finally {
     rmSync(resultsDir, { recursive: true, force: true });
     rmSync(outDir, { recursive: true, force: true });

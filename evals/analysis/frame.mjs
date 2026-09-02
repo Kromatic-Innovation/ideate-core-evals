@@ -63,6 +63,7 @@
 
 import { priceRows } from "../../lib/price.mjs";
 import { configHash as computeConfigHash } from "../../lib/manifest.mjs";
+import { isStudyCellKey } from "./storeConfig.mjs";
 
 /**
  * Thrown by buildFrame() when an arm level has ZERO completed rows (every
@@ -102,9 +103,19 @@ function getPath(obj, path) {
  *
  * @param {import("../../lib/store.mjs").ResultsStore} store
  * @param {object} opts
- *   @param {object} opts.config          the config object whose hash marks
+ *   @param {object} [opts.config]        the config object whose hash marks
  *                                         which stored cells are comparable
  *                                         (passed to lib/manifest.mjs:configHash)
+ *   @param {string} [opts.configHash]    an ALREADY-RESOLVED config hash, used
+ *                                         verbatim instead of hashing
+ *                                         `opts.config`. This is how
+ *                                         analysis.mjs selects cells (issue
+ *                                         #91): it reads the hash off the
+ *                                         store's own index rather than
+ *                                         recomputing it from a config the
+ *                                         operator retyped by hand, which is
+ *                                         a config that drifts. Mutually
+ *                                         exclusive with `opts.config`.
  *   @param {string} [opts.responseField="distinct_k"]  dotted path into a
  *                                         completed cell's `result` naming
  *                                         the numeric response to fit
@@ -152,7 +163,13 @@ export function buildFrame(store, opts = {}) {
   }
   const responseField = opts.responseField || "distinct_k";
   const poolField = opts.poolField;
-  const cfg = computeConfigHash(opts.config || {});
+  if (opts.configHash !== undefined && opts.config !== undefined) {
+    throw new Error(
+      "buildFrame: pass EITHER opts.config (hash it here) OR opts.configHash (already resolved, e.g. read off the " +
+        "store by evals/analysis/storeConfig.mjs) — never both, since the two could disagree and only one can win",
+    );
+  }
+  const cfg = opts.configHash !== undefined ? opts.configHash : computeConfigHash(opts.config || {});
 
   const rows = [];
   const excluded = { failed: [], skipped: [], stale: [] };
@@ -264,6 +281,62 @@ export function buildFrame(store, opts = {}) {
     failuresByArm,
     skippedByArm,
   };
+}
+
+/**
+ * Thrown when a frame selected ZERO rows — every stored cell was excluded.
+ *
+ * Issue #91: this state used to travel silently. `buildFrame()` reports it
+ * honestly (`rows: []`, `armLevels: []`, the whole store in `excluded.stale`),
+ * but the first thing to NOTICE was contrasts.mjs, four modules downstream,
+ * complaining that `referenceArm 'A' is not in armLevels []` — which reads as
+ * a bad `--reference-arm` argument rather than as "your entire dataset was
+ * excluded, under a config hash nothing in the store carries".
+ *
+ * `storeConfig.mjs` now makes the common cause (a config hash the store does
+ * not hold) unreachable from the CLI. This assert is the belt-and-braces
+ * behind it: it names the outcome AS ITSELF, and reports the expected hash
+ * against what the store actually holds. Deliberately a separate assert
+ * rather than a throw inside `buildFrame()` — a zero-row frame is a legitimate
+ * intermediate for other callers (frame.test.mjs builds several), and the
+ * never-silently-pool rule this protects is about REPORTING the exclusion,
+ * not about forbidding it.
+ */
+export class NoCellsSelectedError extends Error {
+  constructor(frame) {
+    // Study cells only: a real store's `stale` pile also holds judge-call and
+    // phase0 records whose `cfg` is a judge model id / an object (see
+    // storeConfig.mjs), and listing those as candidate config hashes would
+    // send the reader chasing a hash that never existed.
+    const staleByCfg = new Map();
+    for (const s of frame.excluded.stale) {
+      if (!isStudyCellKey(s.key, s.cfg)) continue;
+      staleByCfg.set(s.cfg, (staleByCfg.get(s.cfg) || 0) + 1);
+    }
+    const held =
+      Array.from(staleByCfg.entries())
+        .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+        .map(([cfg, n]) => `${cfg} (${n})`)
+        .join(", ") || "no cells at all";
+    const stale = frame.excluded.stale.length;
+    const failed = frame.excluded.failed.length;
+    const skipped = frame.excluded.skipped.length;
+    super(
+      `buildFrame selected 0 cells: ${stale} excluded as stale, ${failed} as failed, ${skipped} as skipped; ` +
+        `expected cfg ${frame.configHash}, store holds ${held}. ` +
+        `This is an EXCLUSION outcome, not a modelling one — nothing downstream was ever given data to fit.`,
+    );
+    this.name = "NoCellsSelectedError";
+    this.configHash = frame.configHash;
+  }
+}
+
+/** Throw NoCellsSelectedError if `frame` has no rows. Called at the CLI
+ *  boundary (analysis.mjs), so total exclusion is reported where the operator
+ *  can act on it. */
+export function assertCellsSelected(frame) {
+  if (!frame.rows.length) throw new NoCellsSelectedError(frame);
+  return frame;
 }
 
 /**
