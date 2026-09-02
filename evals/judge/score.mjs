@@ -65,6 +65,11 @@ import {
   classifyTransportOutcome,
   classifyTransportKind,
   pickFailureKind,
+  // isBillingRefusal (issue #106): the BATCH result paths below carry a
+  // per-request error object with no HTTP status of its own, so they cannot
+  // go through classifyTransportOutcome -- they call the detector directly,
+  // exactly as evals/harness/provider.mjs's generation-side batch rows do.
+  isBillingRefusal,
   buildOpenAIChatParams,
   openaiHeaders,
   openaiAuthOnlyHeaders,
@@ -321,7 +326,7 @@ export class AnthropicJudgeProvider {
     await Promise.all(
       requests.map(async (req) => {
         const params = buildAnthropicMessageParams({ model: judgeModel, prompt: req.prompt, maxTokens: MAX_JUDGE_TOKENS });
-        const { ok, status, json, error } = await anthropicFetchWithRetry(
+        const { ok, status, json, error, errorBody } = await anthropicFetchWithRetry(
           this.fetchImpl,
           "https://api.anthropic.com/v1/messages",
           anthropicHeaders(this.apiKey),
@@ -329,7 +334,12 @@ export class AnthropicJudgeProvider {
           { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
         );
         if (!ok) {
-          classifyTransportOutcome(status, error, classification);
+          // errorBody (issue #106): isBillingRefusal keys on the response BODY,
+          // never on status alone -- dropping it here (as this file did before
+          // #106) made `payment_required` UNREACHABLE on every judge leg, so
+          // #88's abort had nothing to fire on. The fetch helper has always
+          // returned it; only this call site failed to forward it.
+          classifyTransportOutcome(status, error, classification, errorBody);
           return; // absent from `replies` — counted as a missing reply above
         }
         addUsageInto(tokens, json && json.usage);
@@ -357,7 +367,7 @@ export class AnthropicJudgeProvider {
       { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!submit.ok) {
-      classifyTransportOutcome(submit.status, submit.error, classification);
+      classifyTransportOutcome(submit.status, submit.error, classification, submit.errorBody);
       return;
     }
 
@@ -378,7 +388,7 @@ export class AnthropicJudgeProvider {
         { method: "GET", maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
       );
       if (!poll.ok) {
-        classifyTransportOutcome(poll.status, poll.error, classification);
+        classifyTransportOutcome(poll.status, poll.error, classification, poll.errorBody);
         return;
       }
       batchStatus = poll.json;
@@ -392,7 +402,7 @@ export class AnthropicJudgeProvider {
       { method: "GET", raw: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!results.ok) {
-      classifyTransportOutcome(results.status, results.error, classification);
+      classifyTransportOutcome(results.status, results.error, classification, results.errorBody);
       return;
     }
 
@@ -415,7 +425,14 @@ export class AnthropicJudgeProvider {
         replies.set(req.origIndex, extractAnthropicText(message));
       } else if (row.result && row.result.type === "errored") {
         const err = row.result.error || {};
-        if (err.type === "rate_limit_error") classification.rateLimited = true;
+        // Billing FIRST (issue #106): a per-request refusal inside a batch
+        // result carries no HTTP status of its own, so the error object is
+        // wrapped into the error-body shape isBillingRefusal reads. Checked
+        // ahead of rate_limit_error because payment outranks every other
+        // signal (pickFailureKind) -- an unfunded account filed as
+        // `rate_limited` is transient, and every remaining pool retries it.
+        if (isBillingRefusal(undefined, { error: err })) classification.paymentRequired = true;
+        else if (err.type === "rate_limit_error") classification.rateLimited = true;
         else classification.transportError = true;
         // absent from `replies` — a missing reply, classified above
       } else {
@@ -564,7 +581,7 @@ export class OpenAIJudgeProvider {
     await Promise.all(
       requests.map(async (req) => {
         const params = buildOpenAIChatParams({ model: judgeModel, prompt: req.prompt, maxTokens: MAX_JUDGE_TOKENS });
-        const { ok, status, json, error } = await openaiFetchWithRetry(
+        const { ok, status, json, error, errorBody } = await openaiFetchWithRetry(
           this.fetchImpl,
           "https://api.openai.com/v1/chat/completions",
           openaiHeaders(this.apiKey),
@@ -572,7 +589,12 @@ export class OpenAIJudgeProvider {
           { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
         );
         if (!ok) {
-          classifyTransportOutcome(status, error, classification);
+          // errorBody (issue #106) matters MOST here: OpenAI delivers quota
+          // exhaustion as a 429, so without the body this classifies
+          // `rate_limited` -- transient -- and every remaining pool marches
+          // into the identical wall. Judge spend is the dominant OpenAI cost
+          // driver on this study (docs/PREREGISTRATION.md §12).
+          classifyTransportOutcome(status, error, classification, errorBody);
           return; // absent from `replies` — counted as a missing reply above
         }
         addOpenAIUsageInto(tokens, json && json.usage);
@@ -607,7 +629,7 @@ export class OpenAIJudgeProvider {
       { formData: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!upload.ok) {
-      classifyTransportOutcome(upload.status, upload.error, classification);
+      classifyTransportOutcome(upload.status, upload.error, classification, upload.errorBody);
       return;
     }
 
@@ -620,7 +642,7 @@ export class OpenAIJudgeProvider {
       { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!create.ok) {
-      classifyTransportOutcome(create.status, create.error, classification);
+      classifyTransportOutcome(create.status, create.error, classification, create.errorBody);
       return;
     }
 
@@ -646,7 +668,7 @@ export class OpenAIJudgeProvider {
         { method: "GET", maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
       );
       if (!poll.ok) {
-        classifyTransportOutcome(poll.status, poll.error, classification);
+        classifyTransportOutcome(poll.status, poll.error, classification, poll.errorBody);
         return;
       }
       batchStatus = poll.json;
@@ -661,7 +683,7 @@ export class OpenAIJudgeProvider {
       { method: "GET", raw: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!results.ok) {
-      classifyTransportOutcome(results.status, results.error, classification);
+      classifyTransportOutcome(results.status, results.error, classification, results.errorBody);
       return;
     }
 
@@ -680,6 +702,15 @@ export class OpenAIJudgeProvider {
       if (!row.error && resp && resp.status_code >= 200 && resp.status_code < 300 && resp.body) {
         addOpenAIUsageInto(tokens, resp.body.usage);
         replies.set(req.origIndex, extractOpenAIText(resp.body));
+      } else if (isBillingRefusal(resp && resp.status_code, (resp && resp.body) || (row.error ? { error: row.error } : undefined))) {
+        // Billing FIRST (issue #106): OpenAI's quota exhaustion arrives as a
+        // 429 whose BODY says `insufficient_quota`, so the 429 branch below
+        // would file an unfunded account as a transient rate limit. A batch
+        // output row carries its error either as `response.body` (with a
+        // status_code) or as a top-level `error` object (no status) — both
+        // shapes are handed to the detector, which reads only the body.
+        classification.paymentRequired = true;
+        // absent from `replies` — a missing reply, classified above
       } else if (resp && resp.status_code === 429) {
         classification.rateLimited = true;
         // absent from `replies` — a missing reply, classified above
@@ -800,6 +831,56 @@ export function computeJudgeHash({ judgeModels, promptObject } = {}) {
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
 }
 
+// ── Judge-side payment abort (issue #106) ──────────────────────────────────
+// #88 made a `payment_required` classification abort the remaining GENERATION
+// plan. Judging had no counterpart: runSpec() calls runJudgeMatrix once per
+// completed pool, so a dry judge account refused once per pool for the rest of
+// the grid — a few hundred pointless calls on a ~200-cell run, each correctly
+// classified and none of them stopping anything.
+//
+// The sticky state lives HERE, keyed by the PROVIDER INSTANCE, because that is
+// the only object shared across every pool of a run: evals/run.mjs constructs
+// one AnthropicJudgeProvider and one OpenAIJudgeProvider per invocation and
+// hands the same pair down through runSpec() → judgePoolIfEnabled →
+// runJudgeMatrix for every cell. Two consequences, both deliberate:
+//
+//   - The abort is PER PROVIDER. An OpenAI judge refusal stops OpenAI judge
+//     legs and leaves Anthropic judge legs running. The two legs are two
+//     different accounts at two different vendors; an OpenAI balance says
+//     nothing about an Anthropic one, and #88's own reason for over-skipping
+//     a mixed-provider generation grid (it cannot tell which slot refused)
+//     does not apply here — a judge leg is single-model by construction.
+//   - GENERATION IS UNTOUCHED, structurally rather than by policy. A judge
+//     refusal stops judging only. Continuing to generate is value-PRESERVING,
+//     not wasteful: the pools it produces are judged on a later invocation
+//     once the account is funded (judgePoolIfEnabled already judges an
+//     already-generated-but-unjudged pool on resume — issue #68 AC4), and
+//     #90 keeps transient generation failures retryable meanwhile. Symmetry
+//     with #88 would throw away work that is still good.
+//
+// A WeakMap rather than a property on the provider: this module does not own
+// the caller's objects, the entry disappears with the provider it describes,
+// and MockJudgeProvider (and any future double) participates with no changes.
+const JUDGE_PAYMENT_REFUSALS = new WeakMap();
+
+/**
+ * The sticky billing refusal recorded against one judge provider instance, or
+ * `null` if that provider has not been refused this process. Exported so a
+ * caller (and a test) can read the fact without reaching into module state.
+ *
+ * @param {object} provider a JudgeProvider instance
+ * @returns {{judgeProvider:string, judgeModel:string, poolKey:string, detail:string}|null}
+ */
+export function judgePaymentRefusal(provider) {
+  return (provider && JUDGE_PAYMENT_REFUSALS.get(provider)) || null;
+}
+
+/** Forget a provider's sticky refusal — for a test, or for a caller that has
+ *  genuinely funded the account and wants the same instance to try again. */
+export function clearJudgePaymentRefusal(provider) {
+  if (provider) JUDGE_PAYMENT_REFUSALS.delete(provider);
+}
+
 /**
  * Drive the cross-judge matrix as a LIVE scoring pass (issue #21 AC: "the
  * cross-judge matrix schedule from matrix.mjs is actually EXECUTED;
@@ -852,7 +933,22 @@ export function computeJudgeHash({ judgeModels, promptObject } = {}) {
  * @param {object} [o.rateTable=lib/price.mjs's RATE_TABLE]  used only to
  *   compute `spendByProvider` from the recorded rows; never affects what is
  *   stored (store rows are always token counts, priced at READ time).
+ * ── Payment abort (issue #106) ─────────────────────────────────────────────
+ * A leg whose provider has already been refused on billing (see
+ * `judgePaymentRefusal` above) is NOT called: `provider.score()` never runs,
+ * no HTTP request is made, and no cost row is produced for it. It is still
+ * reported — as a `results` entry with `state: "failed"`, `failureKind:
+ * "payment_required"` and `attempted: false` — so the caller's accounting
+ * gives it exactly one terminal state and the whole run groups under a single
+ * `payment_required` category. The same legs are ALSO listed in the returned
+ * `paymentSkipped` for a caller that wants to record them as a *skip* rather
+ * than a failure (see the PR for #106: runSpec()'s judgeAccount currently has
+ * no skip reason that would carry the `payment_required:` colon prefix).
+ * `paymentRefusals` exposes the sticky per-provider refusal record for every
+ * provider passed in, so a caller can log the abort without re-deriving it.
+ *
  * @returns {Promise<{rows:Array, results:Array, deferred:Array, costRows:Array,
+ *   paymentSkipped:Array, paymentRefusals: Object<string, object>,
  *   spendByProvider: Object<string, number>, hasMissingRate: boolean,
  *   missingRateModels: string[]}>}
  */
@@ -874,6 +970,7 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
   const results = [];
   const deferred = [];
   const costRows = [];
+  const paymentSkipped = [];
   for (const row of rows) {
     const pool = poolByKey.get(row.poolKey);
     // (1) Enforce distinctness at CALL time, not just schedule time.
@@ -883,6 +980,36 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
     if (!provider) {
       const reason = `no ${row.judge_provider} judge provider wired — this leg is deferred (issue #77 supplies OpenAIJudgeProvider). NOT dropped: H5's self-preference bias term needs both legs.`;
       deferred.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, reason });
+      continue;
+    }
+
+    // (1b) Payment abort (issue #106): this provider's account has already
+    // said it cannot pay. Calling it again would refuse again — identically,
+    // for every remaining pool. Short-circuit BEFORE assembling a payload or
+    // touching the network, but still emit a terminal record: an unattempted
+    // leg that is silently absent is exactly the hole a reconciliation gate
+    // exists to catch.
+    const refusal = judgePaymentRefusal(provider);
+    if (refusal) {
+      const reason =
+        `payment_required: the ${row.judge_provider} judge account refused on billing at pool ` +
+        `'${refusal.poolKey}' (judge ${refusal.judgeModel}) — this leg was NOT attempted, because it ` +
+        `would hit the identical wall. Nothing was called and nothing was spent for it; fund the ` +
+        `account and re-run to judge this pool. Provider detail: ${refusal.detail}`;
+      const skipped = { poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, reason };
+      paymentSkipped.push(skipped);
+      results.push({
+        poolKey: row.poolKey,
+        judge_provider: row.judge_provider,
+        judge_model: row.judge_model,
+        state: "failed",
+        failureKind: "payment_required",
+        detail: reason,
+        // Self-describing: distinguishes "we called and were refused" (the
+        // leg that SET the sticky flag, which may have consumed tokens) from
+        // "we never called" (this one, which consumed nothing).
+        attempted: false,
+      });
       continue;
     }
 
@@ -918,13 +1045,35 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
         const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
         costRows.push(metered.row);
       }
-      results.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, state: "failed", failureKind: resp.failureKind, detail: resp.detail });
+      // Sticky (issue #106): record the refusal against the provider INSTANCE
+      // AFTER metering, so the money this call already spent is banked before
+      // anything short-circuits. Every later leg of this provider — this pool
+      // and every pool the caller judges next — reads it at (1b) above.
+      if (resp.failureKind === "payment_required" && !JUDGE_PAYMENT_REFUSALS.has(provider)) {
+        JUDGE_PAYMENT_REFUSALS.set(provider, {
+          judgeProvider: row.judge_provider,
+          judgeModel: row.judge_model,
+          poolKey: row.poolKey,
+          detail: resp.detail || "",
+        });
+      }
+      results.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, state: "failed", failureKind: resp.failureKind, detail: resp.detail, attempted: true });
     }
   }
 
   const { byProvider: spendByProvider, hasMissingRate, missingRateModels } = priceRowsByProvider(costRows, rateTable, { batch: mode === "batch" });
 
-  return { rows, results, deferred, costRows, spendByProvider, hasMissingRate, missingRateModels };
+  // The sticky refusal state as it stands AFTER this call, per wired provider
+  // — so a caller can log "judging aborted on <provider>" without reaching
+  // into module state or re-deriving it from `results`. Absent providers are
+  // simply not keyed; an empty object means no judge account has refused.
+  const paymentRefusals = {};
+  for (const [name, p] of Object.entries(providers || {})) {
+    const r = judgePaymentRefusal(p);
+    if (r) paymentRefusals[name] = r;
+  }
+
+  return { rows, results, deferred, costRows, paymentSkipped, paymentRefusals, spendByProvider, hasMissingRate, missingRateModels };
 }
 
 /** Tiny stable string->int32 hash for deriving a per-leg order seed. Not

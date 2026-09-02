@@ -833,6 +833,29 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // see runner.mjs's dry-run branch), so formatSpendSummary's own
   // `if (!summary) return []` guard makes this a no-op there.
   for (const line of formatSpendSummary(result && result.summary)) log(line);
+  // Judge payment abort notice (issue #106). Without this the abort is
+  // INVISIBLE: runner.mjs logs #88's `[run] ABORTED:` line for a
+  // GENERATION-side refusal, but a judge-side one only moves a count inside
+  // `summary.judge.byKind`, which nothing prints. The operator action is the
+  // same as #88's -- fund the account, re-run -- and it cannot be taken if
+  // the run never says the judge account went dry.
+  //
+  // Deliberately says what is and is not affected, because the answer is
+  // asymmetric and surprising by design: GENERATION completed normally, and
+  // the pools it produced are judged on the next invocation once the account
+  // is funded (runSpec() judges an already-generated-but-unjudged pool on
+  // resume -- issue #68 AC4). Nothing here needs re-generating.
+  const judgeSummary = result && result.summary && result.summary.judge;
+  const judgePaymentFailures = (judgeSummary && judgeSummary.byKind && judgeSummary.byKind.payment_required) || 0;
+  if (judgePaymentFailures) {
+    log(
+      `[run] JUDGING ABORTED: a judge account refused on billing/credit. ${judgePaymentFailures} judge leg(s) are ` +
+        `payment_required -- the first was actually refused, the rest were NOT attempted (every one would have hit ` +
+        `the identical wall). GENERATION was NOT stopped and is unaffected: those pools are already stored, and the ` +
+        `next invocation of this same command judges them once the account is funded. Judge legs on the OTHER ` +
+        `provider were unaffected. Spend already incurred is preserved; see docs/retrying-failed-cells.md.`,
+    );
+  }
   return result;
 }
 
