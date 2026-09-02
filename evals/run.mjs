@@ -7,6 +7,8 @@
 //   node evals/run.mjs --max-spend-anthropic 300 --max-spend-openai 150
 //   node evals/run.mjs --phase 0
 //   node evals/run.mjs --max-poll-minutes 90   # batch poll ceiling (issue #92)
+//   node evals/run.mjs --no-resume             # do NOT re-poll/replay a paid-for batch (issue #103)
+//   node evals/run.mjs --no-cancel-on-abandon  # leave an abandoned batch running (issue #92/#103)
 //   node evals/run.mjs --prune                 # what WOULD be removed (issue #98)
 //   node evals/run.mjs --prune --kinds transient --cfg 5ce5478956e5 --apply
 //
@@ -251,6 +253,26 @@ export function parseArgs(argv) {
       case "--no-batch":
         args.noBatch = true;
         break;
+      // ── Issue #103 ──────────────────────────────────────────────
+      // Both of these are OFF-switches for a default-on behaviour, and there
+      // is deliberately no on-switch for either. Resume defaults on because
+      // paying twice for replies the provider has already produced and will
+      // hand back for free is never what anyone wanted. Cancel-on-abandon
+      // defaults on for #92's original reason -- an abandoned batch must not
+      // bill unattended -- and #103 does NOT flip it: the premise that
+      // cancelling destroys the handle resume re-polls turned out to be
+      // false (see provider.mjs's BATCH RESUME section for the documented
+      // behaviour). The two are complements.
+      case "--no-resume":
+        args.noResume = true;
+        break;
+      case "--no-cancel-on-abandon":
+        // The one case this exists for: a batch you believe is nearly done
+        // and would rather leave running than cancel and re-poll later. It
+        // trades a capped billing exposure for a shorter path to the result,
+        // which is a judgement only an operator watching the run can make.
+        args.noCancelOnAbandon = true;
+        break;
       case "--max-poll-minutes":
         // Issue #92: the batch poll ceiling, in MINUTES because that is the
         // unit an operator reasons about batch latency in (the provider takes
@@ -480,6 +502,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (args.maxSpendByProviderUsd !== undefined) runOnlyFlags.push("--max-spend-anthropic/--max-spend-openai");
     if (args.replicates !== undefined) runOnlyFlags.push("--replicates");
     if (args.noBatch) runOnlyFlags.push("--no-batch");
+    if (args.noResume) runOnlyFlags.push("--no-resume");
+    if (args.noCancelOnAbandon) runOnlyFlags.push("--no-cancel-on-abandon");
     if (args.maxPollMinutes !== undefined) runOnlyFlags.push("--max-poll-minutes");
     if (args.phase !== undefined) runOnlyFlags.push("--phase");
     if (runOnlyFlags.length) {
@@ -574,6 +598,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (args.briefs !== undefined) ignoredFlags.push("--briefs");
     if (args.replicates !== undefined) ignoredFlags.push("--replicates");
     if (args.noBatch) ignoredFlags.push("--no-batch");
+    if (args.noResume) ignoredFlags.push("--no-resume");
+    if (args.noCancelOnAbandon) ignoredFlags.push("--no-cancel-on-abandon");
     // --max-poll-minutes (issue #92) is a batch-mode flag; Phase 0 makes no
     // batch calls at all. Listed here for the same reason every other flag is:
     // silently dropping a flag on a live code path is the pattern this branch
@@ -788,6 +814,12 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       corpus: CORPUS,
       armsConfig,
       ...(args.maxPollMinutes !== undefined ? { maxPollMs: args.maxPollMinutes * 60 * 1000 } : {}),
+      // Same "pass only what the operator actually set" discipline as
+      // maxPollMs above: an unset off-switch leaves the provider's own
+      // default-on in place rather than re-specifying it here, where it could
+      // drift out of agreement with the class.
+      ...(args.noResume ? { resume: false } : {}),
+      ...(args.noCancelOnAbandon ? { cancelOnAbandon: false } : {}),
     });
   }
 
@@ -842,6 +874,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     armsConfig,
     provider,
     batch: !args.noBatch,
+    resume: !args.noResume, // issue #103
     dryRun: args.dryRun,
     // judgeModels/judgeProviders/corpus (issue #68): THE wiring that makes
     // judging reachable from a real CLI run at all -- before this, nothing

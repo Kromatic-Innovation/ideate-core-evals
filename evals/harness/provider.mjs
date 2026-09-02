@@ -37,6 +37,7 @@
 // terminalState with the right kind instead of throwing, so those failures are
 // distinguishable from a genuine harness defect.
 
+import { createHash } from "node:crypto";
 import { FAILURE_KINDS } from "../../lib/accounting.mjs";
 import {
   buildRound1Prompt,
@@ -235,6 +236,55 @@ async function cancelBatchQuietly(fetchImpl, url, headers, { sleep, logger, maxR
 
 /** Wall-clock bound on the best-effort cancel above. */
 export const CANCEL_TIMEOUT_MS = 15 * 1000;
+
+// -- How long a durable batch handle is worth re-polling (issue #103) --------
+//
+// #103 was filed saying "Anthropic expires batches at 24h -- confirm the
+// current figure rather than trusting this line". Confirmed 2026-09-02 against
+// platform.claude.com/docs/en/build-with-claude/batch-processing, and the 24h
+// figure is real but describes the WRONG clock for resume. Two separate
+// windows are documented, and only the second one bounds this feature:
+//
+//   PROCESSING  "Batches expire if processing does not complete within 24
+//               hours." A request that never got sent comes back `expired`,
+//               and "You will not be billed for these requests."
+//   RESULTS     "Batch results are available for 29 days after creation.
+//               After that, you may still view the Batch, but its results
+//               will no longer be available for download."
+//
+// Resume re-polls a batch that was already SUBMITTED, so what it needs is the
+// results window, not the processing window: an abandoned batch is recoverable
+// for 29 days, not 24 hours. Had the issue's figure been taken on trust, every
+// handle older than a day would have been discarded as dead while its results
+// were still sitting there for another four weeks.
+//
+// OpenAI: "Each batch completes within 24 hours", the completion window can
+// "only be set to 24h", and "The output file will automatically be deleted 30
+// days after the batch is complete" (developers.openai.com/api/docs/guides/batch,
+// same date). Verified independently rather than generalised from Anthropic's
+// figures -- the two APIs happen to agree closely here, but nothing guaranteed
+// they would.
+export const ANTHROPIC_RESULTS_RETENTION_DAYS = 29;
+export const OPENAI_RESULTS_RETENTION_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ANTHROPIC_RESULTS_RETENTION_MS = ANTHROPIC_RESULTS_RETENTION_DAYS * DAY_MS;
+const OPENAI_RESULTS_RETENTION_MS = OPENAI_RESULTS_RETENTION_DAYS * DAY_MS;
+
+/**
+ * True if a handle submitted at `submittedAt` is past the provider's results
+ * retention window and is therefore not worth a network call.
+ *
+ * An unparseable or missing `submittedAt` returns FALSE -- "not known to be
+ * expired". Guessing "expired" on a missing timestamp would silently throw
+ * away a recoverable batch and re-spend for it, which is the exact failure
+ * this whole feature exists to prevent; guessing "live" costs one wasted GET.
+ */
+export function batchResultsExpired(submittedAt, retentionMs, now = Date.now()) {
+  if (!submittedAt) return false;
+  const t = Date.parse(submittedAt);
+  if (!Number.isFinite(t)) return false;
+  return now - t > retentionMs;
+}
 
 /**
  * Build the per-reply diagnostic record. Provider-agnostic: callers normalize
@@ -599,6 +649,108 @@ export function maxTokensForCell(agents) {
   return Math.max(...list.map((a) => maxTokensForIdeas(a.ideasPerAgent)));
 }
 
+// ══ BATCH RESUME (issue #103) ══════════════════════════════════════
+//
+// A batch that outran the poll ceiling (#92) was, before this, simply lost
+// money: the cell fails `timeout`, #90 re-plans it `todo`, and the next
+// invocation submits a BRAND NEW batch. The provider had already produced
+// those replies and will hand them over again for free -- results stay
+// downloadable for 29 days after batch creation (verified 2026-09-02 against
+// platform.claude.com/docs/en/build-with-claude/batch-processing; OpenAI
+// deletes the output file 30 days after completion, per
+// developers.openai.com/api/docs/guides/batch).
+//
+// ── Why this is request-level replay and not "reload a saved batch id" ────
+// A batch is per ROUND, and ideate-core keeps no durable inter-round state.
+// Resuming a cell whose ROUND 2 batch was abandoned means re-entering the
+// engine, which re-issues ROUND 1 first. Reloading a batch id alone would
+// recover round 2 and re-pay for round 1. So the unit of resume is the
+// REQUEST: every reply this cell has ever received is cached by a
+// content-derived custom_id, and a re-issued request that matches one is
+// served from the cache instead of the network.
+//
+// That the replay reproduces at all rests on one property of ideate-core@0.4.0
+// worth naming, because resume silently degrades to round-1-only if it ever
+// stops holding: round-2 prompts are a deterministic function of the round-1
+// pool in AGENT order, not completion order. `ideateCore` collects round 1 via
+// `Promise.all` over `agents` (which resolves in INPUT order regardless of
+// which reply landed first), assembles `candidates` by iterating `agents` in
+// order, and derives round 2's `seeds` as `dedupe(candidates.slice())`. Batch
+// results arrive in arbitrary JSONL order and are keyed by custom_id, never by
+// position -- so the round-1 pool, and therefore every round-2 prompt, is
+// byte-identical across a re-issue.
+//
+// ── Cancel-on-abandon stays ON, and partial recovery is the NORMAL case ───
+// #92 cancels an abandoned batch by default, and #103 was filed expecting that
+// default to have to flip, on the premise that cancelling destroys the handle
+// resume would re-poll. That premise is false. Per the Anthropic docs above, a
+// `canceled` per-request result means only "user canceled the batch BEFORE
+// this request could be sent to the model", those requests are explicitly not
+// billed, and everything already sent still `succeeded`, is still billed, and
+// is still in the results file. Cancelling therefore CAPS the unattended
+// billing exposure while PRESERVING everything already paid for -- the two
+// features are complements, not alternatives, and the default does not flip.
+//
+// The consequence is that a recovered batch is usually PARTIAL: some
+// `succeeded`, some `canceled`. Per-request replay handles that natively --
+// the succeeded ones are served free and only the canceled ones are re-issued.
+// A per-batch "reload the id" design could not have expressed it at all.
+
+/** Sorted-key JSON, so a request's identity does not depend on the order its
+ *  properties happened to be constructed in. */
+function canonicalRequestJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalRequestJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalRequestJson(value[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+/**
+ * A CONTENT-DERIVED, stable `custom_id` for one batched request (#103 AC1).
+ *
+ * Before this, ids were `req-<i>-<Math.random()>` -- unique within a batch and
+ * meaningless outside it, which is precisely why nothing could match a
+ * persisted reply back to a re-issued request. Here the id is a hash of the
+ * exact params object being sent, so the SAME request re-issued in a later
+ * session derives the SAME id and finds its own prior reply.
+ *
+ * `counts` disambiguates the case where two requests in one cell serialize
+ * identically (a mixed arm could in principle give two slots the same persona
+ * AND model). The occurrence index is taken per CELL, not per batch, and that
+ * distinction is load-bearing: on a resume some requests are served from cache
+ * and never reach a batch at all, so a per-batch counter would renumber the
+ * survivors and hand request #1 the id that belonged to request #0. ideate-core
+ * issues a round's `complete()` calls in agent order, so a per-cell counter is
+ * deterministic across re-issues.
+ *
+ * Format: `r<40 hex>-<n>` -- 43 chars, well inside Anthropic's documented
+ * `^[a-zA-Z0-9_-]{1,64}$`.
+ *
+ * @param {object} params  the provider params object as it will be sent
+ * @param {Map<string, number>} counts  per-cell occurrence counter, mutated
+ */
+export function contentCustomId(params, counts) {
+  const digest = createHash("sha256").update(canonicalRequestJson(params)).digest("hex").slice(0, 40);
+  const n = counts && typeof counts.get === "function" ? counts.get(digest) || 0 : 0;
+  if (counts && typeof counts.set === "function") counts.set(digest, n + 1);
+  return `r${digest}-${n}`;
+}
+
+/**
+ * The replay/handle state one `generate()` call starts from and hands back.
+ * Normalised here so neither adapter has to defend against a half-shaped
+ * `opts.resume` and both return the same thing for the runner to persist.
+ */
+export function normalizeResumeState(resume) {
+  const replies = resume && resume.replies && typeof resume.replies === "object" ? { ...resume.replies } : {};
+  const outstanding = resume && Array.isArray(resume.outstanding) ? [...resume.outstanding] : [];
+  return { replies, outstanding };
+}
+
 /**
  * Validate a provider's return shape against the interface contract above.
  * Runner-internal helper, exported so tests can reuse it if they hand-roll a
@@ -738,6 +890,11 @@ export class AnthropicBatchProvider {
    *   @param {boolean} [opts.cancelOnAbandon] issue #92: cancel an in-flight batch when the
    *     poll ceiling is reached, so it does not bill unattended for work #90 is about to
    *     re-submit. Default true; set false to leave the handle live for a manual re-poll.
+   *     Still true after #103 -- cancelling PRESERVES already-succeeded results (see the
+   *     BATCH RESUME section above), so it caps exposure without costing resume anything.
+   *   @param {boolean} [opts.resume]          issue #103: serve a re-issued request from a
+   *     previously recovered reply, and re-poll a batch handle abandoned in an earlier
+   *     session, instead of paying for it twice. Default true. Batch mode only.
    *   @param {number} [opts.maxRetries]       429/5xx retry budget before classifying (default 3).
    *   @param {(msg: string) => void} [opts.logger]  defaults to console.error; tests inject a silent logger.
    */
@@ -751,6 +908,7 @@ export class AnthropicBatchProvider {
     pollIntervalMs = 2000,
     maxPollMs = DEFAULT_MAX_POLL_MS,
     cancelOnAbandon = true,
+    resume = true,
     maxRetries = 3,
     logger = (msg) => console.error(msg),
   } = {}) {
@@ -763,6 +921,7 @@ export class AnthropicBatchProvider {
     this.pollIntervalMs = pollIntervalMs;
     this.maxPollMs = assertPollCeiling(maxPollMs, "AnthropicBatchProvider");
     this.cancelOnAbandon = cancelOnAbandon;
+    this.resume = resume;
     this.maxRetries = maxRetries;
     this.logger = logger;
 
@@ -781,8 +940,28 @@ export class AnthropicBatchProvider {
    * The interface method (see the file header). Never throws for a transport
    * failure -- every catchable error is classified via FAILURE_KINDS and
    * returned, per the interface contract.
+   *
+   * Issue #103: a thin wrapper around the real body so that the resume state
+   * (`{replies, outstanding}`) is attached to EVERY return path exactly once,
+   * rather than being threaded through each of the six classified-failure
+   * returns by hand -- one of which would eventually be missed, and a missed
+   * one silently drops a recovered reply on the floor and re-pays for it.
+   * The runner owns persisting what comes back; the provider does no store I/O.
    */
-  async generate(cell, arm, { mode = "batch", timestamp } = {}) {
+  async generate(cell, arm, opts = {}) {
+    const mode = (opts && opts.mode) || "batch";
+    // Resume is batch-only by construction: `single` mode never produces a
+    // batch handle, and replaying batch-produced replies into a single-mode
+    // run is exactly the wrong-RATE hazard lib/store.mjs's #103 header
+    // describes. The runner enforces the same rule one level up, from the
+    // durable record's own `pricingLever`; this is the provider-side half.
+    const resumeEnabled = !!this.resume && mode === "batch";
+    const state = normalizeResumeState(resumeEnabled ? opts.resume : null);
+    const resp = await this.#generate(cell, arm, opts, state, resumeEnabled);
+    return resumeEnabled ? { ...resp, resume: { replies: state.replies, outstanding: state.outstanding } } : resp;
+  }
+
+  async #generate(cell, arm, { mode = "batch", timestamp } = {}, state = { replies: {}, outstanding: [] }, resumeEnabled = false) {
     if (!this.apiKey) {
       // The CLI (evals/run.mjs) already fails loudly BEFORE constructing this
       // provider when ANTHROPIC_API_KEY is unset -- this branch is a second
@@ -853,8 +1032,35 @@ export class AnthropicBatchProvider {
     // floor, so their requests are unchanged. See prompts.mjs.
     const cellMaxTokens = maxTokensForCell(agents);
 
-    const ctx = { addUsage, classification, diagnostics, cellMaxTokens };
+    const ctx = {
+      addUsage,
+      classification,
+      diagnostics,
+      cellMaxTokens,
+      // ── Resume state (#103) ────────────────────────────────────────────
+      resumeEnabled,
+      // customId -> {model, text, stopReason, usage}. Seeded from the durable
+      // record, grown by every reply this invocation receives or recovers.
+      replay: state.replies,
+      // Durable batch handles not yet fully recovered.
+      outstanding: state.outstanding,
+      // Per-CELL occurrence counter behind contentCustomId -- see there for
+      // why per-cell and not per-batch.
+      customIdCounts: new Map(),
+      replayHits: 0,
+    };
     const complete = mode === "single" ? (req) => this.#completeSingle(req, ctx) : (req) => this.#completeBatched(req, ctx);
+
+    // ── Re-poll before re-spending (#103) ───────────────────────────────────
+    // Done BEFORE the engine is re-entered, so every reply this cell has
+    // already paid for is in `ctx.replay` by the time the first `complete()`
+    // call is made and can be served for free. Recovery meters what it pulls
+    // down (see #recoverOutstanding), which is also what finally writes a
+    // previously-abandoned batch's spend into the ledger -- the residual
+    // threat named in docs/PREREGISTRATION.md Appendix B item 4, exception 1.
+    if (resumeEnabled && ctx.outstanding.length) {
+      await this.#recoverOutstanding(ctx);
+    }
 
     let ideateResult;
     try {
@@ -997,6 +1203,38 @@ export class AnthropicBatchProvider {
 
   // ── batch mode: buffer this call; flush the whole round as one batch ─────
   #completeBatched(req, ctx) {
+    // Params are built HERE rather than in #flush so the content-derived
+    // custom_id exists before the request is buffered -- which is what lets a
+    // replay hit resolve without ever reaching a batch at all.
+    const params = buildAnthropicMessageParams(withCellMaxTokens(req, ctx.cellMaxTokens));
+    const customId = ctx.resumeEnabled ? contentCustomId(params, ctx.customIdCounts) : null;
+
+    // ── Replay hit: this exact request was already answered and paid for ───
+    // Checked BEFORE the post-abandonment short-circuit below: serving a
+    // cached reply costs nothing and cannot extend the ceiling, so there is
+    // no reason to withhold it from a cell that is already doomed -- and
+    // letting it through keeps the diagnostics complete.
+    //
+    // Deliberately does NOT meter. A reply reaches `ctx.replay` only via
+    // #recoverOutstanding (which meters at recovery) or via a durable record
+    // written by the invocation that received and metered it. Metering here
+    // as well is precisely the double count #103's AC4 names, and it would be
+    // invisible: `spendToDate()` sums the cell record AND the
+    // generation-attempt record that already carries these tokens.
+    if (customId && Object.prototype.hasOwnProperty.call(ctx.replay, customId)) {
+      const cached = ctx.replay[customId] || {};
+      ctx.replayHits += 1;
+      return Promise.resolve(
+        handleReplyText({
+          model: cached.model || req.model,
+          stopReason: cached.stopReason,
+          usage: cached.usage,
+          text: cached.text,
+          diagnostics: ctx.diagnostics,
+        }),
+      );
+    }
+
     // Issue #92: once THIS cell has surrendered a batch at the ceiling it is
     // going to fail `timeout` no matter what the remaining rounds produce (see
     // the partial-pool guard in generate()). Panel arms run 2 rounds, so
@@ -1009,7 +1247,7 @@ export class AnthropicBatchProvider {
       return Promise.resolve({ ok: false, __failureKind: "timeout" });
     }
     return new Promise((resolve, reject) => {
-      this.#pending.push({ req, resolve, reject, ctx });
+      this.#pending.push({ req, params, customId, resolve, reject, ctx });
       if (!this.#flushScheduled) {
         this.#flushScheduled = true;
         // Subsequent-macrotask debounce: every agent's complete() call for
@@ -1029,7 +1267,7 @@ export class AnthropicBatchProvider {
    * classification (the ledger discriminator), and resolve every buffered
    * `complete()` as `timeout` -- a TRANSIENT kind, so #90 re-plans the cell.
    */
-  async #abandon(batch, batchId, startedAt, lastStatus) {
+  async #abandon(batch, batchId, startedAt, lastStatus, submittedAt) {
     const elapsedMs = Date.now() - startedAt;
     const cancelled = this.cancelOnAbandon
       ? await cancelBatchQuietly(
@@ -1056,8 +1294,186 @@ export class AnthropicBatchProvider {
       ctx.classification.timedOut = true;
       if (!Array.isArray(ctx.classification.abandoned)) ctx.classification.abandoned = [];
       ctx.classification.abandoned.push(record);
+      // ── Hand the handle to resume, per cell (#103) ───────────────────────
+      // #92 already made the id reachable (the log line, the ledger detail) so
+      // it was never lost -- but nothing could act on it. `submitToCustom` is
+      // what makes acting on it possible: results come back keyed by the id we
+      // SUBMITTED under, and the cache is keyed by the CONTENT id. Those are
+      // the same string except in the one case where a single flush spanned
+      // two cells and #flush had to disambiguate (see there).
+      if (!ctx.resumeEnabled) continue;
+      const submitToCustom = {};
+      for (const entry of batch) {
+        if (entry.ctx !== ctx || !entry.customId) continue;
+        // The MODEL is recorded alongside the content id, not left to be read
+        // off the recovered message. `addUsage(model, usage)` is a silent
+        // no-op when `model` is falsy -- so a recovery that leaned on the
+        // reply's own `model` field would drop real, already-billed tokens on
+        // the floor for any response shape that omits it, and drop them
+        // invisibly. What we SUBMITTED is the authoritative answer to "which
+        // model was this billed against" and it is known here, for free.
+        submitToCustom[entry.submitId] = { customId: entry.customId, model: entry.req && entry.req.model };
+      }
+      ctx.outstanding.push({
+        provider: "anthropic",
+        batchId,
+        submittedAt: submittedAt || new Date().toISOString(),
+        cancelled,
+        submitToCustom,
+      });
     }
     for (const entry of batch) entry.resolve({ ok: false, __failureKind: "timeout" });
+  }
+
+  /**
+   * Re-poll every durable handle this cell surrendered in an earlier session
+   * and fold whatever the provider still has into `ctx.replay` (#103).
+   *
+   * Every exit drops the handle EXCEPT "the batch is still genuinely running"
+   * and "the poll itself failed transiently" -- a handle that is kept is one
+   * that can still pay off later, and a handle that is dropped is one that
+   * degrades to a fresh submit (#103 AC6) rather than to an error.
+   */
+  async #recoverOutstanding(ctx) {
+    const kept = [];
+    for (const handle of ctx.outstanding) {
+      if (!handle || handle.provider !== "anthropic" || !handle.batchId) continue;
+      // Anthropic keeps results downloadable for 29 days after batch creation
+      // (verified 2026-09-02). Past that the GET would 404 or return a batch
+      // with no results_url; skip the network call rather than spend a
+      // retry budget discovering it.
+      if (batchResultsExpired(handle.submittedAt, ANTHROPIC_RESULTS_RETENTION_MS)) {
+        this.logger(
+          `AnthropicBatchProvider: batch ${handle.batchId} is past the documented ${ANTHROPIC_RESULTS_RETENTION_DAYS}-day results retention ` +
+            "(submitted " + handle.submittedAt + ") -- dropping the handle and re-submitting these requests fresh.",
+        );
+        continue;
+      }
+      const kept0 = await this.#recoverOneAnthropicBatch(ctx, handle);
+      if (kept0) kept.push(handle);
+    }
+    ctx.outstanding.length = 0;
+    ctx.outstanding.push(...kept);
+  }
+
+  /** @returns {Promise<boolean>} true to KEEP the handle for a later attempt. */
+  async #recoverOneAnthropicBatch(ctx, handle) {
+    const url = `https://api.anthropic.com/v1/messages/batches/${handle.batchId}`;
+    const headers = anthropicHeaders(this.apiKey);
+    const startedAt = Date.now();
+    const deadline = startedAt + this.maxPollMs;
+
+    let poll = await anthropicFetchWithRetry(this.fetchImpl, url, headers, undefined, {
+      method: "GET",
+      maxRetries: this.maxRetries,
+      sleep: this.sleep,
+      logger: this.logger,
+    });
+    if (!poll.ok) {
+      // 404/410: the handle is gone for good (deleted, or past retention).
+      // Drop it -- AC6's "an expired handle degrades to a fresh submit rather
+      // than an error". Anything else may be transient, so keep it: a kept
+      // handle costs one GET next time and can still pay off.
+      const gone = poll.status === 404 || poll.status === 410;
+      this.logger(
+        `AnthropicBatchProvider: could not re-poll batch ${handle.batchId} (status ${poll.status}) -- ` +
+          (gone ? "the handle is gone; re-submitting these requests fresh." : "keeping the handle for a later attempt."),
+      );
+      return !gone;
+    }
+
+    while (poll.json.processing_status !== "ended") {
+      if (Date.now() > deadline) {
+        // Re-abandonment, and deliberately a CHEAP one: marking the cell
+        // abandoned makes #completeBatched short-circuit every subsequent
+        // request, so this attempt costs one poll loop and zero new tokens
+        // rather than re-running the whole cell against a fresh batch.
+        this.logger(
+          `AnthropicBatchProvider: resumed batch ${handle.batchId} is still ${poll.json.processing_status} after ${Date.now() - startedAt}ms ` +
+            `(maxPollMs=${this.maxPollMs}) -- surrendering again without submitting anything new. The handle is retained.`,
+        );
+        ctx.classification.timedOut = true;
+        if (!Array.isArray(ctx.classification.abandoned)) ctx.classification.abandoned = [];
+        ctx.classification.abandoned.push({
+          batchId: handle.batchId,
+          elapsedMs: Date.now() - startedAt,
+          maxPollMs: this.maxPollMs,
+          lastStatus: poll.json.processing_status,
+          cancelled: null,
+          resumed: true,
+        });
+        return true;
+      }
+      await this.sleep(this.pollIntervalMs);
+      poll = await anthropicFetchWithRetry(this.fetchImpl, url, headers, undefined, {
+        method: "GET",
+        maxRetries: this.maxRetries,
+        sleep: this.sleep,
+        logger: this.logger,
+      });
+      if (!poll.ok) return poll.status !== 404 && poll.status !== 410;
+    }
+
+    const resultsUrl = poll.json.results_url;
+    if (!resultsUrl) {
+      // An ended batch with no results_url has nothing left to give. Observed
+      // shape for an expired batch; also the honest fallback for a cancelled
+      // batch whose results the API declines to expose.
+      this.logger(`AnthropicBatchProvider: batch ${handle.batchId} ended with no results_url -- nothing to recover; re-submitting fresh.`);
+      return false;
+    }
+    const results = await anthropicFetchWithRetry(this.fetchImpl, resultsUrl, headers, undefined, {
+      method: "GET",
+      raw: true,
+      maxRetries: this.maxRetries,
+      sleep: this.sleep,
+      logger: this.logger,
+    });
+    if (!results.ok) {
+      this.logger(`AnthropicBatchProvider: batch ${handle.batchId} ended but its results download failed (status ${results.status}) -- keeping the handle.`);
+      return true;
+    }
+
+    let recovered = 0;
+    for (const line of results.text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const mapped = (handle.submitToCustom || {})[row.custom_id];
+      const customId = mapped && mapped.customId;
+      if (!customId) continue;
+      // ONLY `succeeded` carries a reply, and only `succeeded` was billed:
+      // `errored`, `canceled` and `expired` are all documented as not billed,
+      // so there is nothing to meter and nothing to cache for them. They are
+      // simply re-issued, which is exactly the partial-recovery case that
+      // makes cancel-on-abandon and resume complements.
+      if (!row.result || row.result.type !== "succeeded") continue;
+      const message = row.result.message;
+      const model = mapped.model || (message && message.model) || null;
+      // METERED HERE, at recovery -- not when the reply is later served. A
+      // reply we pulled down but the engine never asks for is still money the
+      // provider charged; metering on serve would silently drop it, and this
+      // is the write that closes docs/PREREGISTRATION.md Appendix B item 4's
+      // exception 1 for a batch that is ever re-polled.
+      ctx.addUsage(model, message && message.usage);
+      ctx.replay[customId] = {
+        model,
+        text: extractAnthropicText(message),
+        stopReason: message && message.stop_reason,
+        usage: (message && message.usage) || null,
+      };
+      recovered += 1;
+    }
+    this.logger(
+      `AnthropicBatchProvider: recovered ${recovered} already-paid-for repl${recovered === 1 ? "y" : "ies"} from batch ${handle.batchId} ` +
+        "-- these will be replayed instead of re-submitted.",
+    );
+    return false;
   }
 
   async #flush() {
@@ -1066,10 +1482,29 @@ export class AnthropicBatchProvider {
     this.#flushScheduled = false;
     if (!batch.length) return;
 
-    const requests = batch.map((entry, i) => ({
-      custom_id: `req-${i}-${Math.random().toString(36).slice(2, 8)}`,
-      params: buildAnthropicMessageParams(withCellMaxTokens(entry.req, entry.ctx.cellMaxTokens)),
-    }));
+    // custom_ids are CONTENT-DERIVED as of #103 and computed in
+    // #completeBatched, before buffering -- see contentCustomId. The random
+    // suffix they replaced was unique within a batch and meaningless outside
+    // it, which is exactly why no persisted reply could ever be matched back
+    // to a re-issued request.
+    //
+    // `submitId` vs `customId`: identical except when ONE flush spans TWO
+    // cells whose requests serialize identically (two replicates of the same
+    // arm+brief). The content id is then the same string for both, and
+    // Anthropic requires uniqueness within a batch. The runner drives cells
+    // sequentially so this does not arise today, but the barrier-batcher makes
+    // no such promise -- so the SUBMITTED id is disambiguated while the CACHE
+    // id stays content-derived. The cache is per-cell, so two cells sharing a
+    // content id is not a cache collision.
+    const seenSubmitIds = new Set();
+    const requests = batch.map((entry, i) => {
+      const params = entry.params || buildAnthropicMessageParams(withCellMaxTokens(entry.req, entry.ctx.cellMaxTokens));
+      let submitId = entry.customId || `req-${i}-${Math.random().toString(36).slice(2, 8)}`;
+      for (let n = 1; seenSubmitIds.has(submitId); n += 1) submitId = `${entry.customId}_${n}`;
+      seenSubmitIds.add(submitId);
+      entry.submitId = submitId;
+      return { custom_id: submitId, params };
+    });
     const byCustomId = new Map(requests.map((r, i) => [r.custom_id, batch[i]]));
 
     const submit = await anthropicFetchWithRetry(
@@ -1093,6 +1528,10 @@ export class AnthropicBatchProvider {
 
     const batchId = submit.json.id;
     const startedAt = Date.now();
+    // The submission wall-clock, kept separate from `startedAt` (a monotonic-ish
+    // poll origin) because it is what the 29-day results-retention check reads
+    // in a LATER process. Prefer the provider's own `created_at`.
+    const submittedAt = submit.json.created_at || new Date().toISOString();
     const deadline = startedAt + this.maxPollMs;
     // `batchStatus` tracks the most recently observed batch object (submit's
     // response initially, then each poll's) so "ended" can be detected
@@ -1102,7 +1541,7 @@ export class AnthropicBatchProvider {
 
     while (batchStatus.processing_status !== "ended") {
       if (Date.now() > deadline) {
-        await this.#abandon(batch, batchId, startedAt, batchStatus.processing_status);
+        await this.#abandon(batch, batchId, startedAt, batchStatus.processing_status, submittedAt);
         return;
       }
       await this.sleep(this.pollIntervalMs);
@@ -1158,12 +1597,27 @@ export class AnthropicBatchProvider {
       if (row.result && row.result.type === "succeeded") {
         const message = row.result.message;
         entry.ctx.addUsage(entry.req.model, message && message.usage);
+        const text = extractAnthropicText(message);
+        // Cache under the CONTENT id (#103). Every reply this cell receives is
+        // remembered, not only the ones from a batch that later gets
+        // abandoned: a panel cell that finished round 1 and then blew the
+        // ceiling on round 2 has no outstanding handle for round 1 at all, and
+        // without this line the resumed attempt would re-issue and re-pay for
+        // round 1 in order to reach round 2's recoverable batch.
+        if (entry.ctx.resumeEnabled && entry.customId) {
+          entry.ctx.replay[entry.customId] = {
+            model: entry.req.model,
+            text,
+            stopReason: message && message.stop_reason,
+            usage: (message && message.usage) || null,
+          };
+        }
         entry.resolve(
           handleReplyText({
             model: entry.req.model,
             stopReason: message && message.stop_reason,
             usage: message && message.usage,
-            text: extractAnthropicText(message),
+            text,
             diagnostics: entry.ctx.diagnostics,
           }),
         );
@@ -1542,6 +1996,8 @@ export class OpenAIBatchProvider {
    *   @param {number}   [opts.pollIntervalMs]  (live default 2000ms)
    *   @param {number}   [opts.maxPollMs]       (live default DEFAULT_MAX_POLL_MS -- issue #92)
    *   @param {boolean}  [opts.cancelOnAbandon] cancel an in-flight batch at the ceiling (default true)
+   *   @param {boolean}  [opts.resume]          issue #103: replay already-paid-for replies and
+   *     re-poll an abandoned handle instead of re-submitting (default true, batch mode only)
    *   @param {number}   [opts.maxRetries]      (default 3)
    *   @param {(msg:string)=>void} [opts.logger]
    */
@@ -1555,6 +2011,7 @@ export class OpenAIBatchProvider {
     pollIntervalMs = 2000,
     maxPollMs = DEFAULT_MAX_POLL_MS,
     cancelOnAbandon = true,
+    resume = true,
     maxRetries = 3,
     logger = (msg) => console.error(msg),
   } = {}) {
@@ -1567,6 +2024,7 @@ export class OpenAIBatchProvider {
     this.pollIntervalMs = pollIntervalMs;
     this.maxPollMs = assertPollCeiling(maxPollMs, "OpenAIBatchProvider");
     this.cancelOnAbandon = cancelOnAbandon;
+    this.resume = resume;
     this.maxRetries = maxRetries;
     this.logger = logger;
     this.#pending = [];
@@ -1576,7 +2034,16 @@ export class OpenAIBatchProvider {
   #pending;
   #flushScheduled;
 
-  async generate(cell, arm, { mode = "batch" } = {}) {
+  /** Same wrapper shape as AnthropicBatchProvider#generate -- see there. */
+  async generate(cell, arm, opts = {}) {
+    const mode = (opts && opts.mode) || "batch";
+    const resumeEnabled = !!this.resume && mode === "batch";
+    const state = normalizeResumeState(resumeEnabled ? opts.resume : null);
+    const resp = await this.#generate(cell, arm, opts, state, resumeEnabled);
+    return resumeEnabled ? { ...resp, resume: { replies: state.replies, outstanding: state.outstanding } } : resp;
+  }
+
+  async #generate(cell, arm, { mode = "batch" } = {}, state = { replies: {}, outstanding: [] }, resumeEnabled = false) {
     if (!this.apiKey) {
       return { terminalState: "failed", failureKind: "harness_error", detail: "OpenAIBatchProvider: no apiKey (OPENAI_API_KEY unset) -- refusing to call the network with no credential", tokens: { tokens_by_model: {} } };
     }
@@ -1604,9 +2071,25 @@ export class OpenAIBatchProvider {
     // reproduce the bug on a second provider.
     const diagnostics = [];
     const cellMaxTokens = maxTokensForCell(agents);
-    const ctx = { addUsage, classification, diagnostics, cellMaxTokens };
+    // Resume state (#103), mirrored from the Anthropic path -- see the BATCH
+    // RESUME section near the top of this file for the whole design.
+    const ctx = {
+      addUsage,
+      classification,
+      diagnostics,
+      cellMaxTokens,
+      resumeEnabled,
+      replay: state.replies,
+      outstanding: state.outstanding,
+      customIdCounts: new Map(),
+      replayHits: 0,
+    };
 
     const complete = mode === "single" ? (req) => this.#completeSingle(req, ctx) : (req) => this.#completeBatched(req, ctx);
+
+    if (resumeEnabled && ctx.outstanding.length) {
+      await this.#recoverOutstanding(ctx);
+    }
 
     let ideateResult;
     try {
@@ -1698,7 +2181,7 @@ export class OpenAIBatchProvider {
   /** Surrender an in-flight OpenAI batch at the poll ceiling (issue #92).
    *  Mirrors AnthropicBatchProvider#abandon exactly; only the cancel endpoint
    *  differs (`POST /v1/batches/{id}/cancel`). */
-  async #abandon(batch, batchId, startedAt, lastStatus) {
+  async #abandon(batch, batchId, startedAt, lastStatus, submittedAt) {
     const elapsedMs = Date.now() - startedAt;
     const cancelled = this.cancelOnAbandon
       ? await cancelBatchQuietly(this.fetchImpl, `https://api.openai.com/v1/batches/${batchId}/cancel`, openaiHeaders(this.apiKey), { sleep: this.sleep, logger: this.logger })
@@ -1717,12 +2200,49 @@ export class OpenAIBatchProvider {
       ctx.classification.timedOut = true;
       if (!Array.isArray(ctx.classification.abandoned)) ctx.classification.abandoned = [];
       ctx.classification.abandoned.push(record);
+      if (!ctx.resumeEnabled) continue;
+      const submitToCustom = {};
+      for (const entry of batch) {
+        if (entry.ctx !== ctx || !entry.customId) continue;
+        // Model recorded at submit time -- see the Anthropic path for why the
+        // recovered reply's own `model` field is not trusted as the sole source.
+        submitToCustom[entry.submitId] = { customId: entry.customId, model: entry.req && entry.req.model };
+      }
+      // `outputFileId` is unknown at abandonment (OpenAI only populates it
+      // once the batch reaches a terminal state), so recovery re-reads the
+      // batch object to find it -- see #recoverOneOpenAIBatch.
+      ctx.outstanding.push({
+        provider: "openai",
+        batchId,
+        submittedAt: submittedAt || new Date().toISOString(),
+        cancelled,
+        submitToCustom,
+      });
     }
     for (const entry of batch) entry.resolve({ ok: false, __failureKind: "timeout" });
   }
 
   // ── batch mode: buffer this call; flush the round as one OpenAI Batch ─────
   #completeBatched(req, ctx) {
+    const params = buildOpenAIChatParams(withCellMaxTokens(req, ctx.cellMaxTokens));
+    const customId = ctx.resumeEnabled ? contentCustomId(params, ctx.customIdCounts) : null;
+
+    // Replay hit -- see AnthropicBatchProvider#completeBatched for why this is
+    // checked before the abandonment short-circuit and why it never meters.
+    if (customId && Object.prototype.hasOwnProperty.call(ctx.replay, customId)) {
+      const cached = ctx.replay[customId] || {};
+      ctx.replayHits += 1;
+      return Promise.resolve(
+        handleReplyText({
+          model: cached.model || req.model,
+          stopReason: cached.stopReason,
+          usage: cached.usage,
+          text: cached.text,
+          diagnostics: ctx.diagnostics,
+        }),
+      );
+    }
+
     // Same post-abandonment short-circuit as the Anthropic path -- see there
     // for why a later round must not submit a second batch for a cell that has
     // already been given up on.
@@ -1730,12 +2250,145 @@ export class OpenAIBatchProvider {
       return Promise.resolve({ ok: false, __failureKind: "timeout" });
     }
     return new Promise((resolve, reject) => {
-      this.#pending.push({ req, resolve, reject, ctx });
+      this.#pending.push({ req, params, customId, resolve, reject, ctx });
       if (!this.#flushScheduled) {
         this.#flushScheduled = true;
         setTimeout(() => this.#flush(), 0);
       }
     });
+  }
+
+  /** Re-poll every durable OpenAI handle (#103). Mirrors the Anthropic path;
+   *  the differences are OpenAI's own, not stylistic -- a separate output-file
+   *  fetch, a different terminal-status vocabulary, and a cancellation whose
+   *  partial-output behaviour OpenAI does not document (see below). */
+  async #recoverOutstanding(ctx) {
+    const kept = [];
+    for (const handle of ctx.outstanding) {
+      if (!handle || handle.provider !== "openai" || !handle.batchId) continue;
+      if (batchResultsExpired(handle.submittedAt, OPENAI_RESULTS_RETENTION_MS)) {
+        this.logger(
+          `OpenAIBatchProvider: batch ${handle.batchId} is past the documented ${OPENAI_RESULTS_RETENTION_DAYS}-day output-file retention ` +
+            `(submitted ${handle.submittedAt}) -- dropping the handle and re-submitting these requests fresh.`,
+        );
+        continue;
+      }
+      if (await this.#recoverOneOpenAIBatch(ctx, handle)) kept.push(handle);
+    }
+    ctx.outstanding.length = 0;
+    ctx.outstanding.push(...kept);
+  }
+
+  /** @returns {Promise<boolean>} true to KEEP the handle for a later attempt. */
+  async #recoverOneOpenAIBatch(ctx, handle) {
+    const url = `https://api.openai.com/v1/batches/${handle.batchId}`;
+    const headers = openaiHeaders(this.apiKey);
+    const startedAt = Date.now();
+    const deadline = startedAt + this.maxPollMs;
+    const terminal = new Set(["completed", "failed", "expired", "cancelled"]);
+
+    let poll = await openaiFetchWithRetry(this.fetchImpl, url, headers, undefined, {
+      method: "GET",
+      maxRetries: this.maxRetries,
+      sleep: this.sleep,
+      logger: this.logger,
+    });
+    if (!poll.ok) {
+      const gone = poll.status === 404 || poll.status === 410;
+      this.logger(
+        `OpenAIBatchProvider: could not re-poll batch ${handle.batchId} (status ${poll.status}) -- ` +
+          (gone ? "the handle is gone; re-submitting these requests fresh." : "keeping the handle for a later attempt."),
+      );
+      return !gone;
+    }
+
+    while (!terminal.has(poll.json.status)) {
+      if (Date.now() > deadline) {
+        this.logger(
+          `OpenAIBatchProvider: resumed batch ${handle.batchId} is still ${poll.json.status} after ${Date.now() - startedAt}ms ` +
+            `(maxPollMs=${this.maxPollMs}) -- surrendering again without submitting anything new. The handle is retained.`,
+        );
+        ctx.classification.timedOut = true;
+        if (!Array.isArray(ctx.classification.abandoned)) ctx.classification.abandoned = [];
+        ctx.classification.abandoned.push({
+          batchId: handle.batchId,
+          elapsedMs: Date.now() - startedAt,
+          maxPollMs: this.maxPollMs,
+          lastStatus: poll.json.status,
+          cancelled: null,
+          resumed: true,
+        });
+        return true;
+      }
+      await this.sleep(this.pollIntervalMs);
+      poll = await openaiFetchWithRetry(this.fetchImpl, url, headers, undefined, {
+        method: "GET",
+        maxRetries: this.maxRetries,
+        sleep: this.sleep,
+        logger: this.logger,
+      });
+      if (!poll.ok) return poll.status !== 404 && poll.status !== 410;
+    }
+
+    // ── A NAMED RESIDUAL, not an assumption ───────────────────────────────
+    // Anthropic documents explicitly that cancelling preserves already-
+    // succeeded results. OpenAI documents that a cancelling batch lets
+    // "in-flight requests complete (up to 10 minutes)" and then becomes
+    // `cancelled`, but does NOT state whether an output file is produced for
+    // the requests that did complete. So this path does not assume one: a
+    // terminal batch with no `output_file_id` recovers nothing and degrades to
+    // a fresh submit, which is correct whichever way OpenAI actually behaves.
+    // Verified against developers.openai.com/api/docs/guides/batch 2026-09-02.
+    const outputFileId = poll.json.output_file_id;
+    if (!outputFileId) {
+      this.logger(
+        `OpenAIBatchProvider: batch ${handle.batchId} reached '${poll.json.status}' with no output_file_id -- nothing to recover; re-submitting fresh.`,
+      );
+      return false;
+    }
+    const results = await openaiFetchWithRetry(
+      this.fetchImpl,
+      `https://api.openai.com/v1/files/${outputFileId}/content`,
+      headers,
+      undefined,
+      { method: "GET", raw: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!results.ok) {
+      this.logger(`OpenAIBatchProvider: batch ${handle.batchId} output file download failed (status ${results.status}) -- keeping the handle.`);
+      return true;
+    }
+
+    let recovered = 0;
+    for (const line of results.text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const mapped = (handle.submitToCustom || {})[row.custom_id];
+      const customId = mapped && mapped.customId;
+      if (!customId) continue;
+      const resp = row.response;
+      // Only a 2xx row carries a reply. Everything else is re-issued.
+      if (row.error || !resp || !(resp.status_code >= 200 && resp.status_code < 300) || !resp.body) continue;
+      const model = mapped.model || resp.body.model || null;
+      ctx.addUsage(model, resp.body.usage); // metered at RECOVERY -- see the Anthropic path
+      ctx.replay[customId] = {
+        model,
+        text: extractOpenAIText(resp.body),
+        stopReason: normalizeOpenAIFinishReason(resp.body),
+        usage: resp.body.usage || null,
+      };
+      recovered += 1;
+    }
+    this.logger(
+      `OpenAIBatchProvider: recovered ${recovered} already-paid-for repl${recovered === 1 ? "y" : "ies"} from batch ${handle.batchId} ` +
+        "-- these will be replayed instead of re-submitted.",
+    );
+    return false;
   }
 
   async #flush() {
@@ -1744,12 +2397,17 @@ export class OpenAIBatchProvider {
     this.#flushScheduled = false;
     if (!batch.length) return;
 
-    const lines = batch.map((entry, i) => ({
-      custom_id: `req-${i}-${Math.random().toString(36).slice(2, 8)}`,
-      method: "POST",
-      url: "/v1/chat/completions",
-      body: buildOpenAIChatParams(withCellMaxTokens(entry.req, entry.ctx.cellMaxTokens)),
-    }));
+    // Content-derived ids with the same submitId/customId split the Anthropic
+    // path uses -- see there.
+    const seenSubmitIds = new Set();
+    const lines = batch.map((entry, i) => {
+      const body = entry.params || buildOpenAIChatParams(withCellMaxTokens(entry.req, entry.ctx.cellMaxTokens));
+      let submitId = entry.customId || `req-${i}-${Math.random().toString(36).slice(2, 8)}`;
+      for (let n = 1; seenSubmitIds.has(submitId); n += 1) submitId = `${entry.customId}_${n}`;
+      seenSubmitIds.add(submitId);
+      entry.submitId = submitId;
+      return { custom_id: submitId, method: "POST", url: "/v1/chat/completions", body };
+    });
     const byCustomId = new Map(lines.map((l, i) => [l.custom_id, batch[i]]));
     const jsonl = lines.map((l) => JSON.stringify(l)).join("\n");
 
@@ -1791,6 +2449,11 @@ export class OpenAIBatchProvider {
 
     const batchId = create.json.id;
     const startedAt = Date.now();
+    // Wall-clock submission time for the 30-day output-file retention check a
+    // LATER process performs. OpenAI's `created_at` is unix SECONDS.
+    const submittedAt = Number.isFinite(create.json.created_at)
+      ? new Date(create.json.created_at * 1000).toISOString()
+      : new Date().toISOString();
     const deadline = startedAt + this.maxPollMs;
     let batchStatus = create.json;
     // Terminal OpenAI batch states: completed | failed | expired | cancelled.
@@ -1803,7 +2466,7 @@ export class OpenAIBatchProvider {
         return;
       }
       if (Date.now() > deadline) {
-        await this.#abandon(batch, batchId, startedAt, batchStatus.status);
+        await this.#abandon(batch, batchId, startedAt, batchStatus.status, submittedAt);
         return;
       }
       await this.sleep(this.pollIntervalMs);
@@ -1856,12 +2519,20 @@ export class OpenAIBatchProvider {
       const resp = row.response;
       if (!row.error && resp && resp.status_code >= 200 && resp.status_code < 300 && resp.body) {
         entry.ctx.addUsage(entry.req.model, resp.body.usage);
+        const text = extractOpenAIText(resp.body);
+        const stopReason = normalizeOpenAIFinishReason(resp.body);
+        // Remember every reply, not just abandoned ones -- see the Anthropic
+        // path for why a completed round-1 must be replayable to reach an
+        // abandoned round-2 without paying for round 1 twice.
+        if (entry.ctx.resumeEnabled && entry.customId) {
+          entry.ctx.replay[entry.customId] = { model: entry.req.model, text, stopReason, usage: resp.body.usage || null };
+        }
         entry.resolve(
           handleReplyText({
             model: entry.req.model,
-            stopReason: normalizeOpenAIFinishReason(resp.body),
+            stopReason,
             usage: resp.body.usage,
-            text: extractOpenAIText(resp.body),
+            text,
             diagnostics: entry.ctx.diagnostics,
           }),
         );

@@ -182,6 +182,56 @@ test("main() wires --max-poll-minutes through to the real AnthropicBatchProvider
   assert.equal(noFlag.calls[0].opts.provider.maxPollMs, DEFAULT_MAX_POLL_MS, "an unset flag falls through to the provider's own default, not a second copy of the number in run.mjs");
 });
 
+// ── issue #103: batch resume, and the two off-switches ─────────────────────
+
+test("parseArgs accepts --no-resume and --no-cancel-on-abandon (issue #103)", () => {
+  assert.equal(parseArgs(["--no-resume"]).noResume, true);
+  assert.equal(parseArgs(["--no-cancel-on-abandon"]).noCancelOnAbandon, true);
+  // Both are OFF-switches. There is deliberately no `--resume` / `--cancel-on-
+  // abandon`: an on-switch for a default-on behaviour is a flag that only ever
+  // gets typed by someone who has misread the default.
+  assert.throws(() => parseArgs(["--resume"]), /unrecognized flag/);
+  assert.throws(() => parseArgs(["--cancel-on-abandon"]), /unrecognized flag/);
+  assert.equal(parseArgs([]).noResume, undefined);
+  assert.equal(parseArgs([]).noCancelOnAbandon, undefined);
+});
+
+test("main() wires the #103 off-switches to the provider AND to runSpec, and leaves both behaviours ON by default", async (t) => {
+  const priorKey = process.env.ANTHROPIC_API_KEY;
+  const priorVoyageKey = process.env.VOYAGE_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "test-key-not-real";
+  process.env.VOYAGE_API_KEY = "test-voyage-key-not-real";
+  t.after(() => {
+    if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = priorKey;
+    if (priorVoyageKey === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = priorVoyageKey;
+  });
+
+  // Default: both on. #103 did NOT flip cancel-on-abandon -- the premise that
+  // cancelling destroys the handle resume re-polls is false (a `canceled`
+  // result means only "never sent to the model", and those are not billed,
+  // while everything already sent still succeeds and stays in the results
+  // file for 29 days). The two are complements.
+  const dflt = spyRunSpec();
+  await main(["--max-spend", "999"], { runSpecFn: dflt, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(dflt.calls[0].opts.provider.resume, true);
+  assert.equal(dflt.calls[0].opts.provider.cancelOnAbandon, true);
+  assert.equal(dflt.calls[0].opts.resume, true, "runSpec's own resume gate must agree with the provider's");
+
+  const off = spyRunSpec();
+  await main(["--max-spend", "999", "--no-resume", "--no-cancel-on-abandon"], { runSpecFn: off, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(off.calls[0].opts.provider.resume, false);
+  assert.equal(off.calls[0].opts.provider.cancelOnAbandon, false);
+  assert.equal(off.calls[0].opts.resume, false);
+});
+
+test("--prune and --phase 0 both REFUSE the #103 flags rather than silently dropping them", async () => {
+  await assert.rejects(() => main(["--prune", "--no-resume"], { store: FAKE_STORE }), /--prune does not accept .*--no-resume/);
+  await assert.rejects(() => main(["--prune", "--no-cancel-on-abandon"], { store: FAKE_STORE }), /--prune does not accept .*--no-cancel-on-abandon/);
+  await assert.rejects(() => main(["--phase", "0", "--no-resume"], { store: FAKE_STORE }), /--phase 0 does not accept .*--no-resume/);
+});
+
 // ── issue #99: promptHash is a real hash in the SPEC run.mjs builds ─────────
 //
 // evals/harness/reply-recovery.test.mjs already pins that promptTemplateHash()
