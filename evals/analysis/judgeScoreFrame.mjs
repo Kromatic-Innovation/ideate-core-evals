@@ -79,6 +79,54 @@ export class JudgeScoresUnavailableError extends Error {
   }
 }
 
+/**
+ * H5's bias coefficient is not IDENTIFIABLE from this run's arms (issue #97).
+ *
+ * The design matrix (fit.mjs's buildJudgeScoreDesignMatrix) is
+ * [Intercept, judge_provider[T.<other>]..., JUDGE_SCORE_BIAS_COEFFICIENT].
+ * The bias column is "judgeProvider is in that pool's generatorProviders".
+ * If `sameProvider` never VARIES within a judge_provider level, that column
+ * is an exact linear combination of the intercept and the judge-provider
+ * dummies, the design is singular, and there is no bias effect to separate
+ * from the judge_provider main effect.
+ *
+ * This is exactly what an arm SUBSET produces. On arms A and B (the #8 smoke
+ * study) every generator is Anthropic, so the Anthropic judge is always
+ * same-provider and the OpenAI judge never is: sameProvider IS
+ * judge_provider, restated. On the full registered grid the term is
+ * identifiable, and it is arm G (the only provider-MIXED arm, section 3.1)
+ * that makes it so -- G is the sole source of an OpenAI judge leg scoring a
+ * pool that has an OpenAI generator in it.
+ *
+ * buildJudgeScoreFrame() REPORTS this on the frame (`biasTermIdentifiable`,
+ * `biasTermNotIdentifiableReason`) rather than throwing -- a frame whose
+ * bias term happens not to be identifiable is still a valid frame. This
+ * error is what analysis.mjs raises from that flag, so H5's not-computed
+ * reason reads as one message with one name.
+ *
+ * Reported as H5 NOT COMPUTED with this reason, exactly like every other
+ * registered quantity a run cannot reach. NEVER fitted anyway: the sidecar
+ * fails it as `Singular matrix`, which -- routed through
+ * SidecarUnavailableError -- used to abort the WHOLE analysis run (H1-H4 and
+ * the Pareto/cost lanes included) over a hypothesis those lanes have nothing
+ * to do with. That is what this guard prevents, and it prevents it by NAMING
+ * the real cause rather than by broadening a sidecar catch.
+ */
+export class JudgeScoreBiasNotIdentifiableError extends Error {
+  constructor(reason) {
+    super(
+      `buildJudgeScoreFrame: H5's same-provider bias coefficient is NOT IDENTIFIABLE from this run's arms ` +
+        `(${reason}). The bias column is then an exact linear combination of the intercept and the judge_provider ` +
+        `dummies, so the design is singular and there is no bias effect to separate from the judge_provider main ` +
+        `effect. Report H5 as NOT COMPUTED (the same {unimplemented: true, p: 1} shape contrasts.mjs already uses); ` +
+        `never fit it anyway and never substitute a different estimand. On the full registered grid this term is ` +
+        `identifiable because arm G is provider-MIXED; an arm subset without G cannot estimate H5.`,
+    );
+    this.name = "JudgeScoreBiasNotIdentifiableError";
+    this.reason = reason;
+  }
+}
+
 /** Mean over every numeric axis value across every candidate in one judge-scores
  *  record's `scores` array — see this module's header for why this is a
  *  legitimate analysis-time aggregate, not a re-collapse of the judge's own
@@ -178,9 +226,41 @@ export function buildJudgeScoreFrame(store, opts = {}) {
     );
   }
 
+  // Identifiability of the bias term (issue #97). Sibling of the guard
+  // directly above, one step further in: two judge_provider levels are
+  // NECESSARY but not sufficient. `sameProvider` must also vary WITHIN at
+  // least one level, or the bias column is collinear with the judge-provider
+  // dummies and the sidecar fails the fit as `Singular matrix` -- which,
+  // routed through SidecarUnavailableError, takes down the entire analysis
+  // run over H5 alone. Caught here, where the real cause is knowable and
+  // sayable, instead of downstream where it is only "the fit blew up".
+  const sameProviderValuesByJudge = new Map();
+  for (const r of rows) {
+    if (!sameProviderValuesByJudge.has(r.judgeProvider)) sameProviderValuesByJudge.set(r.judgeProvider, new Set());
+    sameProviderValuesByJudge.get(r.judgeProvider).add(r.sameProvider);
+  }
+  const biasTermIdentifiable = Array.from(sameProviderValuesByJudge.values()).some((s) => s.size > 1);
+  const armIds = Array.from(new Set(rows.map((r) => r.armId))).sort();
+  const providers = Array.from(new Set(rows.flatMap((r) => r.generatorProviders))).sort();
+
   return {
     rows,
     judgeProviderLevels,
     responseField: "judge_score_mean",
+    // REPORTED, not thrown. Building the frame and being able to identify
+    // one of its coefficients are different questions, and a frame is still
+    // a valid frame when the second answer is no -- collapsing them into a
+    // throw would make every fixture that exercises some OTHER property of
+    // this frame (the response aggregate, the `run` grouping factor, the
+    // unknown-pool filter) have to satisfy an identifiability constraint it
+    // has nothing to do with. analysis.mjs is the caller that decides what a
+    // non-identifiable bias term means for H5, exactly as it already decides
+    // what an unavailable rarefied fit means for H1.
+    biasTermIdentifiable,
+    biasTermNotIdentifiableReason: biasTermIdentifiable
+      ? null
+      : `sameProvider is constant within every judge_provider level ` +
+        `[${Array.from(sameProviderValuesByJudge.keys()).sort().join(", ")}] over arms [${armIds.join(", ")}], whose ` +
+        `generator providers are [${providers.join(", ")}]`,
   };
 }

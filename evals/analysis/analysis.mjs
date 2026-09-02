@@ -70,7 +70,7 @@ import { ResultsStore } from "../../lib/store.mjs";
 import { buildFrame, summarizeByArm, assertCellsSelected } from "./frame.mjs";
 import { resolveStoreConfigHash } from "./storeConfig.mjs";
 import { buildRarefiedFrame, PoolsUnavailableError } from "./rarefiedFrame.mjs";
-import { buildJudgeScoreFrame, JudgeScoresUnavailableError } from "./judgeScoreFrame.mjs";
+import { buildJudgeScoreFrame, JudgeScoresUnavailableError, JudgeScoreBiasNotIdentifiableError } from "./judgeScoreFrame.mjs";
 import { buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts, familyEstimability } from "./contrasts.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
 import { paretoFrontier, costDiversityRatioByArm, seedFromString } from "./pareto.mjs";
@@ -298,6 +298,12 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // run configuration exactly as frame.mjs stays decoupled from it. ────────
   let judgeScoreLadder = null;
   let judgeScoreUnavailableReason = null;
+  // Issue #97: true when H5 is unreachable because of THIS RUN'S ARMS (no
+  // provider-mixed arm, so the bias term is collinear with judge_provider),
+  // as opposed to "judging has not run yet" or "the ladder did not converge".
+  // Kept separate so the report's arm-subset banner counts H5 only when the
+  // arm subset is genuinely the cause.
+  let judgeScoreNotEstimableForArms = false;
   let armsConfig = null;
   try {
     armsConfig = JSON.parse(readFileSync(join(REPO_ROOT, "arms.config.json"), "utf8"));
@@ -335,6 +341,16 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   } else {
     try {
       const judgeScoreFrame = buildJudgeScoreFrame(store, { pools: judgeScorePools });
+      // Issue #97: H5's bias term must be IDENTIFIABLE before it is worth
+      // fitting. Without a provider-mixed arm the bias column is collinear
+      // with judge_provider, the sidecar answers `Singular matrix`, and that
+      // -- routed through SidecarUnavailableError -- aborted the WHOLE run
+      // (H1-H4 and the Pareto/cost lanes included) over a hypothesis none of
+      // them depend on. Observed against the #8 smoke store (arms A/B, all
+      // Anthropic generators). Refuse the fit by NAME, before spawning it.
+      if (!judgeScoreFrame.biasTermIdentifiable) {
+        throw new JudgeScoreBiasNotIdentifiableError(judgeScoreFrame.biasTermNotIdentifiableReason);
+      }
       const ladderResult = await runJudgeScoreLadder({
         rows: judgeScoreFrame.rows,
         judgeProviderLevels: judgeScoreFrame.judgeProviderLevels,
@@ -353,11 +369,21 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         judgeScoreUnavailableReason = `judge-score ladder reached ${ladderResult.rung} (no confirmatory inference for H5) — see history: ${JSON.stringify(ladderResult.history)}`;
       }
     } catch (err) {
-      if (err instanceof JudgeScoresUnavailableError) {
+      if (err instanceof JudgeScoresUnavailableError || err instanceof JudgeScoreBiasNotIdentifiableError) {
         // Registered, expected state until real judging (#68/#77) has
         // actually run against a study cell -- never silently fall through
         // to a different estimand for H5 (same discipline as the rarefied
         // lane's PoolsUnavailableError handling above).
+        //
+        // JudgeScoreBiasNotIdentifiableError (issue #97) is the ARM-SUBSET
+        // form of the same thing: with no provider-mixed arm present, H5's
+        // bias column is collinear with judge_provider and the term does not
+        // exist to be estimated. Without this branch the sidecar's `Singular
+        // matrix` came back as SidecarUnavailableError and aborted the whole
+        // run -- H1-H4 and the Pareto/cost lanes included -- over a
+        // hypothesis none of them depend on. Observed against the #8 smoke
+        // store (arms A/B, all-Anthropic generators).
+        judgeScoreNotEstimableForArms = err instanceof JudgeScoreBiasNotIdentifiableError;
         judgeScoreUnavailableReason = err.message;
       } else {
         throw err;
@@ -403,6 +429,12 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         id: "H5",
         description: spec.description,
         unimplemented: true,
+        // Issue #97: H5's own arm-subset non-estimability -- the bias term
+        // needs a provider-MIXED arm (G) to be identifiable at all, so a
+        // subset without one cannot reach it. Marked so it appears in the
+        // report's arm-subset banner alongside H1-H4 rather than reading as
+        // the unrelated "judging has not run yet" state.
+        ...(judgeScoreNotEstimableForArms ? { notEstimable: true, missingArms: [], availableArms: [args.referenceArm, ...panelArms] } : {}),
         reason: judgeScoreUnavailableReason || "judge-score lane did not run",
         p: 1,
       };

@@ -156,9 +156,15 @@ function notEstimableSpec({ id, description, kind, missingArms, availableArms, w
     missingArms,
     availableArms,
     reason:
-      `NOT ESTIMABLE under this arm subset: the registered ${id} contrast (${description}) names ` +
-      `arm${missingArms.length === 1 ? "" : "s"} [${missingArms.join(", ")}], which ${missingArms.length === 1 ? "is" : "are"} not among the arms available in this run ` +
-      `[${availableArms.join(", ")}]. ${why} No substitute arm is used and the entry is NOT dropped -- it keeps its ` +
+      `NOT ESTIMABLE under this arm subset: the registered ${id} contrast (${description}) ` +
+      // An entry can be unreachable WITHOUT naming an absent arm -- H1 over
+      // a single panel arm is degenerate rather than missing anything --
+      // and claiming it "names arms []" would be false.
+      (missingArms.length
+        ? `names arm${missingArms.length === 1 ? "" : "s"} [${missingArms.join(", ")}], which ${missingArms.length === 1 ? "is" : "are"} ` +
+          `not among the arms available in this run [${availableArms.join(", ")}]. `
+        : `cannot be formed from the arms available in this run [${availableArms.join(", ")}]. `) +
+      `${why} No substitute arm is used and the entry is NOT dropped -- it keeps its ` +
       `Holm slot with p=1, so the registered family stays 5 slots (docs/PREREGISTRATION.md §6.2 / Appendix B item 6).`,
   };
 }

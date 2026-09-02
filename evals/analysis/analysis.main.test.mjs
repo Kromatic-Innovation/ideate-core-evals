@@ -402,8 +402,14 @@ test("main(): H5's judge-score lane reaching J2 (no confirmatory inference) repo
   // than the judge-score design's 3 parameters), so fitJudgeScoreR1() (the
   // REAL J1 fallback, not faked) genuinely cannot identify the CR2 sandwich
   // and reports converged: false -- a true J2, not a contrived one.
-  for (const briefId of ["b1", "b2"]) {
-    const poolKey = cellKey({ armId: "A", briefId, replicate: 0, cfg });
+  //
+  // One pool from arm A (Anthropic generators) and one from arm G (the only
+  // provider-MIXED arm) so H5's bias term IS identifiable and this test
+  // still reaches the J2 it is about (issue #97). Two arm-A pools would now
+  // be refused one step earlier, by name, as a non-identifiable bias term --
+  // correctly, but that is the other test's subject, not this one's.
+  for (const armId of ["A", "G"]) {
+    const poolKey = cellKey({ armId, briefId: "b1", replicate: 0, cfg });
     recordJudgeScores(store, {
       poolKey,
       judgeModel: "claude-sonnet-5",
@@ -691,6 +697,54 @@ test("main(): #97 -- a TWO-ARM store analyses end to end, recording the unreacha
     assert.ok(existsSync(join(outDir, "pareto.svg")));
     assert.ok(existsSync(join(outDir, "fit.json")));
     assert.ok(Object.keys(result.costRatioByArm).length > 0);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test("main(): #97 -- judge scores on a TWO-ARM store degrade H5 to not-estimable instead of aborting the whole run on `Singular matrix`", async () => {
+  const resultsDir = seedStore(RUNNER_CONFIG, { withPools: false, arms: TWO_ARMS });
+  const store = new ResultsStore(resultsDir);
+  const cfg = configHash(RUNNER_CONFIG);
+
+  // Both judge legs on every pool, so the judgeProviderLevels < 2 guard does
+  // NOT fire. Arms A and B are both all-Anthropic generators, so
+  // `sameProvider` IS judge_provider restated and the bias column is
+  // collinear -- the sidecar answers `Singular matrix`, which used to come
+  // back as SidecarUnavailableError and take H1-H4 and the Pareto/cost lanes
+  // down with it. Observed against the real #8 store.
+  let s = 0;
+  for (const armId of TWO_ARMS) {
+    for (const briefId of BRIEFS) {
+      const poolKey = cellKey({ armId, briefId, replicate: 0, cfg });
+      s += 1;
+      recordJudgeScores(store, { poolKey, judgeModel: "claude-sonnet-5", judgeProvider: "anthropic", scores: [{ originality: 4 + (s % 5), feasibility: 5 + (s % 3) }] });
+      recordJudgeScores(store, { poolKey, judgeModel: "gpt-5.6-terra", judgeProvider: "openai", scores: [{ originality: 3 + (s % 4), feasibility: 6 + (s % 2) }] });
+    }
+  }
+
+  const outDir = tmpOutDir();
+  try {
+    const result = await main(["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A"], {
+      runner: fakeSidecarRunnerWithJudgeScore,
+    });
+
+    // The run COMPLETED -- that is the whole point.
+    assert.ok(result.ladder.fit, "the full-pool lane must still produce a fit");
+    assert.ok(existsSync(join(outDir, "REPORT.md")));
+
+    const h5 = result.registeredResults.find((r) => r.id === "H5");
+    assert.equal(h5.notEstimable, true, "H5's arm-subset non-identifiability must be recorded as such");
+    assert.equal(h5.p, 1);
+    assert.match(h5.reason, /NOT IDENTIFIABLE/);
+    assert.match(h5.reason, /arm G/, "must say what a run would need to estimate H5");
+    assert.doesNotMatch(h5.reason, /Singular matrix/, "the report must name the CAUSE, not the sidecar's symptom");
+
+    // All five slots, and H5 now joins the arm-subset banner.
+    assert.equal(result.holmAdjusted.length, 5);
+    assert.deepEqual(result.estimability.notEstimable.map((e) => e.id), ["H1", "H2", "H3", "H4", "H5"]);
+    assert.match(readFileSync(join(outDir, "REPORT.md"), "utf8"), /5 of 5 registered/);
   } finally {
     rmSync(resultsDir, { recursive: true, force: true });
     rmSync(outDir, { recursive: true, force: true });
