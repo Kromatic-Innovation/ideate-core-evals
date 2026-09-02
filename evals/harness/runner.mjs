@@ -618,14 +618,29 @@ export async function runSpec(spec, opts) {
             `Add the missing model(s) to lib/price.mjs's RATE_TABLE.`,
         );
       }
+      let rowTotalUsd = excludedNonProviderUsd;
       for (const [provider, usd] of Object.entries(byProvider)) {
         runningTotalByProvider[provider] = (runningTotalByProvider[provider] || 0) + usd;
+        rowTotalUsd += usd;
       }
       // A known non-provider model (e.g. the embedder) in a generation/judge
       // cell's cost rows is NOT gated by any provider ceiling -- tracked here
       // rather than silently dropped, never thrown on. See isNonProviderModel
       // (lib/price.mjs) and spendToDate's own excludedNonProviderUsd.
       runningNonProviderTotal += excludedNonProviderUsd;
+      // Sentry review finding (PR #76 fix round, HIGH): `runningTotal` --
+      // the GLOBAL `--max-spend` ceiling's actual-spend-so-far counter --
+      // was never updated here, only `runningTotalByProvider` was. Judge
+      // spend (and, in principle, any actual spend at all) therefore never
+      // reached the global ceiling's admission check, which used a STALE
+      // per-cell PROJECTED increment instead (see the removed
+      // `runningTotal += cellCost` at the old call site below -- replaced
+      // by this actual-spend accumulation, mirroring `runningTotalByProvider`
+      // exactly). Basis matches `priorSpend.totalUsd` (see the summary-
+      // assembly BASIS comment near the end of this function): ALL priced
+      // spend, provider AND non-provider, since a global ceiling is a
+      // total-dollars backstop, not scoped to any one provider.
+      runningTotal += rowTotalUsd;
     }
   }
 
@@ -900,7 +915,18 @@ export async function runSpec(spec, opts) {
       account.skip(cell.key, trippedProvider ? `budget_exceeded:${trippedProvider}` : "budget_exceeded");
       continue;
     }
-    runningTotal += cellCost;
+    // `runningTotal` is no longer bumped by this cell's PROJECTED `cellCost`
+    // here (PR #76 fix round, Sentry HIGH finding) -- it is now maintained
+    // exclusively as ACTUAL spend-so-far, updated inside recordActualSpend()
+    // below, exactly mirroring `runningTotalByProvider`. The comparison
+    // above and the NEXT cell's own admission check still add `cellCost`
+    // (this cell's own PROJECTED share) on top of `runningTotal` (everything
+    // ACTUAL so far) -- the same already-actual + projected-this-cell shape
+    // the per-provider check uses just above. Before this fix, `runningTotal`
+    // accumulated PROJECTED cost at admission time and was NEVER updated by
+    // real spend afterward, so judge spend (added only to
+    // `runningTotalByProvider` by recordActualSpend) never reached the
+    // GLOBAL `--max-spend` ceiling at all.
 
     const arm = armsConfig.arms[cell.armId];
     if (!arm) throw new Error(`runSpec: cell '${cell.key}' references unknown arm '${cell.armId}'`);

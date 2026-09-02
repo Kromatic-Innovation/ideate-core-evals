@@ -222,7 +222,53 @@ test("a ceiling with headroom for judge spend as well as generation admits every
   assert.equal(summary.skipped, 0);
 });
 
-// ── AC4: resumed runs project and meter judge cost for generated-but-unjudged pools ──
+test("Sentry HIGH finding (PR #76 fix round): judge spend also trips the GLOBAL --max-spend ceiling, not only a per-provider one -- runningTotal now tracks ACTUAL spend, not a stale projected increment", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }], replicates: 1, config: CFG };
+
+  // Same calibration technique as the per-provider ceiling test above:
+  // learn the REAL per-cell generation cost empirically (MockProvider's
+  // fixed 500/300 tokens don't match either pricer's token-VOLUME estimate,
+  // so a hand-computed or projected number would drift from what
+  // recordActualSpend will actually compute -- see that test's own comment).
+  const calibStore = new ResultsStore(tempDir(t));
+  const calibSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const { summary: calibSummary } = await runSpec(calibSpec, { store: calibStore, armsConfig: soloArms, provider: new MockProvider(), log: silentLog });
+  const perCellGenUsd = calibSummary.spendByProvider.anthropic;
+  assert.ok(perCellGenUsd > 0);
+  const exactPriceGrid = (plannedCells) => ({
+    usd: plannedCells.length * perCellGenUsd,
+    breakdown: plannedCells.map((c) => ({ cellKey: c.key, usd: perCellGenUsd, byProvider: { anthropic: perCellGenUsd } })),
+  });
+  // GLOBAL ceiling (maxSpendUsd, not maxSpendByProviderUsd) covering BOTH
+  // cells' generation with zero room for anything else. If judge spend were
+  // excluded from the GLOBAL running total (the bug: `runningTotal` was
+  // bumped only by PROJECTED cellCost at admission time, never by actual
+  // spend afterward), both cells would complete.
+  const ceiling = perCellGenUsd * 2;
+
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider,
+    priceGrid: exactPriceGrid,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge }, // openai deferred, $0 -- isolates the trip to anthropic judge spend
+    corpus: CORPUS,
+    maxSpendUsd: ceiling, // GLOBAL ceiling this time, not per-provider
+    log: silentLog,
+  });
+
+  assert.ok(anthropicJudge.calls.length >= 1, "sanity: the judge ran for the first cell before the second was admission-controlled");
+  assert.equal(summary.completed, 1, "only the FIRST cell's generation was admitted under the GLOBAL ceiling");
+  assert.equal(summary.skipped, 1, "the SECOND cell was skipped -- cell 1's judge spend pushed the GLOBAL running total over the ceiling");
+});
+
+// ── AC4: resumed runs project and meter judge cost for generated-but-unjudged pools ────
 
 test("resume: a session that generated but never judged has its unjudged pools judged on the NEXT invocation", async (t) => {
   const dir = tempDir(t);
