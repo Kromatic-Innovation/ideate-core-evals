@@ -94,6 +94,148 @@ export const RAW_SNIPPET_CHARS = 240;
  *  produce a multi-kilobyte ledger row. */
 export const MAX_DETAIL_CHARS = 1400;
 
+// ── The batch poll ceiling (issue #92) ───────────────────────────────────────
+//
+// This used to be a flat 15 minutes, shorter than real batch latency and not
+// settable from the CLI. Measured on the study account on 2026-09-02, four
+// single-request batches: 2m24s, 9m53s, 21m07s, and one still `in_progress`
+// past 20m -- the first two created 23 SECONDS apart. That is an existence
+// proof that 15 minutes is too short; four observations in one afternoon are
+// emphatically NOT a latency distribution, so the new default is not derived
+// from them. It is derived from the API's own stated envelope:
+//
+//   * Anthropic documents Message Batches as "most batches complete within
+//     1 hour; maximum 24 hours" -- 24h is when the API itself gives up and
+//     marks the outstanding requests `expired`.
+//   * So a ceiling below ~1 hour abandons batches the API considers ordinary,
+//     and 24h is the API's own hard bound.
+//
+// 60 minutes sits at the top of the documented "most" window and ~3x above the
+// worst latency actually observed, while staying far below the 24h expiry. The
+// reason NOT to simply poll to expiry: runSpec drives cells SEQUENTIALLY, so a
+// 24h ceiling lets one stalled cell hold a ~200-cell overnight grid for a day.
+// Issue #90 makes `timeout` transient, so the cell is re-planned `todo` next
+// invocation rather than destroyed.
+//
+// What the ceiling bounds, precisely: it is per BATCH, and a panel arm submits
+// one batch per round (panel.maxRounds is 2). A cell whose round-1 batch is
+// abandoned stops right there -- see the post-abandonment short-circuit in
+// #completeBatched -- so the worst ABANDONMENT wait is one ceiling. A cell
+// whose rounds are both slow but finish under the ceiling can still take up to
+// maxRounds x ceiling; that is ordinary slow progress, not a stall, and is not
+// what this bound exists to catch.
+// Override per invocation with `node evals/run.mjs --max-poll-minutes N`.
+export const DEFAULT_MAX_POLL_MS = 60 * 60 * 1000;
+
+/** Trim a composed detail string to the ledger's row bound. */
+function truncateDetail(detail) {
+  return detail.length > MAX_DETAIL_CHARS ? `${detail.slice(0, MAX_DETAIL_CHARS - 3)}...` : detail;
+}
+
+/**
+ * Validate an operator-supplied poll ceiling (issue #92). A NaN ceiling is
+ * strictly WORSE than the bug it would replace: `Date.now() > NaN` is always
+ * false, so the poll loop would never exit at all. A zero/negative ceiling is
+ * accepted ONLY as an explicit "abandon immediately" (the tests use -1), so the
+ * guard rejects only non-finite values.
+ */
+function assertPollCeiling(maxPollMs, providerName) {
+  if (!Number.isFinite(maxPollMs)) {
+    throw new Error(
+      `${providerName}: maxPollMs must be a finite number of milliseconds, got ${JSON.stringify(maxPollMs)} -- ` +
+        "a NaN ceiling never expires (NaN comparisons are always false), so the poll loop would spin forever instead of failing",
+    );
+  }
+  return maxPollMs;
+}
+
+/**
+ * The ledger discriminator issue #92 asks for: "we gave up waiting" must be
+ * distinguishable from "the API failed". `failureKind` is `timeout` in both the
+ * ceiling case and a hypothetical provider-reported one, so the DETAIL string
+ * -- the only structured channel that reaches the store (see the header above)
+ * -- leads with a greppable `POLL_CEILING_REACHED` token plus the batch handles
+ * that were abandoned, how long each was polled, the ceiling it blew, the last
+ * observed processing status, and whether the cancel succeeded.
+ *
+ * The batch ids matter beyond diagnostics: a submitted batch id is durable and
+ * re-pollable, so this line is the operator's manual recovery path (and the
+ * seam a future automatic resume would build on -- see issue #92's PR body).
+ *
+ * @param {string} providerName
+ * @param {Array<object>} abandoned  records pushed by the flush loop's ceiling branch
+ */
+export function formatAbandonDetail(providerName, abandoned = []) {
+  const rows = abandoned.map((a) => ({
+    batch_id: a.batchId,
+    elapsed_ms: a.elapsedMs,
+    max_poll_ms: a.maxPollMs,
+    last_status: a.lastStatus,
+    cancelled: a.cancelled,
+  }));
+  return (
+    `${providerName}: POLL_CEILING_REACHED -- gave up waiting; the API did NOT fail. ` +
+    `abandoned_batches=${JSON.stringify(rows)}`
+  );
+}
+
+/** `formatAbandonDetail(...) + " -- "` when this cell abandoned a batch, else "". */
+function abandonPrefix(classification, providerName) {
+  const abandoned = (classification && classification.abandoned) || [];
+  return abandoned.length ? `${formatAbandonDetail(providerName, abandoned)} -- ` : "";
+}
+
+/**
+ * Best-effort cancel of an in-flight batch we are abandoning (issue #92).
+ *
+ * Nothing cancelled batches before this: the #8 smoke run's two orphans had to
+ * be cancelled by hand. Since #90 re-plans a `timeout` cell, an uncancelled
+ * batch keeps billing for work the next invocation is about to pay for again.
+ *
+ * Three properties this must have, all load-bearing:
+ *   1. It can never throw out of `#flush()` -- an abandonment path that itself
+ *      explodes leaves every buffered `complete()` promise unresolved, hanging
+ *      the run.
+ *   2. It never retries (`maxRetries: 0`): we are already over the ceiling, and
+ *      a backoff loop here would extend exactly the wait we just gave up on.
+ *   3. A cancel FAILURE never changes the failure kind -- the cell is still a
+ *      `timeout`. The outcome is recorded in the detail so an operator can see
+ *      a batch may still be billing and cancel it by hand.
+ *   4. It is WALL-CLOCK BOUNDED. `maxRetries: 0` stops a retry loop but not a
+ *      single hung socket, and the abandonment path awaits this before
+ *      resolving the buffered `complete()` promises -- so an unbounded cancel
+ *      could hang the run outright, which is strictly worse than the ceiling
+ *      bug it is cleaning up after (that at least terminated). The bound uses
+ *      a real, unref'd timer rather than the injected `sleep`, because tests
+ *      inject a no-op sleep that would make the bound win every race.
+ *
+ * @returns {Promise<true|false|"timed_out">}
+ */
+// Shared by BOTH providers: for a body-less POST with JSON headers,
+// anthropicFetchWithRetry and openaiFetchWithRetry are byte-identical in
+// behaviour, so the cancel path has one implementation rather than two.
+async function cancelBatchQuietly(fetchImpl, url, headers, { sleep, logger, maxRetries = 0, timeoutMs = CANCEL_TIMEOUT_MS } = {}) {
+  const attempt = (async () => {
+    try {
+      const res = await anthropicFetchWithRetry(fetchImpl, url, headers, undefined, { method: "POST", maxRetries, sleep, logger });
+      return !!(res && res.ok);
+    } catch {
+      return false;
+    }
+  })();
+  let timer;
+  const bound = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("timed_out"), timeoutMs);
+    if (timer && typeof timer.unref === "function") timer.unref();
+  });
+  const outcome = await Promise.race([attempt, bound]);
+  clearTimeout(timer);
+  return outcome;
+}
+
+/** Wall-clock bound on the best-effort cancel above. */
+export const CANCEL_TIMEOUT_MS = 15 * 1000;
+
 /**
  * Build the per-reply diagnostic record. Provider-agnostic: callers normalize
  * their provider's stop-reason vocabulary to Anthropic's before calling (see
@@ -392,7 +534,11 @@ export class AnthropicBatchProvider {
    *   @param {Function} [opts.sleep]          `(ms) => Promise<void>`; injectable
    *     for fast, deterministic retry/backoff tests.
    *   @param {number} [opts.pollIntervalMs]   batch-poll interval (live default 2000ms).
-   *   @param {number} [opts.maxPollMs]        poll ceiling before classifying `timeout` (live default 15 min).
+   *   @param {number} [opts.maxPollMs]        poll ceiling before classifying `timeout`
+   *     (live default DEFAULT_MAX_POLL_MS -- see that constant for why 60 min).
+   *   @param {boolean} [opts.cancelOnAbandon] issue #92: cancel an in-flight batch when the
+   *     poll ceiling is reached, so it does not bill unattended for work #90 is about to
+   *     re-submit. Default true; set false to leave the handle live for a manual re-poll.
    *   @param {number} [opts.maxRetries]       429/5xx retry budget before classifying (default 3).
    *   @param {(msg: string) => void} [opts.logger]  defaults to console.error; tests inject a silent logger.
    */
@@ -404,7 +550,8 @@ export class AnthropicBatchProvider {
     ideateImpl = async (...a) => (await import("ideate-core")).ideateCore(...a),
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     pollIntervalMs = 2000,
-    maxPollMs = 15 * 60 * 1000,
+    maxPollMs = DEFAULT_MAX_POLL_MS,
+    cancelOnAbandon = true,
     maxRetries = 3,
     logger = (msg) => console.error(msg),
   } = {}) {
@@ -415,7 +562,8 @@ export class AnthropicBatchProvider {
     this.ideateImpl = ideateImpl;
     this.sleep = sleep;
     this.pollIntervalMs = pollIntervalMs;
-    this.maxPollMs = maxPollMs;
+    this.maxPollMs = assertPollCeiling(maxPollMs, "AnthropicBatchProvider");
+    this.cancelOnAbandon = cancelOnAbandon;
     this.maxRetries = maxRetries;
     this.logger = logger;
 
@@ -487,7 +635,12 @@ export class AnthropicBatchProvider {
     // Classification signals threaded through `complete()` calls, read after
     // ideateCore settles (or throws) to pick the most specific FAILURE_KINDS
     // value -- see the bottom of this method.
-    const classification = { transportError: false, rateLimited: false, timedOut: false };
+    // `abandoned` (issue #92): one record per batch this cell gave up waiting
+    // on. Distinct from `timedOut` -- the flag says "a timeout happened", the
+    // list says WHICH batch handle was surrendered, for how long it was
+    // polled, and whether it was cancelled. That is the operator's recovery
+    // path and the ledger's "we gave up" vs "the API failed" discriminator.
+    const classification = { transportError: false, rateLimited: false, timedOut: false, abandoned: [] };
 
     // Per-cell reply diagnostics (issue #93). One record per model reply --
     // stop_reason, output tokens, what parsing did, a bounded raw snippet --
@@ -528,13 +681,42 @@ export class AnthropicBatchProvider {
       return {
         terminalState: "failed",
         failureKind: pickFailureKind(classification, "transport_error"),
-        detail: `AnthropicBatchProvider: ideateImpl threw: ${err && err.message}`,
+        detail: truncateDetail(abandonPrefix(classification, "AnthropicBatchProvider") + `AnthropicBatchProvider: ideateImpl threw: ${err && err.message}`),
         tokens: { tokens_by_model: tokensByModel },
         diagnostics,
       };
     }
 
     const candidates = (ideateResult && ideateResult.candidates) || [];
+
+    // ── A PARTIAL pool after an abandoned batch is not a measurement (#92) ───
+    // Panel arms run panel.maxRounds (2) rounds. If round 1's batch returns
+    // and round 2's blows the ceiling, ideate-core still resolves cleanly with
+    // round 1's candidates -- so without this branch the cell would store as
+    // `completed` carrying a SILENTLY TRUNCATED pool, under-reporting distinct_k
+    // for exactly the panel arms H1 compares against solo. That is the silent
+    // pooling lib/manifest.mjs exists to prevent, arriving through the runner
+    // instead. A pool assembled while we were still waiting on a batch we paid
+    // for is classified `timeout` (transient, per #90): the cell is re-planned
+    // next invocation and its spend is preserved under the attempt key.
+    //
+    // Deliberately scoped to ABANDONMENT, not to every partial: a round that
+    // partially rate-limited is the same defect class but a wider decision than
+    // #92 -- see the PR body, which names it rather than silently widening here.
+    if (candidates.length > 0 && classification.abandoned.length > 0) {
+      return {
+        terminalState: "failed",
+        failureKind: "timeout",
+        detail: truncateDetail(
+          abandonPrefix(classification, "AnthropicBatchProvider") +
+            `discarding a PARTIAL pool of ${candidates.length} candidate(s) assembled from the rounds that did finish -- ` +
+            "storing it would silently under-report this cell's pool size",
+        ),
+        tokens: { tokens_by_model: tokensByModel },
+        diagnostics,
+      };
+    }
+
     if (candidates.length === 0) {
       // IC-08 silent mode: ideateCore resolved cleanly (no throw) but the
       // pool is empty. Since #93 this is no longer one undifferentiated
@@ -552,7 +734,7 @@ export class AnthropicBatchProvider {
       return {
         terminalState: "failed",
         failureKind: pickFailureKind(classification, pool.kind),
-        detail: pool.detail,
+        detail: truncateDetail(abandonPrefix(classification, "AnthropicBatchProvider") + pool.detail),
         tokens: { tokens_by_model: tokensByModel },
         diagnostics,
       };
@@ -592,6 +774,17 @@ export class AnthropicBatchProvider {
 
   // ── batch mode: buffer this call; flush the whole round as one batch ─────
   #completeBatched(req, ctx) {
+    // Issue #92: once THIS cell has surrendered a batch at the ceiling it is
+    // going to fail `timeout` no matter what the remaining rounds produce (see
+    // the partial-pool guard in generate()). Panel arms run 2 rounds, so
+    // without this short-circuit a cell that blew the ceiling in round 1 would
+    // submit a SECOND batch and poll it for another full maxPollMs -- paying
+    // real money for a pool the harness has already decided to discard, and
+    // making the ceiling a per-batch rather than a per-cell bound. Resolve
+    // immediately with the same failure the abandonment produced.
+    if (ctx && ctx.classification && (ctx.classification.abandoned || []).length > 0) {
+      return Promise.resolve({ ok: false, __failureKind: "timeout" });
+    }
     return new Promise((resolve, reject) => {
       this.#pending.push({ req, resolve, reject, ctx });
       if (!this.#flushScheduled) {
@@ -604,6 +797,44 @@ export class AnthropicBatchProvider {
         setTimeout(() => this.#flush(), 0);
       }
     });
+  }
+
+  /**
+   * Surrender an in-flight batch at the poll ceiling (issue #92): cancel it so
+   * it does not bill unattended, log the durable handle so the operator can
+   * re-poll or cancel by hand, record the abandonment on every waiting cell's
+   * classification (the ledger discriminator), and resolve every buffered
+   * `complete()` as `timeout` -- a TRANSIENT kind, so #90 re-plans the cell.
+   */
+  async #abandon(batch, batchId, startedAt, lastStatus) {
+    const elapsedMs = Date.now() - startedAt;
+    const cancelled = this.cancelOnAbandon
+      ? await cancelBatchQuietly(
+          this.fetchImpl,
+          `https://api.anthropic.com/v1/messages/batches/${batchId}/cancel`,
+          anthropicHeaders(this.apiKey),
+          { sleep: this.sleep, logger: this.logger },
+        )
+      : null;
+    this.logger(
+      `AnthropicBatchProvider: poll ceiling reached after ${elapsedMs}ms (maxPollMs=${this.maxPollMs}) -- abandoning batch ${batchId}. ` +
+        (cancelled === null
+          ? "cancelOnAbandon is off, so it was left running."
+          : cancelled === true
+            ? "It was cancelled so it will not bill unattended."
+            : `The cancel call did not succeed (${cancelled}) -- it may still bill; cancel by hand: POST /v1/messages/batches/${batchId}/cancel.`) +
+        ` The handle is durable: GET /v1/messages/batches/${batchId} still reports it.`,
+    );
+    // ONE record shared by every cell waiting on this batch (in practice one
+    // cell per flush, since generate() drives ideate-core to completion before
+    // the next cell starts -- but the barrier-batcher makes no such promise).
+    const record = { batchId, elapsedMs, maxPollMs: this.maxPollMs, lastStatus: lastStatus || null, cancelled };
+    for (const ctx of new Set(batch.map((entry) => entry.ctx))) {
+      ctx.classification.timedOut = true;
+      if (!Array.isArray(ctx.classification.abandoned)) ctx.classification.abandoned = [];
+      ctx.classification.abandoned.push(record);
+    }
+    for (const entry of batch) entry.resolve({ ok: false, __failureKind: "timeout" });
   }
 
   async #flush() {
@@ -635,7 +866,8 @@ export class AnthropicBatchProvider {
     }
 
     const batchId = submit.json.id;
-    const deadline = Date.now() + this.maxPollMs;
+    const startedAt = Date.now();
+    const deadline = startedAt + this.maxPollMs;
     // `batchStatus` tracks the most recently observed batch object (submit's
     // response initially, then each poll's) so "ended" can be detected
     // whether it happens on the submit response itself (a trivially fast
@@ -644,10 +876,7 @@ export class AnthropicBatchProvider {
 
     while (batchStatus.processing_status !== "ended") {
       if (Date.now() > deadline) {
-        for (const entry of batch) {
-          entry.ctx.classification.timedOut = true;
-          entry.resolve({ ok: false, __failureKind: "timeout" });
-        }
+        await this.#abandon(batch, batchId, startedAt, batchStatus.processing_status);
         return;
       }
       await this.sleep(this.pollIntervalMs);
@@ -951,7 +1180,8 @@ export class OpenAIBatchProvider {
    *   @param {Function} [opts.ideateImpl]  live default dynamically imports ideate-core.
    *   @param {Function} [opts.sleep]       (ms)=>Promise; injectable for instant tests.
    *   @param {number}   [opts.pollIntervalMs]  (live default 2000ms)
-   *   @param {number}   [opts.maxPollMs]       (live default 15 min)
+   *   @param {number}   [opts.maxPollMs]       (live default DEFAULT_MAX_POLL_MS -- issue #92)
+   *   @param {boolean}  [opts.cancelOnAbandon] cancel an in-flight batch at the ceiling (default true)
    *   @param {number}   [opts.maxRetries]      (default 3)
    *   @param {(msg:string)=>void} [opts.logger]
    */
@@ -963,7 +1193,8 @@ export class OpenAIBatchProvider {
     ideateImpl = async (...a) => (await import("ideate-core")).ideateCore(...a),
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     pollIntervalMs = 2000,
-    maxPollMs = 15 * 60 * 1000,
+    maxPollMs = DEFAULT_MAX_POLL_MS,
+    cancelOnAbandon = true,
     maxRetries = 3,
     logger = (msg) => console.error(msg),
   } = {}) {
@@ -974,7 +1205,8 @@ export class OpenAIBatchProvider {
     this.ideateImpl = ideateImpl;
     this.sleep = sleep;
     this.pollIntervalMs = pollIntervalMs;
-    this.maxPollMs = maxPollMs;
+    this.maxPollMs = assertPollCeiling(maxPollMs, "OpenAIBatchProvider");
+    this.cancelOnAbandon = cancelOnAbandon;
     this.maxRetries = maxRetries;
     this.logger = logger;
     this.#pending = [];
@@ -1003,7 +1235,8 @@ export class OpenAIBatchProvider {
       row.input_tokens += usage.prompt_tokens || usage.input_tokens || 0;
       row.output_tokens += usage.completion_tokens || usage.output_tokens || 0;
     };
-    const classification = { transportError: false, rateLimited: false, timedOut: false };
+    // `abandoned` (issue #92) -- mirrored from the Anthropic path above.
+    const classification = { transportError: false, rateLimited: false, timedOut: false, abandoned: [] };
     // Issue #93, mirrored from the Anthropic path above -- same diagnostics,
     // same max_tokens sizing. Arm H (homogeneous OpenAI) and arm G's OpenAI
     // slots were never exercised by the #8 smoke study, but they have exactly
@@ -1031,14 +1264,29 @@ export class OpenAIBatchProvider {
         },
       );
     } catch (err) {
-      return { terminalState: "failed", failureKind: pickFailureKind(classification, "transport_error"), detail: `OpenAIBatchProvider: ideateImpl threw: ${err && err.message}`, tokens: { tokens_by_model: tokensByModel }, diagnostics };
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, "transport_error"), detail: truncateDetail(abandonPrefix(classification, "OpenAIBatchProvider") + `OpenAIBatchProvider: ideateImpl threw: ${err && err.message}`), tokens: { tokens_by_model: tokensByModel }, diagnostics };
     }
 
     const candidates = (ideateResult && ideateResult.candidates) || [];
+    // A partial pool after an abandoned batch is not a measurement -- see the
+    // matching branch (and its full rationale) on the Anthropic path above.
+    if (candidates.length > 0 && classification.abandoned.length > 0) {
+      return {
+        terminalState: "failed",
+        failureKind: "timeout",
+        detail: truncateDetail(
+          abandonPrefix(classification, "OpenAIBatchProvider") +
+            `discarding a PARTIAL pool of ${candidates.length} candidate(s) assembled from the rounds that did finish -- ` +
+            "storing it would silently under-report this cell's pool size",
+        ),
+        tokens: { tokens_by_model: tokensByModel },
+        diagnostics,
+      };
+    }
     if (candidates.length === 0) {
       const allRefused = !!(ideateResult && ideateResult.meta && ideateResult.meta.agentsFailed === ideateResult.meta.agentsAttempted);
       const pool = classifyPoolFailure(diagnostics, { providerName: "OpenAIBatchProvider", allRefused });
-      return { terminalState: "failed", failureKind: pickFailureKind(classification, pool.kind), detail: pool.detail, tokens: { tokens_by_model: tokensByModel }, diagnostics };
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, pool.kind), detail: truncateDetail(abandonPrefix(classification, "OpenAIBatchProvider") + pool.detail), tokens: { tokens_by_model: tokensByModel }, diagnostics };
     }
 
     return { terminalState: "completed", result: { candidates, agents: ideateResult.agents, meta: ideateResult.meta }, tokens: { tokens_by_model: tokensByModel }, diagnostics };
@@ -1068,8 +1316,40 @@ export class OpenAIBatchProvider {
     });
   }
 
+  /** Surrender an in-flight OpenAI batch at the poll ceiling (issue #92).
+   *  Mirrors AnthropicBatchProvider#abandon exactly; only the cancel endpoint
+   *  differs (`POST /v1/batches/{id}/cancel`). */
+  async #abandon(batch, batchId, startedAt, lastStatus) {
+    const elapsedMs = Date.now() - startedAt;
+    const cancelled = this.cancelOnAbandon
+      ? await cancelBatchQuietly(this.fetchImpl, `https://api.openai.com/v1/batches/${batchId}/cancel`, openaiHeaders(this.apiKey), { sleep: this.sleep, logger: this.logger })
+      : null;
+    this.logger(
+      `OpenAIBatchProvider: poll ceiling reached after ${elapsedMs}ms (maxPollMs=${this.maxPollMs}) -- abandoning batch ${batchId}. ` +
+        (cancelled === null
+          ? "cancelOnAbandon is off, so it was left running."
+          : cancelled === true
+            ? "It was cancelled so it will not bill unattended."
+            : `The cancel call did not succeed (${cancelled}) -- it may still bill; cancel by hand: POST /v1/batches/${batchId}/cancel.`) +
+        ` The handle is durable: GET /v1/batches/${batchId} still reports it.`,
+    );
+    const record = { batchId, elapsedMs, maxPollMs: this.maxPollMs, lastStatus: lastStatus || null, cancelled };
+    for (const ctx of new Set(batch.map((entry) => entry.ctx))) {
+      ctx.classification.timedOut = true;
+      if (!Array.isArray(ctx.classification.abandoned)) ctx.classification.abandoned = [];
+      ctx.classification.abandoned.push(record);
+    }
+    for (const entry of batch) entry.resolve({ ok: false, __failureKind: "timeout" });
+  }
+
   // ── batch mode: buffer this call; flush the round as one OpenAI Batch ─────
   #completeBatched(req, ctx) {
+    // Same post-abandonment short-circuit as the Anthropic path -- see there
+    // for why a later round must not submit a second batch for a cell that has
+    // already been given up on.
+    if (ctx && ctx.classification && (ctx.classification.abandoned || []).length > 0) {
+      return Promise.resolve({ ok: false, __failureKind: "timeout" });
+    }
     return new Promise((resolve, reject) => {
       this.#pending.push({ req, resolve, reject, ctx });
       if (!this.#flushScheduled) {
@@ -1131,7 +1411,8 @@ export class OpenAIBatchProvider {
     }
 
     const batchId = create.json.id;
-    const deadline = Date.now() + this.maxPollMs;
+    const startedAt = Date.now();
+    const deadline = startedAt + this.maxPollMs;
     let batchStatus = create.json;
     // Terminal OpenAI batch states: completed | failed | expired | cancelled.
     while (batchStatus.status !== "completed") {
@@ -1143,10 +1424,7 @@ export class OpenAIBatchProvider {
         return;
       }
       if (Date.now() > deadline) {
-        for (const entry of batch) {
-          entry.ctx.classification.timedOut = true;
-          entry.resolve({ ok: false, __failureKind: "timeout" });
-        }
+        await this.#abandon(batch, batchId, startedAt, batchStatus.status);
         return;
       }
       await this.sleep(this.pollIntervalMs);
