@@ -56,6 +56,7 @@ import { orderCandidates } from "./order.mjs";
 import { assertEvaluatorDistinct } from "./distinct.mjs";
 import { buildJudgeMatrix } from "./matrix.mjs";
 import { meterJudgeCall } from "./gate.mjs";
+import { priceRowsByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
 import {
   buildAnthropicMessageParams,
   anthropicHeaders,
@@ -561,9 +562,31 @@ export function computeJudgeHash({ judgeModels, promptObject } = {}) {
  *   @param {number} o.seed    base integer seed; each (pool, provider) leg gets a distinct derived seed.
  *   @param {"batch"|"single"} [o.mode]  batch-first, defaults to "batch".
  *   @param {string} o.timestamp  ISO 8601, caller-supplied (meterJudgeCall requires it — replayability).
- * @returns {Promise<{rows:Array, results:Array, deferred:Array}>}
+ *
+ * ── Cost rows and per-provider attribution (issue #63) ──────────────────────
+ * Every judge call meterJudgeCall() records (completed OR failed — tokens
+ * consumed by a failed call are still spend) is collected into the returned
+ * `costRows`, so a caller (the ledger, a future spend pre-flight) can see
+ * judge spend WITHOUT re-reading the store. Each row is built exactly ONCE
+ * by meterJudgeCall itself and handed back via its `row` field — never
+ * rebuilt here, so a judge call's cost can never be double-counted between
+ * the store and this return value. `spendByProvider` attributes those SAME
+ * rows per provider via lib/price.mjs's priceRowsByProvider (which reduces
+ * to providerOf(judgeModel) for a judge row — single-model, never assumed
+ * from the pool's generating arm), so a cross-provider generating arm (e.g.
+ * arm G) does not put an OpenAI judge's spend in the anthropic bucket just
+ * because most of that arm's slots are Anthropic. `hasMissingRate`/
+ * `missingRateModels` surface a judge model with no lib/price.mjs RATE_TABLE
+ * row rather than silently pricing it at $0.
+ *
+ * @param {object} [o.rateTable=lib/price.mjs's RATE_TABLE]  used only to
+ *   compute `spendByProvider` from the recorded rows; never affects what is
+ *   stored (store rows are always token counts, priced at READ time).
+ * @returns {Promise<{rows:Array, results:Array, deferred:Array, costRows:Array,
+ *   spendByProvider: Object<string, number>, hasMissingRate: boolean,
+ *   missingRateModels: string[]}>}
  */
-export async function runJudgeMatrix({ pools, judgeModels, providers, store, seed = 1, mode = "batch", timestamp }) {
+export async function runJudgeMatrix({ pools, judgeModels, providers, store, seed = 1, mode = "batch", timestamp, rateTable = DEFAULT_RATE_TABLE }) {
   if (!Array.isArray(pools)) throw new Error("runJudgeMatrix: pools must be an array");
   if (!store) throw new Error("runJudgeMatrix: store is required");
   if (!timestamp) throw new Error("runJudgeMatrix: timestamp is required (caller-supplied ISO 8601, for meterJudgeCall replayability)");
@@ -580,6 +603,7 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
 
   const results = [];
   const deferred = [];
+  const costRows = [];
   for (const row of rows) {
     const pool = poolByKey.get(row.poolKey);
     // (1) Enforce distinctness at CALL time, not just schedule time.
@@ -602,18 +626,25 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
     if (resp.terminalState === "completed") {
       for (const s of resp.scores) assertAxesNotCollapsed(s); // defense: never store a collapsed score
       recordJudgeScores(store, { poolKey: row.poolKey, judgeModel: row.judge_model, judgeProvider: row.judge_provider, scores: resp.scores });
-      meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
+      const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
+      costRows.push(metered.row);
       results.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, state: "completed", scores: resp.scores });
     } else {
       // A classified judge failure is a datum, surfaced — never a silent drop.
+      // Tokens consumed by a failed call are still spend, so it still meters
+      // and still contributes a costRow — the ledger must not undercount spend
+      // just because the call didn't complete.
       if (resp.tokens && (resp.tokens.input_tokens || resp.tokens.output_tokens)) {
-        meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
+        const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
+        costRows.push(metered.row);
       }
       results.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, state: "failed", failureKind: resp.failureKind, detail: resp.detail });
     }
   }
 
-  return { rows, results, deferred };
+  const { byProvider: spendByProvider, hasMissingRate, missingRateModels } = priceRowsByProvider(costRows, rateTable, { batch: mode === "batch" });
+
+  return { rows, results, deferred, costRows, spendByProvider, hasMissingRate, missingRateModels };
 }
 
 /** Tiny stable string->int32 hash for deriving a per-leg order seed. Not

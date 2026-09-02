@@ -422,10 +422,14 @@ export async function runSpec(spec, opts) {
   // wholly on whichever model happens to be listed first in the row.
   //
   // Fail loud on a missing rate WHEN per-provider spend-gating is active
-  // (issue #62 MEDIUM): runnerPriceGrid already throws pre-flight on a model
-  // absent from RATE_TABLE, but that guard only ever sees arm-slot models --
-  // it never runs for judge rows, since JUDGE_MODELS models don't pass
-  // through runnerPriceGrid. Without this check, a rate-less model would
+  // (issue #62 MEDIUM): runnerPriceGrid's fail-loud-on-missing-rate guard
+  // (extended to judge legs too as of issue #63) only ever runs at PLAN
+  // time, against the PROJECTED grid -- it never sees a judge row's ACTUAL
+  // tokens_by_model, because runJudgeMatrix (evals/judge/score.mjs) is not
+  // itself invoked from this runSpec() path (see that module's own
+  // disclosure). So a rate-less judge model reaching THIS function's actual-
+  // spend accounting still has no upstream guard to rely on. Without this
+  // check, a rate-less model would
   // silently contribute $0 to `runningTotalByProvider` (priceRowByProvider's
   // documented, otherwise-correct default for re-pricing a recorded row),
   // quietly undercounting real spend against the very ceiling this admission

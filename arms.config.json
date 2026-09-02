@@ -9,7 +9,7 @@
   "arms": {
     "A": {
       "label": "Solo baseline",
-      "purpose": "The control that can falsify the product -- single call, no panel, no rounds. Matched on total ideas requested (5 x 6 = 30).",
+      "purpose": "The control that can falsify the product -- single call, no panel, no rounds. totalIdeasRequested: 30 (5 x 6, maxRounds: 1) -- this is Arm A's ROUND-1-ONLY total, and Arm A has only one round, so it is Arm A's whole pool. A panel arm is NOT matched to this at pool level: panel.maxRounds is 2, round 2 APPENDS to round 1's candidates rather than replacing them, so a panel arm's real pool is ~60 (size x ideasPerAgent x maxRounds), not 30. See evals/judge/matrix.mjs's judgeLegsFor comment for the pre-flight pricing consequence of this asymmetry.",
       "mode": "solo",
       "personaDisabled": false,
       "totalIdeasRequested": 30,
