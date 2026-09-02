@@ -18,3 +18,8 @@ results/
 # Si et al. 2024 expert-score slice — fetched locally, never redistributed here.
 # Provenance: docs/fetching-si-et-al.md (evals#24). arXiv 2409.04109.
 data/si-et-al/
+
+# evals/analysis/ sidecar (issue #46) — pinned Python venv, in-repo but never
+# committed (see sidecar/requirements.txt), and generated run outputs.
+evals/analysis/sidecar/.venv/
+evals/analysis/out/
