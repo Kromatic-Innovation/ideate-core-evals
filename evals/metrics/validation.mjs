@@ -19,9 +19,10 @@
 //   - the hermetic tests here (validation.test.mjs) call them with
 //     fixtureEmbedder(FIXTURES) and assert the exact same properties
 //     dat-replication.test.mjs / negative-controls.test.mjs already assert,
-//   - ./live-validation.mjs (opt-in, never imported by a test) calls the
-//     exact same functions with a real voyageEmbedder, so the live run is
-//     provably the same check, not a hand-rolled approximation of it.
+//   - ./phase0.mjs (evals/run.mjs's `--phase 0`, opt-in/live, never imported
+//     by a hermetic test with a real embedder) calls the exact same
+//     functions with a real voyageEmbedder, so the live run is provably the
+//     same check, not a hand-rolled approximation of it.
 //
 // This module is PURE: no network, no top-level dependency beyond the other
 // metrics modules and the frozen control texts. It never calls fetch itself
@@ -64,8 +65,8 @@ export async function datReplication(embedder) {
     average,
     high,
     // The falsifiable claim — computed honestly, never forced. A caller
-    // (live-validation.mjs) that gets `orderingHolds: false` back MUST report
-    // that as a failure, per the issue's "never worked around" requirement.
+    // (phase0.mjs) that gets `orderingHolds: false` back MUST report that as
+    // a failure, per the issue's "never worked around" requirement.
     orderingHolds: low < average && average < high,
     margin: high - low,
   };
@@ -121,8 +122,34 @@ export async function negativeControls(embedder, { threshold = CLUSTER_DISTANCE_
   };
 }
 
+// The duplicate-pool control's diversity bound: "near-zero" is operationalized
+// as strictly below this constant, not a bare literal repeated at each call
+// site (see duplicatePoolVerdict below -- this used to be an unpinned 0.05
+// copy-pasted into both evals/metrics/phase0.mjs and the now-deleted
+// live-validation.mjs, with no test ever exercising the bound itself).
+export const DUPLICATE_DIVERSITY_MAX = 0.05;
+
 /**
- * Random-pool verdict (docs/PREREGISTRATION.md §4.4, live-validation.mjs
+ * Duplicate-pool verdict (docs/PREREGISTRATION.md §4.4): 30 copies of one
+ * idea should collapse to distinct_k=1 AND diversity below
+ * DUPLICATE_DIVERSITY_MAX. Both conjuncts are required -- distinct_k=1 with
+ * a large diversity (or vice versa) would be an internally inconsistent
+ * result from a clustering bug, not a pass. Extracted here (mirroring
+ * randomPoolVerdict just below) so evals/metrics/phase0.mjs's live
+ * `--phase 0` gate and any future caller share ONE tested implementation of
+ * this rule instead of each hand-rolling the same two-part check.
+ *
+ * @param {{ distinctK: number, diversity: number }} args
+ * @returns {{ distinctKPass: boolean, diversityPass: boolean, passed: boolean }}
+ */
+export function duplicatePoolVerdict({ distinctK, diversity }) {
+  const distinctKPass = distinctK === 1;
+  const diversityPass = diversity < DUPLICATE_DIVERSITY_MAX;
+  return { distinctKPass, diversityPass, passed: distinctKPass && diversityPass };
+}
+
+/**
+ * Random-pool verdict (docs/PREREGISTRATION.md §4.4, evals/run.mjs --phase 0
  * random-pool check): the random-pool negative control asserts TWO
  * independent things, and they must be reported independently because one
  * of them has a precondition the other does not share.

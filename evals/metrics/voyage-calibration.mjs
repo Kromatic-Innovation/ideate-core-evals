@@ -23,7 +23,7 @@
 // directory embeds with fixtureEmbedder(FIXTURES) (MiniLM), so hermetic
 // tests must keep using that number. VOYAGE_CLUSTER_DISTANCE_THRESHOLD below
 // is the number production code (a live Voyage embedder, e.g.
-// live-validation.mjs, or a future run.mjs consumer) must use instead. Two
+// phase0.mjs / evals/run.mjs's `--phase 0`) must use instead. Two
 // distinct constants for two distinct embedding spaces — collapsing them
 // into one is exactly the defect issue #42 fixes.
 

@@ -9,7 +9,7 @@
 // every cell through unthrottled instead of erroring).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, main, formatSpendSummary } from "./run.mjs";
+import { parseArgs, main, formatSpendSummary, formatPhase0Report } from "./run.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
@@ -203,4 +203,227 @@ test("main() prints an explicit 'NOT COMPUTED' line for cumulative spend, never 
 test("formatSpendSummary returns no lines for a dry-run result (no summary at all)", () => {
   assert.deepEqual(formatSpendSummary(undefined), []);
   assert.deepEqual(formatSpendSummary(null), []);
+});
+
+// ── --phase 0 wiring (issue #48) ────────────────────────────────────────────
+// The actual controls logic lives in evals/metrics/phase0.mjs and is tested
+// there (phase0.test.mjs); these tests exercise main()'s WIRING of it --
+// same rationale as the --max-spend-anthropic/priceGrid tests above (issue
+// #62 BLOCKER 2): dropping the apiKey/store forwarding, or the VOYAGE_API_KEY
+// pre-flight check, would leave every OTHER test here green.
+
+function spyRunPhase0(result) {
+  const calls = [];
+  const fn = async (deps) => {
+    calls.push(deps);
+    return result;
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+const PASSING_PHASE0_SUMMARY = {
+  dat: { low: 0.1, average: 0.2, high: 0.3, orderingHolds: true, margin: 0.2 },
+  controls: {
+    duplicate: { distinctK: 1, diversity: 0, collapseRate: 1 },
+    random: { distinctK: 30, diversity: 0.5, collapseRate: 0 },
+  },
+  duplicatePassed: true,
+  dupVerdict: { distinctKPass: true, diversityPass: true, passed: true },
+  randomVerdict: { distinctKPass: true, floorVerdict: "pass", failed: false },
+  allPassed: true,
+  embedderId: "voyage-4-lite",
+  totalTokens: 42,
+  threshold: 0.23141118234233987,
+  runId: "2026-09-02T01:43:26.641Z-abcd1234",
+  datKey: "phase0/dat-replication@2026-09-02T01:43:26.641Z-abcd1234",
+  controlsKey: "phase0/negative-controls@2026-09-02T01:43:26.641Z-abcd1234",
+  gitSha: "deadbeef",
+};
+
+test("main() --phase 0 requires VOYAGE_API_KEY and never invents one", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  delete process.env.VOYAGE_API_KEY;
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--phase", "0"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /VOYAGE_API_KEY is not set/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0, "must fail BEFORE calling runPhase0 -- never a network call with no key");
+  } finally {
+    if (prior !== undefined) process.env.VOYAGE_API_KEY = prior;
+  }
+});
+
+test("main() rejects --dry-run combined with --phase 0", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key";
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--dry-run", "--phase", "0"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--dry-run is not supported with --phase 0/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+  }
+});
+
+test("main() --phase 0 forwards apiKey/store to runPhase0Fn and does not touch the arms/briefs pipeline", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key-123";
+  const priorExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await main(["--phase", "0"], { runPhase0Fn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+    assert.equal(runPhase0Fn.calls.length, 1);
+    assert.equal(runPhase0Fn.calls[0].apiKey, "test-key-123");
+    assert.equal(runPhase0Fn.calls[0].store, FAKE_STORE);
+    assert.notEqual(process.exitCode, 1, "a passing Phase 0 must not set a failing exit code");
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("main() --phase 0 prints NO spend summary via the injected log -- it never calls runSpec, so there is no summary to render (merge of #64/PR #72 and #69/Phase 0)", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key-123";
+  const priorExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    const runSpecFn = spyRunSpec(); // must NEVER be called for --phase 0
+    const lines = [];
+    await main(["--phase", "0"], {
+      runPhase0Fn,
+      runSpecFn,
+      store: FAKE_STORE,
+      getEngineVersion: STUB_ENGINE_VERSION,
+      log: (msg) => lines.push(msg),
+    });
+
+    assert.equal(runSpecFn.calls.length, 0, "--phase 0 must never call runSpec -- it has no arms/briefs grid");
+    assert.deepEqual(lines, [], "formatSpendSummary's [spend] lines must never appear for --phase 0 -- it has no runSpec summary to render, only formatPhase0Report's own (console.log-only) report");
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("main() --phase 0 sets a non-zero exit code when a control fails, and never throws to paper over it", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key-123";
+  const priorExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    const failingSummary = { ...PASSING_PHASE0_SUMMARY, allPassed: false, duplicatePassed: false };
+    const runPhase0Fn = spyRunPhase0(failingSummary);
+    await main(["--phase", "0"], { runPhase0Fn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+    assert.equal(process.exitCode, 1, "§8.3: 'all controls pass, or stop' -- a failed control must be reported via a failing exit code");
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("main() --phase for any value other than 0 still fails loudly (no phase->arms/briefs mapping exists yet)", async () => {
+  await assert.rejects(
+    () => main(["--phase", "2"], { getEngineVersion: STUB_ENGINE_VERSION }),
+    /only --phase 0 is wired to a real mapping/,
+  );
+});
+
+test("formatPhase0Report names all three in-scope controls and never claims the judge test-retest control ran", () => {
+  const { lines, allPassed } = formatPhase0Report(PASSING_PHASE0_SUMMARY);
+  const text = lines.join("\n");
+  assert.equal(allPassed, true);
+  assert.match(text, /DAT replication/);
+  assert.match(text, /duplicate pool/);
+  assert.match(text, /random-text pool/);
+  assert.match(text, /judge test-retest.*NOT run/i);
+});
+
+test("formatPhase0Report reports the failing outcome honestly when allPassed is false", () => {
+  const { lines, allPassed } = formatPhase0Report({ ...PASSING_PHASE0_SUMMARY, allPassed: false });
+  assert.equal(allPassed, false);
+  assert.match(lines.join("\n"), /AT LEAST ONE FAILED/);
+});
+
+test("formatPhase0Report labels margin as descriptive only, not a gating result", () => {
+  const { lines } = formatPhase0Report(PASSING_PHASE0_SUMMARY);
+  assert.match(lines.join("\n"), /margin.*DESCRIPTIVE ONLY/i);
+});
+
+// ── --phase 0 rejects every other flag (Quine smaller item, PR #69) ────────
+test("main() --phase 0 rejects --max-spend instead of silently ignoring it", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key";
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--phase", "0", "--max-spend", "50"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --max-spend/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+  }
+});
+
+test("main() --phase 0 rejects --max-spend-anthropic and --max-spend-openai instead of silently ignoring them", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key";
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--phase", "0", "--max-spend-anthropic", "50"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --max-spend-anthropic\/--max-spend-openai/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--max-spend-openai", "20"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --max-spend-anthropic\/--max-spend-openai/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+  }
+});
+
+test("main() --phase 0 rejects --arms/--briefs/--replicates/--no-batch the same way", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key";
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--phase", "0", "--arms", "A"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --arms/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--briefs", "b1"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --briefs/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--replicates", "2"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --replicates/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--no-batch"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --no-batch/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+  }
 });

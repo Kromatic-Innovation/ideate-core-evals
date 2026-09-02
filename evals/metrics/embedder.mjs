@@ -26,8 +26,9 @@
 // ordering/normalization/usage-accounting logic by injecting a FAKE
 // `fetchImpl` (see embedder.test.mjs), so `node --test` never makes a live
 // network call even though this module is the production HTTP client. The
-// live path is exercised only by ./live-validation.mjs, an opt-in script no
-// test imports (see that file's header).
+// live path is exercised only by ./phase0.mjs (evals/run.mjs's `--phase 0`),
+// an opt-in, live entry point no hermetic test drives against a real key
+// (see that file's header).
 
 /**
  * The hermetic embedder: a pure text -> vector LOOKUP over a committed JSON
