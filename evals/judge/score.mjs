@@ -875,11 +875,11 @@ export function judgePaymentRefusal(provider) {
   return (provider && JUDGE_PAYMENT_REFUSALS.get(provider)) || null;
 }
 
-/** Forget a provider's sticky refusal — for a test, or for a caller that has
- *  genuinely funded the account and wants the same instance to try again. */
-export function clearJudgePaymentRefusal(provider) {
-  if (provider) JUDGE_PAYMENT_REFUSALS.delete(provider);
-}
+// Deliberately NO `clearJudgePaymentRefusal`: funding an account means a new
+// invocation, which builds new provider instances (evals/run.mjs), so a
+// resetter would be an export with no non-test caller — the exact "registered
+// stage, no caller" shape issues #68/#77/#85 exist to fix. The entry dies with
+// the provider it describes.
 
 /**
  * Drive the cross-judge matrix as a LIVE scoring pass (issue #21 AC: "the

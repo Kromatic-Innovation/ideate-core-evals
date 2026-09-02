@@ -411,6 +411,11 @@ test("issue #106: main() surfaces a judge-side payment abort to the operator, an
   const joined = lines.join("\n");
   assert.match(joined, /JUDGING ABORTED/, "the abort is announced -- otherwise it is invisible outside summary.judge");
   assert.match(joined, /4 judge leg\(s\) are payment_required/, "the count comes from summary.judge.byKind, not a re-derivation");
+  assert.match(
+    joined,
+    /cannot say how the total splits/,
+    "byKind cannot distinguish a refused leg from a short-circuited one, so the notice must not claim a split it has no basis for",
+  );
   assert.match(joined, /GENERATION was NOT stopped/, "the asymmetry with #88 is stated, because it is the whole operator-facing decision");
 });
 

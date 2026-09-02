@@ -15,7 +15,6 @@ import {
   parseAxisScores,
   runJudgeMatrix,
   judgePaymentRefusal,
-  clearJudgePaymentRefusal,
   recordJudgeScores,
   judgeScoresKey,
   judgeScoresForAxis,
@@ -1335,22 +1334,42 @@ test("issue #106: spend already incurred survives the abort, and a short-circuit
   assert.ok(runs[1].costRows.find((r) => r.model === anthropicLeg.judge_model), "the unaffected provider's spend is unaffected");
 });
 
-test("issue #106: clearJudgePaymentRefusal lets a funded account be retried with the same provider instance", async () => {
-  const store = makeTempStore("judge-payment-clear-");
+// The two abort tests above drive the refusing leg with MockJudgeProvider.
+// This file's own F5 comment (above) records why that is not always enough:
+// a defect conditional on the real provider stays green under the Mock. The
+// sticky-set reads only `resp.failureKind`, so the risk is small — but the
+// end-to-end path (real transport → real classification → abort) is the one
+// an operator actually runs, so pin it once with a REAL OpenAIJudgeProvider.
+
+test("issue #106: a REAL OpenAIJudgeProvider quota refusal sets the abort and short-circuits the next pool -- not just the Mock", async () => {
+  const store = makeTempStore("judge-payment-real-");
   const anthropic = new MockJudgeProvider();
-  const failFor = new Map(PAYMENT_FAIL_OPENAI);
-  const openai = new MockJudgeProvider({ failFor });
-  const opts = { judgeModels: JUDGE_MODELS, providers: { anthropic, openai }, store, seed: 1, timestamp: "2026-08-02T00:00:00Z" };
+  let openaiHttpCalls = 0;
+  const fetchImpl = async () => {
+    openaiHttpCalls++;
+    return jsonResponse(429, OPENAI_QUOTA_BODY);
+  };
+  const openai = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 0, logger: silentLogger });
+  const poolKeys = ["arm=B|brief=biz-01|rep=0|cfg=x", "arm=B|brief=biz-02|rep=0|cfg=x"];
+  const runs = [];
+  for (const poolKey of poolKeys) {
+    runs.push(
+      await runJudgeMatrix({
+        pools: [poolEntry(poolKey, "B", "b idea 1")],
+        judgeModels: JUDGE_MODELS,
+        providers: { anthropic, openai },
+        store,
+        seed: 1,
+        mode: "single",
+        timestamp: "2026-08-02T00:00:00Z",
+      }),
+    );
+  }
 
-  await runJudgeMatrix({ pools: [poolEntry("arm=B|brief=biz-01|rep=0|cfg=x", "B", "b idea 1")], ...opts });
-  assert.ok(judgePaymentRefusal(openai));
-
-  // "The operator funded the account."
-  failFor.clear();
-  clearJudgePaymentRefusal(openai);
-  assert.equal(judgePaymentRefusal(openai), null);
-
-  const after = await runJudgeMatrix({ pools: [poolEntry("arm=B|brief=biz-02|rep=0|cfg=x", "B", "b idea 1")], ...opts });
-  assert.equal(openai.calls.length, 2, "the provider is callable again once the refusal is cleared");
-  assert.equal(after.results.find((r) => r.judge_provider === "openai").state, "completed");
+  assert.equal(runs[0].results.find((r) => r.judge_provider === "openai").failureKind, "payment_required");
+  assert.equal(openaiHttpCalls, 1, "the second pool's openai leg makes NO HTTP request at all -- the abort happens before the transport");
+  const second = runs[1].results.find((r) => r.judge_provider === "openai");
+  assert.equal(second.failureKind, "payment_required");
+  assert.equal(second.attempted, false);
+  assert.equal(runs[1].results.find((r) => r.judge_provider === "anthropic").state, "completed", "the anthropic leg of the same pool still judged");
 });

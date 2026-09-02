@@ -849,9 +849,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const judgePaymentFailures = (judgeSummary && judgeSummary.byKind && judgeSummary.byKind.payment_required) || 0;
   if (judgePaymentFailures) {
     log(
-      `[run] JUDGING ABORTED: a judge account refused on billing/credit. ${judgePaymentFailures} judge leg(s) are ` +
-        `payment_required -- the first was actually refused, the rest were NOT attempted (every one would have hit ` +
-        `the identical wall). GENERATION was NOT stopped and is unaffected: those pools are already stored, and the ` +
+      `[run] JUDGING ABORTED: at least one judge account refused on billing/credit. ${judgePaymentFailures} judge ` +
+        `leg(s) are payment_required -- the leg(s) that were actually refused, plus every later leg on that same ` +
+        `account, which were NOT attempted (each would have hit the identical wall). This count cannot say how the ` +
+        `total splits between the two, only that it is entirely billing. GENERATION was NOT stopped and is ` +
+        `unaffected: those pools are already stored, and the ` +
         `next invocation of this same command judges them once the account is funded. Judge legs on the OTHER ` +
         `provider were unaffected. Spend already incurred is preserved; see docs/retrying-failed-cells.md.`,
     );
