@@ -138,8 +138,20 @@ export function parseArgs(argv) {
   return args;
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+// argv/deps are injectable (issue #62 BLOCKER 2): main() previously always
+// read process.argv and always constructed the real runSpec/ResultsStore,
+// so nothing outside a real CLI invocation could exercise its WIRING --
+// e.g. mutating away `priceGrid: runnerPriceGrid()` or
+// `maxSpendByProviderUsd: args.maxSpendByProviderUsd` from the runSpec call
+// below left every test green, because run.test.mjs only ever called
+// parseArgs(), never main(). `deps.runSpecFn`/`deps.store` let a test inject
+// a spy in place of the real runSpec and a hermetic temp store in place of
+// the real `results/` directory, so main()'s actual call site can be
+// asserted against directly. Both default to the real implementations, so a
+// genuine CLI invocation (`main()`, no args) is unchanged.
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  const { runSpecFn = runSpec, store: injectedStore } = deps;
+  const args = parseArgs(argv);
 
   // --phase is accepted (per §12's flag table) but NOT YET wired to a
   // phase->arms/briefs mapping: docs/PREREGISTRATION.md §8.3 defines phases
@@ -219,7 +231,7 @@ async function main() {
     },
   };
 
-  const store = new ResultsStore(join(REPO_ROOT, "results"));
+  const store = injectedStore || new ResultsStore(join(REPO_ROOT, "results"));
 
   // Provider wiring: --dry-run calls nothing (provider: undefined, unchanged
   // from before #19 -- runSpec() only requires a provider when !dryRun -- see
@@ -245,7 +257,7 @@ async function main() {
     provider = new AnthropicBatchProvider({ apiKey, corpus: CORPUS, armsConfig });
   }
 
-  await runSpec(spec, {
+  const runSpecOpts = {
     store,
     armsConfig,
     provider,
@@ -265,7 +277,8 @@ async function main() {
     armIds: args.arms,
     briefIds: args.briefs,
     replicates: args.replicates,
-  });
+  };
+  await runSpecFn(spec, runSpecOpts);
 }
 
 // Only auto-run when this file is the actual entry point (`node evals/run.mjs

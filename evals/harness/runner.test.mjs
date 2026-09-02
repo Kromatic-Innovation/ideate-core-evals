@@ -17,6 +17,8 @@ import { tmpdir } from "node:os";
 
 import { ResultsStore } from "../../lib/store.mjs";
 import { configHash, cellKey } from "../../lib/manifest.mjs";
+import { costRow } from "../../lib/accounting.mjs";
+import { priceRowByProvider } from "../../lib/price.mjs";
 import { runSpec, planAndPrice, interimPriceGrid } from "./runner.mjs";
 import { MockProvider } from "./provider.mjs";
 
@@ -291,6 +293,128 @@ test("running per-provider totals are tracked between cells, not only in the pre
   assert.equal(summary.planned, 2);
   assert.equal(summary.completed, 1, "only the first cell fit under the ceiling once its ACTUAL cost was booked");
   assert.equal(summary.skipped, 1, "the second cell was skipped -- the running total already accounted for the first cell's real spend");
+});
+
+test("issue #62 BLOCKER 2: the runner's ACTUAL per-provider running total matches an INDEPENDENTLY computed expected amount -- not merely > 0", async (t) => {
+  // MockProvider's defaultCompletion is deterministic: 500 input / 300
+  // output tokens per slot model (see provider.mjs). H2 has exactly one
+  // Anthropic slot (claude-haiku-4-5), so the expected total is computed
+  // here directly via priceRowByProvider on an IDENTICAL synthetic row --
+  // completely independent of runSpec's internal bookkeeping. A mutation
+  // that scales the running total (e.g. x10) fails this exact-equality
+  // check even though it would pass a bare "> 0" assertion.
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2"],
+    briefIds: ["b1"],
+    log: silentLog,
+  });
+
+  const expectedRow = costRow({
+    cellKey: "expected",
+    timestamp: "2026-08-01T00:00:00Z",
+    billing_mode: "api",
+    model: "claude-haiku-4-5",
+    input_tokens: 500,
+    output_tokens: 300,
+  });
+  // runSpec's default `batch` is true (batch-first, see runner.mjs) -- match
+  // it here so the independent expectation prices the same discounted rate
+  // the actual run did.
+  const { byProvider: expected } = priceRowByProvider(expectedRow, undefined, { batch: true });
+
+  assert.equal(summary.completed, 1);
+  assert.equal(summary.spendByProvider.anthropic, expected.anthropic, "the actual running total must equal the independently-derived expected amount exactly, not merely be positive");
+});
+
+test("issue #62 HIGH/BLOCKER 2: --max-spend-<provider> requires every priced todo cell to carry byProvider, and fails loud (not merely 'within budget') when an injected priceGrid omits it", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+
+  // A priceGrid that prices cells but never reports byProvider -- the exact
+  // shape the pre-flight guard (runner.mjs) exists to reject.
+  const brokenPriceGrid = (plannedCells) => ({
+    usd: plannedCells.length,
+    breakdown: plannedCells.map((c) => ({ cellKey: c.key, usd: 1 })), // no byProvider
+  });
+
+  await assert.rejects(
+    () =>
+      runSpec(SPEC_PROVIDERS, {
+        store,
+        armsConfig: ARMS_CONFIG_PROVIDERS,
+        provider,
+        armIds: ["H2"],
+        priceGrid: brokenPriceGrid,
+        maxSpendByProviderUsd: { anthropic: 1000 },
+        log: silentLog,
+      }),
+    /requires every priced todo cell to carry a 'byProvider' breakdown/,
+  );
+});
+
+test("issue #62 BLOCKER 1 (regression): once ONE provider's ceiling has been exhausted by real spend, a later cell that does NOT touch that provider still runs -- it must not be wrongly attributed to the exhausted provider", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+
+  // H2 (Anthropic-only) first, tripping a near-zero Anthropic ceiling; H3
+  // (OpenAI-only) second, under a wide-open OpenAI ceiling. Before the fix,
+  // once `already > ceiling` for anthropic, EVERY remaining cell -- including
+  // the OpenAI-only H3, whose projected anthropic share is $0 -- was skipped
+  // and mislabeled `budget_exceeded:anthropic`.
+  const { summary, account } = await runSpec(SPEC_PROVIDERS, {
+    store,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2", "H3"],
+    maxSpendByProviderUsd: { anthropic: 0, openai: 1000 },
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 1, "the OpenAI-only cell (H3) ran despite Anthropic's ceiling being exhausted");
+  assert.equal(summary.skipped, 1, "the Anthropic-only cell (H2) was skipped");
+  const h3Key = cellKey({ armId: "H3", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  assert.equal(account.states.get(h3Key).state, "completed", "H3 must not be misclassified as skipped:budget_exceeded:anthropic");
+});
+
+test("issue #62 MEDIUM: the spend-gating path fails loud (not a silent $0) when an actual cost row references a model with no RATE_TABLE entry, while a per-provider ceiling is active", async (t) => {
+  // "claude-fake-model-62" carries a real `claude-` prefix (providerOf
+  // resolves it to anthropic fine) but has no lib/price.mjs RATE_TABLE
+  // entry -- exactly the "JUDGE_MODELS model never went through
+  // runnerPriceGrid" gap the QA review names. A custom priceGrid stands in
+  // for the pre-flight pricer (which would otherwise reject an unknown
+  // model before the provider is ever called) so the failure under test is
+  // specifically the ACTUAL-spend path, after the mock provider responds.
+  const store = new ResultsStore(tempDir(t));
+  const unratedArmsConfig = {
+    arms: {
+      NR: { mode: "panel", slots: [{ persona: "proposer_1", model: "claude-fake-model-62" }] },
+    },
+  };
+  const unratedSpec = { arms: [{ id: "NR" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const provider = new MockProvider();
+  const fakePriceGrid = (plannedCells) => ({
+    usd: plannedCells.length,
+    breakdown: plannedCells.map((c) => ({ cellKey: c.key, usd: 1, byProvider: { anthropic: 1 } })),
+  });
+
+  await assert.rejects(
+    () =>
+      runSpec(unratedSpec, {
+        store,
+        armsConfig: unratedArmsConfig,
+        provider,
+        priceGrid: fakePriceGrid,
+        maxSpendByProviderUsd: { anthropic: 1000 },
+        log: silentLog,
+      }),
+    /no RATE_TABLE entry/,
+  );
 });
 
 // ── AC3: resume -- killing mid-grid and restarting re-runs only incomplete cells ──
