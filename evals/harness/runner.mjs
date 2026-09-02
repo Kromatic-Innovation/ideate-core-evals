@@ -579,6 +579,20 @@ export function foldCostRows(rows, rateTable = DEFAULT_RATE_TABLE, { batch = tru
   return { rows: foldedRows, folded: true };
 }
 
+/** Sorted-key JSON, matching how lib/store.mjs canonicalizes a body before
+ *  writing it — so a record built here compares equal to its own stored
+ *  form regardless of property insertion order. */
+function canonicalJson(value) {
+  return JSON.stringify(value, (_k, v) => {
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const out = {};
+      for (const k of Object.keys(v).sort()) out[k] = v[k];
+      return out;
+    }
+    return v;
+  });
+}
+
 /** Sort cost rows into a canonical order so a compacted record's body is a
  *  pure function of what it accounts for. Without this, re-running a prune
  *  over an already-compacted record could produce the same rows in a
@@ -665,6 +679,11 @@ export function planPrune(store, opts = {}) {
         armId: cell.armId,
         briefId: cell.briefId,
         replicate: cell.replicate,
+        // storedAt identifies this PHYSICAL record, and that is what makes
+        // the salvage idempotent without being wrong -- see
+        // salvageEvictedCellSpend's own doc for why content alone cannot
+        // distinguish a crash-retry from a genuine re-run.
+        storedAt: entry.storedAt,
         costRows: body.costRows || [],
         resolvedModels: body.resolvedModels || {},
       };
@@ -787,7 +806,7 @@ export function planPrune(store, opts = {}) {
  * @param {object} [opts] planPrune()'s options, plus:
  *   @param {(msg: string) => void} [opts.log]
  * @returns {{plan: object, spendBefore: object, spendAfter: object,
- *   removed: string[], written: string[]}}
+ *   removed: string[], written: string[], duplicateSpendUsd: number}}
  */
 export function pruneStore(store, opts = {}) {
   const { log = () => {} } = opts;
@@ -796,11 +815,21 @@ export function pruneStore(store, opts = {}) {
 
   const removed = [];
   const written = [];
+  // Rows this prune knowingly removes as a DUPLICATE rather than as spend:
+  // the crash-window repair, where a salvage record for this exact cell
+  // record already exists because a previous prune died after writing it and
+  // before removing the cell. Both copies were being counted; taking one
+  // away is the repair, not a loss. Tracked explicitly so the verification
+  // below can still be an equality check on everything else — "spend may go
+  // down a bit sometimes" is not an invariant worth having.
+  const knownDuplicateRows = [];
 
   // ── 1. Evict cells, salvaging their spend first ─────────────────────────
   for (const evicted of plan.evictions) {
     if (evicted.costRows.length > 0) {
-      written.push(salvageEvictedCellSpend(store, evicted));
+      const salvage = salvageEvictedCellSpend(store, evicted);
+      written.push(salvage.key);
+      if (salvage.reused) knownDuplicateRows.push(...evicted.costRows);
     }
     store.remove([evicted.key], { allowCompleted: opts.allowCompleted === true });
     removed.push(evicted.key);
@@ -835,18 +864,27 @@ export function pruneStore(store, opts = {}) {
   }
 
   // ── 3. Prove the money survived ─────────────────────────────────────────
+  // The last line of defence, and the only one that runs in production: a
+  // fold bug or a lost salvage shows up here, on the operator's terminal,
+  // rather than three weeks later in a cost figure nobody can reconcile.
   const spendAfter = spendToDate(store);
+  const duplicates = priceRows(knownDuplicateRows, DEFAULT_RATE_TABLE, { batch: true });
+  const duplicatesByProvider = priceRowsByProvider(knownDuplicateRows, DEFAULT_RATE_TABLE, { batch: true });
   const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
   const providers = new Set([...Object.keys(spendBefore.byProvider), ...Object.keys(spendAfter.byProvider)]);
-  const drifted = !close(spendBefore.totalUsd, spendAfter.totalUsd) || [...providers].some((p) => !close(spendBefore.byProvider[p] || 0, spendAfter.byProvider[p] || 0));
+  const expectedTotal = spendBefore.totalUsd - duplicates.totalUsd;
+  const drifted =
+    !close(expectedTotal, spendAfter.totalUsd) ||
+    [...providers].some((p) => !close((spendBefore.byProvider[p] || 0) - (duplicatesByProvider.byProvider[p] || 0), spendAfter.byProvider[p] || 0));
   if (drifted) {
     throw new Error(
-      `pruneStore: spend-to-date changed across the prune -- $${spendBefore.totalUsd} before, $${spendAfter.totalUsd} after. ` +
+      `pruneStore: spend-to-date changed across the prune -- $${spendBefore.totalUsd} before, $${spendAfter.totalUsd} after, ` +
+        `$${expectedTotal} expected (${knownDuplicateRows.length} row(s) were a recognised crash-window duplicate, worth $${duplicates.totalUsd}). ` +
         `A prune must never make the study look cheaper (or dearer) than it was; this is a bug in the fold/salvage path, ` +
         `not an operator error. The store has already been modified -- restore it from a copy before running anything else.`,
     );
   }
-  return { plan, spendBefore, spendAfter, removed, written };
+  return { plan, spendBefore, spendAfter, removed, written, duplicateSpendUsd: duplicates.totalUsd };
 }
 
 /**
@@ -860,10 +898,25 @@ export function pruneStore(store, opts = {}) {
  *
  * The `pruned=N` suffix is chosen so the operation is IDEMPOTENT rather than
  * merely unique: N is the lowest index at which either nothing is stored, or
- * what is stored is this exact salvage of this exact cell. So a prune
+ * what is stored is a salvage of THIS PHYSICAL cell record. So a prune
  * interrupted between the salvage write and the cell removal, then re-run,
  * reuses the record it already wrote instead of writing a second copy of the
  * same money.
+ *
+ * "This physical record" is the load-bearing phrase, and identity here is the
+ * index entry's `storedAt`, never the body's content. Content cannot tell the
+ * two cases apart, and they need opposite answers:
+ *
+ *   - CRASH: salvage written, process died before the cell was removed. The
+ *     cell and the salvage hold the SAME money. A re-run must reuse.
+ *   - RE-RUN: the cell was pruned, re-attempted, failed the same way, and
+ *     was stored again — byte-identical content, but a SECOND real spend.
+ *     A re-prune must write a second salvage.
+ *
+ * A `storedAt` collision would need two stores of the same cell key inside
+ * one millisecond with a prune in between; the failure it would cause is an
+ * under-count of one attempt, which is why the whole prune re-verifies
+ * `spendToDate()` afterwards and throws rather than trusting this.
  */
 function salvageEvictedCellSpend(store, evicted) {
   const body = {
@@ -882,6 +935,8 @@ function salvageEvictedCellSpend(store, evicted) {
       cellKey: evicted.key,
       prunedFromState: evicted.state,
       prunedFromKind: evicted.kind,
+      // The identity of the cell record this salvages. See the doc above.
+      prunedFromStoredAt: evicted.storedAt,
     },
     resolvedModels: evicted.resolvedModels,
     accounting: {
@@ -895,13 +950,22 @@ function salvageEvictedCellSpend(store, evicted) {
     const key = `${PRUNED_CELL_FAMILY}|cell=${evicted.key}|pruned=${n}`;
     if (store.has(key)) {
       const prior = store.get(key);
-      if (JSON.stringify(prior.result) === JSON.stringify(body.result) && JSON.stringify(prior.costRows) === JSON.stringify(body.costRows)) {
-        return key; // already salvaged by an interrupted earlier prune
+      // Sorted-key comparison, not a bare JSON.stringify: what comes BACK
+      // from the store was canonicalized on write (lib/store.mjs sorts
+      // object keys), so a literal stringify of the record we are about to
+      // write compares unequal to its own stored form purely on property
+      // order. `result` carries `prunedFromStoredAt`, so this compares
+      // RECORD IDENTITY and not merely equal content.
+      if (canonicalJson(prior.result) === canonicalJson(body.result) && canonicalJson(prior.costRows) === canonicalJson(body.costRows)) {
+        // Already salvaged by an interrupted earlier prune. The caller needs
+        // to know, because removing the cell now takes away a DUPLICATE of
+        // money that is already recorded, not money.
+        return { key, reused: true };
       }
       continue;
     }
     store.put({ key, ...body });
-    return key;
+    return { key, reused: false };
   }
   throw new Error(`salvageEvictedCellSpend: 1000 salvage records already exist for cell '${evicted.key}' -- refusing to write another`);
 }

@@ -9,7 +9,7 @@
 // every cell through unthrottled instead of erroring).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, main, formatSpendSummary, formatPhase0Report } from "./run.mjs";
+import { parseArgs, main, formatSpendSummary, formatPhase0Report, formatPrunePlan } from "./run.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
@@ -20,6 +20,55 @@ import { configHash } from "../lib/manifest.mjs";
 import { createHash } from "node:crypto";
 import { CORPUS } from "./corpus/index.mjs";
 import armsConfigJson from "../arms.config.json" with { type: "json" };
+
+// --prune (issue #98) is the one CLI mode that touches a REAL store rather
+// than being handed to a spy runSpec, so these tests build a genuine temp
+// ResultsStore. Still hermetic: temp dirs, no provider, no network.
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ResultsStore } from "../lib/store.mjs";
+import { cellKey } from "../lib/manifest.mjs";
+import { TRANSIENT_FAILURE_KINDS, INTRINSIC_FAILURE_KINDS, PAYMENT_FAILURE_KINDS } from "../lib/accounting.mjs";
+
+const PRUNE_CFG = "abcdef012345";
+const pruneTempDirs = [];
+process.on("exit", () => {
+  for (const dir of pruneTempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+/** One transient failure (arm A / b1), one completed cell (arm A / b2), and
+ *  eight generation-attempt records for a third cell — enough for a prune to
+ *  have something to evict, something to refuse, and something to compact. */
+function pruneFixtureStore() {
+  const dir = mkdtempSync(join(tmpdir(), "ideate-run-prune-"));
+  pruneTempDirs.push(dir);
+  const store = new ResultsStore(dir);
+  const put = (key, accounting, rows) =>
+    store.put({
+      key,
+      armId: "A",
+      briefId: "b",
+      replicate: 0,
+      cfg: PRUNE_CFG,
+      result: { candidates: [] },
+      resolvedModels: { proposer: "claude-haiku-4-5" },
+      accounting,
+      costRows: rows,
+    });
+  const rowFor = (k) => [{ cellKey: k, timestamp: "2026-09-01T00:00:00Z", billing_mode: "api", model: "claude-haiku-4-5", input_tokens: 1000, output_tokens: 200 }];
+
+  const transient = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: PRUNE_CFG });
+  put(transient, { state: "failed", kind: "rate_limited", detail: "429" }, rowFor(transient));
+  const completed = cellKey({ armId: "A", briefId: "b2", replicate: 0, cfg: PRUNE_CFG });
+  put(completed, { state: "completed" }, rowFor(completed));
+  const busy = cellKey({ armId: "A", briefId: "b3", replicate: 0, cfg: PRUNE_CFG });
+  for (let n = 0; n < 8; n++) {
+    const k = `generation-attempt|cell=${busy}|attempt=${n}`;
+    put(k, { state: "failed", kind: "rate_limited", detail: "429" }, rowFor(busy));
+  }
+  return store;
+}
 
 // A stand-in store: main()'s wiring is under test here, not ResultsStore
 // itself (see lib/store.test.mjs for that) -- the spy runSpecFn below never
@@ -582,4 +631,153 @@ test("main() --phase 0 rejects --arms/--briefs/--replicates/--no-batch the same 
     if (prior === undefined) delete process.env.VOYAGE_API_KEY;
     else process.env.VOYAGE_API_KEY = prior;
   }
+});
+
+// ── --prune (issue #98) ─────────────────────────────────────────────────────
+// The prune is the only CLI mode that DELETES, so its argv handling gets the
+// same scrutiny --max-spend does, and for a sharper reason: a mis-parsed
+// budget flag spends money, a mis-parsed prune flag destroys measurements.
+
+test("parseArgs accepts --prune and its selectors", () => {
+  const args = parseArgs(["--prune", "--cfg", "5ce5478956e5", "--arms", "A,B", "--briefs", "b1", "--kinds", "rate_limited,timeout", "--keep-attempts", "3", "--apply"]);
+  assert.equal(args.prune, true);
+  assert.equal(args.apply, true);
+  assert.equal(args.cfg, "5ce5478956e5");
+  assert.deepEqual(args.arms, ["A", "B"]);
+  assert.deepEqual(args.briefs, ["b1"]);
+  assert.deepEqual(args.kinds, ["rate_limited", "timeout"]);
+  assert.equal(args.keepAttempts, 3);
+  assert.equal(args.allowCompleted, undefined);
+});
+
+test("--kinds expands the three set names lib/accounting.mjs already defines", () => {
+  assert.deepEqual(parseArgs(["--prune", "--kinds", "transient"]).kinds, [...TRANSIENT_FAILURE_KINDS]);
+  assert.deepEqual(parseArgs(["--prune", "--kinds", "intrinsic"]).kinds, [...INTRINSIC_FAILURE_KINDS]);
+  assert.deepEqual(parseArgs(["--prune", "--kinds", "payment"]).kinds, [...PAYMENT_FAILURE_KINDS]);
+  // Mixed, de-duplicated.
+  assert.deepEqual(
+    parseArgs(["--prune", "--kinds", "transient,rate_limited,refusal"]).kinds,
+    [...TRANSIENT_FAILURE_KINDS, "refusal"],
+  );
+});
+
+test("--kinds refuses an unknown token rather than silently ignoring it", () => {
+  // A kind this command silently drops is a cell that stays unretryable --
+  // the exact failure mode the whole issue is about.
+  assert.throws(() => parseArgs(["--prune", "--kinds", "rate_limitd"]), /neither a failure kind/);
+  assert.throws(() => parseArgs(["--prune", "--kinds", ""]), /--kinds requires/);
+});
+
+test("--states validates against the real terminal states", () => {
+  assert.deepEqual(parseArgs(["--prune", "--states", "failed,completed"]).states, ["failed", "completed"]);
+  assert.throws(() => parseArgs(["--prune", "--states", "borked"]), /valid terminal states/);
+});
+
+test("--keep-attempts refuses zero, a fraction and a non-number", () => {
+  assert.throws(() => parseArgs(["--prune", "--keep-attempts", "0"]), /positive integer/);
+  assert.throws(() => parseArgs(["--prune", "--keep-attempts", "1.5"]), /positive integer/);
+  assert.throws(() => parseArgs(["--prune", "--keep-attempts", "lots"]), /numeric argument/);
+});
+
+test("--prune is dry-run by default: main() reports a plan and writes nothing", async () => {
+  const store = pruneFixtureStore();
+  const before = store.keys();
+  const lines = [];
+  await main(["--prune", "--kinds", "transient"], { store, log: (m) => lines.push(m), getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+
+  assert.deepEqual(store.keys(), before, "a dry run modifies nothing");
+  assert.ok(lines.some((l) => l.includes("EVICT would remove")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("DRY RUN")), lines.join("\n"));
+});
+
+test("--prune --apply removes the cell, and reports the spend it verified", async () => {
+  const store = pruneFixtureStore();
+  const lines = [];
+  await main(["--prune", "--kinds", "transient", "--apply"], { store, log: (m) => lines.push(m), getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+
+  assert.equal(store.keys().some((k) => k.startsWith("arm=A|brief=b1|")), false, "the transient cell is gone");
+  assert.ok(store.keys().some((k) => k.startsWith("pruned-cell|")), "its spend is not");
+  assert.ok(lines.some((l) => l.includes("EVICT removed")), lines.join("\n"));
+  assert.ok(lines.some((l) => /spend-to-date after/.test(l)), lines.join("\n"));
+  assert.equal(lines.some((l) => l.includes("DRY RUN")), false);
+});
+
+test("--prune never calls runSpec, never resolves the engine version, and needs no API key", async () => {
+  const store = pruneFixtureStore();
+  const runSpecFn = spyRunSpec();
+  // A repair command that cannot run on a machine missing a dependency it
+  // will never call is a repair command that is unavailable exactly when it
+  // is needed. Throwing from the engine-version seam proves main() never
+  // reaches it.
+  await main(["--prune"], {
+    store,
+    log: () => {},
+    runSpecFn,
+    getEngineVersion: () => {
+      throw new Error("engine version must not be resolved for a prune");
+    },
+  });
+  assert.equal(runSpecFn.calls.length, 0);
+});
+
+test("--prune rejects run-only flags rather than silently ignoring them", async () => {
+  const base = { store: pruneFixtureStore(), log: () => {}, getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() };
+  await assert.rejects(() => main(["--prune", "--max-spend", "10"], base), /--prune does not accept --max-spend/);
+  await assert.rejects(() => main(["--prune", "--replicates", "2"], base), /--prune does not accept --replicates/);
+  await assert.rejects(() => main(["--prune", "--no-batch"], base), /--prune does not accept --no-batch/);
+});
+
+test("--prune refuses --dry-run and --apply together", async () => {
+  await assert.rejects(
+    () => main(["--prune", "--dry-run", "--apply"], { store: pruneFixtureStore(), log: () => {}, getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() }),
+    /contradict each other/,
+  );
+});
+
+test("--prune --apply on a completed cell refuses without --allow-completed, and complies with it", async () => {
+  const store = pruneFixtureStore();
+  const completedKey = store.keys().find((k) => k.startsWith("arm=A|brief=b2|"));
+  const lines = [];
+  await main(["--prune", "--states", "completed", "--apply"], { store, log: (m) => lines.push(m), getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+  assert.ok(store.has(completedKey), "paid-for data survives a prune that did not ask for it");
+  assert.ok(lines.some((l) => l.includes("REFUSED")), lines.join("\n"));
+
+  await main(["--prune", "--states", "completed", "--allow-completed", "--apply"], { store, log: () => {}, getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+  assert.equal(store.has(completedKey), false);
+});
+
+test("formatPrunePlan names the no-selector case explicitly rather than reporting an empty eviction list", () => {
+  const lines = formatPrunePlan({ keysBefore: 3, keysAfter: 3, selectorsGiven: false, evictions: [], refused: [], compactions: [] });
+  assert.ok(lines.some((l) => l.includes("no cell selector given")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("nothing to compact")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("DRY RUN")), lines.join("\n"));
+});
+
+test("formatPrunePlan surfaces an unfolded compaction group and says why", () => {
+  const lines = formatPrunePlan(
+    {
+      keysBefore: 9,
+      keysAfter: 4,
+      selectorsGiven: false,
+      evictions: [],
+      refused: [],
+      compactions: [
+        {
+          family: "generation-attempt",
+          cellKey: "arm=A|brief=b1|rep=0|cfg=abc",
+          newKey: "generation-attempt-compacted|cell=arm=A|brief=b1|rep=0|cfg=abc|through=4",
+          removeKeys: ["a", "b", "c", "d", "e"],
+          keptKeys: ["f", "g"],
+          rows: [1, 2, 3, 4, 5],
+          rowsBefore: 5,
+          rowsFolded: false,
+          foldSkippedReason: "folding these rows would reprice them",
+        },
+      ],
+    },
+    { applied: true },
+  );
+  assert.ok(lines.some((l) => l.includes("kept UNFOLDED")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("COMPACT removed")), lines.join("\n"));
+  assert.equal(lines.some((l) => l.includes("DRY RUN")), false);
 });
