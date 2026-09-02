@@ -105,22 +105,24 @@ async function fakeSidecarRunner(request) {
   };
 }
 
-// buildRegisteredFamily()'s DEFAULTS (analysis.mjs never overrides them --
-// no CLI flag exists for h2Pair/h3TargetVsBest/h4Pair, a pre-existing gap
-// independent of this issue) name arms B, D, E, G, H directly (H2: E vs D,
-// H3: G vs D/H, H4: B vs D). A minimal 2-arm A/P store makes
-// buildRegisteredFamily() throw on those defaults before H1 is ever
-// reached -- so this fixture uses the REAL registered arm set (reference A
-// + the five registered panel arms) instead of inventing a smaller one.
+// buildRegisteredFamily()'s DEFAULTS name arms B, D, E, G, H directly
+// (H2: E vs D, H3: G vs D/H, H4: B vs D), so this fixture uses the REAL
+// registered arm set (reference A + the five registered panel arms).
+//
+// Until issue #97 that was not a choice but a constraint: a smaller store
+// made the family name arms the fit did not carry, and the run died as
+// `contrastVector: unknown coefficient 'arm[T.E]'`. #97 fixed that -- see
+// the two-arm end-to-end test at the bottom of this file, which is the
+// #8 smoke study's shape (arms A and B only).
 const ARMS = ["A", "B", "D", "E", "G", "H"];
 
-function seedStore(config, { withPools }) {
+function seedStore(config, { withPools, arms = ARMS }) {
   const dir = mkdtempSync(join(tmpdir(), "ideate-store-main-"));
   const store = new ResultsStore(dir);
   const cfg = configHash(config);
   let seed = 30000;
   for (const briefId of BRIEFS) {
-    for (const armId of ARMS) {
+    for (const armId of arms) {
       const n = armId === "A" ? N_A : N_PANEL; // Arm A: maxRounds 1 (~30); every panel arm: maxRounds 2 (~60)
       const pool = makeCategoricalPool(CATEGORY_COUNT, n, seed++);
       const key = cellKey({ armId, briefId, replicate: 0, cfg });
@@ -619,5 +621,99 @@ test("main(): a --config-hash the store does not hold is reported as the exclusi
   } finally {
     rmSync(resultsDir, { recursive: true, force: true });
     rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+// ── Issue #97: analysis over a TWO-ARM store, end to end ─────────────────
+// The #8 smoke study's shape: arms A and B only. Before #97 this run got
+// past cell selection (#91), through the full-pool and rarefied ladders,
+// and then died on `contrastVector: unknown coefficient 'arm[T.E]' -- not
+// in [Intercept, arm[T.B]]` -- because --panel-arms scoped the model fit
+// but not the registered contrast family. These two tests are the ones
+// that must go red if that scoping is removed.
+
+const TWO_ARMS = ["A", "B"];
+
+test("main(): #97 -- a TWO-ARM store analyses end to end, recording the unreachable registered hypotheses instead of dying on 'unknown coefficient'", async () => {
+  const resultsDir = seedStore(RUNNER_CONFIG, { withPools: false, arms: TWO_ARMS });
+  const outDir = tmpOutDir();
+  try {
+    // No --panel-arms: the operator's actual path. panelArms is derived
+    // from the frame's own armLevels, so the family scopes itself.
+    const result = await main(["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A"], {
+      runner: fakeSidecarRunner,
+    });
+
+    // Selection and the full-pool fit both worked -- this is a real run,
+    // not an early bail that happens to avoid the contrast.
+    assert.equal(result.frame.rows.length, BRIEFS.length * TWO_ARMS.length);
+    assert.deepEqual(result.frame.armLevels, ["A", "B"]);
+    assert.ok(result.ladder.fit, "the full-pool ladder must still produce a fit");
+    assert.deepEqual(result.ladder.fit.coefficientNames, ["Intercept", "arm[T.B]"]);
+
+    // Every registered slot is present and each names why it could not be
+    // reached -- naming the arm, the entry, and the arms available.
+    assert.deepEqual(result.registeredResults.map((r) => r.id), ["H1", "H2", "H3", "H4", "H5"]);
+    for (const id of ["H2", "H3", "H4"]) {
+      const entry = result.registeredResults.find((r) => r.id === id);
+      assert.equal(entry.notEstimable, true, `${id} must be recorded not-estimable, not computed against a substitute arm`);
+      assert.equal(entry.p, 1);
+      assert.match(entry.reason, /NOT ESTIMABLE/);
+      assert.match(entry.reason, /\[A, B\]/, `${id}'s reason must name the arms actually available`);
+      assert.doesNotMatch(entry.reason, /unknown coefficient/);
+    }
+    assert.deepEqual(result.registeredResults.find((r) => r.id === "H2").missingArms, ["E", "D"]);
+    assert.deepEqual(result.registeredResults.find((r) => r.id === "H4").missingArms, ["D"]);
+
+    // H1: a single panel arm collapses mean(panel arms) - A into a per-arm
+    // comparison, which Appendix B item 5 keeps OUT of the Holm family.
+    const h1 = result.registeredResults.find((r) => r.id === "H1");
+    assert.equal(h1.notEstimable, true);
+    assert.equal(h1.estimate, undefined, "H1 must not silently become an exploratory per-arm contrast under a registered name");
+
+    // Multiplicity: still the REGISTERED 5 slots, not the estimated count.
+    assert.equal(result.holmAdjusted.length, 5);
+    assert.equal(result.estimability.slots, 5);
+    assert.deepEqual(result.estimability.notEstimable.map((e) => e.id), ["H1", "H2", "H3", "H4"]);
+
+    // And the report says all of it out loud.
+    const reportMd = readFileSync(join(outDir, "REPORT.md"), "utf8");
+    assert.match(reportMd, /REGISTERED FAMILY ONLY PARTLY ESTIMABLE/);
+    assert.match(reportMd, /4 of 5 registered/);
+    assert.match(reportMd, /- \*\*H2\*\* — NOT ESTIMABLE/);
+    // The H1 row must NOT be attributed to a rarefaction failure -- it was
+    // never estimable for this arm subset in the first place.
+    assert.match(reportMd, /NOT a rarefaction failure/);
+    assert.doesNotMatch(reportMd, /unknown coefficient/);
+
+    // The rest of the pipeline still ran: Pareto/cost and the artifacts.
+    assert.ok(existsSync(join(outDir, "analysis-data.csv")));
+    assert.ok(existsSync(join(outDir, "pareto.svg")));
+    assert.ok(existsSync(join(outDir, "fit.json")));
+    assert.ok(Object.keys(result.costRatioByArm).length > 0);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test("main(): #97 -- explicit --panel-arms B converges on the same result as deriving it from the store", async () => {
+  const resultsDir = seedStore(RUNNER_CONFIG, { withPools: false, arms: TWO_ARMS });
+  const outDirA = tmpOutDir();
+  const outDirB = tmpOutDir();
+  try {
+    const derived = await main(["--results-dir", resultsDir, "--out-dir", outDirA, "--reference-arm", "A"], { runner: fakeSidecarRunner });
+    const explicit = await main(["--results-dir", resultsDir, "--out-dir", outDirB, "--reference-arm", "A", "--panel-arms", "B"], {
+      runner: fakeSidecarRunner,
+    });
+    assert.deepEqual(
+      explicit.registeredResults.map((r) => [r.id, Boolean(r.notEstimable), r.p]),
+      derived.registeredResults.map((r) => [r.id, Boolean(r.notEstimable), r.p]),
+    );
+    assert.deepEqual(explicit.estimability, derived.estimability);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDirA, { recursive: true, force: true });
+    rmSync(outDirB, { recursive: true, force: true });
   }
 });
