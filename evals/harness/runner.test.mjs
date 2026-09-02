@@ -1953,6 +1953,55 @@ test("issue #90: an attempt-scoped generation record is invisible to planRun -- 
   assert.deepEqual(plan.stale, [], "the attempt record must not surface as a stale prior-config cell either");
 });
 
+test("issue #90: a LEGACY store holding a transient failure under cell.key still runs, warns that it cannot be re-attempted, and is NOT promised as re-runnable", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // The issue is explicit that a fix must not assume the store is empty:
+  // stores written BEFORE this change put every classified generation
+  // failure under cell.key, transient ones included. Construct exactly that
+  // shape by hand -- nothing in the runner can produce one any more.
+  const legacyStore = new ResultsStore(dir);
+  legacyStore.put({
+    key,
+    armId: "A",
+    briefId: "b1",
+    replicate: 0,
+    cfg: CFG_HASH,
+    result: { failed: true, failureKind: "rate_limited" },
+    resolvedModels: { solo: "claude-sonnet-5" },
+    accounting: { state: "failed", kind: "rate_limited", detail: "429 after retries" },
+    costRows: [],
+  });
+
+  const store = new ResultsStore(dir);
+  const provider = new MockProvider();
+  const lines = [];
+  const { summary, account } = await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, log: (m) => lines.push(m) });
+
+  // A pre-#90 store must still RUN -- the fix must not turn an operator's
+  // existing results directory into a hard error.
+  assert.doesNotThrow(() => account.reconcile());
+  assert.equal(summary.failed, 1);
+  assert.equal(provider.calls.length, 0, "the legacy record is reuse -- planRun sees the key and there is nothing this run can do about it");
+
+  const warning = lines.find((l) => l.includes("WARNING") && l.includes(key));
+  assert.ok(warning, "a legacy transient failure the harness cannot retry must be said out loud, not hidden inside a plausible failed=1");
+  assert.match(warning, /rate_limited/);
+  assert.match(warning, /docs\/retrying-failed-cells\.md/, "and must point at the one-time remediation");
+
+  // The load-bearing assertion: the re-runnable notice must NOT fire. It is
+  // driven by the todo loop's own tally of cells it declined to store, so a
+  // reused legacy failure -- which IS stored and will never be re-attempted
+  // -- can never be advertised as "re-run the same command to fix this".
+  assert.equal(
+    lines.some((l) => l.includes("were NOT stored under their cell keys")),
+    false,
+    "a legacy stored transient failure must never be reported as re-runnable -- summary.byKind counts it, which is exactly why the notice is not derived from summary.byKind",
+  );
+});
+
 test("issue #90: the run summary tells an operator that environmental failures are re-runnable, so failed=N is never ambiguous", async (t) => {
   const store = new ResultsStore(tempDir(t));
   const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
@@ -1962,8 +2011,9 @@ test("issue #90: the run summary tells an operator that environmental failures a
   const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
   await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider: new MockProvider({ overrides }), log: (m) => lines.push(m) });
 
-  const notice = lines.find((l) => l.includes("environmental"));
+  const notice = lines.find((l) => l.includes("were NOT stored under their cell keys"));
   assert.ok(notice, "the summary must name environmental failures explicitly");
+  assert.match(notice, /environmental/);
   assert.match(notice, /rate_limited=1/);
   assert.match(notice, /re-run/, "and must say what to do about them");
 });

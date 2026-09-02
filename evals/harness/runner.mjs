@@ -1117,6 +1117,11 @@ export async function runSpec(spec, opts) {
     }
   }
 
+  // Transient generation failures THIS INVOCATION declined to store (issue
+  // #90), keyed by kind. Populated only by the todo loop's transient branch
+  // -- see there for why this is not derived from summary.byKind.
+  const notStoredTransientByKind = {};
+
   const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usd]));
   // Projected per-provider cost for each todo cell, split slot-by-slot (see
   // the pre-flight block above) -- used to decide, BEFORE a cell runs,
@@ -1363,6 +1368,15 @@ export async function runSpec(spec, opts) {
         // next invocation re-attempts it (genuinely re-spending, which is
         // correct and honest). The attempt -- its kind, its detail, and
         // every token it consumed -- is durable under its own key.
+        //
+        // Tallied HERE, in the branch that actually declined to store the
+        // cell, rather than derived from summary.byKind at the end. byKind
+        // counts the reuse loop's failures too, and a LEGACY stored
+        // transient failure (written before this fix) lands in it -- so a
+        // notice driven off byKind would tell an operator to re-run a cell
+        // that is permanently `reuse` and will never be re-attempted. That
+        // is the exact ambiguity the notice exists to remove.
+        notStoredTransientByKind[response.failureKind] = (notStoredTransientByKind[response.failureKind] || 0) + 1;
         recordGenerationAttemptFailure(store, {
           cell,
           costRows,
@@ -1481,13 +1495,15 @@ export async function runSpec(spec, opts) {
     `[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}` +
       (skipBreakdown ? ` (${skipBreakdown})` : ""),
   );
-  // Retryable-failure notice (issue #90). Derived here from summary.byKind
-  // rather than added as a field on reconcile()'s return, so the summary
-  // shape every other caller reads is untouched. `failed=N` alone cannot
-  // tell an operator whether the night was lost to rate limits (re-run it)
-  // or to the arms genuinely refusing (that IS the result) -- which is the
-  // exact ambiguity that cost the #8 study a dataset.
-  const retryable = Object.entries(summary.byKind).filter(([kind]) => isTransientFailure(kind));
+  // Retryable-failure notice (issue #90). Built from the todo loop's own
+  // tally of cells it declined to store -- NOT from summary.byKind, which
+  // also counts legacy stored transient failures restored by the reuse loop
+  // and would therefore promise a re-attempt that can never happen. Kept out
+  // of reconcile()'s return so the summary shape every other caller reads is
+  // untouched. `failed=N` alone cannot tell an operator whether the night was
+  // lost to rate limits (re-run it) or to the arms genuinely refusing (that
+  // IS the result) -- the exact ambiguity that cost the #8 study a dataset.
+  const retryable = Object.entries(notStoredTransientByKind);
   if (retryable.length) {
     const n = retryable.reduce((a, [, count]) => a + count, 0);
     log(
