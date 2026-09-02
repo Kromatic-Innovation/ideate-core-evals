@@ -39,10 +39,34 @@ function ciStr(ci, digits = 3) {
  *   @param {Array<object>} input.paretoPoints          pareto.mjs paretoFrontier() output
  *   @param {Record<string, object>} input.costRatioByArm  pareto.mjs costDiversityRatioByArm() output
  *   @param {string} input.analysisHash
+ *   @param {ReturnType<typeof import("./rarefiedFrame.mjs").buildRarefiedFrame>|null} [input.rarefiedFrame]
+ *     H1's rarefied frame (issue #73, docs/PREREGISTRATION.md Appendix C) —
+ *     null when rarefied `distinct_k` could not be computed (no per-cell
+ *     pools in the store yet). When present, every row carries BOTH
+ *     `responseFullPool` and `response` (rarefied) — Appendix C item 5
+ *     registers reporting both, never the rarefied number alone.
+ *   @param {{rung: string}|null} [input.rarefiedLadder]  runLadder() result
+ *     for the rarefied lane, for the rung line.
+ *   @param {string} [input.rarefiedUnavailableReason]  set when
+ *     `rarefiedFrame` is null — printed verbatim rather than silently
+ *     omitting the section (never let a reader assume rarefaction ran).
  * @returns {string} full REPORT.md content
  */
 export function renderReport(input) {
-  const { frame, ladder, registeredResults, holmAdjusted, exploratoryResults = [], bhAdjusted = [], paretoPoints, costRatioByArm, analysisHash } = input;
+  const {
+    frame,
+    ladder,
+    registeredResults,
+    holmAdjusted,
+    exploratoryResults = [],
+    bhAdjusted = [],
+    paretoPoints,
+    costRatioByArm,
+    analysisHash,
+    rarefiedFrame = null,
+    rarefiedLadder = null,
+    rarefiedUnavailableReason,
+  } = input;
 
   const lines = [];
   lines.push("# Analysis report");
@@ -67,7 +91,7 @@ export function renderReport(input) {
   for (let i = 0; i < flatRegistered.length; i++) {
     const r = flatRegistered[i];
     if (r.unimplemented) {
-      lines.push(`| ${r.id} | (judge-score frame not wired — #45/B5) | — | — | — | unimplemented |`);
+      lines.push(`| ${r.id} | ${r.description ? `${r.description} — ` : ""}(${r.reason || "not wired"}) | — | — | — | unimplemented |`);
       continue;
     }
     // Verdict is read from applyHolmVerdicts()'s output ONLY (r.holmP +
@@ -99,6 +123,29 @@ export function renderReport(input) {
       ? [`binding: ${ciStr(r.ci)}`, ...r.components.map((c) => `${c.id}: ${ciStr(c.ci)}`)].join("<br>")
       : ciStr(r.ci);
     lines.push(`| ${r.id} | ${(r.description || "")}${deviationNote} | ${estimateCell} | ${ciCell} | ${fmt(adj, 4)} | ${verdict} |`);
+  }
+  lines.push("");
+
+  lines.push("## Rarefaction — H1's registered estimand (docs/PREREGISTRATION.md Appendix C)");
+  lines.push("");
+  if (rarefiedFrame) {
+    lines.push(
+      `Every pool in H1's contrast rarefied to the minimum pool size actually present (rarefiedN, per row below), ` +
+        `Appendix C item 2. H1 above is evaluated against the RAREFIED value, fitted at rung **${rarefiedLadder ? rarefiedLadder.rung : "n/a"}**. ` +
+        "Both values are reported (Appendix C item 5) — full-pool distinct_k is a secondary descriptive, never the registered estimand.",
+    );
+    lines.push("");
+    lines.push("| Cell | Arm | Pool size | Rarefied N | Full-pool `distinct_k` | Rarefied `distinct_k` |");
+    lines.push("|---|---|---|---|---|---|");
+    for (const r of rarefiedFrame.rows) {
+      lines.push(`| ${r.cellKey} | ${r.armId} | ${r.poolSize} | ${r.rarefiedN} | ${fmt(r.responseFullPool)} | ${fmt(r.response)} |`);
+    }
+  } else {
+    lines.push(
+      `**Rarefied \`distinct_k\` NOT COMPUTED** — ${rarefiedUnavailableReason || "no per-cell pools in the store yet"}. ` +
+        "H1 above is reported `unimplemented` (p=1, occupies its Holm slot) rather than falling back to the full-pool contrast, " +
+        "per Appendix C item 5: rarefied distinct_k is H1's registered estimand and the full-pool value is never a silent substitute for it.",
+    );
   }
   lines.push("");
 

@@ -8,7 +8,7 @@ const CONFIG = { harnessVersion: "0.0.1", engineSha: "abc", promptHash: "p1" };
 const CFG = configHash(CONFIG);
 const STALE_CFG = configHash({ ...CONFIG, promptHash: "p2" });
 
-function put(store, { armId, briefId, replicate, cfg = CFG, state = "completed", distinctK = 3, costs = [] }) {
+function put(store, { armId, briefId, replicate, cfg = CFG, state = "completed", distinctK = 3, costs = [], pool = undefined }) {
   const key = cellKey({ armId, briefId, replicate, cfg });
   const costRows = costs.map((c, i) => ({
     cellKey: key,
@@ -29,6 +29,7 @@ function put(store, { armId, briefId, replicate, cfg = CFG, state = "completed",
   };
   if (state === "completed") {
     record.result = { distinct_k: distinctK };
+    if (pool !== undefined) record.result.pool = pool;
     record.accounting = { state: "completed" };
   } else if (state === "failed") {
     record.result = { failed: true, failureKind: "parse_failure" };
@@ -190,4 +191,36 @@ test("buildFrame: a caller-pinned armLevel the store has NO cells for at all is 
   // (existing behavior this fix must not regress).
   const frame = buildFrame(store, { config: CONFIG, armLevels: ["A", "C"] });
   assert.deepEqual(frame.armLevels, ["A", "C"]);
+});
+
+// ── poolField (issue #73): OPTIONAL, off by default ─────────────────────────
+
+test("buildFrame: without opts.poolField, rows carry no `pool` at all (existing callers unaffected)", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 });
+  const frame = buildFrame(store, { config: CONFIG });
+  assert.equal(frame.poolField, undefined);
+  assert.ok(!("pool" in frame.rows[0]), "a row must not gain a `pool` key when poolField was never requested");
+});
+
+test("buildFrame: opts.poolField reads the embedded pool when a cell has one", () => {
+  const store = makeTempStore();
+  const vectors = [[1, 0], [0, 1]];
+  put(store, { armId: "A", briefId: "b1", replicate: 0, pool: vectors });
+  const frame = buildFrame(store, { config: CONFIG, poolField: "pool" });
+  assert.equal(frame.poolField, "pool");
+  assert.deepEqual(frame.rows[0].pool, vectors);
+});
+
+test("buildFrame: opts.poolField on a cell that predates #8 (no pool stored) leaves that row's pool undefined -- never a hard failure", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 }); // no `pool`
+  const frame = buildFrame(store, { config: CONFIG, poolField: "pool" });
+  assert.equal(frame.rows[0].pool, undefined);
+});
+
+test("buildFrame: opts.poolField on a PRESENT but malformed pool (not a non-empty array) is a hard error", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0, pool: [] });
+  assert.throws(() => buildFrame(store, { config: CONFIG, poolField: "pool" }), /invalid pool/);
 });

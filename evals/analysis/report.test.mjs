@@ -115,3 +115,41 @@ test("renderReport: an unimplemented H5 entry renders without throwing", () => {
   const md = renderReport(input);
   assert.match(md, /unimplemented/);
 });
+
+// ── Rarefaction (issue #73, Appendix C) ─────────────────────────────────────
+
+test("renderReport: rarefiedFrame present -- renders both full-pool and rarefied distinct_k per cell", () => {
+  const input = baseInput();
+  input.rarefiedFrame = {
+    rows: [
+      { cellKey: "arm=A|brief=b1|rep=0|cfg=c", armId: "A", poolSize: 30, rarefiedN: 30, responseFullPool: 22, response: 22 },
+      { cellKey: "arm=P|brief=b1|rep=0|cfg=c", armId: "P", poolSize: 60, rarefiedN: 30, responseFullPool: 35, response: 23.4 },
+    ],
+  };
+  input.rarefiedLadder = { rung: "R0" };
+  const md = renderReport(input);
+  assert.match(md, /## Rarefaction/);
+  assert.match(md, /arm=A\|brief=b1\|rep=0\|cfg=c/);
+  assert.match(md, /35\.000/); // full-pool value present
+  assert.match(md, /23\.400/); // rarefied value present, distinct from full-pool
+  assert.doesNotMatch(md, /NOT COMPUTED/);
+});
+
+test("renderReport: rarefiedFrame absent -- prints an explicit NOT COMPUTED line, never a silent omission or fallback", () => {
+  const input = baseInput();
+  input.rarefiedFrame = null;
+  input.rarefiedUnavailableReason = "no per-cell pools present for the [A, P] contrast";
+  const md = renderReport(input);
+  assert.match(md, /## Rarefaction/);
+  assert.match(md, /NOT COMPUTED/);
+  assert.match(md, /no per-cell pools present for the \[A, P\] contrast/);
+});
+
+test("renderReport: an unimplemented H1 (rarefied lane unavailable) renders its own reason, not H5's judge-score text", () => {
+  const input = baseInput();
+  input.registeredResults[0] = { id: "H1", description: "mean(panel) - A", unimplemented: true, reason: "no per-cell pools present", p: 1 };
+  input.holmAdjusted[0] = 1;
+  const md = renderReport(input);
+  assert.match(md, /no per-cell pools present/);
+  assert.doesNotMatch(md, /judge-score frame not wired/);
+});
