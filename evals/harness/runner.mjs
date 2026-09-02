@@ -241,24 +241,28 @@ function subsetSpec(spec, { arms, briefs, replicates } = {}) {
  * trigger (spend resets on config change) instead of closing it. So this
  * sums cost rows across the ENTIRE store, regardless of each record's `cfg`.
  *
- * ── What this measures, given issue #68 and the resume blind spot ───────
+ * ── What this measures, given issue #68 ─────────────────────────────────
  * This sums whatever cost rows the store actually holds -- nothing more,
- * nothing less. Today that is GENERATION spend only: `runJudgeMatrix`/
- * `runJudgeValidation` (evals/judge/*.mjs) have no caller on this
- * `runSpec()` path (issue #68), so no judge cost row is ever written here.
- * That is not this function under-reporting judge spend -- there is no
- * judge spend recorded anywhere to report, because none has been billed
- * through this path yet. Once #68 wires judging in and its cost rows start
- * landing via `store.put()`, this function picks them up with zero changes,
- * because it prices the ledger, never a projection.
+ * nothing less. UPDATED (PR #76 fix round): issue #68 now wires
+ * `runJudgeMatrix` into `runSpec()`'s own per-cell loop (see
+ * `judgePoolIfEnabled` below), so judge cost rows DO land via `store.put()`
+ * on this path -- this function picks them up with zero changes of its own,
+ * because it prices the ledger, never a projection, exactly as designed.
+ * `runJudgeValidation` is a separate composition (evals/judge/validate.mjs)
+ * that still has no non-test caller -- out of scope for #68 (filed
+ * separately) -- so its cost rows are absent from any store `runSpec()`
+ * alone populates; that is a scoping gap in a DIFFERENT code path, not a
+ * defect in what this function measures.
  *
- * It also does NOT compensate for the separate, still-open resume blind
- * spot: `runnerPriceGrid`'s judge-cost PROJECTION only estimates judging for
- * `plan.todo` cells, so a cell reused this session (already generated in an
- * earlier session, not yet judged) contributes no judging estimate either --
- * neither here (nothing recorded) nor in the pre-flight projection (not
- * `todo`). A cumulative ceiling built on top of both stays exposed to that
- * gap; it is not fixed by this function and is not silently assumed away.
+ * The resume blind spot this comment used to describe is CLOSED as of #68:
+ * `judgePoolIfEnabled` judges a `plan.reuse` cell (already generated in an
+ * earlier session, not yet judged) on THIS invocation too, not only
+ * `plan.todo` cells -- see the per-cell loop and the `plan.reuse` restore
+ * loop below. `runnerPriceGrid`'s pre-flight PROJECTION still only estimates
+ * judging for `plan.todo` (it has no way to know a reused cell needs
+ * judging until the ACTUAL run discovers that), so a reused-but-unjudged
+ * cell's judge spend is unprojected but IS metered and counted here once it
+ * runs -- a pre-flight under-estimate, never a ledger under-count.
  *
  * @param {object} store       a lib/store.mjs ResultsStore
  * @param {object} [rateTable=DEFAULT_RATE_TABLE]  pinned, dated rate table
@@ -753,6 +757,19 @@ export async function runSpec(spec, opts) {
     // themselves, so this can never double-persist the same row under a
     // second store key (the exact double-count meterJudgeCall's own header
     // comment guards against).
+    //
+    // N5 (PR #76 review): this means `account.ledger` -- populated ONLY via
+    // addCost(), see the generation branches below -- now carries BOTH
+    // generation and judge cost rows under the SAME planned cellKey (a
+    // judge costRow's `cellKey` is the poolKey, which equals the generating
+    // cell's key). Harmless today: nothing reads `account.ledger` outside a
+    // test, and `summary.spendByProvider` is derived from
+    // `runningTotalByProvider` (recordActualSpend's own running total, see
+    // above), never from `account.ledger`, so it is NOT silently mislabeled
+    // "generation spend" by this. Flagged here so a FUTURE consumer of
+    // `account.ledger` treats it as "every dollar this run's planned cells
+    // spent, generation and judging both" -- not generation-only -- rather
+    // than discovering the mix the hard way.
     for (const row of costRows) account.addCost(row);
     recordActualSpend(costRows);
   }

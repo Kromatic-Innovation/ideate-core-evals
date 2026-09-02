@@ -273,7 +273,9 @@ test("AC10 — a judge call produces a costRow (tokens x model, no cost_usd) tha
   });
   assert.equal(outcome.written, true);
 
-  const key = "judge-call|cell=arm=B|brief=b1|rep=0|cfg=deadbeef1234|judge=claude-sonnet-5";
+  // Attempt-scoped (PR #76 fix round): the FIRST call for this (cellKey,
+  // judgeModel) pair is always attempt 0 -- see meterJudgeCall's own header.
+  const key = "judge-call|cell=arm=B|brief=b1|rep=0|cfg=deadbeef1234|judge=claude-sonnet-5|attempt=0";
   const stored = store.get(key);
   assert.equal(stored.costRows.length, 1);
   const row = stored.costRows[0];

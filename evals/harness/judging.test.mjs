@@ -392,3 +392,206 @@ test("issue #74: the genuine production trigger -- a judge-model RATE_TABLE gap 
   assert.ok(store.has(targetKey), "the generation cell's result was not discarded by the judge-side missing-rate throw");
   assert.equal(store.get(targetKey).accounting.state, "completed");
 });
+
+// ── PR #76 fix round: a judge leg that fails WITH TOKENS CONSUMED must not brick the store on resume ──
+//
+// evals/judge/score.mjs's AnthropicJudgeProvider threads ONE mutable
+// `tokens` accumulator through its whole call and classifies the outcome
+// only afterward, so a rate_limited/timeout/transport_error/parse_failure
+// leaves REAL, non-zero usage on the failed response -- MockJudgeProvider's
+// `failFor` reproduces the identical shape (tokens are always computed from
+// the payload BEFORE the forced-failure check runs). Before this fix,
+// meterJudgeCall's key carried no attempt discriminator, so a resumed retry
+// of that SAME leg collided with the orphaned judge-call row from the
+// failed attempt and lib/store.mjs's append-only put() threw -- permanently,
+// since the store has no delete API.
+
+test("BLOCKING (PR #76 fix round): a judge leg that fails with tokens consumed resumes and retries cleanly -- no store-bricking key collision on retry", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+  const provider = new MockProvider();
+  // Forces the anthropic leg to fail as rate_limited -- MockJudgeProvider
+  // still computes real tokens from the payload before checking `failFor`
+  // (see score.mjs), so this leg fails WITH consumed tokens, exactly the
+  // shape that bricked the store pre-fix.
+  const failingJudge = new MockJudgeProvider({ failFor: new Map([["claude-opus-5", { failureKind: "rate_limited" }]]) });
+
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const { summary: summary1 } = await runSpec(soloSpec, {
+    store: store1,
+    armsConfig: soloArms,
+    provider,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: failingJudge },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+  assert.equal(summary1.judge.failed, 1, "sanity: the anthropic leg failed (forced rate_limited)");
+
+  const cellA = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  assert.equal(store1.has(judgeScoresKey({ poolKey: cellA, judgeModel: "claude-opus-5" })), false, "sanity: no scores were written -- the leg failed before scoring");
+  assert.ok(store1.has("judge-call|cell=" + cellA + "|judge=claude-opus-5|attempt=0"), "tokens consumed by the failed attempt were still metered (attempt 0)");
+
+  // Resume: a FRESH session, a HEALTHY judge this time. Pre-fix, this threw
+  // on the store collision -- the store was permanently bricked by session
+  // 1's single 429.
+  const store2 = new ResultsStore(dir);
+  const healthyJudge = new MockJudgeProvider();
+  const { summary: summary2 } = await runSpec(soloSpec, {
+    store: store2,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: healthyJudge },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+
+  assert.equal(healthyJudge.calls.length, 1, "the leg was retried exactly once, cleanly -- no throw");
+  assert.equal(summary2.judge.completed, 1, "the anthropic leg is now complete");
+  assert.ok(store2.has(judgeScoresKey({ poolKey: cellA, judgeModel: "claude-opus-5" })), "scores now exist");
+  assert.ok(store2.has("judge-call|cell=" + cellA + "|judge=claude-opus-5|attempt=1"), "the retry's spend landed under its OWN attempt-scoped row, not a collision with attempt 0");
+
+  // Both attempts' spend is durably preserved -- the honest model: a retry
+  // genuinely spent more money and deserves its own row, never collapsed
+  // away or lost.
+  const attempt0Row = store2.get("judge-call|cell=" + cellA + "|judge=claude-opus-5|attempt=0").costRows[0];
+  const attempt1Row = store2.get("judge-call|cell=" + cellA + "|judge=claude-opus-5|attempt=1").costRows[0];
+  assert.ok(attempt0Row.input_tokens > 0, "attempt 0's spend (the failed call) is still on record");
+  assert.ok(attempt1Row.input_tokens > 0, "attempt 1's spend (the retry) is a SEPARATE record");
+});
+
+test("N1 mirror (PR #76 fix round): a leg interrupted BETWEEN the money-first cost-row write and the scores write never loses its cost row, and the retry gets its own attempt-scoped row", async (t) => {
+  const dir = tempDir(t);
+  const realStore1 = new ResultsStore(dir);
+  // Simulates a crash between meterJudgeCall's write (money-first) and
+  // recordJudgeScores' write -- everything else passes through to the real
+  // store untouched.
+  const crashingStore = {
+    keys: (...a) => realStore1.keys(...a),
+    has: (...a) => realStore1.has(...a),
+    list: (...a) => realStore1.list(...a),
+    get: (...a) => realStore1.get(...a),
+    put: (record) => {
+      if (record.key.startsWith("judge-scores|")) {
+        throw new Error("SIMULATED CRASH between the money-first judge-call write and the judge-scores write");
+      }
+      return realStore1.put(record);
+    },
+  };
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  await assert.rejects(
+    () =>
+      runSpec(soloSpec, {
+        store: crashingStore,
+        armsConfig: soloArms,
+        provider,
+        judgeModels: JUDGE_MODELS,
+        judgeProviders: { anthropic: anthropicJudge },
+        corpus: CORPUS,
+        log: silentLog,
+      }),
+    /SIMULATED CRASH/,
+  );
+
+  const cellA = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const attempt0Key = "judge-call|cell=" + cellA + "|judge=claude-opus-5|attempt=0";
+  // Read back via the REAL store directly (bypassing the crashing wrapper) --
+  // money-first ordering means the cost row survived the simulated crash.
+  assert.ok(realStore1.has(attempt0Key), "the FIRST attempt's judge-call cost row survived the crash (money-first ordering)");
+  assert.equal(realStore1.has(judgeScoresKey({ poolKey: cellA, judgeModel: "claude-opus-5" })), false, "scores were never written -- the crash happened before that write");
+
+  // Resume against the SAME (real, non-crashing) store: the leg is retried
+  // cleanly -- no collision with the surviving attempt-0 row, and the
+  // FIRST attempt's spend is never silently dropped.
+  const store2 = new ResultsStore(dir);
+  const anthropicJudge2 = new MockJudgeProvider();
+  const { summary } = await runSpec(soloSpec, {
+    store: store2,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge2 },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+
+  assert.equal(anthropicJudge2.calls.length, 1, "the leg was retried exactly once");
+  assert.equal(summary.judge.completed, 1, "the anthropic leg is now complete");
+  assert.ok(store2.has(judgeScoresKey({ poolKey: cellA, judgeModel: "claude-opus-5" })), "scores now exist, written by the retry");
+  const attempt1Key = "judge-call|cell=" + cellA + "|judge=claude-opus-5|attempt=1";
+  assert.ok(store2.has(attempt1Key), "the retry got its OWN attempt-scoped row, not a collision with the surviving attempt-0 row");
+  assert.ok(store2.has(attempt0Key), "the pre-crash attempt-0 row is STILL present -- its spend was never lost");
+});
+
+// ── N2: issue #74's fix must cover the FAILED branch too, not only completed ──
+
+test("N2: issue #74's ordering fix also covers the FAILED generation branch -- a failed cell's result and cost row survive a subsequent missing-rate throw", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const unratedArmsConfig = { arms: { NR: { mode: "panel", slots: [{ persona: "proposer_1", model: "claude-fake-model-74-failed" }] } } };
+  const unratedSpec = { arms: [{ id: "NR" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const targetKey = cellKey({ armId: "NR", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  // Forces the FAILED branch specifically -- MockProvider's defaultCompletion
+  // still reports real tokens_by_model for the rate-less model regardless of
+  // terminalState (a failed call can still have consumed real tokens -- see
+  // costRowsFor's own caller comment in runner.mjs), so this fails on the
+  // SAME missing-rate guard the completed-branch test above exercises, but
+  // via the `else` branch of the per-cell loop.
+  const overrides = new Map([[targetKey, { terminalState: "failed", failureKind: "empty_pool", detail: "forced failure with tokens consumed" }]]);
+  const provider = new MockProvider({ overrides });
+  const fakePriceGrid = (plannedCells) => ({
+    usd: plannedCells.length,
+    breakdown: plannedCells.map((c) => ({ cellKey: c.key, usd: 1, byProvider: { anthropic: 1 } })),
+  });
+
+  await assert.rejects(
+    () =>
+      runSpec(unratedSpec, {
+        store,
+        armsConfig: unratedArmsConfig,
+        provider,
+        priceGrid: fakePriceGrid,
+        maxSpendByProviderUsd: { anthropic: 1000 },
+        log: silentLog,
+      }),
+    /no RATE_TABLE entry/,
+  );
+
+  assert.ok(store.has(targetKey), "N2: the FAILED cell's result was NOT discarded by the missing-rate throw");
+  const stored = store.get(targetKey);
+  assert.equal(stored.accounting.state, "failed");
+  assert.ok(Array.isArray(stored.costRows) && stored.costRows.length > 0, "the cost row itself also survived, not just the result");
+});
+
+// ── N6: the unknown-arm guard (armsConfig.arms[cell.armId] missing on resume) fails loud ──
+
+test("N6: a reused cell whose arm was removed from armsConfig between sessions fails loud when judging tries to look it up, rather than crashing on a bare undefined", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+  const armsWithZ = { arms: { ...ARMS_CONFIG.arms, Z: { mode: "solo", slots: [{ persona: "solo", model: "claude-haiku-4-5" }] } } };
+  const specWithZ = { arms: [{ id: "Z" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  await runSpec(specWithZ, { store: store1, armsConfig: armsWithZ, provider: new MockProvider(), log: silentLog });
+
+  // Session 2: arm Z has been removed from arms.config.json (armsConfig no
+  // longer defines it), but the store still has a completed cell for it.
+  const store2 = new ResultsStore(dir);
+  await assert.rejects(
+    () =>
+      runSpec(specWithZ, {
+        store: store2,
+        armsConfig: ARMS_CONFIG, // no arm Z
+        provider: new MockProvider(),
+        judgeModels: JUDGE_MODELS,
+        judgeProviders: { anthropic: new MockJudgeProvider(), openai: new MockJudgeProvider() },
+        corpus: CORPUS,
+        log: silentLog,
+      }),
+    /unknown arm 'Z'/,
+  );
+});

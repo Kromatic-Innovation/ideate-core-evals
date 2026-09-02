@@ -519,6 +519,29 @@ export function attachIdeaLevelScores({ store, judgeHash, pools, ideaLevelScores
  * attribution via lib/price.mjs's priceRowsByProvider) WITHOUT building a
  * second row for the same call — exactly one costRow() per judge call, ever.
  *
+ * ── Attempt-scoped key (PR #76 fix round, blocking) ──────────────────────
+ * A judge leg's transport call can fail AFTER consuming real tokens --
+ * AnthropicJudgeProvider threads ONE mutable `tokens` accumulator through
+ * its whole call and classifies the outcome only afterward, so a
+ * rate_limited/timeout/transport_error/parse_failure leaves REAL usage on
+ * `resp.tokens` (see score.mjs's AnthropicJudgeProvider#score). A caller
+ * that resumes and retries that SAME leg (evals/harness/runner.mjs's
+ * judgePoolIfEnabled, keyed on whether judge-SCORES exist, never on
+ * whether a judge-CALL row exists) is making a SECOND real API call that
+ * spends REAL money again -- not a replay of the first attempt. A fixed,
+ * deterministic key (the pre-fix `judge-call|cell=...|judge=...`, no
+ * discriminator) collided on that retry: lib/store.mjs's append-only,
+ * byte-identical-or-throw put() rejected the new (different-timestamp) row
+ * outright, permanently bricking the store (no delete API) on the very
+ * first judge-side transport hiccup. Mirrors phase0.mjs's identical fix for
+ * its own re-run/retry collision (see that module's header) -- an attempt
+ * discriminator, scanning the store for how many attempts already exist
+ * under this (cellKey, judgeModel) pair and suffixing the NEXT integer, so
+ * every attempt's spend gets its own durable, non-colliding row. This is
+ * the honest model, not a workaround: a retry genuinely spent more money
+ * and deserves its own cost row, exactly the family of defect issue #74
+ * exists to close (collapsing two billed attempts into one row
+ * under-counts real spend).
  * @returns {{key: string, written: boolean, row: object}}
  */
 export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp }) {
@@ -532,14 +555,22 @@ export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp }
     model: judgeModel,
     ...tokens,
   });
-  const key = `judge-call|cell=${cellKey}|judge=${judgeModel}`;
+  // See the attempt-scoping comment above: `store.keys()` is index-only
+  // (cheap; lib/store.mjs) and reflects every attempt already durably
+  // recorded for this exact (cellKey, judgeModel) pair, including ones from
+  // a PRIOR session (a fresh ResultsStore instance reads index.jsonl from
+  // disk) -- so the next attempt number is always the count of prior ones,
+  // regardless of which process or session wrote them.
+  const keyPrefix = `judge-call|cell=${cellKey}|judge=${judgeModel}|attempt=`;
+  const attempt = store.keys().filter((k) => k.startsWith(keyPrefix)).length;
+  const key = `${keyPrefix}${attempt}`;
   const result = store.put({
     key,
     armId: "__judge-call__",
     briefId: cellKey,
     replicate: 0,
     cfg: judgeModel,
-    result: { kind: "judge-call", cellKey, judgeModel },
+    result: { kind: "judge-call", cellKey, judgeModel, attempt },
     resolvedModels: { judge: judgeModel },
     accounting: { state: "completed" },
     costRows: [row],
