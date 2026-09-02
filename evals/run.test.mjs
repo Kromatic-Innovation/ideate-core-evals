@@ -291,6 +291,26 @@ test("main() --phase 0 rejects --max-spend instead of silently ignoring it", asy
   }
 });
 
+test("main() --phase 0 rejects --max-spend-anthropic and --max-spend-openai instead of silently ignoring them", async () => {
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key";
+  try {
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await assert.rejects(
+      () => main(["--phase", "0", "--max-spend-anthropic", "50"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --max-spend-anthropic\/--max-spend-openai/,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", "--max-spend-openai", "20"], { runPhase0Fn, getEngineVersion: STUB_ENGINE_VERSION }),
+      /--phase 0 does not accept --max-spend-anthropic\/--max-spend-openai/,
+    );
+    assert.equal(runPhase0Fn.calls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+  }
+});
+
 test("main() --phase 0 rejects --arms/--briefs/--replicates/--no-batch the same way", async () => {
   const prior = process.env.VOYAGE_API_KEY;
   process.env.VOYAGE_API_KEY = "test-key";

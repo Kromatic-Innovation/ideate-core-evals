@@ -91,6 +91,8 @@
 
 import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 import { costRow } from "../../lib/accounting.mjs";
 import { voyageEmbedder } from "./embedder.mjs";
@@ -102,6 +104,13 @@ import {
 } from "./validation.mjs";
 import { RANDOM_TEXT_POOL, DUPLICATE_POOL } from "./fixtures/control-texts.mjs";
 import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD, VOYAGE_CALIBRATION_RECORD } from "./voyage-calibration.mjs";
+
+// This module's own repo root -- evals/metrics/phase0.mjs is two directories
+// below it, mirroring evals/run.mjs's own __dirname/REPO_ROOT pattern. Used
+// ONLY by realGetGitSha below (see that function's header for why it needs
+// an explicit cwd rather than inheriting process.cwd()).
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(__dirname, "..", "..");
 
 export const DAT_REPLICATION_KEY_PREFIX = "phase0/dat-replication";
 export const NEGATIVE_CONTROLS_KEY_PREFIX = "phase0/negative-controls";
@@ -117,10 +126,19 @@ export function phase0Key(prefix, runId) {
  *  to "unknown" rather than throwing: provenance is a nice-to-have on a
  *  stored row, and a git lookup failure (detached worktree oddities, no git
  *  binary) must never abort an otherwise-successful live Phase 0 run over a
- *  cosmetic field. */
+ *  cosmetic field.
+ *
+ *  `cwd: REPO_ROOT` is load-bearing, not cosmetic (Quine finding, PR #69
+ *  second fix round): `execSync` with no `cwd` inherits `process.cwd()`,
+ *  which is NOT necessarily this repo -- the store path already resolves
+ *  off `REPO_ROOT` (see evals/run.mjs), but a git lookup with no cwd
+ *  invoked from any OTHER directory would silently record a DIFFERENT
+ *  repository's HEAD (or fail) instead of this one's. A wrong-but-plausible
+ *  SHA on a provenance field is strictly worse than the "unknown" soft-fail
+ *  below, since a wrong SHA looks trustworthy and an "unknown" does not. */
 function realGetGitSha() {
   try {
-    return execSync("git rev-parse HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    return execSync("git rev-parse HEAD", { cwd: REPO_ROOT, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
   } catch {
     return "unknown";
   }

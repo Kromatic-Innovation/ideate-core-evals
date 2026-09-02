@@ -241,6 +241,64 @@ test("runPhase0 evaluates the random-pool distinct_k bound against the real 30-i
   assert.equal(summary.allPassed, false);
 });
 
+// ── cfg.passed on the negative-controls row for the FAILING case (Quine,
+// PR #69 second fix round) ───────────────────────────────────────────
+// A passing cfg.passed=true was already covered (the happy-path test
+// above); nothing previously pinned the FAILING value at the index level,
+// which is exactly the field #48 AC1 ("the study stops here with the
+// failure recorded") depends on being legible without opening a body.
+test("runPhase0 sets cfg.passed=false (index-visible) on the negative-controls row when a control fails", async () => {
+  const deps = BASE_DEPS();
+  const failingControlsFn = async (embedder) => {
+    await embedder.embed(["dup"]);
+    return {
+      duplicate: { distinctK: 3, diversity: 0.5, collapseRate: 0.5 }, // fails both conjuncts
+      random: { distinctK: 30, diversity: 0.5, collapseRate: 0.0 },
+    };
+  };
+
+  const summary = await runPhase0({ ...deps, datReplicationFn: passingDatFn(), negativeControlsFn: failingControlsFn });
+
+  assert.equal(summary.allPassed, false);
+  const controlsListEntry = deps.store.list().find((e) => e.key === summary.controlsKey);
+  assert.equal(controlsListEntry.cfg.passed, false, "cfg.passed must reflect the real (failing) verdict, not a hardcoded true");
+  // the DAT row passed independently -- confirms this isn't a blanket flag
+  // shared across both rows.
+  const datListEntry = deps.store.list().find((e) => e.key === summary.datKey);
+  assert.equal(datListEntry.cfg.passed, true);
+});
+
+// ── storedAt pinning (Quine, PR #69 second fix round) ─────────────────
+// storedAt must be the plain ISO `timestamp` (the value costRow's
+// `timestamp` also carries), NOT the compound `runId` (which has a random
+// suffix appended purely for key uniqueness -- see phase0.mjs's "Re-run /
+// retry safety" header section). Pinned here with an injected `now` so the
+// expected value is exact, not just "truthy".
+test("runPhase0 stores storedAt as the plain ISO timestamp, not the compound runId", async () => {
+  const FIXED_TIMESTAMP = "2026-09-02T12:00:00.000Z";
+  const deps = BASE_DEPS();
+  const capturedOpts = [];
+  const summary = await runPhase0({
+    ...deps,
+    now: () => FIXED_TIMESTAMP,
+    datReplicationFn: passingDatFn(),
+    negativeControlsFn: passingControlsFn(capturedOpts),
+  });
+
+  assert.ok(summary.runId.startsWith(FIXED_TIMESTAMP), "runId must still be PREFIXED by the timestamp");
+  assert.notEqual(summary.runId, FIXED_TIMESTAMP, "runId must carry a suffix beyond the bare timestamp (key-uniqueness entropy)");
+
+  const datListEntry = deps.store.list().find((e) => e.key === summary.datKey);
+  const controlsListEntry = deps.store.list().find((e) => e.key === summary.controlsKey);
+  assert.equal(datListEntry.storedAt, FIXED_TIMESTAMP);
+  assert.equal(controlsListEntry.storedAt, FIXED_TIMESTAMP);
+
+  const datRecord = deps.store.get(summary.datKey);
+  const controlsRecord = deps.store.get(summary.controlsKey);
+  assert.equal(datRecord.costRows[0].timestamp, FIXED_TIMESTAMP);
+  assert.equal(controlsRecord.costRows[0].timestamp, FIXED_TIMESTAMP);
+});
+
 // ── Provenance ───────────────────────────────────────────────────────────
 test("runPhase0 records calibration pair-set hash and git SHA provenance on the negative-controls row", async () => {
   const deps = BASE_DEPS();
