@@ -165,6 +165,25 @@ test("de-identification: no arm/model/persona label reaches the judge prompt", a
   }
 });
 
+// ── #82 (A1/A2): the batch path submitted no assertion on model/max_tokens —
+// a mutated judgeModel or a dropped maxTokens (falling back to the provider
+// helper's 2048 default) shipped green. Pin what is ACTUALLY submitted on
+// the wire, not merely what score() returns — mirrors the OpenAI fixture's
+// F1 fix (score.test.mjs, post-#79) rather than inventing a second shape.
+
+test("AnthropicJudgeProvider batch: submits the exact judgeModel and MAX_JUDGE_TOKENS on every request, never a different model or the transport helper's default budget (A1/A2)", async () => {
+  const capture = [];
+  const provider = new AnthropicJudgeProvider({ apiKey: "k", fetchImpl: judgeBatchFetch({ capture }), sleep: noopSleep, logger: silentLogger });
+  const payload = { briefText: BRIEF, candidates: poolOf("a", "b", "c") };
+  const resp = await provider.score(payload, { judgeModel: "claude-sonnet-5", mode: "batch", seed: 2 });
+  assert.equal(resp.terminalState, "completed");
+  assert.equal(capture.length, 3, "one submitted request per candidate");
+  for (const req of capture) {
+    assert.equal(req.params.model, "claude-sonnet-5", "the submitted request must use the exact judgeModel passed in, not a different/wrong model");
+    assert.equal(req.params.max_tokens, MAX_JUDGE_TOKENS, "the submitted request must use MAX_JUDGE_TOKENS, not the transport helper's default budget");
+  }
+});
+
 // ── single mode ─────────────────────────────────────────────────────────────
 
 test("score (single) hits /v1/messages (not /batches) and scores each candidate", async () => {
@@ -187,6 +206,24 @@ test("score (single) hits /v1/messages (not /batches) and scores each candidate"
   resp.scores.forEach((s, i) => assert.equal(s.originality, i + 1));
   assert.ok(urls.every((u) => u === "https://api.anthropic.com/v1/messages"));
   assert.ok(!urls.some((u) => u.includes("/batches")));
+});
+
+test("AnthropicJudgeProvider single: submits the exact judgeModel and MAX_JUDGE_TOKENS, never a different model or the transport helper's default budget (A1/A2)", async () => {
+  const capturedBodies = [];
+  const provider = new AnthropicJudgeProvider({
+    apiKey: "k",
+    fetchImpl: async (url, opts) => {
+      capturedBodies.push(JSON.parse(opts.body));
+      return jsonResponse(200, { content: [{ type: "text", text: scoreJsonForIndex(0) }], usage: { input_tokens: 4, output_tokens: 2 }, stop_reason: "end_turn" });
+    },
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("only one") }, { judgeModel: "claude-sonnet-5", mode: "single", seed: 1 });
+  assert.equal(resp.terminalState, "completed");
+  assert.equal(capturedBodies.length, 1);
+  assert.equal(capturedBodies[0].model, "claude-sonnet-5", "single mode must submit the exact judgeModel passed in, not a different/wrong model");
+  assert.equal(capturedBodies[0].max_tokens, MAX_JUDGE_TOKENS, "single mode must submit MAX_JUDGE_TOKENS, not the transport helper's default budget");
 });
 
 // ── AC6: judge failures are classified into FAILURE_KINDS, never thrown ──────
@@ -238,6 +275,67 @@ test("a batch that never ends before the poll ceiling classifies as timeout", as
   const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "claude-sonnet-5", mode: "batch", seed: 1 });
   assert.equal(resp.terminalState, "failed");
   assert.equal(resp.failureKind, "timeout");
+});
+
+// ── #82 (A3): a batch result row without result.type === "succeeded" must
+// never be parsed as if it had succeeded — an errored row carries no
+// `message`, so treating `row.result` truthy as sufficient (dropping the
+// `.type === "succeeded"` check) silently reads an errored row's absent
+// text as an empty reply instead of surfacing the real classified failure.
+
+test("AnthropicJudgeProvider batch: a result row without result.type === 'succeeded' is never treated as a success (A3)", async () => {
+  const provider = new AnthropicJudgeProvider({
+    apiKey: "k",
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.endsWith("/v1/messages/batches")) return jsonResponse(200, { id: "jbatch_1", processing_status: "ended", results_url: "https://fake/jresults" });
+      // The ONLY result row is ERRORED, not succeeded — it carries no `message`.
+      const row = { custom_id: "cand-0", result: { type: "errored", error: { type: "rate_limit_error" } } };
+      return textResponse(JSON.stringify(row));
+    },
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("only one") }, { judgeModel: "claude-sonnet-5", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed", "an errored row must never be accepted as a successful reply");
+  assert.equal(resp.failureKind, "rate_limited", "the errored row's rate_limit_error type must be classified — a row.result truthy check alone would instead treat the row as a (missing) success and fail later as an unrelated parse_failure");
+});
+
+// ── #82 (A4): silent score mis-attribution. A batch result row whose
+// custom_id is not in the request set must be DROPPED, never attributed to
+// a real candidate by line position — asserting the STRONG invariant (every
+// candidate keeps its OWN score) rather than merely "the pool fails", which
+// a `requests[0]`-style positional fallback can satisfy for the wrong reason
+// (it can only overwrite an already-filled slot, so replies.size still comes
+// up short and the pool still fails — but via the partial-reply guard, not
+// because the unmatched row was actually rejected).
+
+test("AnthropicJudgeProvider batch: an unmatched custom_id in the output is dropped, never attributed to a real candidate by line position (A4)", async () => {
+  const provider = new AnthropicJudgeProvider({
+    apiKey: "k",
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.endsWith("/v1/messages/batches")) return jsonResponse(200, { id: "jbatch_1", processing_status: "ended", results_url: "https://fake/jresults" });
+      if (u.includes("/v1/messages/batches/")) return jsonResponse(200, { id: "jbatch_1", processing_status: "ended", results_url: "https://fake/jresults" });
+      if (u === "https://fake/jresults") {
+        const lines = [
+          resultLine("cand-0", scoreJsonForIndex(0)),
+          resultLine("cand-1", scoreJsonForIndex(1)),
+          // An UNMATCHED custom_id, appended LAST — under a positional-
+          // fallback bug, a wraparound line index would silently OVERWRITE
+          // whichever real candidate landed at requests[0] with this 10/10.
+          resultLine("cand-does-not-exist", JSON.stringify({ originality: 10, feasibility: 10 })),
+        ];
+        return textResponse(lines.map((l) => JSON.stringify(l)).join("\n"));
+      }
+      throw new Error(`unexpected URL ${u}`);
+    },
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b") }, { judgeModel: "claude-sonnet-5", mode: "batch", seed: 3 });
+  assert.equal(resp.terminalState, "completed");
+  resp.scores.forEach((s, i) => assert.equal(s.originality, i + 1, `candidate ${i} must keep its OWN score, never the unmatched line's 10/10`));
 });
 
 test("no apiKey: score() returns a classified harness_error rather than throwing", async () => {
@@ -683,7 +781,16 @@ test("runJudgeMatrix does NOT silently drop the OpenAI leg when its provider is 
   assert.match(deferred[0].reason, /issue #77/i);
 });
 
-test("runJudgeMatrix enforces distinctness at CALL time: the guarantee holds end-to-end", async () => {
+// #81 — this test's ORIGINAL name ("enforces distinctness at CALL time") was
+// false: buildJudgeMatrix refuses to SCHEDULE here (no distinct Haiku
+// candidate exists for all-Haiku arm B), so runJudgeMatrix's per-row loop —
+// and the call-time assertEvaluatorDistinct at score.mjs:880 — is never
+// reached. `assert.rejects` here is satisfied by buildJudgeMatrix's own
+// thrown error. This is still a legitimate, worth-keeping test — it just
+// verifies schedule-time refusal SURFACED THROUGH runJudgeMatrix, not
+// call-time enforcement. Renamed to say that; see the next test for actual
+// call-time coverage.
+test("runJudgeMatrix surfaces buildJudgeMatrix's SCHEDULE-time refusal when no candidate judge is distinct from the arm's generators (not call-time — see the next test for that)", async () => {
   const store = makeTempStore("judge-distinct-");
   // Arm B is all-Haiku, so a Haiku judge would be non-distinct. Give the matrix
   // ONLY Haiku as an anthropic candidate → buildJudgeMatrix must refuse to
@@ -692,6 +799,48 @@ test("runJudgeMatrix enforces distinctness at CALL time: the guarantee holds end
   await assert.rejects(
     () => runJudgeMatrix({ pools, judgeModels: { anthropic: ["claude-haiku-4-5"], openai: ["gpt-5.4"] }, providers: { anthropic: new MockJudgeProvider(), openai: new MockJudgeProvider() }, store, seed: 1, timestamp: "2026-08-02T00:00:00Z" }),
     /no distinct anthropic judge|generator model/i,
+  );
+});
+
+// #81 — actual CALL-time coverage. The belt (score.mjs:880's
+// assertEvaluatorDistinct call inside the per-row loop) is separately
+// reachable from the suspenders (buildJudgeMatrix's schedule-time refusal)
+// whenever the arm a row was SCHEDULED against diverges from the arm looked
+// up for that row at CALL time. That divergence is reachable today without
+// any production change: runJudgeMatrix's `poolByKey` Map is keyed by
+// `poolKey` alone (score.mjs:863-867, "for (const p of pools)
+// poolByKey.set(p.poolKey, p)"), last-write-wins — while buildJudgeMatrix
+// schedules each pool ENTRY independently against its OWN arm
+// (matrix.mjs's pickDistinctJudge runs per entry, not per unique poolKey).
+// So two pool entries sharing one poolKey but carrying DIFFERENT arms both
+// schedule successfully (each against its own arm — buildJudgeMatrix never
+// refuses), but every row for that poolKey is then looked up against
+// whichever entry's arm was written LAST. This test builds exactly that:
+// arm B (all-Haiku) and arm D (all-Opus) share one poolKey; an Opus judge is
+// scheduled for the arm-B entry (distinct from Haiku) and a Sonnet judge for
+// the arm-D entry (Opus isn't distinct from Opus, so pickDistinctJudge falls
+// through to Sonnet) — buildJudgeMatrix returns normally. But poolByKey
+// resolves EVERY row for this poolKey to the arm-D entry, so the row
+// scheduled with the Opus judge is checked at call time against arm D
+// (all-Opus generators) — only score.mjs:880 can catch that.
+test("runJudgeMatrix enforces distinctness at CALL time: a row's arm can diverge from what it was scheduled against, and only the call-time assert catches it (#81)", async () => {
+  const store = makeTempStore("judge-distinct-calltime-");
+  const poolKey = "arm=B|brief=biz-01|rep=0|cfg=x";
+  const pools = [
+    { poolKey, arm: { id: "B", ...armsConfigJson.arms.B }, briefText: BRIEF, candidates: poolOf("b idea 1") },
+    { poolKey, arm: { id: "D", ...armsConfigJson.arms.D }, briefText: BRIEF, candidates: poolOf("d idea 1") },
+  ];
+  await assert.rejects(
+    () =>
+      runJudgeMatrix({
+        pools,
+        judgeModels: { anthropic: ["claude-opus-5", "claude-sonnet-5"], openai: ["gpt-5.6-terra"] },
+        providers: { anthropic: new MockJudgeProvider(), openai: new MockJudgeProvider() },
+        store,
+        seed: 1,
+        timestamp: "2026-08-02T00:00:00Z",
+      }),
+    /also a generator model in this arm/i,
   );
 });
 
