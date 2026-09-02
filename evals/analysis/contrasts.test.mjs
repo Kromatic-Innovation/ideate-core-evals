@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { contrastVector, armCoefficientName, evaluateContrast, buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts } from "./contrasts.mjs";
+import { contrastVector, armCoefficientName, evaluateContrast, buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts, familyEstimability } from "./contrasts.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
 import { JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
 
@@ -341,4 +341,163 @@ test("applyHolmVerdicts: a raw-significant contrast becomes not-supported once H
 
 test("applyHolmVerdicts: length mismatch between flatResults and holmAdjusted is a hard error", () => {
   assert.throws(() => applyHolmVerdicts([{ id: "H1", p: 0.01 }], [0.01, 0.02]), /does not match/);
+});
+
+// ── Issue #97: the registered family over an ARM SUBSET ────────────────────
+// The registered contrasts name D/E/G/H. A store holding only A and B (the
+// #8 smoke study) must produce a family that is EXPLICIT about what it
+// cannot estimate, not one that dies four modules later as
+// `contrastVector: unknown coefficient 'arm[T.E]'`. See contrasts.mjs's
+// "ARM SUBSETS AND THE REGISTERED FAMILY" header for the decision.
+
+test("#97: an A/B arm subset records H2/H3/H4 as NOT ESTIMABLE rather than emitting weights naming absent arms", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"] });
+
+  for (const id of ["H2", "H3", "H4"]) {
+    const entry = family.find((f) => f.id === id);
+    assert.equal(entry.notEstimable, true, `${id} must be recorded not-estimable under an A/B arm subset`);
+    assert.equal(entry.weights, undefined, `${id} must NOT carry weights naming an arm the fit cannot have`);
+    assert.equal(entry.components, undefined);
+  }
+
+  // The message must name the ARM, the FAMILY ENTRY, and the ARMS AVAILABLE
+  // -- the whole point of the issue is that `unknown coefficient 'arm[T.E]'`
+  // told an operator none of those three things.
+  const h2 = family.find((f) => f.id === "H2");
+  assert.deepEqual(h2.missingArms, ["E", "D"]);
+  assert.deepEqual(h2.availableArms, ["A", "B"]);
+  assert.match(h2.reason, /NOT ESTIMABLE/);
+  assert.match(h2.reason, /H2/);
+  assert.match(h2.reason, /\[E, D\]/);
+  assert.match(h2.reason, /\[A, B\]/);
+
+  // H4 is B >= D: B IS present, D is not -- only the genuinely absent arm
+  // may be named, or the message misleads about which arm to go collect.
+  const h4 = family.find((f) => f.id === "H4");
+  assert.deepEqual(h4.missingArms, ["D"]);
+
+  // H3's IUT baselines are D and H, both absent.
+  assert.deepEqual(family.find((f) => f.id === "H3").missingArms, ["G", "D", "H"]);
+});
+
+test("#97: NO substitute arm is ever used -- a not-estimable entry's weights are absent, not re-pointed at a present arm", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"] });
+  const fit = { coefficients: [10, 3], coefficientNames: ["Intercept", "arm[T.B]"], vcov: [[0.01, 0], [0, 0.01]] };
+  for (const id of ["H2", "H3", "H4"]) {
+    const result = evaluateSpec(family.find((f) => f.id === id), fit);
+    assert.equal(result.notEstimable, true);
+    assert.equal(result.p, 1, "a not-estimable registered hypothesis cannot be rejected");
+    assert.equal(result.estimate, undefined, `${id} must produce NO estimate -- an estimate here would be some OTHER arm's`);
+  }
+});
+
+test("#97: a PARTIAL arm subset still estimates the entries whose arms are all present", () => {
+  // B, D and E present: H2 (E vs D) and H4 (B vs D) are estimable; H3
+  // (G vs D/H) is not. A blanket "any subset -> nothing estimable" fix
+  // would fail this.
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E"] });
+  assert.equal(family.find((f) => f.id === "H2").notEstimable, undefined);
+  assert.equal(family.find((f) => f.id === "H4").notEstimable, undefined);
+  assert.equal(family.find((f) => f.id === "H3").notEstimable, true);
+  assert.deepEqual(family.find((f) => f.id === "H3").missingArms, ["G", "H"]);
+});
+
+test("#97: the full registered arm set is UNAFFECTED -- every entry stays estimable", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
+  for (const f of family) assert.equal(f.notEstimable, undefined, `${f.id} must stay estimable on the full grid`);
+  assert.ok(family.find((f) => f.id === "H3").components.length === 2);
+});
+
+// H1's registered form is mean(panel arms) - A. Over ONE panel arm that is
+// arithmetically (armX - A), a per-arm comparison that Appendix B item 5
+// assigns to the §6.3 exploratory BH section and says is "never folded into
+// the confirmatory Holm family". Computing it would put an exploratory
+// contrast inside the Holm family under a registered hypothesis's name.
+test("#97: H1 is NOT ESTIMABLE with a single panel arm (it would be a §6.3 exploratory per-arm contrast under H1's name)", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"] });
+  const h1 = family.find((f) => f.id === "H1");
+  assert.equal(h1.notEstimable, true);
+  assert.equal(h1.weights, undefined);
+  assert.match(h1.reason, /per-arm/i);
+  assert.match(h1.reason, /exploratory/i);
+});
+
+test("#97: H1 IS estimable with two or more panel arms", () => {
+  const h1 = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D"] }).find((f) => f.id === "H1");
+  assert.equal(h1.notEstimable, undefined);
+  assert.equal(h1.weights["arm[T.B]"], 0.5);
+});
+
+// The belt behind buildRegisteredFamily()'s spec-time scoping: H1 is
+// evaluated against the RAREFIED fit and H2-H4 against the FULL-POOL one
+// (analysis.mjs), and those two fits' arm sets can differ, so a spec built
+// against one arm set can still meet a fit built from another.
+test("#97: evaluateSpec() records not-estimable when the FIT lacks an arm the spec names, instead of throwing 'unknown coefficient'", () => {
+  // Built against the full arm set (so the spec really does carry weights),
+  // then evaluated against a two-arm fit.
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
+  const twoArmFit = { coefficients: [10, 3], coefficientNames: ["Intercept", "arm[T.B]"], vcov: [[0.01, 0], [0, 0.01]] };
+
+  const h2 = evaluateSpec(family.find((f) => f.id === "H2"), twoArmFit);
+  assert.equal(h2.notEstimable, true);
+  assert.equal(h2.p, 1);
+  assert.deepEqual(h2.missingArms, ["E", "D"]);
+  assert.deepEqual(h2.availableArms, ["B"], "the fit's own non-reference arms, read off its coefficient names");
+  assert.match(h2.reason, /NOT ESTIMABLE/);
+
+  // Same for an IUT spec, whose arms live on `components`, not `weights`.
+  const h3 = evaluateSpec(family.find((f) => f.id === "H3"), twoArmFit);
+  assert.equal(h3.notEstimable, true);
+  assert.equal(h3.p, 1);
+});
+
+test("#97: the not-estimable belt is scoped to ARM coefficients -- a non-arm unknown name is still contrastVector()'s hard error", () => {
+  // A typo'd or structurally-wrong coefficient name must NOT be quietly
+  // absorbed as "not estimable": that is exactly the silent-drift the
+  // contrastVector() guard exists to prevent.
+  const spec = { id: "X", description: "typo", kind: "superiority", weights: { "totally_not_a_coefficient": 1 } };
+  const fit = { coefficients: [10, 3], coefficientNames: ["Intercept", "arm[T.B]"], vcov: [[0.01, 0], [0, 0.01]] };
+  assert.throws(() => evaluateSpec(spec, fit), /unknown coefficient/);
+});
+
+// ── Issue #97, the multiplicity half ───────────────────────────────────
+test("#97: an arm subset does NOT shrink the registered family -- 5 slots, 5 entries, no drops", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"] });
+  assert.equal(family.length, 5, "a not-estimable entry is RECORDED, never dropped");
+  assert.deepEqual(family.map((f) => f.id), ["H1", "H2", "H3", "H4", "H5"]);
+  assert.equal(registeredFamilySlotCount(family), 5, "the Holm multiplier is the REGISTERED family size, not the estimated count");
+});
+
+test("#97: keeping m=5 over an arm subset is the CONSERVATIVE direction (never anti-conservative)", () => {
+  // The AC's premise -- "correct as if it were 2 when only 2 were
+  // estimable" -- points the wrong way. Holm's first step multiplies the
+  // smallest p by m, so shrinking m makes rejection EASIER. Pin the
+  // inequality so nobody "fixes" this into an FWER inflation.
+  const withPlaceholders = holmBonferroni([0.004, 0.01, 1, 1, 1], { familySize: 5 });
+  const shrunk = holmBonferroni([0.004, 0.01]);
+  assert.ok(
+    withPlaceholders[0] >= shrunk[0] && withPlaceholders[1] >= shrunk[1],
+    `m=5 must adjust upward relative to m=2: ${JSON.stringify(withPlaceholders.slice(0, 2))} vs ${JSON.stringify(shrunk)}`,
+  );
+  assert.equal(withPlaceholders[0], 0.02); // 5 * 0.004
+  assert.equal(shrunk[0], 0.008); // 2 * 0.004 -- the anti-conservative one
+});
+
+test("#97: familyEstimability() reports the loss WITHOUT feeding it back into the family size", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"] });
+  const fit = { coefficients: [10, 3], coefficientNames: ["Intercept", "arm[T.B]"], vcov: [[0.01, 0], [0, 0.01]] };
+  const results = family.map((spec) => evaluateSpec(spec, fit));
+  const estimability = familyEstimability(results);
+
+  assert.equal(estimability.slots, 5, "slots is the registered count, always");
+  assert.equal(estimability.estimated, 0, "A/B subset: H1-H4 not estimable, H5 unwired");
+  assert.deepEqual(estimability.notEstimable.map((e) => e.id), ["H1", "H2", "H3", "H4"]);
+  // H5 is unimplemented but NOT notEstimable -- "the judge-score fit did not
+  // run" and "this run's arms cannot reach the contrast" are different
+  // facts and must stay distinguishable.
+  assert.ok(!estimability.notEstimable.some((e) => e.id === "H5"));
+
+  // And the whole family still passes holmBonferroni()'s familySize gate.
+  const holm = holmBonferroni(results.map((r) => r.p), { familySize: registeredFamilySlotCount(family) });
+  assert.equal(holm.length, 5);
 });
