@@ -18,8 +18,8 @@ import { tmpdir } from "node:os";
 import { ResultsStore } from "../../lib/store.mjs";
 import { configHash, cellKey } from "../../lib/manifest.mjs";
 import { costRow } from "../../lib/accounting.mjs";
-import { priceRowByProvider } from "../../lib/price.mjs";
-import { runSpec, planAndPrice, interimPriceGrid } from "./runner.mjs";
+import { priceRowByProvider, priceRowsByProvider } from "../../lib/price.mjs";
+import { runSpec, planAndPrice, interimPriceGrid, spendToDate } from "./runner.mjs";
 import { MockProvider } from "./provider.mjs";
 
 function tempDir(t) {
@@ -693,4 +693,349 @@ test("runSpec throws if an injected priceGrid omits a planned cell from its brea
     () => runSpec(SPEC, { store, armsConfig: ARMS_CONFIG, provider, priceGrid: brokenPriceGrid, maxSpendUsd: 100, log: silentLog }),
     /breakdown is missing an entry/,
   );
+});
+
+// ── issue #64: spend ceilings must be cumulative across invocations ─────────
+// The defect: `runningTotalByProvider` (and the global `runningTotal`) seeded
+// at `{}`/`0` on every runSpec() call, never read back from the store -- so a
+// resumed run's ceiling gated only THAT invocation's spend, letting N
+// invocations spend roughly N x the stated cap. The fix reconstructs
+// spend-to-date from the store's own cost rows (the durable record) at the
+// start of every runSpec() call and folds it into every admission decision.
+
+/** Seed a store with an already-"spent" cost row directly (no provider call,
+ *  no runSpec) -- a controlled, arithmetic-exact way to establish "prior
+ *  spend of exactly $X" without depending on any pricing table's real
+ *  numbers. Deliberately stores the row under `seedCfg` (which may differ
+ *  from the config the test's real runSpec call uses) -- this is itself part
+ *  of what these tests verify: cumulative spend-to-date is NOT scoped to the
+ *  current configHash (see spendToDate's own header for why). */
+function seedSpentRow(store, { key, armId, briefId, cfg, model, inputTokens, outputTokens }) {
+  store.put({
+    key,
+    armId,
+    briefId,
+    replicate: 0,
+    cfg,
+    result: { candidates: [] },
+    resolvedModels: { solo: model },
+    accounting: { state: "completed" },
+    costRows: [
+      costRow({
+        cellKey: key,
+        timestamp: "2026-08-01T00:00:00.000Z",
+        billing_mode: "api",
+        tokens_by_model: { [model]: { input_tokens: inputTokens, output_tokens: outputTokens } },
+      }),
+    ],
+  });
+}
+
+test("issue #64: spendToDate sums a store's cost rows across EVERY configHash and EVERY provider, never scoped to just one", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+
+  // Two rows under TWO DIFFERENT configHashes ("old-cfg" and "new-cfg") and
+  // TWO DIFFERENT providers (Anthropic and OpenAI) -- a store a real study
+  // would produce after a harness bump plus a mixed-provider grid.
+  seedSpentRow(store, {
+    key: "arm=H2|brief=seed1|rep=0|cfg=old-cfg",
+    armId: "H2",
+    briefId: "seed1",
+    cfg: "old-cfg",
+    model: "claude-haiku-4-5",
+    inputTokens: 1_000_000,
+    outputTokens: 0,
+  });
+  seedSpentRow(store, {
+    key: "arm=H3|brief=seed2|rep=0|cfg=new-cfg",
+    armId: "H3",
+    briefId: "seed2",
+    cfg: "new-cfg",
+    model: "gpt-5.6-terra",
+    inputTokens: 1_000_000,
+    outputTokens: 0,
+  });
+
+  const result = spendToDate(store, undefined, { batch: true });
+
+  // Independently derive the expected totals via priceRowsByProvider over
+  // the SAME two rows, built by hand rather than read back off the store --
+  // an assertion that would still pass if spendToDate silently dropped a
+  // provider bucket or a configHash's rows would be a useless test.
+  const expected = priceRowsByProvider(
+    [
+      costRow({ cellKey: "a", timestamp: "2026-08-01T00:00:00.000Z", billing_mode: "api", tokens_by_model: { "claude-haiku-4-5": { input_tokens: 1_000_000, output_tokens: 0 } } }),
+      costRow({ cellKey: "b", timestamp: "2026-08-01T00:00:00.000Z", billing_mode: "api", tokens_by_model: { "gpt-5.6-terra": { input_tokens: 1_000_000, output_tokens: 0 } } }),
+    ],
+    undefined,
+    { batch: true },
+  );
+
+  assert.ok(result.byProvider.anthropic > 0, "the old-configHash Anthropic row was consulted");
+  assert.ok(result.byProvider.openai > 0, "the new-configHash OpenAI row was consulted");
+  assert.equal(result.byProvider.anthropic, expected.byProvider.anthropic, "Anthropic total matches an independently-derived expectation exactly");
+  assert.equal(result.byProvider.openai, expected.byProvider.openai, "OpenAI total matches an independently-derived expectation exactly");
+  assert.equal(result.totalUsd, expected.byProvider.anthropic + expected.byProvider.openai, "the global total is the sum across both providers and both configHashes");
+});
+
+test("issue #64: a per-provider ceiling fails loud when the STORE's own history holds a cost row for a model with no RATE_TABLE entry -- never a silent under-count of spend-to-date", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  seedSpentRow(store, {
+    key: "arm=NR|brief=seed|rep=0|cfg=old-cfg",
+    armId: "NR",
+    briefId: "seed",
+    cfg: "old-cfg",
+    model: "claude-fake-model-64", // no lib/price.mjs RATE_TABLE entry
+    inputTokens: 1000,
+    outputTokens: 0,
+  });
+
+  const provider = new MockProvider();
+  await assert.rejects(
+    () =>
+      runSpec(SPEC_PROVIDERS, {
+        store,
+        armsConfig: ARMS_CONFIG_PROVIDERS,
+        provider,
+        armIds: ["H2"],
+        maxSpendByProviderUsd: { anthropic: 1000 },
+        log: silentLog,
+      }),
+    /cumulative spend-to-date cannot be priced/,
+  );
+});
+
+test("issue #64: a run with NO ceiling active does not fail loud on an unrated model in the store's history -- there is nothing to gate", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  seedSpentRow(store, {
+    key: "arm=NR|brief=seed|rep=0|cfg=old-cfg",
+    armId: "NR",
+    briefId: "seed",
+    cfg: "old-cfg",
+    model: "claude-fake-model-64",
+    inputTokens: 1000,
+    outputTokens: 0,
+  });
+
+  const provider = new MockProvider();
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2"],
+    log: silentLog,
+  });
+  assert.equal(summary.completed, 1, "no ceiling active -- the unrated row in history does not block the run");
+});
+
+test("issue #64: an empty store's spend-to-date is exactly zero, both globally and per-provider", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const result = spendToDate(store, undefined, { batch: true });
+  assert.equal(result.totalUsd, 0);
+  assert.deepEqual(result.byProvider, {});
+  assert.equal(result.hasMissingRate, false);
+});
+
+test("issue #64: a per-provider ceiling is enforced against spend already recorded by an EARLIER invocation of the same store, not reset to zero", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+  const provider1 = new MockProvider();
+
+  const twoBriefSpec = { ...SPEC_PROVIDERS, briefs: [{ id: "b1" }, { id: "b2" }] };
+
+  // First invocation: only H2/b1 admitted (no ceiling), spending real,
+  // deterministic money (MockProvider's fixed 500 in / 300 out tokens).
+  const { summary: first } = await runSpec(twoBriefSpec, {
+    store: store1,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider: provider1,
+    armIds: ["H2"],
+    briefIds: ["b1"],
+    log: silentLog,
+  });
+  assert.equal(first.completed, 1);
+  const priorAnthropic = first.spendByProvider.anthropic;
+  assert.ok(priorAnthropic > 0, "sanity: the first invocation actually spent something");
+
+  // Second invocation: a DIFFERENT process (a fresh ResultsStore instance
+  // opened on the SAME directory -- exactly how a resumed CLI invocation
+  // would see it, never sharing in-memory state with the first). Plans a
+  // NEW cell (H2/b2) and sets the per-provider ceiling to EXACTLY what the
+  // first invocation spent. Ceiling logging in runner.mjs's own per-cell
+  // loop only gates a cell whose projected share is positive, so first
+  // confirm (via planAndPrice) that H2/b2 genuinely projects a positive
+  // Anthropic share -- otherwise this test would pass for the wrong reason
+  // (the "projected > 0" guard skipping the check entirely, not the
+  // cumulative-total comparison this test targets).
+  const store2 = new ResultsStore(dir);
+  const provider2 = new MockProvider();
+  const { projection } = planAndPrice(
+    { ...twoBriefSpec, briefs: [{ id: "b2" }] },
+    { store: store2, armsConfig: ARMS_CONFIG_PROVIDERS },
+  );
+  const b2Anthropic = projection.breakdown.find((b) => b.cellKey.includes("H2")).byProvider.anthropic;
+  assert.ok(b2Anthropic > 0, "sanity: H2/b2 projects a positive Anthropic share");
+
+  // The ceiling MUST sit strictly ABOVE the pre-flight projection alone
+  // (b2Anthropic) -- otherwise a broken implementation that never consults
+  // the store at all (already = 0) would ALSO skip this cell, just because
+  // its own pre-flight estimate already exceeds a too-tight ceiling, and
+  // this test would pass for the wrong reason. It must sit BELOW
+  // projection + prior actual spend, so only folding the prior invocation's
+  // real spend into the decision tips it over.
+  const ceiling = b2Anthropic + priorAnthropic / 2;
+  assert.ok(ceiling > b2Anthropic, "sanity: the ceiling alone would NOT be tripped by the pre-flight projection");
+
+  const { summary: second } = await runSpec(twoBriefSpec, {
+    store: store2,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider: provider2,
+    armIds: ["H2"],
+    briefIds: ["b2"],
+    maxSpendByProviderUsd: { anthropic: ceiling },
+    log: silentLog,
+  });
+
+  assert.equal(second.completed, 0, "H2/b2 must be skipped -- admitting it would push cumulative Anthropic spend past a ceiling only crossed once the first invocation's real spend is added in");
+  assert.equal(second.skipped, 1);
+  assert.equal(provider2.calls.length, 0, "the provider was never called for the budget-skipped cell");
+});
+
+test("issue #64: a GLOBAL --max-spend ceiling is also enforced cumulatively across invocations, not just the per-provider ceiling", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+  const provider1 = new MockProvider();
+
+  const twoBriefSpec = { ...SPEC_PROVIDERS, briefs: [{ id: "b1" }, { id: "b2" }] };
+
+  const { summary: first } = await runSpec(twoBriefSpec, {
+    store: store1,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider: provider1,
+    armIds: ["H2"],
+    briefIds: ["b1"],
+    log: silentLog,
+  });
+  assert.equal(first.completed, 1);
+  const priorTotal = first.cumulativeSpendUsd;
+  assert.ok(priorTotal > 0);
+
+  const store2 = new ResultsStore(dir);
+  const provider2 = new MockProvider();
+  const { projection } = planAndPrice({ ...twoBriefSpec, arms: [{ id: "H2" }], briefs: [{ id: "b2" }] }, { store: store2, armsConfig: ARMS_CONFIG_PROVIDERS });
+
+  // Same reasoning as the per-provider test above: the ceiling must sit
+  // strictly above the pre-flight projection ALONE (projection.usd), or a
+  // broken implementation that never consults the store would also trip it
+  // for the wrong reason.
+  const ceiling = projection.usd + priorTotal / 2;
+  assert.ok(ceiling > projection.usd, "sanity: the ceiling alone would NOT be tripped by the pre-flight projection");
+
+  const { summary: second } = await runSpec(twoBriefSpec, {
+    store: store2,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider: provider2,
+    armIds: ["H2"],
+    briefIds: ["b2"],
+    maxSpendUsd: ceiling,
+    log: silentLog,
+  });
+
+  assert.equal(second.completed, 0, "the global ceiling must already be considered crossed once the first invocation's real spend is folded in");
+  assert.equal(second.skipped, 1);
+});
+
+test("issue #64: cumulative admission uses strict '>' -- a cell that would land EXACTLY on the ceiling is admitted, one cent over is skipped", async (t) => {
+  // A hand-rolled priceGrid gives an exact, round projected cost ($0.50 for
+  // Anthropic) so the boundary math has no dependency on any real pricing
+  // table's numbers -- isolates the comparison OPERATOR itself as the thing
+  // under test, per the task's named mutation ("> where it needs >= or vice
+  // versa").
+  const exactPriceGrid = () => ({
+    usd: 0.5,
+    breakdown: [{ cellKey: "arm=H2|brief=bNew|rep=0|cfg=" + CFG_HASH, usd: 0.5, byProvider: { anthropic: 0.5 } }],
+  });
+  const newCellSpec = { arms: [{ id: "H2" }], briefs: [{ id: "bNew" }], replicates: 1, config: CFG };
+
+  async function runSecondInvocation(ceiling) {
+    const dir = tempDir(t);
+    const store1 = new ResultsStore(dir);
+    // Seed EXACTLY $1.00 of prior Anthropic spend, arithmetic-exact via a
+    // custom rate table rather than a real MockProvider run.
+    seedSpentRow(store1, {
+      key: "arm=H2|brief=seedExact|rep=0|cfg=" + CFG_HASH,
+      armId: "H2",
+      briefId: "seedExact",
+      cfg: CFG_HASH,
+      model: "claude-haiku-4-5",
+      inputTokens: 2_000_000,
+      outputTokens: 0,
+    });
+    const exactRateTable = { "claude-haiku-4-5": { in: 1, out: 0, source: "test", date: "2026-08-01" } };
+    // Sanity: this rate table x these tokens x the default batch discount
+    // (0.5, since claude-haiku-4-5 has no override) prices the seeded row at
+    // EXACTLY $1.00 -- (2,000,000/1e6 * 1) * (1 - 0.5) = $1.00.
+    const seeded = spendToDate(store1, exactRateTable, { batch: true });
+    assert.equal(seeded.byProvider.anthropic, 1, "sanity: the seeded row prices to exactly $1.00 under the test rate table");
+
+    const store2 = new ResultsStore(dir);
+    const provider = new MockProvider();
+    const { summary } = await runSpec(newCellSpec, {
+      store: store2,
+      armsConfig: ARMS_CONFIG_PROVIDERS,
+      provider,
+      priceGrid: exactPriceGrid,
+      rateTable: exactRateTable,
+      maxSpendByProviderUsd: { anthropic: ceiling },
+      log: silentLog,
+    });
+    return summary;
+  }
+
+  // $1.00 prior + $0.50 projected = $1.50 exactly. At ceiling === $1.50, the
+  // cell lands EXACTLY on the ceiling and must be ADMITTED (`already +
+  // projected > ceiling` is false when they're equal).
+  const atBoundary = await runSecondInvocation(1.5);
+  assert.equal(atBoundary.completed, 1, "exactly-at-the-ceiling must be admitted, not skipped -- '>' not '>='");
+  assert.equal(atBoundary.skipped, 0);
+
+  // One cent over: must now be skipped.
+  const overBoundary = await runSecondInvocation(1.49);
+  assert.equal(overBoundary.completed, 0, "one cent over the ceiling must be skipped");
+  assert.equal(overBoundary.skipped, 1);
+});
+
+test("issue #64: summary exposes BOTH this-invocation spend (spendByProvider, unchanged) and cumulative spend (cumulativeSpendByProvider/cumulativeSpendUsd)", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+  const provider1 = new MockProvider();
+  const twoBriefSpec = { ...SPEC_PROVIDERS, briefs: [{ id: "b1" }, { id: "b2" }] };
+
+  const { summary: first } = await runSpec(twoBriefSpec, {
+    store: store1,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider: provider1,
+    armIds: ["H2"],
+    briefIds: ["b1"],
+    log: silentLog,
+  });
+
+  const store2 = new ResultsStore(dir);
+  const provider2 = new MockProvider();
+  const { summary: second } = await runSpec(twoBriefSpec, {
+    store: store2,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider: provider2,
+    armIds: ["H2"],
+    briefIds: ["b2"],
+    log: silentLog,
+  });
+
+  assert.equal(second.completed, 1);
+  // spendByProvider stays THIS-INVOCATION-ONLY -- second invocation never ran
+  // H2/b1, so it must not appear in second.spendByProvider's contribution
+  // beyond what the second invocation itself spent.
+  assert.equal(second.spendByProvider.anthropic, second.cumulativeSpendByProvider.anthropic - first.spendByProvider.anthropic, "cumulative = prior invocations' spend + this invocation's own spend, never conflating the two");
+  assert.ok(second.cumulativeSpendByProvider.anthropic > second.spendByProvider.anthropic, "cumulative total is strictly larger than this invocation's own total once a prior invocation spent something");
+  assert.equal(second.cumulativeSpendUsd, second.cumulativeSpendByProvider.anthropic, "single-provider grid: the global cumulative total equals the one provider's cumulative total");
 });
