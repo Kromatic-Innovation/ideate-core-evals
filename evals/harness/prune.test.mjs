@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { ResultsStore } from "../../lib/store.mjs";
 import { cellKey, configHash, planRun } from "../../lib/manifest.mjs";
 import { RATE_TABLE } from "../../lib/price.mjs";
+import { INTRINSIC_FAILURE_KINDS } from "../../lib/accounting.mjs";
 import {
   planPrune,
   pruneStore,
@@ -405,10 +406,43 @@ test("scoping by arm/brief/kind each narrow the selection independently", (t) =>
   const a2 = putCell(store, { armId: "A", briefId: "b2", kind: "parse_failure" });
   const b1 = putCell(store, { armId: "B", briefId: "b1", kind: "rate_limited" });
 
-  assert.deepEqual(planPrune(store, { armIds: ["A"] }).evictions.map((e) => e.key).sort(), [a1, a2].sort());
+  // --arms A alone does NOT sweep up a2: the default kind filter is the
+  // store-absent sets, and `parse_failure` is intrinsic. See the next test.
+  assert.deepEqual(planPrune(store, { armIds: ["A"] }).evictions.map((e) => e.key), [a1]);
   assert.deepEqual(planPrune(store, { briefIds: ["b1"] }).evictions.map((e) => e.key).sort(), [a1, b1].sort());
   assert.deepEqual(planPrune(store, { kinds: ["parse_failure"] }).evictions.map((e) => e.key), [a2]);
   assert.deepEqual(planPrune(store, { armIds: ["A"], kinds: ["rate_limited"] }).evictions.map((e) => e.key), [a1]);
+  assert.deepEqual(planPrune(store, { armIds: ["A"], kinds: INTRINSIC_FAILURE_KINDS }).evictions.map((e) => e.key), [a2]);
+});
+
+test("the default kind filter never reaches an intrinsic failure -- that is a measurement, not a fault", (t) => {
+  const store = tempStore(t);
+  // The #8 smoke store's nine failed cells are all `empty_pool` -- IC-08's
+  // silent mode, one of the behaviours the study exists to measure. The
+  // natural "repair my legacy store" invocation is `--prune --cfg <hash>`,
+  // and without a default kind filter it would evict every one of them; the
+  // arm's real failure rate would then be re-rolled toward zero on the next
+  // run. The spend survives an eviction, the observation does not.
+  const intrinsic = [
+    putCell(store, { briefId: "b1", kind: "empty_pool" }),
+    putCell(store, { briefId: "b2", kind: "parse_failure" }),
+    putCell(store, { briefId: "b3", kind: "refusal" }),
+  ];
+  const storeAbsent = [
+    putCell(store, { briefId: "b4", kind: "rate_limited" }),
+    putCell(store, { briefId: "b5", kind: "timeout" }),
+    putCell(store, { briefId: "b6", kind: "payment_required" }),
+  ];
+
+  const plan = planPrune(store, { configHash: CFG });
+  assert.deepEqual(plan.evictions.map((e) => e.key).sort(), storeAbsent.slice().sort());
+
+  pruneStore(store, { configHash: CFG });
+  for (const key of intrinsic) assert.ok(store.has(key), `${key} must survive an unqualified prune`);
+
+  // Naming them explicitly is the opt-in, and it works.
+  pruneStore(store, { configHash: CFG, kinds: INTRINSIC_FAILURE_KINDS });
+  for (const key of intrinsic) assert.equal(store.has(key), false);
 });
 
 test("planPrune with no selector plans zero evictions -- there is no all-or-nothing wipe", (t) => {

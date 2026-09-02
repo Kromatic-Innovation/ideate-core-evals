@@ -120,7 +120,7 @@ on the next run.
 | `--cfg <hash>`      | cells under one `configHash`                                                                                                   |
 | `--arms A,B`        | cells for those arms                                                                                                           |
 | `--briefs biz-01`   | cells for those briefs                                                                                                         |
-| `--kinds …`         | cells whose stored `accounting.kind` matches. Accepts literal kinds, or the set names `transient` / `intrinsic` / `payment` |
+| `--kinds …`         | failed cells whose stored `accounting.kind` matches. Accepts literal kinds, or the set names `transient` / `intrinsic` / `payment`. **Defaults to `transient` + `payment`** |
 | `--states …`        | cells in those terminal states. **Defaults to `failed` alone**                                                                 |
 | `--allow-completed` | permits evicting a `completed` cell (see below)                                                                                |
 | `--keep-attempts N` | attempt-record retention window (default 5)                                                                                    |
@@ -128,6 +128,22 @@ on the next run.
 
 With **no** selector at all, `--prune` evicts nothing — it only compacts
 attempt records. There is no all-or-nothing wipe.
+
+### It will not touch an intrinsic failure unless you name one
+
+The default `--kinds` is the two **store-absent** sets, `transient` +
+`payment` — exactly the failures #90 and #88 would have kept out of the store
+in the first place. So `--prune --cfg <hash> --apply`, the most natural
+"repair my legacy store" invocation, clears the environmental faults and
+leaves `parse_failure`, `empty_pool` and `refusal` alone.
+
+That default is a guard, not a convenience. An intrinsic failure is a real,
+paid-for observation about the arm — `empty_pool` is IC-08's silent mode, one
+of the behaviours this study exists to measure. Evicting one makes the next
+run re-roll it, and an arm that genuinely returns nothing gets resampled until
+it happens not to. The salvage preserves the spend; it cannot preserve the
+measurement. Reaching one takes `--kinds intrinsic` (or the literal kind),
+which is the explicit act.
 
 ### It refuses to delete a completed cell
 

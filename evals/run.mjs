@@ -513,6 +513,26 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     return result;
   }
 
+  // The mirror image of the --prune branch's own rejection above, and of
+  // --phase 0's: a prune-only flag on a REAL run is silently meaningless
+  // today, and the run is the code path that spends money. The concrete
+  // hazard is an edit, not a typo -- an operator runs
+  // `--prune --cfg X --kinds transient --apply`, deletes the `--prune`, and
+  // gets a full unscoped run under flags that read exactly like scoping.
+  const pruneOnlyFlags = [];
+  if (args.apply) pruneOnlyFlags.push("--apply");
+  if (args.cfg !== undefined) pruneOnlyFlags.push("--cfg");
+  if (args.kinds !== undefined) pruneOnlyFlags.push("--kinds");
+  if (args.states !== undefined) pruneOnlyFlags.push("--states");
+  if (args.allowCompleted) pruneOnlyFlags.push("--allow-completed");
+  if (args.keepAttempts !== undefined) pruneOnlyFlags.push("--keep-attempts");
+  if (pruneOnlyFlags.length) {
+    throw new Error(
+      `run.mjs: ${pruneOnlyFlags.join(", ")} ${pruneOnlyFlags.length === 1 ? "is" : "are"} only meaningful with --prune, ` +
+        "and this invocation would run real cells. Add --prune if you meant to repair the store; remove the flag(s) if you meant to run.",
+    );
+  }
+
   // --phase is accepted (per §12's flag table). Phase 0 (docs/PREREGISTRATION.md
   // §8.3: negative controls + DAT replication, issue #48) is now REAL --
   // it runs the three in-scope controls (see phase0.mjs header for why the

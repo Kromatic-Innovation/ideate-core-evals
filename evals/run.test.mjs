@@ -746,6 +746,19 @@ test("--prune --apply on a completed cell refuses without --allow-completed, and
   assert.equal(store.has(completedKey), false);
 });
 
+test("prune-only flags on a REAL run are rejected, not silently ignored", async () => {
+  // The mirror of --prune's own run-only-flag rejection. The hazard is an
+  // edit rather than a typo: drop `--prune` from a prune command line and
+  // the remaining flags read like scoping while the run spends real money.
+  const base = { store: FAKE_STORE, log: () => {}, getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() };
+  await assert.rejects(() => main(["--cfg", "abc"], base), /only meaningful with --prune/);
+  await assert.rejects(() => main(["--kinds", "transient"], base), /only meaningful with --prune/);
+  await assert.rejects(() => main(["--apply"], base), /only meaningful with --prune/);
+  await assert.rejects(() => main(["--allow-completed"], base), /only meaningful with --prune/);
+  await assert.rejects(() => main(["--keep-attempts", "3"], base), /only meaningful with --prune/);
+  await assert.rejects(() => main(["--states", "failed"], base), /only meaningful with --prune/);
+});
+
 test("formatPrunePlan names the no-selector case explicitly rather than reporting an empty eviction list", () => {
   const lines = formatPrunePlan({ keysBefore: 3, keysAfter: 3, selectorsGiven: false, evictions: [], refused: [], compactions: [] });
   assert.ok(lines.some((l) => l.includes("no cell selector given")), lines.join("\n"));

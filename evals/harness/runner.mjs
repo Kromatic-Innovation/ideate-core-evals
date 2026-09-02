@@ -37,7 +37,16 @@
 // silently dropped from the plan.
 
 import { planRun } from "../../lib/manifest.mjs";
-import { RunAccount, costRow, TERMINAL_STATES, FAILURE_KINDS, isTransientFailure, isPaymentFailure } from "../../lib/accounting.mjs";
+import {
+  RunAccount,
+  costRow,
+  TERMINAL_STATES,
+  FAILURE_KINDS,
+  TRANSIENT_FAILURE_KINDS,
+  PAYMENT_FAILURE_KINDS,
+  isTransientFailure,
+  isPaymentFailure,
+} from "../../lib/accounting.mjs";
 import { assertValidProviderResponse } from "./provider.mjs";
 // providerOf/priceRowByProvider (issue #51, per-provider --max-spend): pure
 // data-shape utilities, not the interim estimator this module owns -- see
@@ -617,9 +626,12 @@ function sortRowsCanonically(rows) {
  *   @param {string}   [opts.configHash] select cells under this cfg only
  *   @param {string[]} [opts.armIds]     select cells for these arms only
  *   @param {string[]} [opts.briefIds]   select cells for these briefs only
- *   @param {string[]} [opts.kinds]      select cells whose stored
+ *   @param {string[]} [opts.kinds]      select FAILED cells whose stored
  *     `accounting.kind` is one of these (requires reading those bodies — the
- *     index carries `state`, not `kind`)
+ *     index carries `state`, not `kind`). DEFAULTS to the store-absent sets
+ *     (`TRANSIENT_FAILURE_KINDS` + `PAYMENT_FAILURE_KINDS`), so an intrinsic
+ *     observation is never evicted unless it is asked for by name — see the
+ *     `kindFilter` comment in the body.
  *   @param {string[]} [opts.states=["failed"]] select cells in these terminal
  *     states. Defaults to `failed` ALONE: the eviction case this exists for
  *     is a legacy transient failure, and a default that could reach a
@@ -645,6 +657,21 @@ export function planPrune(store, opts = {}) {
 
   const selectorsGiven = Boolean(configHash || armIds || briefIds || kinds || states);
   const wantStates = states || ["failed"];
+  // The DEFAULT kind filter is the store-absent sets — exactly the failures
+  // #90 and #88 would have kept out of the store in the first place. It is a
+  // default and not merely a convenience, for the same reason `completed` is
+  // protected: an INTRINSIC failure (`parse_failure`, `empty_pool`,
+  // `refusal`) is a real, paid-for observation about the arm, and IC-08's
+  // silent mode (`empty_pool`) is one of the behaviours the study exists to
+  // measure. `--prune --cfg <hash> --apply` is the most natural "repair my
+  // legacy store" invocation there is; without this default it would evict
+  // every intrinsic failure under that hash, and the arm's real failure rate
+  // would be re-rolled toward zero on the next run — precisely the silent
+  // bias lib/accounting.mjs's own header warns about. Reaching one requires
+  // typing `--kinds intrinsic` (or the literal kind), which is the explicit
+  // act the salvage cannot substitute for: the spend survives an eviction,
+  // the OBSERVATION does not.
+  const kindFilter = kinds || [...TRANSIENT_FAILURE_KINDS, ...PAYMENT_FAILURE_KINDS];
   const entries = store.list();
 
   // ── Eviction: cell records that should leave so planRun re-plans them ────
@@ -663,12 +690,16 @@ export function planPrune(store, opts = {}) {
       if (briefIds && !briefIds.includes(cell.briefId)) continue;
       if (!wantStates.includes(entry.state)) continue;
 
-      let body = null;
-      if (kinds) {
-        body = store.get(entry.key);
-        if (!kinds.includes(body.accounting && body.accounting.kind)) continue;
+      let body = store.get(entry.key);
+      if (entry.state === "failed") {
+        if (!kindFilter.includes(body.accounting && body.accounting.kind)) continue;
+      } else if (kinds) {
+        // An explicit kind filter cannot match a record that carries no
+        // failure kind at all (a `completed` cell). Excluded rather than
+        // waved through: someone who asked for `--kinds rate_limited` did
+        // not ask for a completed cell.
+        continue;
       }
-      if (!body) body = store.get(entry.key);
 
       const record = {
         key: entry.key,
