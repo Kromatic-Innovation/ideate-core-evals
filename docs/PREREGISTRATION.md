@@ -83,6 +83,8 @@ Panel size fixed at **5 agents**, `ideasPerAgent: 6`, `maxRounds: 2` (blind → 
 
 **Ablation arm (cheap, high value):** **A′** — panel of 5 identical models with _identical personas_ (persona lever disabled). Isolates how much of the panel's benefit is persona engineering vs. merely sampling 5 times. Costs one extra arm; answers the question a skeptical reviewer asks first.
 
+> _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), items 1 and 4). Arm A's row above says "Matched on total ideas requested" — true of round-1 requests only. At the pool level (the unit `distinct_k` is computed over) Arm A's pool is ~30 and every panel arm's is ~60, including **A′** above, which is itself a panel. See the appendix for the correction and the registered rarefaction rule that operationalizes §6.1's "at matched idea count" clause against this gap._
+
 ### 3.2 Items (briefs) — n = 12, stratified
 
 Held constant across arms. Stratified so results generalize across task type, not just one domain:
@@ -101,6 +103,8 @@ Briefs are **frozen and hashed** into the run manifest. Adding a brief mid-study
 ### 3.3 Held constant (and the awkward part)
 
 Same prompt builders, same `ideasPerAgent`, same personas, same rounds, same embedder, same judge panel, same seed for all non-model randomness.
+
+> _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 1). "Same rounds" above is false: Arm A runs `maxRounds: 1`; every panel arm runs `maxRounds: 2`. See the appendix for the correction and its consequences._
 
 **Temperature cannot be held constant, and this is a real threat to validity.** Per B2, Haiku 4.5 accepts `temperature`; Opus 5 / Sonnet 5 reject it with a 400. So we cannot run all arms at matched temperature. Options, with the honest trade-off:
 
@@ -134,6 +138,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 | **Pool diversity**          | Mean pairwise cosine _distance_ across the embedded pool                                                                                                                                                  | ideate-core's own `poolDiversity` — tests the library's own metric                                                               |
 | **Collapse rate**           | 1 − (semantic-dedup survivors ÷ raw candidates)                                                                                                                                                           | Direct mode-collapse measure                                                                                                     |
 | **Fluency / Flexibility**   | LiveIdeaBench axes: count of valid candidates emitted; breadth of distinct categories (clusters) covered — pool properties, computed by `evals/metrics/operational.mjs` (`poolFluency`/`poolFlexibility`) | See §4.2 amendment below — moved here from the idea-level table ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 2) |
+
+> _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 3). In any Arm-A contrast (§3.1), `distinct_k`, `poolFluency`, and collapse rate are computed on the **rarefied** pool (registered rule: Appendix C item 2); pool diversity and `distinct_k` per dollar are computed on the **full pool**. See the appendix for the per-metric rationale._
 
 ### 4.2 Secondary (idea-level, split axes — never collapsed)
 
@@ -218,6 +224,8 @@ Wataoka et al. 2024: models rate their own output higher. Every arm here is scor
 | **H3** | Cross-provider (G) > best within-provider (D or H) on `distinct_k`             | G > max(D,H)             | The heterogeneity claim (Wataoka)                                                                                                                            |
 | **H4** | Haiku panel (B) ≥ Opus panel (D) on `distinct_k`                               | B ≥ D                    | NoveltyBench inverse-scaling, **replicated on pools**. A genuinely surprising prediction — registering it in advance is what makes confirming it meaningful. |
 | **H5** | Same-provider judging inflates scores vs cross-provider                        | bias > 0                 | Judge validity                                                                                                                                               |
+
+> _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 2). H1's "at matched idea count" clause above is unchanged — this is a specification of how it is operationalized, not an amendment to the hypothesis: rarefy every pool in an Arm-A contrast to the minimum pool size present, `distinct_k` averaged over `RAREFACTION_R = 1000` random subsamples at seed `RAREFACTION_SEED = 20260901` (`evals/analysis/rarefaction.mjs`). See the appendix for the full rule, why no pool size is hardcoded, and why truncation to the first n is ruled out._
 
 ### 6.2 Model
 
@@ -344,6 +352,8 @@ Per-run estimate ≈ 16k input / 9k output tokens (5 agents × 2 rounds, pool-sh
 | Embedding model shapes diversity metric                 | DAT replication as validity check; single embedder held constant | An embedder that can't separate our domain would compress all arms |
 | 12 briefs may not generalize                            | Stratified; brief as random effect                               | Still 12. Report per-stratum effects                               |
 | Prompt builders tuned (unintentionally) to one provider | Same builder everywhere; generic wording                         | Untested — could add a prompt-variant robustness check             |
+
+> _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 7). "DAT replication as validity check" (row: "Embedding model shapes diversity metric") is a real but weak mitigation — reported, not verified against a committed artifact in this repo: over 3,000 seeds, a semantics-free SHA-512-of-text embedder cleared the DAT ordering 16.4% of the time (null 16.7%) and cleared all three negative controls together 1.9% of the time (reproducible witness: seed 97). About 0.8 bits of evidence, not a guarantee the embedder carries real semantics. See the appendix item for the full construction._
 
 ---
 
@@ -679,5 +689,110 @@ This entry does not independently re-run #47's bootstrap. The construction param
 **What changed.** §10/§11 register `configHash` as covering everything that changes **the measurement** (engine SHA, prompt hash, judge hash, embedder, panel shape, and now `corpusHash` / `clusterDistanceThreshold`, Items 13/8 above). This entry registers a **separate `analysisHash`** — the analysis toolchain's Python/numpy/scipy/statsmodels versions plus `sha256(fit_mixedlm.py)` — stamped in `REPORT.md` alongside `configHash`, explicitly **not folded into `configHash`**: a toolchain version bump changes how the numbers are _computed_, not what was _measured_, and folding it into `configHash` would falsely mark old cells `stale` on a pure tooling change. `evals/analysis/fit.mjs`'s `analysisHash()` and `report.mjs`'s rendered `analysisHash:` line implement exactly this separation.
 
 **Scope, population, and rate-table date (§10, remainder of B10).** Register the study's population as **the briefs actually tested** (§3.2, now 24 briefs, Item 13) — drop any claim of generalization across task type beyond per-stratum reporting (§10 already lists "12 briefs may not generalize" as a threat; this stands, updated for 24). Pin the dated rate table used for the ledger (§8.1) and record that **Sonnet 5's introductory rate ($2.00/$10.00) expired 2026-08-31** (§8.1's own text already states this expiry date; verify first-party against the live rate card before pinning a run that starts after that date, rather than assuming the intro rate still applies).
+
+---
+
+## Appendix C — Amendments (dated 2026-09-01)
+
+Per the amendment rule at the top of this document. **Nothing in §6 is changed by any entry below.** §6.1 already registers H1 as "at matched idea count" — that clause has been in the frozen text since this document's first commit. This appendix **specifies how an already-registered clause is operationalized**; it is not an amendment to H1, and no entry here proposes different words for §6.1's hypothesis table.
+
+### Item 1 — §3.1/§3.3: two claims about Arm A were false; corrected here
+
+**What changed.** Two frozen-text claims are corrected (left in place, marked amended, per the amendment rule):
+
+- §3.1's arm-A row states _"Matched on total ideas requested."_ True of **round-1** requests only (30 vs 30). At the **pool** level — the unit `distinct_k` is computed over — it is **~30 vs ~60**: Arm A resolves to `maxRounds: 1`; every panel arm resolves to `maxRounds: 2` (`arms.config.json`'s `panel: {size: 5, ideasPerAgent: 6, maxRounds: 2}`, `evals/harness/provider.mjs:496-516`'s `resolveIdeateAgents`), and round 2 **appends** candidates to the shared pool rather than replacing round 1 (`ideate-core.mjs:271` accumulates, `:338` appends, `:354` returns the deduped union with no cap).
+- §3.3 lists **"same rounds"** under _Held constant_. Arm A runs 1 round; every panel arm runs 2. Not held constant.
+
+**Why.** Caught during the QA review of PR #69 (issue #70). Both corrected here, at pool level, rather than at the round-1-request level the original text implicitly measured.
+
+**Verification status.** Traced from `resolveIdeateAgents` and `arms.config.json`, not measured — **no generation has ever been run**. ≈60 is a traced upper bound: `ideate-core.mjs:354` dedupes the panel pool by normalized text, and round 2 is only _prompted_ for new ideas (`evals/harness/prompts.mjs:96`: `` `Generate exactly ${n} NEW candidate ideas` ``), not guaranteed to produce them — the true observed panel pool size may be well under 60. This is exactly why Item 2's rule never hardcodes a number.
+
+### Item 2 — §6.1: how "at matched idea count" is operationalized — the rarefaction rule (the substantive item)
+
+**What this specifies.** §6.1's H1 reads: _"Any panel arm > Arm A (solo) on `distinct_k` **at matched idea count**."_ The matching clause was already registered; Item 1 shows the implementation did not enforce it. This item registers the operationalization.
+
+**The registered rule.** For every arm-A contrast (see Item 4 for which contrasts that is): rarefy every pool in the contrast down to the **minimum pool size present in that contrast**, and take `distinct_k` as the **mean over R random subsamples**, drawn without replacement, uniformly over the whole pool, at that minimum size.
+
+**No hardcoded pool size — registered as a rule, not a number.** The rule is "rarefy to the minimum pool size actually present in the contrast," never "rarefy to 30." No generation has ever been run (Item 1); ≈60 is a traced upper bound, not an observation, and the true panel pool size is unknown until #8 (Phase 2a) measures it. A rule that hardcoded a number would need re-amending the moment that measurement lands; "the minimum actually observed" does not.
+
+**Truncation to the first n is explicitly ruled out.** The first 30 ideas of a panel pool ARE that arm's round-1 output — round 2 appends, it does not rewrite (`ideate-core.mjs:271`/`:338`, Item 1). Truncating to the first n would therefore discard exactly the build-on-each-other mechanism ideate-core's multi-agent machinery exists to test, biasing the rarefied comparison **against** the panel arms — the opposite direction from the pool-size confound this appendix exists to remove. It is also not the registered comparison: §6.1 asks about the panel's finished pool, not its round-1 output alone. Every subsample this rule draws is a uniform random draw over the **whole** pool; there is no first-n code path.
+
+**R and the seed, registered.** Named constants in `evals/analysis/rarefaction.mjs`, cited here by name rather than by value so the document and the code cannot silently drift apart:
+
+- `RAREFACTION_R = 1000` — number of random subsamples averaged per rarefied `distinct_k` estimate.
+- `RAREFACTION_SEED = 20260901` — explicit integer seed for the subsampling PRNG (mulberry32, vendored per this repo's convention — see `order.mjs`/`sample.mjs`/`pareto.mjs`). Never wall-clock, so a reported rarefied value is exactly reproducible.
+
+Averaging over `R` draws only **partly recovers** the information a single full-pool measurement would carry — this is registered as a noisier estimator than the full-pool `distinct_k`, not a free lunch (Item 6).
+
+**Implementation.** `evals/analysis/rarefaction.mjs`: `minPoolSize` (the target-size rule), `sampleIndicesWithoutReplacement` (the only sampling primitive — no truncation path), `rarefiedDistinctK` (one pool → its rarefied estimate), `rarefyPools` (a whole contrast → both rarefied and full-pool values per pool, Item 5). Tested in `evals/analysis/rarefaction.test.mjs`:
+
+- The KEY discriminating test (`KEY: rarefaction removes a pool-size confound that raw distinct_k is sensitive to`) constructs two pools from an **identical** generative process at different sizes and shows raw `distinct_k` is sensitive to the size difference (a real, large gap) while the rarefied value is not, within sampling tolerance.
+- A separate test (`R controls estimator variance`) makes `R` itself load-bearing on the property it exists for — estimator variance across seeds — rather than only on input validation: at the registered `R`, five independent seeds on the same pool agree tightly; at a low `r`, the same five seeds disagree by several units.
+
+Verified by targeted mutation (each reverted before commit): hardcoding `R=1` fails 7 of 16 tests (both statistical tests above, plus the determinism/exactness tests that assume averaging); using max instead of min in `minPoolSize` fails 3; silently ignoring the seed fails 2; dropping the min-size computation inside `rarefyPools` (hardcoding a pool size) fails 1. Every one of the four targeted mutations goes red.
+
+### Item 3 — §4.1: which primary metrics receive the rarefied treatment
+
+**What's registered**, per §4.1 primary metric, in any arm-A contrast — `RAREFACTION_TREATMENT` in `evals/analysis/rarefaction.mjs` is the code-side record of this table, so the two cannot drift apart:
+
+| Metric                                         | Treatment                  | Why                                                                          |
+| ---------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------- |
+| `distinct_k`                                   | **Rarefied**               | Monotone non-decreasing in pool size (§0 of issue #70)                       |
+| `poolFluency`                                  | **Rarefied**               | It _is_ the pool size                                                        |
+| Collapse rate                                  | **Rarefied**               | A larger pool has more chances of internal duplication                       |
+| Pool diversity (mean pairwise cosine distance) | Full-pool                  | A mean, roughly n-robust                                                     |
+| `distinct_k` per dollar                        | Full-pool, self-correcting | The extra generation the panel arms run is paid for on the cost side already |
+
+### Item 4 — scope: every arm-A contrast, A′ included; H2/H3/H4 unaffected
+
+**What's registered.** The rarefaction rule (Item 2) applies to **every contrast that includes Arm A**, not only H1:
+
+- **H1** (mean(panel arms) − A, §6.1/Appendix B item 5) — the confound this appendix exists to fix.
+- **Per-arm exploratory breakdowns** (armX − A for one arm at a time, §6.3/Appendix B item 5) — same confound, same fix.
+- **A′ (the persona-ablation arm, §3.1)** — A′ is a **panel** (identical models, disabled persona lever), so it resolves to `maxRounds: 2` and an ≈60 pool exactly like every other panel arm. The A-vs-A′ comparison — "the question a skeptical reviewer asks first" per §3.1 — is unmatched in exactly the same way H1 is, and is rarefied by the same rule.
+
+**H2 (E vs D), H3 (G vs D/H) and H4 (B vs D) are unaffected.** Every arm on both sides of those contrasts is a panel arm at the same registered shape (`panel: {size: 5, ideasPerAgent: 6, maxRounds: 2}` for all of B/D/E/G/H) — no pool-size asymmetry exists between them, so no rarefaction is registered for those contrasts.
+
+### Item 5 — both values are reported
+
+**What's registered.** For every rarefied contrast (Item 4), `REPORT.md` reports **both**:
+
+- **Rarefied `distinct_k`** — H1's (and A′'s, and the per-arm breakdowns') registered estimand, the quantity §6.2's Holm-corrected family is tested on.
+- **Full-pool `distinct_k`** — a secondary descriptive, never substituted for the registered estimand, reported so a reader can see what the unmatched comparison would have shown.
+
+`rarefyPools()`'s return shape (`{poolSize, rarefiedN, distinctKFullPool, distinctKRarefied}` per pool) carries both numbers through by construction — there is no code path that produces one without the other.
+
+### Item 6 — §3.4/§8.3: consequences for the pilot (#49)
+
+**What's registered.** Variance of a count scales with the count, so a between-run variance estimate collected from a 30-pool arm (Arm A) does not transfer to a 60-pool arm (every panel arm) — the two arms' `distinct_k` have structurally different sampling variance even before any model effect. §3.4/§8.3's pilot (Phase 2, "estimate variance → recompute n") is registered to derive H1's required `n` from the **rarefied** `distinct_k` variance, computed at the contrast's rarefaction target, never from the raw full-pool variance of either side.
+
+**This makes H1 noisier than the full-pool comparison, by construction, and that is registered in advance.** Rarefaction discards information (Item 2); averaging over `R = 1000` draws only **partly** recovers what a single full-pool measurement at the true (larger) pool size would have given. A pilot-derived `n` for H1 must therefore be derived from data that has itself already been rarefied — deriving it from full-pool variance and applying that `n` to a rarefied confirmatory test would understate H1's true required sample size.
+
+### Item 7 — §10: Phase 0's power against a semantics-free embedder, and the DAT mitigation's strength
+
+**What's registered.** §10's threat table lists "DAT replication as validity check" as the mitigation for "Embedding model shapes diversity metric." This entry quantifies how strong that mitigation actually is.
+
+**Reported, not verified against a committed artifact in this repo** — measured during the QA review of PR #69, reproducible from the construction described, not independently re-run in this session:
+
+- The DAT replication control (§4.4) is a 3-point ordering (`low < avg < high`), which holds **1-in-6 (16.7%) under a null** with no semantic signal at all.
+- Measured over **3,000 seeds** with a pure SHA-512-of-text embedder (deterministic, text-dependent, carrying **zero semantics**): the DAT ordering held **16.4%** of the time (null expectation 16.7% — consistent with the embedder carrying no real signal, as constructed).
+- **All three negative controls (duplicate pool, random pool, DAT ordering) passed together 1.9% of the time** over the same 3,000 seeds. A reproducible witness: **seed 97** — `low 0.9481 < avg 0.9594 < high 0.9738`, `distinct_k` 1 (duplicate pool) and 30 (random pool) — a fully semantics-free embedder that nonetheless clears every registered control simultaneously, at that seed.
+- Only the DAT control has power against this failure mode: a text-hash embedder passes the duplicate-pool control **exactly** (identical text → identical vector → all pairwise distances exactly 0) and the random-text control **trivially** (unrelated sentences hash to unrelated, well-separated vectors) by construction, regardless of whether the embedder carries any semantics.
+
+**The mitigation therefore carries only about 0.8 bits of evidence against a semantics-free embedder, not a validity guarantee.** This figure is carried over verbatim from the PR #69 QA review; it is **reported, not re-derived or independently verified in this session** — a naive `log2(1/0.164) ≈ 2.6` (surprisal of a single DAT pass under this null) does not obviously reproduce 0.8 bits on its own, and the exact derivation (e.g. relative to a different reference distribution) is not restated here. Treat the bit figure as a labelled estimate from that review, not a computed one; the pass-rate numbers above it (16.4%, 1.9%) are the load-bearing, directly-stated measurements. Either way, the qualitative conclusion is unaffected: a control a semantics-free embedder clears roughly 1 time in 6 is weak evidence, not a validity guarantee. §10's table is corrected below to say so rather than presenting DAT replication as closing the threat.
+
+> _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 7). "DAT replication as validity check" (row: "Embedding model shapes diversity metric") is a real but weak mitigation — reported, not verified against a committed artifact in this repo: over 3,000 seeds, a semantics-free SHA-512-of-text embedder cleared the DAT ordering 16.4% of the time (null 16.7%) and cleared all three negative controls together 1.9% of the time (reproducible witness: seed 97). Carried over as "about 0.8 bits of evidence" from that review; this session did not independently re-derive that figure from the pass rates above (see the appendix item). Not a guarantee the embedder carries real semantics either way. See the appendix item for the full construction._
+
+### Item 8 — §4.4: the two degenerate negative controls are nearly threshold-free
+
+**What's registered.** §4.4's qualitative note that the duplicate-pool and random-pool controls pass "under almost any threshold" is true but under-specified. This entry registers the numbers.
+
+**Reported, not verified against a committed artifact in this repo** — measured during the QA review of PR #69, reproducible from the construction described, not independently re-run in this session:
+
+- **Duplicate pool.** Passes (`distinct_k = 1`, `diversity < 0.05`) over the **entire** threshold domain, unconditionally: identical text embeds to an identical vector, so every pairwise distance is exactly 0 regardless of where the threshold is set.
+- **Random pool.** Passes for every threshold in roughly **(0, 0.730)**, measured on the committed MiniLM fixture. Two ratios, not one, because the band is MiniLM-measured and two different thresholds are registered in two different embedding spaces (Appendix B item 8 is explicit that cosine-distance distributions do not transfer across embedders): **~3×** the production Voyage-space `clusterDistanceThreshold` (0.730 / 0.2314) — a cross-space ratio, not a same-space robustness factor — and **~1.5×** the MiniLM-space threshold the 0.730 figure was itself measured against (0.730 / 0.4923). Corrupting the registered threshold constant to anything in **[1e-9, 0.9]** leaves the whole negative-control suite green.
+- **The one control that did NOT clear widely: the random-pool diversity margin.** `0.7525 / 0.6970 = 1.080` — an **8%** margin against a floor self-calibrated from `dat.high` in the same run. Named here because it is the one number in this item that is close to failing, not comfortably far from it like the other two.
+
+> _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 8). The duplicate-pool and random-pool negative controls (§4.4 table) are both nearly threshold-free: the duplicate pool passes over the entire threshold domain unconditionally; the random pool passes for roughly (0, 0.730) on the MiniLM fixture — ~3× the production Voyage-space threshold (0.2314) or ~1.5× the MiniLM-space threshold it was measured against (0.4923), the two ratios disclosed separately because the band is MiniLM-measured and cosine distances don't transfer across embedding spaces (Appendix B item 8) — and the whole suite stays green with the threshold corrupted to anywhere in [1e-9, 0.9]. The one control that did not clear widely was the random-pool diversity margin itself: 0.7525/0.6970 = 1.080, an 8% margin. Reported, not verified against a committed artifact in this repo. See the appendix item for the full construction._
 
 ---
