@@ -262,10 +262,12 @@ introductory rate by row timestamp, so a group straddling a dated rate change
 is left unfolded rather than repriced. The bound is best-effort; the ledger is
 not.
 
-Not yet compacted: `judge-call` records (`evals/judge/gate.mjs`), which have
-the same shape and the same growth property. Their attempt numbering is
-derived from a raw key count in that module, which compaction would break, so
-bringing them in is a follow-up rather than part of #98.
+`judge-call` records (`evals/judge/gate.mjs`) fold the same way as of #108,
+under the same `--prune --keep-attempts` and with no judge-specific flag —
+they group per (cell, judge model), so two judges scoring one pool are two
+independent sequences. Still not compacted: `pruned-cell` records, which need
+a second numbering fix in `salvageEvictedCellSpend` before they can be (it
+re-uses the lowest free `pruned=N` slot, and a fold frees the low ones).
 
 ## The store's append-only contract, precisely
 

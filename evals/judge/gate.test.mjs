@@ -287,6 +287,84 @@ test("AC10 — a judge call produces a costRow (tokens x model, no cost_usd) tha
   assert.ok(!("notional_usd" in row));
 });
 
+// ── #108: max+1, not a count ────────────────────────────────────────
+// These assert the numbering directly against a store the prune has already
+// folded, WITHOUT running the prune -- the record shapes are the contract
+// between the two modules, and a test that goes through pruneStore() would
+// pass even if meterJudgeCall only agreed with today's pruner by accident.
+// (The end-to-end pairing lives in evals/harness/prune.test.mjs.)
+
+const NUMBERING_CELL = "arm=B|brief=b1|rep=0|cfg=deadbeef1234";
+const NUMBERING_JUDGE = "claude-sonnet-5";
+
+/** A compacted judge-call record in the exact shape planPrune writes. */
+function putCompactedJudgeCall(store, through) {
+  const scope = `${NUMBERING_CELL}|judge=${NUMBERING_JUDGE}`;
+  store.put({
+    key: `judge-call-compacted|cell=${scope}|through=${through}`,
+    armId: "__judge-call-compacted__",
+    briefId: scope,
+    replicate: 0,
+    cfg: NUMBERING_JUDGE,
+    result: { kind: "judge-call-compacted", cellKey: scope, through },
+    resolvedModels: { models: [NUMBERING_JUDGE] },
+    accounting: { state: "completed" },
+    costRows: [{ cellKey: scope, timestamp: "2026-09-01T00:00:00Z", billing_mode: "api", model: NUMBERING_JUDGE, input_tokens: 10, output_tokens: 5 }],
+  });
+}
+
+const meterNext = (store) =>
+  meterJudgeCall({
+    store,
+    cellKey: NUMBERING_CELL,
+    judgeModel: NUMBERING_JUDGE,
+    tokens: { input_tokens: 100, output_tokens: 20 },
+    timestamp: "2026-09-02T00:00:00Z",
+  });
+
+test("#108 — meterJudgeCall numbers the next attempt max+1 across a COMPACTED record, not by counting keys", () => {
+  const store = makeTempStore("judge-gate-test-");
+  // The exact post-fold shape: attempts 0..4 folded into one, 5 retained.
+  putCompactedJudgeCall(store, 4);
+  meterJudgeCall({
+    store,
+    cellKey: NUMBERING_CELL,
+    judgeModel: NUMBERING_JUDGE,
+    tokens: { input_tokens: 1, output_tokens: 1 },
+    timestamp: "2026-09-01T00:00:01Z",
+  });
+  // ^ that call is itself the first assertion: under the old count it would
+  // have been numbered 1 (one key present), and here it must be 5.
+  assert.ok(store.has(`judge-call|cell=${NUMBERING_CELL}|judge=${NUMBERING_JUDGE}|attempt=5`));
+
+  // Two records in the store, next attempt is 6 -- a count would say 2.
+  const outcome = meterNext(store);
+  assert.equal(outcome.key, `judge-call|cell=${NUMBERING_CELL}|judge=${NUMBERING_JUDGE}|attempt=6`);
+  assert.equal(outcome.written, true);
+  assert.equal(store.get(outcome.key).result.attempt, 6, "and the body agrees with the key");
+});
+
+test("#108 — the numbering is unchanged from the old count when nothing has been folded", () => {
+  const store = makeTempStore("judge-gate-test-");
+  for (let n = 0; n < 4; n++) {
+    assert.equal(meterNext(store).key, `judge-call|cell=${NUMBERING_CELL}|judge=${NUMBERING_JUDGE}|attempt=${n}`);
+  }
+});
+
+test("#108 — a second judge model on the same cell gets its own attempt sequence", () => {
+  const store = makeTempStore("judge-gate-test-");
+  putCompactedJudgeCall(store, 9);
+  const other = meterJudgeCall({
+    store,
+    cellKey: NUMBERING_CELL,
+    judgeModel: "gpt-5.6-terra",
+    tokens: { input_tokens: 1, output_tokens: 1 },
+    timestamp: "2026-09-02T00:00:00Z",
+  });
+  assert.equal(other.key, `judge-call|cell=${NUMBERING_CELL}|judge=gpt-5.6-terra|attempt=0`, "a fold under one judge must not push another judge's numbering");
+  assert.equal(meterNext(store).key, `judge-call|cell=${NUMBERING_CELL}|judge=${NUMBERING_JUDGE}|attempt=10`);
+});
+
 test("meterJudgeCall requires store, cellKey, and judgeModel", () => {
   assert.throws(() => meterJudgeCall({ cellKey: "x", judgeModel: "y", tokens: {}, timestamp: "t" }), /store is required/);
   const store = makeTempStore("judge-gate-test-");

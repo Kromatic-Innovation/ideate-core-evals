@@ -10,6 +10,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseArgs, main, formatSpendSummary, formatPhase0Report, formatPrunePlan } from "./run.mjs";
+// The real judge-call writer (issue #108) -- the CLI prune tests below use it
+// rather than hand-built keys, so the fixture cannot drift from the writer.
+import { meterJudgeCall } from "./judge/gate.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
@@ -733,6 +736,58 @@ test("--prune --apply removes the cell, and reports the spend it verified", asyn
   assert.ok(lines.some((l) => l.includes("EVICT removed")), lines.join("\n"));
   assert.ok(lines.some((l) => /spend-to-date after/.test(l)), lines.join("\n"));
   assert.equal(lines.some((l) => l.includes("DRY RUN")), false);
+});
+
+// ── #108 AC5: judge-call records, same command ────────────────────────────
+// The acceptance criterion is about the INTERFACE, so it is asserted at the
+// CLI: the same `--prune [--keep-attempts N] --apply`, no judge-specific
+// flag, and no `--allow-completed` even though judge-call records are stored
+// `completed`. That last part is the one an operator would otherwise learn
+// the hard way, and passing that flag habitually is how a real measurement
+// eventually gets deleted.
+
+/** pruneFixtureStore() plus six real judge-call records for one
+ *  (cell, judge model) pair, written through gate.mjs's own metering path. */
+function judgeCallFixtureStore() {
+  const store = pruneFixtureStore();
+  const judged = cellKey({ armId: "A", briefId: "b4", replicate: 0, cfg: PRUNE_CFG });
+  for (let n = 0; n < 6; n++) {
+    meterJudgeCall({
+      store,
+      cellKey: judged,
+      judgeModel: "claude-opus-5",
+      tokens: { input_tokens: 900 + n, output_tokens: 120 },
+      timestamp: "2026-09-01T00:00:00Z",
+    });
+  }
+  return { store, judged };
+}
+
+test("#108 AC5: --prune --keep-attempts compacts judge-call records through the same command, with no extra flag", async () => {
+  const { store, judged } = judgeCallFixtureStore();
+  const before = store.keys().length;
+  const lines = [];
+  // No --kinds, no --cfg, no --allow-completed, no judge selector.
+  await main(["--prune", "--keep-attempts", "2", "--apply"], { store, log: (m) => lines.push(m), getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+
+  assert.ok(store.keys().length < before, "the store shrinks");
+  assert.ok(store.has(`judge-call-compacted|cell=${judged}|judge=claude-opus-5|through=3`), store.keys().join("\n"));
+  for (const n of [4, 5]) assert.ok(store.has(`judge-call|cell=${judged}|judge=claude-opus-5|attempt=${n}`), `attempt ${n} is inside the retention window`);
+  assert.ok(lines.some((l) => l.includes("COMPACT removed") && l.includes("judge-call")), lines.join("\n"));
+  // The same invocation reached the generation-attempt family too -- one
+  // command, every family, which is the whole criterion.
+  assert.ok(lines.some((l) => l.includes("COMPACT removed") && l.includes("generation-attempt")), lines.join("\n"));
+  assert.ok(lines.some((l) => /spend-to-date after/.test(l)), lines.join("\n"));
+});
+
+test("#108: a judge-call compaction is visible in the dry run before anything is written", async () => {
+  const { store } = judgeCallFixtureStore();
+  const before = store.keys();
+  const lines = [];
+  await main(["--prune", "--keep-attempts", "2"], { store, log: (m) => lines.push(m), getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+  assert.deepEqual(store.keys(), before, "still a dry run");
+  assert.ok(lines.some((l) => l.includes("COMPACT would remove") && l.includes("judge-call")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("DRY RUN")), lines.join("\n"));
 });
 
 test("--prune never calls runSpec, never resolves the engine version, and needs no API key", async () => {
