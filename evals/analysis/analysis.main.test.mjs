@@ -684,6 +684,8 @@ test("main(): #97 -- a TWO-ARM store analyses end to end, recording the unreacha
 
     // And the report says all of it out loud.
     const reportMd = readFileSync(join(outDir, "REPORT.md"), "utf8");
+    // 4 of 5 here -- H5 is unimplemented for the unrelated "no judging has
+    // run" reason, not an arm-subset one, so it is NOT in the banner.
     assert.match(reportMd, /REGISTERED FAMILY ONLY PARTLY ESTIMABLE/);
     assert.match(reportMd, /4 of 5 registered/);
     assert.match(reportMd, /- \*\*H2\*\* — NOT ESTIMABLE/);
@@ -744,7 +746,11 @@ test("main(): #97 -- judge scores on a TWO-ARM store degrade H5 to not-estimable
     // All five slots, and H5 now joins the arm-subset banner.
     assert.equal(result.holmAdjusted.length, 5);
     assert.deepEqual(result.estimability.notEstimable.map((e) => e.id), ["H1", "H2", "H3", "H4", "H5"]);
-    assert.match(readFileSync(join(outDir, "REPORT.md"), "utf8"), /5 of 5 registered/);
+    // 5 of 5 is not "partly" -- the heading must say so.
+    const reportMd = readFileSync(join(outDir, "REPORT.md"), "utf8");
+    assert.match(reportMd, /REGISTERED FAMILY NOT ESTIMABLE FROM THIS ARM SUBSET/);
+    assert.doesNotMatch(reportMd, /ONLY PARTLY ESTIMABLE/);
+    assert.match(reportMd, /5 of 5 registered/);
   } finally {
     rmSync(resultsDir, { recursive: true, force: true });
     rmSync(outDir, { recursive: true, force: true });

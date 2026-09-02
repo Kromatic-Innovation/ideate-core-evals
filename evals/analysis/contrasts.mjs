@@ -511,6 +511,12 @@ export function familyEstimability(results) {
     .map((r) => ({ id: r.id, missingArms: r.missingArms || [], reason: r.reason }));
   return {
     slots: results.length,
+    // Entries that produced a real estimate -- i.e. NOT unimplemented for
+    // ANY reason, which is broader than "estimable given this run's arms".
+    // On the full grid with no pools and no judging yet, H1 and H5 are
+    // unimplemented for reasons that have nothing to do with arms, so this
+    // reads 3 while `notEstimable` is correctly empty. The report's
+    // arm-subset banner keys off `notEstimable`, never off this.
     estimated: results.length - results.filter((r) => r && r.unimplemented).length,
     notEstimable,
   };

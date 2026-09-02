@@ -106,8 +106,12 @@ export function renderReport(input) {
   // (§11). What a reader needs instead is to SEE that some registered
   // hypotheses were unreachable, and why.
   if (estimability && estimability.notEstimable && estimability.notEstimable.length) {
+    // "Partly" is false when NONE of the family is estimable, which is
+    // exactly what the #8 smoke store (arms A/B) produces -- 5 of 5.
+    const allUnreachable = estimability.notEstimable.length >= estimability.slots;
     lines.push(
-      `**REGISTERED FAMILY ONLY PARTLY ESTIMABLE** — ${estimability.notEstimable.length} of ${estimability.slots} registered ` +
+      `**REGISTERED FAMILY ${allUnreachable ? "NOT ESTIMABLE FROM THIS ARM SUBSET" : "ONLY PARTLY ESTIMABLE"}** — ` +
+        `${estimability.notEstimable.length} of ${estimability.slots} registered ` +
         "hypotheses cannot be estimated from this run's arm subset. This is an ARM-SUBSET run (a smoke study, a pilot, or a " +
         "re-analysis of a partial store), not the confirmatory analysis of §6.1. No substitute arm was used for any absent " +
         "arm, and no entry was dropped from the family: each is reported below with p=1, still occupying its Holm slot, so " +
