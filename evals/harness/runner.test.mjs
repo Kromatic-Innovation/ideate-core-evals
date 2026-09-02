@@ -417,6 +417,53 @@ test("issue #62 MEDIUM: the spend-gating path fails loud (not a silent $0) when 
   );
 });
 
+test("issue #78: the spend-gating path fails loud (not a silent $0) when an actual cost row references a model with no RATE_TABLE entry, on a GLOBAL-ONLY --max-spend (no per-provider ceiling)", async (t) => {
+  // Same shape as the issue #62 MEDIUM test above, but the ONLY ceiling
+  // supplied is the global `maxSpendUsd` -- `maxSpendByProviderUsd` is
+  // deliberately omitted. Before the #78 fix, recordActualSpend's guard
+  // checked `maxSpendByProviderUsd && hasMissingRate`, so with no
+  // per-provider ceiling active this branch was unreachable and the
+  // rate-less row silently priced at $0, landing in `runningTotal` without
+  // ever tripping anything.
+  //
+  // The ceiling is set FAR above the fake $1/cell projection (1000 vs 1) so
+  // the run is never within budget-shortfall distance of throwing for the
+  // wrong reason -- the only way this test can throw is the missing-rate
+  // guard itself. A ceiling set at or below the projection would make a
+  // still-broken guard pass this test via the ORDINARY budget check instead
+  // (the trap this repo has shipped before): that check runs on the
+  // PROJECTED grid before any cell executes and would abort the whole run
+  // with a "within budget"/skip outcome rather than the RATE_TABLE error
+  // asserted below, so a regression back to the narrow `maxSpendByProviderUsd`
+  // condition must be caught here, not masked by an unrelated ceiling trip.
+  const store = new ResultsStore(tempDir(t));
+  const unratedArmsConfig = {
+    arms: {
+      NR: { mode: "panel", slots: [{ persona: "proposer_1", model: "claude-fake-model-78" }] },
+    },
+  };
+  const unratedSpec = { arms: [{ id: "NR" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const provider = new MockProvider();
+  const fakePriceGrid = (plannedCells) => ({
+    usd: plannedCells.length,
+    breakdown: plannedCells.map((c) => ({ cellKey: c.key, usd: 1, byProvider: { anthropic: 1 } })),
+  });
+
+  await assert.rejects(
+    () =>
+      runSpec(unratedSpec, {
+        store,
+        armsConfig: unratedArmsConfig,
+        provider,
+        priceGrid: fakePriceGrid,
+        maxSpendUsd: 1000, // global-only ceiling -- no maxSpendByProviderUsd at all
+        log: silentLog,
+      }),
+    /no RATE_TABLE entry/,
+    "a rate-less model must be refused specifically for lacking a RATE_TABLE entry, not for tripping a low ceiling",
+  );
+});
+
 // ── AC3: resume -- killing mid-grid and restarting re-runs only incomplete cells ──
 
 test("resume: a killed run re-runs only incomplete cells on restart", async (t) => {
