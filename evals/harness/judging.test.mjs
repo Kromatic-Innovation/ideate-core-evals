@@ -150,17 +150,172 @@ test("issue #106: a judge-leg payment refusal stops further judging on THAT prov
   // all is the gate passing.)
   assert.equal(summary.judge.planned, 8, "4 pools x 2 legs -- unattempted legs are still PLANNED and still accounted");
   assert.equal(summary.judge.completed, 4, "the four anthropic legs");
-  assert.equal(summary.judge.failed, 4, "the four openai legs: one refused, three never attempted");
+
+  // issue #112: the four openai legs no longer share one terminal state. ONE
+  // of them made a call and was refused -- that is a genuine failure, on its
+  // own merits, and keeps kind `payment_required`. The other THREE were never
+  // attempted, because the sticky refusal short-circuited them before a
+  // payload was assembled; they are classified SKIPS carrying the reason.
+  // Rolling all four into `failed` inflated the judge-side failure count with
+  // three legs that never made a call.
+  assert.equal(summary.judge.failed, 1, "only the leg that actually called and was actually refused is a FAILURE");
+  assert.equal(summary.judge.skipped, 3, "the three never-attempted legs are classified skips, not failures");
   assert.deepEqual(
     summary.judge.byKind,
-    { payment_required: 4 },
-    "one category for the whole abort -- an operator reads `payment_required=4`, not an undifferentiated failure count",
+    { payment_required: 1 },
+    "byKind now counts ONLY legs refused on their own call -- an operator reads `the account refused us once`",
+  );
+  assert.deepEqual(
+    summary.judge.skippedByReason,
+    { payment_required: 3 },
+    "#88's colon-prefix grouping collapses the three skip reasons to one category -- `we declined to try 3 times`",
+  );
+
+  // THE hazard this change had to avoid (issue #112's named trap): every one
+  // of these legs appears in BOTH runJudgeMatrix's `results` (as a
+  // failed/payment_required row) and its `paymentSkipped`. Terminating it
+  // twice is what RunAccount forbids. reconcile() throwing is the gate, but
+  // "it did not throw" is a vacuous pin on its own -- it stays green if the
+  // scenario silently stops producing skips at all. The sum identity plus the
+  // exact split above is what actually pins it: 4+1+3 must equal 8 with no
+  // leg counted twice and none missing.
+  assert.equal(
+    summary.judge.completed + summary.judge.failed + summary.judge.skipped,
+    summary.judge.planned,
+    "every planned judge leg reached EXACTLY ONE terminal state -- no leg double-terminated, no leg dropped",
+  );
+
+  // The judge-side summary distinguishes the two outcomes explicitly, so a
+  // reader does not have to notice that one number lives in `byKind` and the
+  // other in `skippedByReason`.
+  assert.deepEqual(
+    summary.judgePaymentAbort,
+    { refused: 1, skipped: 3 },
+    "'the account refused us N times' and 'we declined to try M times' are separately legible",
   );
 
   // Every one of the four pools has its anthropic scores durably stored --
   // the half of the matrix that COULD be paid for is not thrown away.
   const scored = store.keys().filter((k) => k.startsWith("judge-scores|") && k.includes(JUDGE_MODELS.anthropic[0]));
   assert.equal(scored.length, 4, "the payable leg of every pool was still scored and stored");
+});
+
+// ── issue #112: an UNATTEMPTED judge leg is a classified skip, not a fail ───
+//
+// #106 (PR #111) left every payment-short-circuited leg as a terminal `fail`
+// with kind `payment_required`. That reconciles -- no leg goes missing -- but
+// it is the wrong CATEGORY: a leg that never made a call did not fail on its
+// own merits, and counting it as a failure inflates the judge-side failure
+// count with legs that were never attempted. #88 set the generation-side
+// precedent: a classified `skip` carrying a colon-prefixed reason.
+//
+// The trap: such a leg appears in BOTH runJudgeMatrix's `results` (a
+// failed/payment_required row carrying `attempted: false`) and its
+// `paymentSkipped`. Reconciliation is a one-terminal-state-per-leg gate, so
+// recording the skip WITHOUT excluding the leg from the results loop
+// double-terminates it and RunAccount throws. The mid-run test above pins the
+// split and the sum identity on a 4-pool grid; the tests below pin the two
+// boundary conditions that split has to respect.
+
+// A one-pool spec. The refusing leg and a short-circuited leg can never
+// co-occur in a single pool -- rows are one per provider per pool, so the
+// refusal fires on the FIRST pool's openai leg and the short-circuit only on
+// later pools. With exactly one pool there is nothing left to short-circuit,
+// which is precisely the case that must still be a FAIL.
+const SINGLE_POOL_SPEC = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+test("issue #112: a judge leg REFUSED ON ITS OWN CALL stays a `fail` with kind payment_required -- only never-attempted legs become skips", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+  const openaiJudge = new MockJudgeProvider({ failFor: new Map(JUDGE_MODELS.openai.map((m) => [m, { failureKind: "payment_required" }])) });
+
+  const { summary } = await runSpec(SINGLE_POOL_SPEC, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge, openai: openaiJudge },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+
+  assert.equal(openaiJudge.calls.length, 1, "the leg WAS attempted -- the account was asked, and said no");
+  assert.equal(summary.judge.planned, 2, "1 pool x 2 legs");
+  assert.equal(summary.judge.completed, 1, "the anthropic leg");
+  assert.equal(summary.judge.failed, 1, "a leg refused on its own call is a genuine FAILURE and stays one");
+  assert.equal(summary.judge.skipped, 0, "nothing was short-circuited -- there was no later leg to short-circuit");
+  assert.deepEqual(summary.judge.byKind, { payment_required: 1 }, "the failure keeps kind payment_required");
+  assert.deepEqual(summary.judge.skippedByReason, {}, "a genuine refusal must NOT be reclassified into a skip");
+  assert.deepEqual(
+    summary.judgePaymentAbort,
+    { refused: 1, skipped: 0 },
+    "the account refused us once and we never declined to try -- both halves reported, one of them zero",
+  );
+});
+
+test("issue #112: the never-attempted leg's skip reason is colon-prefixed `payment_required:` and says nothing was called or spent", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+  const openaiJudge = new MockJudgeProvider({ failFor: new Map(JUDGE_MODELS.openai.map((m) => [m, { failureKind: "payment_required" }])) });
+
+  const { summary } = await runSpec(SPEC, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge, openai: openaiJudge },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+
+  // The colon prefix is what #88's grouping keys on (lib/accounting.mjs
+  // collapses a skip reason on the portion BEFORE THE FIRST COLON), so it is
+  // load-bearing, not cosmetic: get it wrong and three skips scatter into
+  // three one-off categories instead of one legible `payment_required=3`.
+  assert.deepEqual(summary.judge.skippedByReason, { payment_required: 3 }, "one category, from the colon prefix");
+
+  // Nothing was stored for a leg that was never called -- not even a $0 cost
+  // row. A skip that quietly wrote a judge-call row would make the study look
+  // like it paid for work it never asked for. Exactly ONE openai judge-call
+  // row exists across the four pools: the single leg that was actually
+  // attempted. Its spend is preserved (a refused call that burned tokens is
+  // still spend); the three short-circuited legs wrote nothing at all. That
+  // 1-not-4 is the same boundary the fail/skip split draws, seen in the
+  // ledger rather than in the summary.
+  const openaiJudgeRows = store.keys().filter((k) => k.startsWith("judge-call|") && k.includes(JUDGE_MODELS.openai[0]));
+  assert.equal(openaiJudgeRows.length, 1, "one row for the one ATTEMPTED leg -- spend already incurred survives; the three skips wrote nothing");
+  const openaiScores = store.keys().filter((k) => k.startsWith("judge-scores|") && k.includes(JUDGE_MODELS.openai[0]));
+  assert.equal(openaiScores.length, 0, "no scores were fabricated for a leg that was never judged");
+});
+
+test("issue #112: an ORDINARY judge failure produces no payment abort and no skip -- the split is billing-specific, not a general reclassification", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+  const openaiJudge = new MockJudgeProvider({ failFor: new Map(JUDGE_MODELS.openai.map((m) => [m, { failureKind: "parse_failure" }])) });
+
+  const { summary } = await runSpec(SPEC, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge, openai: openaiJudge },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+
+  assert.equal(openaiJudge.calls.length, 4, "a non-billing failure is not sticky -- every pool is still attempted");
+  assert.equal(summary.judge.failed, 4, "all four remain failures");
+  assert.equal(summary.judge.skipped, 0, "nothing became a skip");
+  assert.deepEqual(summary.judge.byKind, { parse_failure: 4 });
+  assert.equal(summary.judgePaymentAbort, null, "null means no judge-side billing refusal occurred, never 'we did not check'");
+  assert.equal(
+    summary.judge.completed + summary.judge.failed + summary.judge.skipped,
+    summary.judge.planned,
+    "the reconciliation identity holds on the untouched path too",
+  );
 });
 
 test("runSpec does NOT invoke judging when judgeModels is omitted -- generation-only callers/tests are unaffected", async (t) => {
