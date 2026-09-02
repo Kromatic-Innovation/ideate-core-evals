@@ -624,6 +624,37 @@ test("#92: a PARTIAL pool whose later round outran the ceiling is FAILED, never 
   assert.match(resp.detail, /discarding a PARTIAL pool of 1 candidate/);
 });
 
+test("#92: once a cell has abandoned a batch, a LATER round submits no second batch -- the ceiling is a per-cell bound, not a per-batch one", async () => {
+  // Without the short-circuit this pins, a 2-round panel cell whose round-1
+  // batch blew the ceiling would submit round 2 as a fresh batch and poll it
+  // for another full maxPollMs -- paying real money for a pool the
+  // partial-pool guard has already decided to discard.
+  const submits = [];
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    maxPollMs: -1,
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u.endsWith("/v1/messages/batches")) submits.push(u);
+      return stuckBatchFetch()(url, opts);
+    },
+    ideateImpl: async (input, deps) => {
+      const agent = deps.agents[0];
+      await deps.complete({ model: agent.model, prompt: "round 1", persona: agent.persona });
+      await deps.complete({ model: agent.model, prompt: "round 2", persona: agent.persona });
+      return { candidates: [], agents: deps.agents, meta: { agentsAttempted: 1, agentsFailed: 1 } };
+    },
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch" });
+  assert.equal(resp.failureKind, "timeout");
+  assert.equal(submits.length, 1, "exactly ONE batch was submitted -- round 2 must not re-submit for a cell already given up on");
+});
+
 test("#92 + #90 END TO END: a cell lost to the poll ceiling is NOT stored under cell.key and is re-planned todo on the next invocation", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ideate-poll-ceiling-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
