@@ -22,3 +22,8 @@ data/si-et-al/
 # Merge-conflict artifacts
 *.orig
 *.rej
+
+# evals/analysis/ sidecar (issue #46) — pinned Python venv, in-repo but never
+# committed (see sidecar/requirements.txt), and generated run outputs.
+evals/analysis/sidecar/.venv/
+evals/analysis/out/
