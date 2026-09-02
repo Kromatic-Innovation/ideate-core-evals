@@ -1676,3 +1676,112 @@ test("issue #85: omitting opts.embedder leaves runSpec's behavior byte-for-byte 
   assert.equal(record.result.pool, undefined);
   assert.deepEqual(record.costRows.filter((r) => r.model === "voyage-4-lite"), []);
 });
+
+// ── PR #86 review, fix round 2 ────────────────────────────────────────────────────────────
+// 1. Attempt-scoping was correct in shape but UNPINNED -- no test drove a
+//    SECOND metrics failure on the same cell, which is exactly the scenario
+//    the attempt counter exists for (ordinary operator flow: run 1 fails
+//    metrics on cell X, operator re-runs, cell X is todo again, metrics
+//    fails AGAIN). A hardcoded `attempt=0` key would make the second
+//    store.put() collide with the first under DIFFERENT content -- the
+//    exact store-bricking shape #76 fixed for judge retries, reappearing
+//    here. This is verified RED under that exact mutation below.
+// 2. Skip reasons were aggregated into one undifferentiated `skipped` count
+//    -- `metrics_failed` and `budget_exceeded` mean opposite things to an
+//    operator and Phase 2a's go/no-go depends on telling them apart.
+
+test("issue #85 fix round 2: two metrics failures on the SAME cell each get their own attempt-scoped key, with their own cost rows, neither lost nor double-counted", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // Attempt 1: fails.
+  const store1 = new ResultsStore(dir);
+  const failingEmbedder1 = new MockEmbedder({
+    vectorFor: orthogonalVectorFor,
+    failOnText: new Set([`mock-idea-1-${key}`, `mock-idea-2-${key}`]),
+    partialTokensBeforeFail: 5,
+  });
+  await runSpec(oneCellSpec, { store: store1, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: failingEmbedder1, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+
+  // Attempt 2, over the SAME store (a fresh instance, exactly like a real
+  // resumed session re-reading index.jsonl from disk): fails AGAIN, with a
+  // DIFFERENT partial-token count so the two attempt records are
+  // distinguishable by content, not just by key.
+  const store2 = new ResultsStore(dir);
+  const failingEmbedder2 = new MockEmbedder({
+    vectorFor: orthogonalVectorFor,
+    failOnText: new Set([`mock-idea-1-${key}`, `mock-idea-2-${key}`]),
+    partialTokensBeforeFail: 9,
+  });
+  // This is the call that would THROW (store-bricking, #76-shaped defect)
+  // under a hardcoded attempt key, because the second store.put() would
+  // collide with the first under different content (different tokens,
+  // different timestamp).
+  const { summary: summary2 } = await runSpec(oneCellSpec, { store: store2, armsConfig: ARMS_CONFIG, provider: new MockProvider(), embedder: failingEmbedder2, clusterDistanceThreshold: METRICS_THRESHOLD, log: silentLog });
+  assert.equal(summary2.skipped, 1, "the second attempt is ALSO a retryable skip, not a crash");
+
+  const attempt0Key = `metrics-attempt|cell=${key}|attempt=0`;
+  const attempt1Key = `metrics-attempt|cell=${key}|attempt=1`;
+  const record0 = store2.get(attempt0Key);
+  const record1 = store2.get(attempt1Key);
+  assert.equal(record0.costRows.find((r) => r.model === "voyage-4-lite").input_tokens, 5, "attempt 0's own tokens, untouched by attempt 1");
+  assert.equal(record1.costRows.find((r) => r.model === "voyage-4-lite").input_tokens, 9, "attempt 1's own tokens -- a DISTINCT record, not a merge or an overwrite of attempt 0");
+  assert.notDeepEqual(record0, record1, "the two attempts are genuinely distinct stored records");
+
+  // Both attempts' generation spend is durably counted -- neither lost nor
+  // double-counted (two real, separate generation calls really happened).
+  const totalSpend = spendToDate(store2).totalUsd;
+  const spendAfterOne = spendToDate(store1).totalUsd;
+  assert.ok(totalSpend > spendAfterOne, "the second attempt's spend is ADDED on top of the first, never replacing it");
+
+  // The cell itself is STILL absent and STILL todo after two failed
+  // attempts -- a third attempt would retry it exactly the same way.
+  assert.throws(() => store2.get(key), /no stored record/);
+  const plan = planRun(oneCellSpec, store2.keys());
+  assert.deepEqual(plan.todo.map((c) => c.key), [key]);
+});
+
+test("issue #85 fix round 2: in a single invocation, a budget_exceeded skip and a metrics_failed skip are counted under DISTINCT reasons in summary.skippedByReason, never merged", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const key1 = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const twoBriefSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }], replicates: 1, config: CFG };
+
+  // b1's own projected cost, used to set a ceiling that admits b1 (and its
+  // metrics-failing embedder call) but leaves no headroom for b2 at all --
+  // b2 must be budget-skipped, never even reaching the provider.
+  const { projection } = planAndPrice(twoBriefSpec, { store, armsConfig: ARMS_CONFIG });
+  const perCellCost = projection.breakdown.find((b) => b.cellKey === key1).usd;
+
+  const embedder = new MockEmbedder({
+    vectorFor: orthogonalVectorFor,
+    failOnText: new Set([`mock-idea-1-${key1}`, `mock-idea-2-${key1}`]), // fails ONLY b1's cell
+  });
+
+  const { summary } = await runSpec(twoBriefSpec, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider: new MockProvider(),
+    embedder,
+    clusterDistanceThreshold: METRICS_THRESHOLD,
+    // Admits b1's own PROJECTED cost (so b1 is at least attempted), but b1's
+    // ACTUAL post-hoc spend (MockProvider's real, fixed token count prices
+    // at 1/5th the interim per-cell PROJECTION -- verified empirically:
+    // interim projects $0.015/cell, MockProvider's real cost is $0.003/cell)
+    // plus b2's own projected cost together exceed this -- b2 is
+    // budget-skipped. 1.1x is deliberately tight to that measured ratio: a
+    // wider margin (e.g. 1.5x) would let b2's projected cost slip in under
+    // the ceiling even after b1's real spend, admitting it instead of
+    // skipping it.
+    maxSpendUsd: perCellCost * 1.1,
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 0);
+  assert.equal(summary.skipped, 2, "both cells end up skipped, for TWO DIFFERENT reasons");
+  assert.deepEqual(
+    summary.skippedByReason,
+    { metrics_failed: 1, budget_exceeded: 1 },
+    "a metrics-failure wave must stay visibly distinct from a budget stop -- never conflated into one undifferentiated skip count",
+  );
+});

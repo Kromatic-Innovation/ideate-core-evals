@@ -1354,6 +1354,19 @@ export async function runSpec(spec, opts) {
     summary.cumulativeNonProviderModels = null;
     summary.cumulativeSpendUsd = null;
   }
-  log(`[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
+  // Skip-reason breakdown (PR #86 review): summary.skippedByReason (from
+  // RunAccount.reconcile(), see lib/accounting.mjs) already distinguishes
+  // `budget_exceeded` from `metrics_failed` from any other skip reason --
+  // this just surfaces it in the same log line the bare `skipped=N` count
+  // was already printed on, so a run reporting `skipped=30` is never
+  // ambiguous between "you hit your ceiling" and "the embedder is failing"
+  // at exactly the moment (#8/Phase 2a's go/no-go) that distinction matters.
+  const skipBreakdown = Object.entries(summary.skippedByReason)
+    .map(([reason, n]) => `${reason}=${n}`)
+    .join(", ");
+  log(
+    `[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}` +
+      (skipBreakdown ? ` (${skipBreakdown})` : ""),
+  );
   return { summary, account };
 }
