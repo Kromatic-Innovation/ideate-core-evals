@@ -6,6 +6,7 @@
 //   node evals/run.mjs --max-spend 50 --arms A,B --briefs biz-01,biz-02 --replicates 2
 //   node evals/run.mjs --max-spend-anthropic 300 --max-spend-openai 150
 //   node evals/run.mjs --phase 0
+//   node evals/run.mjs --max-poll-minutes 90   # batch poll ceiling (issue #92)
 //
 // This file is intentionally thin: it parses argv, loads the corpus + arm
 // config + a results store rooted at `results/` (gitignored, per-deployment --
@@ -34,6 +35,7 @@ import { ResultsStore } from "../lib/store.mjs";
 import { runSpec } from "./harness/runner.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
+import { promptTemplateHash } from "./harness/prompts.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
 import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD } from "./metrics/voyage-calibration.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
@@ -142,6 +144,21 @@ export function parseArgs(argv) {
         break;
       case "--no-batch":
         args.noBatch = true;
+        break;
+      case "--max-poll-minutes":
+        // Issue #92: the batch poll ceiling, in MINUTES because that is the
+        // unit an operator reasons about batch latency in (the provider takes
+        // milliseconds). Validated the same way as --max-spend, and for a
+        // sharper reason: a NaN ceiling does not merely disable a gate, it
+        // makes `Date.now() > deadline` permanently false, so the poll loop
+        // would never exit at all. A non-positive value is rejected here too
+        // -- at the CLI, "wait zero minutes" is always a typo, even though
+        // AnthropicBatchProvider accepts it directly so tests can force the
+        // ceiling without waiting.
+        args.maxPollMinutes = parseRequiredNumber(argv, ++i, "--max-poll-minutes");
+        if (!(args.maxPollMinutes > 0)) {
+          throw new Error(`run.mjs: --max-poll-minutes must be greater than 0, got ${args.maxPollMinutes}`);
+        }
         break;
       default:
         throw new Error(`run.mjs: unrecognized flag '${a}'`);
@@ -333,6 +350,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (args.briefs !== undefined) ignoredFlags.push("--briefs");
     if (args.replicates !== undefined) ignoredFlags.push("--replicates");
     if (args.noBatch) ignoredFlags.push("--no-batch");
+    // --max-poll-minutes (issue #92) is a batch-mode flag; Phase 0 makes no
+    // batch calls at all. Listed here for the same reason every other flag is:
+    // silently dropping a flag on a live code path is the pattern this branch
+    // exists to refuse.
+    if (args.maxPollMinutes !== undefined) ignoredFlags.push("--max-poll-minutes");
     if (ignoredFlags.length > 0) {
       throw new Error(
         `run.mjs: --phase 0 does not accept ${ignoredFlags.join(", ")} -- Phase 0 is a fixed three-control run ` +
@@ -430,7 +452,22 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     config: {
       harnessVersion: "0.0.1",
       engineSha,
-      promptHash: "unpinned",
+      // promptHash (issue #99): the REAL generation-prompt hash, not the
+      // literal "unpinned" this used to carry. A constant is a CONFIG_FIELDS
+      // entry that can never change, so a prompt edit was invisible to the
+      // staleness machinery built to catch exactly that -- #93 changed the
+      // generation prompts' token budget and added salvage, and cells from
+      // before and after that change hashed identically and would have been
+      // pooled as comparable data. promptTemplateHash() (evals/harness/prompts.mjs,
+      // sha256/12, mirroring judgePromptHash) covers both templates RENDERED,
+      // the token-sizing constants, and SALVAGE_VERSION.
+      //
+      // This moves configHash, and therefore every arm's cellKey, marking the
+      // whole #8 smoke-study dataset `stale`. That is correct and intended:
+      // #8's results are discarded from confirmatory analysis by construction,
+      // and absorbing the invalidation now costs a $3.32 smoke run rather than
+      // Phase 2's grid.
+      promptHash: promptTemplateHash(),
       embedderId,
       corpusHash: CORPUS_HASH,
     },
@@ -459,7 +496,17 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
           "run without calling anything.",
       );
     }
-    provider = new AnthropicBatchProvider({ apiKey, corpus: CORPUS, armsConfig });
+    // maxPollMs (issue #92): passed only when the operator actually set
+    // --max-poll-minutes, so an unset flag falls through to the provider's own
+    // DEFAULT_MAX_POLL_MS rather than being re-specified (and able to drift)
+    // here. `undefined` would trigger the same default, but passing the key
+    // explicitly-as-undefined hides which layer owns the number.
+    provider = new AnthropicBatchProvider({
+      apiKey,
+      corpus: CORPUS,
+      armsConfig,
+      ...(args.maxPollMinutes !== undefined ? { maxPollMs: args.maxPollMinutes * 60 * 1000 } : {}),
+    });
   }
 
   // judgeProviders (issue #68 anthropic leg, issue #77 openai leg): the real

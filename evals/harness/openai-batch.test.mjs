@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { OpenAIBatchProvider, buildOpenAIChatParams } from "./provider.mjs";
+import { OpenAIBatchProvider, buildOpenAIChatParams, DEFAULT_MAX_POLL_MS } from "./provider.mjs";
 import { interimPriceGrid } from "./runner.mjs";
 import { runnerPriceGrid } from "../../lib/price.mjs";
 
@@ -254,6 +254,66 @@ test("mode: 'single' hits /v1/chat/completions, not /v1/batches", async () => {
   assert.ok(urls.every((u) => u === "https://api.openai.com/v1/chat/completions"));
   assert.ok(!urls.some((u) => u.includes("/batches")));
 });
+
+// ── issue #92: the batch poll ceiling, mirrored from the Anthropic path ─────
+//
+// Arm H and arm G's OpenAI slots were never exercised by the #8 smoke study,
+// so this provider has never met a real batch ceiling. It gets the same fix
+// and the same tests rather than waiting to reproduce the bug on a second
+// provider.
+
+test("#92: the live default poll ceiling is 60 minutes (DEFAULT_MAX_POLL_MS), not the old 15", () => {
+  const provider = makeProvider({ fetchImpl: async () => { throw new Error("never called"); } });
+  assert.equal(provider.maxPollMs, DEFAULT_MAX_POLL_MS);
+  assert.notEqual(provider.maxPollMs, 15 * 60 * 1000);
+});
+
+test("#92: a non-finite maxPollMs is rejected at construction (a NaN ceiling never expires)", () => {
+  assert.throws(() => new OpenAIBatchProvider({ apiKey: "k", maxPollMs: NaN }), /maxPollMs must be a finite number/);
+});
+
+test("#92: a batch that outruns the ceiling says POLL_CEILING_REACHED, names the handle, and cancels it", async () => {
+  const cancels = [];
+  const provider = makeProvider({
+    maxPollMs: -1,
+    fetchImpl: stuckOpenAIBatchFetch({ onCancel: (u) => cancels.push(u) }),
+  });
+  const resp = await provider.generate(cellFor("H"), armsConfigJson.arms.H, { mode: "batch" });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "timeout");
+  assert.match(resp.detail, /POLL_CEILING_REACHED/);
+  assert.match(resp.detail, /batch_stuck/);
+  assert.match(resp.detail, /"last_status":"in_progress"/);
+  assert.deepEqual(cancels, ["https://api.openai.com/v1/batches/batch_stuck/cancel"], "an abandoned OpenAI batch is cancelled too");
+  assert.match(resp.detail, /"cancelled":true/);
+});
+
+test("#92: cancelOnAbandon: false issues no cancel and records cancelled: null", async () => {
+  const cancels = [];
+  const provider = makeProvider({
+    maxPollMs: -1,
+    cancelOnAbandon: false,
+    fetchImpl: stuckOpenAIBatchFetch({ onCancel: (u) => cancels.push(u) }),
+  });
+  const resp = await provider.generate(cellFor("H"), armsConfigJson.arms.H, { mode: "batch" });
+  assert.deepEqual(cancels, []);
+  assert.match(resp.detail, /"cancelled":null/);
+});
+
+/** An OpenAI batch that uploads and creates fine, then never leaves `in_progress`. */
+function stuckOpenAIBatchFetch({ onCancel } = {}) {
+  return async (url, opts) => {
+    const u = String(url);
+    if (u.endsWith("/cancel")) {
+      if (onCancel) onCancel(u);
+      return jsonResponse(200, { id: "batch_stuck", status: "cancelling" });
+    }
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") return jsonResponse(200, { id: "file_1", object: "file" });
+    if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") return jsonResponse(200, { id: "batch_stuck", status: "in_progress" });
+    if (u.startsWith("https://api.openai.com/v1/batches/")) return jsonResponse(200, { id: "batch_stuck", status: "in_progress" });
+    throw new Error(`stuckOpenAIBatchFetch: unexpected URL ${u}`);
+  };
+}
 
 // ── AC: arms G and H plan and price correctly under --dry-run (hermetic) ────
 
