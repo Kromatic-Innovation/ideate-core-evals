@@ -9,17 +9,28 @@ exception is, and how to tell which case you are in.
 
 ## The rule
 
-A failed cell is one of two things, and the harness treats them differently:
+A failed cell is one of three things, and the harness treats them differently:
 
-| | Kinds | Stored under `cell.key`? | Next run |
-|---|---|---|---|
-| **Cell-intrinsic** — an observation about the arm | `parse_failure`, `empty_pool`, `refusal` | yes | `reuse` (free, never re-called) |
-| **Transient / environmental** — a fact about the night you ran | `rate_limited`, `timeout`, `transport_error`, `budget_exceeded`, `harness_error` | **no** | `todo` (re-attempted, real spend) |
+|                                                                | Kinds                                                                            | Stored under `cell.key`? | Rest of this run                                                 | Next run                                 |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------ | ---------------------------------------------------------------- | ---------------------------------------- |
+| **Cell-intrinsic** — an observation about the arm              | `parse_failure`, `empty_pool`, `refusal`                                         | yes                      | continues                                                        | `reuse` (free, never re-called)          |
+| **Transient / environmental** — a fact about the night you ran | `rate_limited`, `timeout`, `transport_error`, `budget_exceeded`, `harness_error` | **no**                   | continues                                                        | `todo` (re-attempted, real spend)        |
+| **Payment** — the account cannot pay                           | `payment_required`                                                               | **no**                   | **aborts** — every remaining cell is `skipped: payment_required` | `todo`, once you have funded the account |
 
 The sets live in `lib/accounting.mjs` (`INTRINSIC_FAILURE_KINDS` /
-`TRANSIENT_FAILURE_KINDS`) with the reasoning for each membership; the branch
-that consults them is in `evals/harness/runner.mjs`'s generation-failure
-handler.
+`TRANSIENT_FAILURE_KINDS` / `PAYMENT_FAILURE_KINDS`) with the reasoning for
+each membership; the branch that consults them is in
+`evals/harness/runner.mjs`'s generation-failure handler.
+
+`payment_required` (issue #88) is the odd one out because it answers the two
+questions in a combination neither other set expresses: it is **not** a fact
+about the arm (so it must never be stored under `cell.key`), and it is **not**
+worth re-attempting right now (so, unlike a rate limit, the runner stops). It
+is detected on the response body's error signature — Anthropic returns the
+credit refusal as an HTTP **400** and OpenAI returns quota exhaustion as a
+**429**, so keying on status alone would file the first as a flaky wire and
+the second as an ordinary rate limit. Both are transient classes, and both
+would march a ~200-cell grid into an account that cannot pay for any of it.
 
 Why it has to work this way: `planRun(spec, storedKeys)` receives **only
 keys**. It cannot see `accounting.state`, so it cannot tell a completed cell
@@ -48,6 +59,24 @@ $ node evals/run.mjs --dry-run --arms A,B --briefs biz-01,biz-02 --replicates 5
 ```
 
 The 9 are back as `todo`. Drop `--dry-run` and they run.
+
+A run that stopped because the account went dry says something different — and
+the difference is the point, because the action is different:
+
+```
+[run] planned=200 completed=37 failed=1 skipped=162 (payment_required=162)
+[run] ABORTED: the provider refused on billing/credit at cell
+      'arm=A|brief=biz-14|rep=2|cfg=...' (providers: anthropic). 162 remaining
+      cell(s) were skipped, not attempted -- every one of them would have hit
+      the identical wall. Nothing was stored under those cell keys, so fund
+      the account and re-run the same command to pick up where this stopped
+      (spend already incurred is preserved). Provider detail: ...
+```
+
+`skipped`, not `failed`: "we never tried" is the honest record, where 162
+identical failures would be noise. Fund the account, then re-run the same
+command — the 162 skipped cells and the one that hit the wall all come back as
+`todo`, and the 37 that completed stay `reuse`.
 
 ## The money you already spent is not lost
 
@@ -86,7 +115,7 @@ Two one-time remedies, in order of preference:
    `lib/manifest.mjs`) yields a new `configHash`, so the affected cells get
    fresh keys and are planned `todo`. The old records survive under their own
    hash and surface as `stale` — nothing is destroyed, nothing is silently
-   pooled. Correct, but it re-plans *every* cell under the new config, not
+   pooled. Correct, but it re-plans _every_ cell under the new config, not
    just the broken ones.
 2. **Prune the legacy records.** `results/` is gitignored and per-deployment,
    so there is no shared state to migrate — but back it up first, then remove
@@ -101,7 +130,7 @@ cell key in the first place.
 
 ## What this page is not
 
-It is not a retry *policy* for within a single invocation. A provider adapter
+It is not a retry _policy_ for within a single invocation. A provider adapter
 still does its own bounded retries before classifying a call `rate_limited`
 (see `evals/harness/provider.mjs`); by the time a kind reaches the runner,
 those are already exhausted. This page is about the boundary between
