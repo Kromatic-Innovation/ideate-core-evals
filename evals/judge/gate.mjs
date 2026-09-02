@@ -64,6 +64,12 @@
 // like an implicit pass.
 
 import { costRow } from "../../lib/accounting.mjs";
+// Shared attempt-record key grammar (issues #98, #108). Imported from the
+// store module rather than evals/harness/runner.mjs -- where the prune policy
+// that consumes it lives -- because runner.mjs already reaches this module
+// (runner -> evals/judge/score.mjs -> gate.mjs) and the reverse edge would
+// close a cycle. See lib/store.mjs's own block on that.
+import { nextAttemptNumber } from "../../lib/store.mjs";
 
 /**
  * Si et al. 2024's reported human-human balanced accuracy — the floor this gate
@@ -555,15 +561,36 @@ export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp }
     model: judgeModel,
     ...tokens,
   });
-  // See the attempt-scoping comment above: `store.keys()` is index-only
-  // (cheap; lib/store.mjs) and reflects every attempt already durably
+  // ── Numbering: MAX+1, never a count (issue #108) ────────────────────────
+  // This was `store.keys().filter(k => k.startsWith(prefix)).length` until
+  // #108, and the count was correct only for as long as nothing could ever
+  // leave the store. #98 gave the store a removal path and a compaction that
+  // folds older attempt records into one -- at which point a count is a
+  // collision generator: fold attempts 0..4 into a single compacted record
+  // and the count says "1 record, so the next attempt is 1", writing on top
+  // of the retained attempt 5. put() throws on same-key/different-content,
+  // so that lands as a hard, store-bricking failure rather than a silent
+  // one, which is exactly why judge-call records could not be compacted at
+  // all before this change.
+  //
+  // nextAttemptNumber takes the maximum across BOTH the raw
+  // (`|attempt=N`) and compacted (`-compacted|…|through=N`) shapes, so it is
+  // correct under every mix of folded and unfolded records and is identical
+  // to the old count for the un-compacted 0..n-1 case. `store.keys()` is
+  // index-only (cheap; lib/store.mjs) and reflects every attempt durably
   // recorded for this exact (cellKey, judgeModel) pair, including ones from
   // a PRIOR session (a fresh ResultsStore instance reads index.jsonl from
-  // disk) -- so the next attempt number is always the count of prior ones,
-  // regardless of which process or session wrote them.
-  const keyPrefix = `judge-call|cell=${cellKey}|judge=${judgeModel}|attempt=`;
-  const attempt = store.keys().filter((k) => k.startsWith(keyPrefix)).length;
-  const key = `${keyPrefix}${attempt}`;
+  // disk) -- so the number is correct across process and session boundaries.
+  //
+  // The identity attempts are numbered per is the (cellKey, judgeModel)
+  // PAIR, and it is passed as the composite `<cellKey>|judge=<model>`. That
+  // is not an encoding trick: it is literally the substring of the key
+  // between `|cell=` and `|attempt=`, which is what parseAttemptKey returns
+  // as `cellKey`. Two judge models scoring the same pool are two independent
+  // attempt sequences and two independent compaction groups.
+  const attemptScope = `${cellKey}|judge=${judgeModel}`;
+  const attempt = nextAttemptNumber(store, "judge-call", attemptScope);
+  const key = `judge-call|cell=${attemptScope}|attempt=${attempt}`;
   const result = store.put({
     key,
     armId: "__judge-call__",

@@ -33,8 +33,12 @@ import {
   parseAttemptKey,
   nextAttemptNumber,
   spendToDate,
+  ATTEMPT_FAMILIES,
   DEFAULT_ATTEMPT_RETENTION,
 } from "./runner.mjs";
+// The real judge-call writer (issue #108). Imported so these tests exercise
+// the actual numbering, not a fixture's guess at the key shape.
+import { meterJudgeCall } from "../judge/gate.mjs";
 
 function tempStore(t) {
   const dir = mkdtempSync(join(tmpdir(), "ideate-prune-test-"));
@@ -500,7 +504,31 @@ test("parseAttemptKey handles the embedded cell key, which itself contains | and
     compacted: true,
   });
   assert.equal(parseAttemptKey(cell), null);
-  assert.equal(parseAttemptKey(`judge-call|cell=${cell}|judge=claude-opus-5|attempt=0`), null);
+  // #108: judge-call is now a compacted family, and its extra `|judge=<model>`
+  // segment is absorbed into the parsed `cellKey` by the same split-on-the-
+  // last-`|attempt=` rule -- no per-family branch. The composite IS the
+  // identity attempts are numbered and grouped per: two judge models scoring
+  // one pool are two independent sequences.
+  assert.deepEqual(parseAttemptKey(`judge-call|cell=${cell}|judge=claude-opus-5|attempt=0`), {
+    family: "judge-call",
+    cellKey: `${cell}|judge=claude-opus-5`,
+    through: 0,
+    compacted: false,
+  });
+  assert.deepEqual(parseAttemptKey(`judge-call-compacted|cell=${cell}|judge=gpt-5.6-terra|through=4`), {
+    family: "judge-call",
+    cellKey: `${cell}|judge=gpt-5.6-terra`,
+    through: 4,
+    compacted: true,
+  });
+  // Round-trip: the compacted key planPrune builds from a parsed raw key
+  // re-parses to the same family/cellKey. A drift here is a silent restart of
+  // the attempt sequence at 0.
+  const raw = parseAttemptKey(`judge-call|cell=${cell}|judge=claude-opus-5|attempt=9`);
+  const recompacted = parseAttemptKey(`judge-call-compacted|cell=${raw.cellKey}|through=${raw.through}`);
+  assert.equal(recompacted.family, raw.family);
+  assert.equal(recompacted.cellKey, raw.cellKey);
+  assert.equal(recompacted.through, 9);
 });
 
 test("parseCellKey accepts a real cell key and rejects every side-ledger shape", (t) => {
@@ -520,4 +548,199 @@ test("pruneStore reports the spend it verified, and the figure is non-zero for a
   assert.ok(result.spendBefore.totalUsd > 0);
   assert.equal(result.spendAfter.totalUsd, result.spendBefore.totalUsd);
   assert.deepEqual(result.removed.length, 1);
+});
+
+// ── judge-call compaction (issue #108) ──────────────────────────────────
+// #98 left judge-call records out for one reason: meterJudgeCall numbered
+// attempts by COUNTING matching keys, so the first fold would have made the
+// next attempt collide with a retained record. These exercise the real
+// meterJudgeCall rather than a synthetic putAttempt() -- the whole defect was
+// a disagreement between the writer's numbering and the pruner's grammar, and
+// a fixture that reimplements the key shape cannot catch that disagreement.
+
+const JUDGE_A = "claude-opus-5";
+const JUDGE_B = "gpt-5.6-terra";
+
+/** Assert the ledger came through a fold intact, to the SAME tolerance
+ *  `pruneStore()` itself throws on (1e-9 relative, see its `close`). Folding
+ *  re-associates a float sum -- N rows priced and added, versus their tokens
+ *  added and priced once -- so the two agree to within an ULP or so and not
+ *  always bit-for-bit. Asserting exact equality here would be asserting a
+ *  property of IEEE-754 addition order rather than the property #108 is
+ *  about, and it is the production check, not this test, that defines what
+ *  "the money survived" means. */
+function assertSpendPreserved(after, before, msg) {
+  const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+  assert.ok(close(after.totalUsd, before.totalUsd), `${msg}: $${before.totalUsd} before, $${after.totalUsd} after`);
+  const providers = new Set([...Object.keys(before.byProvider), ...Object.keys(after.byProvider)]);
+  for (const p of providers) {
+    assert.ok(close(before.byProvider[p] || 0, after.byProvider[p] || 0), `${msg}: provider ${p} drifted`);
+  }
+}
+
+/** Write one real judge-call record through gate.mjs's own metering path. */
+function meterJudge(store, cell, judgeModel, { input = 1200, output = 300, timestamp = "2026-09-01T00:00:00Z" } = {}) {
+  return meterJudgeCall({
+    store,
+    cellKey: cell,
+    judgeModel,
+    tokens: { input_tokens: input, output_tokens: output },
+    timestamp,
+  });
+}
+
+test("#108 AC3: compacting judge-call records leaves spendToDate() untouched AND strictly shrinks the store", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 8; n++) {
+    const { key } = meterJudge(store, cell, JUDGE_A, { input: 1000 + 10 * n });
+    assert.equal(key, `judge-call|cell=${cell}|judge=${JUDGE_A}|attempt=${n}`, "precondition: attempts number 0..7 with nothing folded");
+  }
+
+  const before = spendToDate(store);
+  const keysBefore = store.keys().length;
+  assert.ok(before.totalUsd > 0, "guard: a fixture that cost nothing makes the spend assertion vacuous");
+
+  const result = pruneStore(store, { keepAttempts: 5 });
+
+  const after = spendToDate(store);
+  const keysAfter = store.keys().length;
+  // BOTH halves, in one test, deliberately. Either alone passes trivially:
+  // doing nothing preserves the spend, and deleting everything shrinks the
+  // store. Only the conjunction is the property #108 is about.
+  assertSpendPreserved(after, before, "a fold must never change what the study cost");
+  assert.ok(keysAfter < keysBefore, `the store must actually shrink (${keysBefore} -> ${keysAfter})`);
+  assert.equal(keysAfter, keysBefore - 2, "8 records, keep 5: attempts 0..2 fold into one");
+
+  const compactedKey = `judge-call-compacted|cell=${cell}|judge=${JUDGE_A}|through=2`;
+  assert.ok(store.has(compactedKey), "the fold lands under the compacted key shape");
+  for (const n of [0, 1, 2]) assert.ok(!store.has(`judge-call|cell=${cell}|judge=${JUDGE_A}|attempt=${n}`), `attempt ${n} was folded away`);
+  for (const n of [3, 4, 5, 6, 7]) assert.ok(store.has(`judge-call|cell=${cell}|judge=${JUDGE_A}|attempt=${n}`), `attempt ${n} is inside the retention window`);
+  assert.equal(result.plan.compactions.length, 1);
+  assert.equal(result.plan.compactions[0].family, "judge-call");
+
+  // The point of the numbering change, asserted where it bites: the NEXT
+  // real judge call after a fold. Under the pre-#108 count this is
+  // `attempt=6` (6 surviving keys), which collides with the retained
+  // attempt 6 and makes put() throw.
+  const next = meterJudge(store, cell, JUDGE_A, { input: 4242 });
+  assert.equal(next.key, `judge-call|cell=${cell}|judge=${JUDGE_A}|attempt=8`);
+  assert.equal(next.written, true, "and it is a genuinely new record, not a byte-identical no-op onto an existing one");
+  assert.ok(spendToDate(store).totalUsd > after.totalUsd, "a retry spends real money again and the ledger says so");
+});
+
+test("#108: judge-call attempts are numbered and compacted per (cell, judge model), not per cell", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 8; n++) meterJudge(store, cell, JUDGE_A);
+  for (let n = 0; n < 2; n++) {
+    const { key } = meterJudge(store, cell, JUDGE_B);
+    assert.equal(key, `judge-call|cell=${cell}|judge=${JUDGE_B}|attempt=${n}`, "a second judge on the same pool starts its own sequence at 0");
+  }
+
+  const before = spendToDate(store);
+  pruneStore(store, { keepAttempts: 5 });
+
+  assert.ok(store.has(`judge-call-compacted|cell=${cell}|judge=${JUDGE_A}|through=2`), "the busy judge folds");
+  for (let n = 0; n < 2; n++) {
+    assert.ok(store.has(`judge-call|cell=${cell}|judge=${JUDGE_B}|attempt=${n}`), "the quiet judge is under the bound and is left entirely alone");
+  }
+  assert.ok(!store.keys().some((k) => k.startsWith(`judge-call-compacted|cell=${cell}|judge=${JUDGE_B}`)));
+  assertSpendPreserved(spendToDate(store), before, "folding one judge's records must not move the other's money");
+  assert.equal(nextAttemptNumber(store, "judge-call", `${cell}|judge=${JUDGE_B}`), 2, "and its numbering is unaffected by the other judge's fold");
+});
+
+test("#108 AC4: a judge-call fold whose rows straddle a dated rate change is abandoned, not mispriced", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  // claude-sonnet-5 is the one model in the pinned RATE_TABLE with an
+  // introductory regime (`introUntil: 2026-08-31`). Read from the table
+  // rather than hardcoded, so this test fails loudly if the fixture stops
+  // being a straddle case at all.
+  assert.ok(RATE_TABLE["claude-sonnet-5"].introUntil, "precondition: the straddle fixture needs a model with a dated rate change");
+  const STRADDLE_JUDGE = "claude-sonnet-5";
+  const beforeIntroEnd = "2026-08-30T00:00:00Z";
+  const afterIntroEnd = "2026-09-01T00:00:00Z";
+
+  // Direction 1: a straddling group is refused.
+  const straddling = [
+    row(cell, { model: STRADDLE_JUDGE, timestamp: beforeIntroEnd }),
+    row(cell, { model: STRADDLE_JUDGE, timestamp: afterIntroEnd }),
+  ];
+  const refused = foldCostRows(straddling, RATE_TABLE, { batch: true });
+  assert.equal(refused.folded, false);
+  assert.match(refused.reason, /reprice/);
+  assert.deepEqual(refused.rows, straddling, "the ORIGINAL rows come back, untouched");
+
+  // Direction 2: the otherwise-identical non-straddling group DOES fold --
+  // without this half, "abandoned correctly" is indistinguishable from
+  // "never folds anything".
+  const sameSide = [
+    row(cell, { model: STRADDLE_JUDGE, timestamp: afterIntroEnd }),
+    row(cell, { model: STRADDLE_JUDGE, timestamp: afterIntroEnd }),
+  ];
+  assert.equal(foldCostRows(sameSide, RATE_TABLE, { batch: true }).folded, true);
+
+  // And end to end through the prune: the RECORD count still comes down (the
+  // bound is the point), the ROWS are carried through unfolded, the reason is
+  // reported to the operator, and the ledger is bit-for-bit unchanged.
+  for (let n = 0; n < 8; n++) {
+    meterJudge(store, cell, STRADDLE_JUDGE, { timestamp: n % 2 === 0 ? beforeIntroEnd : afterIntroEnd });
+  }
+  const before = spendToDate(store);
+  const keysBefore = store.keys().length;
+  const result = pruneStore(store, { keepAttempts: 5 });
+
+  assert.equal(result.plan.compactions.length, 1);
+  const c = result.plan.compactions[0];
+  assert.equal(c.rowsFolded, false, "the fold was abandoned");
+  assert.match(c.foldSkippedReason, /reprice/);
+  assert.equal(c.rows.length, c.rowsBefore, "every original row survives verbatim");
+  assert.ok(store.keys().length < keysBefore, "but the record count still comes down");
+  assert.equal(spendToDate(store).totalUsd, before.totalUsd);
+  assert.deepEqual(spendToDate(store).byProvider, before.byProvider);
+});
+
+test("#108: compaction removes `completed` judge-call records without the operator reaching for --allow-completed", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  const keys = [];
+  for (let n = 0; n < 8; n++) keys.push(meterJudge(store, cell, JUDGE_A).key);
+
+  // The guard is real and still armed for anyone else: a bare remove() of
+  // one of these refuses, exactly as it does for a paid-for cell.
+  assert.throws(() => store.remove([keys[0]]), /allowCompleted/);
+
+  // The prune reaches them anyway, because a compaction deletes no
+  // measurement: judge SCORES are a separate family, and the fold is
+  // priced-verified before it is written.
+  const before = spendToDate(store);
+  pruneStore(store, { keepAttempts: 5 });
+  assert.ok(!store.has(keys[0]));
+  assertSpendPreserved(spendToDate(store), before, "a compaction deletes records, never money");
+
+  // A completed CELL is still protected -- the flag above is scoped to the
+  // compaction path and cannot be reached by an eviction.
+  const completed = putCell(store, { briefId: "b9", state: "completed" });
+  const plan = planPrune(store, { configHash: CFG, states: ["completed"], keepAttempts: null });
+  assert.equal(plan.evictions.length, 0);
+  assert.equal(plan.refused.length, 1);
+  assert.equal(plan.refused[0].key, completed);
+  assert.ok(store.has(completed));
+});
+
+test("#108 AC5: judge-call records are covered by the SAME prune invocation as every other family", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 8; n++) putAttempt(store, { cell, attempt: n });
+  for (let n = 0; n < 8; n++) meterJudge(store, cell, JUDGE_A);
+
+  const before = spendToDate(store);
+  // One call, one option (`keepAttempts`), no judge-specific selector.
+  const result = pruneStore(store, { keepAttempts: 5 });
+
+  const families = result.plan.compactions.map((c) => c.family).sort();
+  assert.deepEqual(families, ["generation-attempt", "judge-call"], "both families in one plan");
+  assertSpendPreserved(spendToDate(store), before, "one prune, two families, same ledger");
+  assert.ok(ATTEMPT_FAMILIES.includes("judge-call"), "and it is a first-class member of the family list, not a special case");
 });

@@ -37,6 +37,11 @@
 // silently dropped from the plan.
 
 import { planRun } from "../../lib/manifest.mjs";
+// The attempt-record key grammar (issues #98, #108). It lives in the store
+// module because evals/judge/gate.mjs needs the identical next-attempt
+// derivation and cannot import THIS module without closing a cycle -- see
+// that block's own comment in lib/store.mjs.
+import { ATTEMPT_FAMILIES, parseAttemptKey, nextAttemptNumber } from "../../lib/store.mjs";
 import {
   RunAccount,
   costRow,
@@ -390,13 +395,14 @@ function recordGenerationAttemptFailure(store, { cell, costRows, kind, detail, r
 // dry-run by default — because a mutation that a normal invocation can reach
 // is a mutation that will eventually happen when nobody meant it to.
 
-/** Attempt-record families this module compacts. `judge-call` records
- *  (evals/judge/gate.mjs) have the same shape and the same unbounded-growth
- *  property, but their attempt numbering lives in that module and derives
- *  from a raw `startsWith(...).length` count that compaction would break —
- *  bringing them in means changing gate.mjs, which is deliberately out of
- *  scope here. Noted in docs/retrying-failed-cells.md as a known follow-up. */
-export const ATTEMPT_FAMILIES = ["generation-attempt", "metrics-attempt"];
+/** The attempt-record key grammar is defined in lib/store.mjs (imported at
+ *  the top of this module) and re-exported here unchanged, so every existing
+ *  importer of `ATTEMPT_FAMILIES` / `parseAttemptKey` / `nextAttemptNumber`
+ *  from the runner keeps working and the prune policy below still reads as
+ *  one self-contained section. `judge-call` is one of the families as of
+ *  #108: same record shape, same unbounded growth, and now the same
+ *  max+1 numbering rather than gate.mjs's old key COUNT. */
+export { ATTEMPT_FAMILIES, parseAttemptKey, nextAttemptNumber };
 
 /** Family carrying cost rows salvaged off a cell record the prune evicted. */
 const PRUNED_CELL_FAMILY = "pruned-cell";
@@ -423,65 +429,6 @@ export function parseCellKey(key) {
   return { armId: m[1], briefId: m[2], replicate: Number(m[3]), cfg: m[4] };
 }
 
-/**
- * Parse a stored key as an attempt record of one of ATTEMPT_FAMILIES, raw or
- * compacted. Returns `{ family, cellKey, through, compacted }` or null.
- *
- * `through` is the HIGHEST attempt number the record accounts for — the
- * attempt number itself for a raw record, the fold's upper bound for a
- * compacted one. That single field is what makes ordering, next-number
- * derivation and crash recovery all work off one comparison.
- *
- * Parsed by suffix position, never by a greedy regex: the cell key sits in
- * the MIDDLE of these keys and itself contains `|` and `=`.
- */
-export function parseAttemptKey(key) {
-  for (const family of ATTEMPT_FAMILIES) {
-    const rawPrefix = `${family}|cell=`;
-    if (key.startsWith(rawPrefix)) {
-      const at = key.lastIndexOf("|attempt=");
-      if (at <= rawPrefix.length - 1) return null;
-      const n = Number(key.slice(at + "|attempt=".length));
-      if (!Number.isInteger(n) || n < 0) return null;
-      return { family, cellKey: key.slice(rawPrefix.length, at), through: n, compacted: false };
-    }
-    const compactedPrefix = `${family}-compacted|cell=`;
-    if (key.startsWith(compactedPrefix)) {
-      const at = key.lastIndexOf("|through=");
-      if (at <= compactedPrefix.length - 1) return null;
-      const n = Number(key.slice(at + "|through=".length));
-      if (!Number.isInteger(n) || n < 0) return null;
-      return { family, cellKey: key.slice(compactedPrefix.length, at), through: n, compacted: true };
-    }
-  }
-  return null;
-}
-
-/**
- * The next attempt number for `cellKey` in `family`: one past the highest
- * attempt any stored record accounts for, across BOTH the raw and compacted
- * shapes.
- *
- * This replaces the pre-#98 `store.keys().filter(startsWith).length` count,
- * and the replacement is required rather than cosmetic: once compaction
- * folds attempts 0..4 into a single record, a COUNT says "1 record, so the
- * next attempt is 1" — colliding with the retained attempt 5. Deriving from
- * the maximum is correct under every mix of folded and unfolded records, and
- * is identical to the old count for the un-compacted 0..n-1 case.
- *
- * `store.keys()` is index-only (cheap; lib/store.mjs) and reflects every
- * attempt durably recorded for this cell INCLUDING ones from a prior
- * session, so the number is correct across process boundaries.
- */
-export function nextAttemptNumber(store, family, cellKey) {
-  let max = -1;
-  for (const key of store.keys()) {
-    const parsed = parseAttemptKey(key);
-    if (!parsed || parsed.family !== family || parsed.cellKey !== cellKey) continue;
-    if (parsed.through > max) max = parsed.through;
-  }
-  return max + 1;
-}
 
 const FOLDABLE_TOKEN_FIELDS = [
   "input_tokens",
@@ -887,15 +834,43 @@ export function pruneStore(store, opts = {}) {
       cfg: c.cfg,
       result: { kind: `${c.family}-compacted`, cellKey: c.cellKey, through: c.through },
       resolvedModels: { models: c.models },
-      accounting: {
-        state: "failed",
-        kind: "harness_error",
-        detail: `compacted ${c.family} records for cell '${c.cellKey}' through attempt ${c.through} (issue #98 retention)`,
-      },
+      // The compacted record reports the state of what it folds, rather than
+      // one hardcoded state for every family. A generation/metrics attempt
+      // record is a FAILED attempt by construction (that is why it exists
+      // apart from its cell); a `judge-call` record is a SUCCESSFUL, billed
+      // judge call stored `completed`. Writing the fold of a pile of
+      // completed judge calls as `failed/harness_error` would put a fiction
+      // in the ledger, and would also mean a re-compaction of an
+      // already-compacted judge record needed a different removal guard than
+      // the first one did.
+      accounting:
+        c.family === "judge-call"
+          ? { state: "completed" }
+          : {
+              state: "failed",
+              kind: "harness_error",
+              detail: `compacted ${c.family} records for cell '${c.cellKey}' through attempt ${c.through} (issue #98 retention)`,
+            },
       costRows: c.rows,
     });
     written.push(c.newKey);
-    store.remove(c.removeKeys);
+    // `allowCompleted` on the COMPACTION path only, and it is not a loosening
+    // of lib/store.mjs's guard so much as a statement about what these keys
+    // can be. The guard protects paid-for MEASUREMENTS from a silent delete.
+    // `c.removeKeys` comes from parseAttemptKey, which matches only
+    // attempt-family keys -- a study cell key (`arm=…|brief=…|rep=…|cfg=…`)
+    // is structurally unmatchable here, so no measurement can be in this
+    // list. What IS in it, as of #108, are `judge-call` records, which
+    // meterJudgeCall stores `completed` because the call succeeded; they
+    // carry a cost row and nothing else (the judge's actual scores live in a
+    // separate `judge-scores` family, and no analysis module reads a
+    // judge-call body). And unlike an eviction, a compaction does not remove
+    // money: the fold is priced both ways before it is written, and
+    // spendToDate() is re-verified below and throws on any drift.
+    // Requiring the operator to type `--allow-completed` -- the flag whose
+    // whole meaning is "yes, delete a paid-for measurement" -- to perform an
+    // operation that deletes no measurement would train them to pass it.
+    store.remove(c.removeKeys, { allowCompleted: true });
     removed.push(...c.removeKeys);
     log(`[prune] compacted ${c.removeKeys.length} ${c.family} record(s) for '${c.cellKey}' into ${c.newKey} (${c.rowsBefore} -> ${c.rows.length} cost row(s))`);
   }
