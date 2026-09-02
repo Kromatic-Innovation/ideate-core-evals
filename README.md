@@ -20,6 +20,8 @@ Full design, hypotheses, threats to validity, and the analysis plan: **[`docs/PR
 
 **2. Results are additive, never silently pooled.** `lib/manifest.mjs` keys each cell by `(arm, brief, replicate)` plus a `configHash` over everything affecting comparability. Re-running reuses completed cells and queues only what's missing; changing the engine SHA or a prompt changes the hash, so old results are surfaced as `stale` rather than quietly mixed into new ones.
 
+Those two invariants pull against each other on a failed cell: invariant 1 says record it, invariant 2 says a recorded cell is never re-run. The harness resolves it by asking whether the failure is a fact about the *arm* or about the *night* — an arm's refusal or unparseable output is stored as terminal data, while a rate limit, a 5xx, or an empty credit balance is accounted for but deliberately kept out of the store so the next run re-attempts the cell (the money already spent is preserved under an attempt-scoped key). See [`docs/retrying-failed-cells.md`](docs/retrying-failed-cells.md).
+
 See [`docs/PREREGISTRATION.md` §11](docs/PREREGISTRATION.md) for why accumulation creates an **optional-stopping hazard**, and the rule that resolves it.
 
 ## Cost

@@ -37,7 +37,7 @@
 // silently dropped from the plan.
 
 import { planRun } from "../../lib/manifest.mjs";
-import { RunAccount, costRow, TERMINAL_STATES } from "../../lib/accounting.mjs";
+import { RunAccount, costRow, TERMINAL_STATES, isTransientFailure } from "../../lib/accounting.mjs";
 import { assertValidProviderResponse } from "./provider.mjs";
 // providerOf/priceRowByProvider (issue #51, per-provider --max-spend): pure
 // data-shape utilities, not the interim estimator this module owns -- see
@@ -255,6 +255,63 @@ function recordMetricsAttemptFailure(store, { cell, costRows, detail }) {
     result: { kind: "metrics-attempt", cellKey: cell.key, attempt, detail },
     resolvedModels: { models: [...models] },
     accounting: { state: "failed", kind: "harness_error", detail },
+    costRows,
+  });
+}
+
+/**
+ * Persist a failed GENERATION attempt's cost rows under an attempt-scoped key
+ * (issue #90) -- the exact counterpart of recordMetricsAttemptFailure above,
+ * one door further upstream, and deliberately the SAME mechanism rather than
+ * a second pattern.
+ *
+ * The hazard is identical and the reasoning transfers verbatim: a cell whose
+ * generation failed on an ENVIRONMENTAL fault (a 429, a 5xx, a timeout, a
+ * zero credit balance, our own bug) must not be written under `cell.key`,
+ * because `planRun(spec, storedKeys)` sees only keys and would classify it
+ * `reuse` forever after. The store is append-only; there is no delete. And
+ * because a panel arm issues ~5x the generation calls per cell, the loss
+ * lands preferentially on panel arms -- an arm-correlated hole in the data
+ * that confounds exactly the panel-vs-solo comparison H1 tests.
+ *
+ * So the cell stays OUT of the store and this record carries the money.
+ * `store.keys()` is index-only (cheap; lib/store.mjs) and reflects every
+ * attempt already durably recorded for this exact cell INCLUDING ones from a
+ * prior session, so the next attempt number is always correct across process
+ * boundaries -- meterJudgeCall's own contract, unchanged.
+ *
+ * Unlike recordMetricsAttemptFailure, this carries the REAL failure kind
+ * rather than a constant `harness_error`: this record is the only durable
+ * evidence that the cell was ever attempted, so it has to be able to answer
+ * an operator asking "why is this cell `todo` again?" with `rate_limited`
+ * rather than a generic shrug.
+ *
+ * @param {object} store  a lib/store.mjs ResultsStore
+ * @param {object} o
+ *   @param {{key: string, cfg: string}} o.cell
+ *   @param {Array}  o.costRows        every costRow() for this attempt
+ *   @param {string} o.kind            the FAILURE_KINDS value the provider reported
+ *   @param {string} o.detail          the provider's own detail string
+ *   @param {object} o.resolvedModels  resolvedModelsFor(arm) -- what actually ran
+ */
+function recordGenerationAttemptFailure(store, { cell, costRows, kind, detail, resolvedModels }) {
+  const keyPrefix = `generation-attempt|cell=${cell.key}|attempt=`;
+  const attempt = store.keys().filter((k) => k.startsWith(keyPrefix)).length;
+  const key = `${keyPrefix}${attempt}`;
+  return store.put({
+    key,
+    // A sentinel armId, exactly like recordMetricsAttemptFailure's -- this is
+    // a side ledger record, not a planned cell. It is invisible to planRun()
+    // (whose key regex requires a leading `arm=`) and visible to spendToDate()
+    // (which sums costRows across every stored body, unfiltered), which is
+    // precisely the pair of properties this record needs.
+    armId: "__generation-attempt__",
+    briefId: cell.key,
+    replicate: 0,
+    cfg: cell.cfg,
+    result: { kind: "generation-attempt", cellKey: cell.key, attempt, failureKind: kind, detail },
+    resolvedModels,
+    accounting: { state: "failed", kind, detail },
     costRows,
   });
 }
@@ -1024,6 +1081,20 @@ export async function runSpec(spec, opts) {
       await judgePoolIfEnabled(cell, armsConfig.arms[cell.armId], priorRecord.result);
     } else if (priorState.state === "failed") {
       account.fail(cell.key, priorState.kind, priorState.detail || "");
+      // A stored TRANSIENT failure can only be a LEGACY record -- written
+      // before issue #90's fix, when every classified generation failure
+      // went into the store under cell.key. Nothing this runner writes can
+      // produce one any more. It is permanently unretryable (append-only
+      // store, no delete) and it is silently dragging an environmental
+      // fault forward as though it were a measurement, so say so out loud
+      // rather than letting a plausible-looking `failed=N` hide it.
+      if (isTransientFailure(priorState.kind)) {
+        log(
+          `[run] WARNING: reused cell '${cell.key}' is a stored '${priorState.kind}' failure -- an environmental ` +
+            `fault recorded before issue #90's fix, which this run cannot re-attempt. See ` +
+            `docs/retrying-failed-cells.md for the one-time remediation.`,
+        );
+      }
     } else if (priorState.state === "skipped") {
       // This runner itself never persists a `skipped` record (see the
       // budget-skip comment below -- a budget skip is deliberately kept
@@ -1045,6 +1116,11 @@ export async function runSpec(spec, opts) {
       throw new Error(`runSpec: stored cell '${cell.key}' has an unrecognized accounting.state '${priorState.state}' -- expected one of ${TERMINAL_STATES.join(", ")}`);
     }
   }
+
+  // Transient generation failures THIS INVOCATION declined to store (issue
+  // #90), keyed by kind. Populated only by the todo loop's transient branch
+  // -- see there for why this is not derived from summary.byKind.
+  const notStoredTransientByKind = {};
 
   const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usd]));
   // Projected per-provider cost for each todo cell, split slot-by-slot (see
@@ -1149,6 +1225,13 @@ export async function runSpec(spec, opts) {
       // classify it as harness_error rather than letting it crash the run
       // and silently drop every cell after it. Still terminal, still
       // reconciled, still a datum.
+      //
+      // Nothing is written under cell.key here, and as of issue #90 that is
+      // the STATED rule rather than an accident of where this `continue`
+      // sits: harness_error is in TRANSIENT_FAILURE_KINDS, so once our bug
+      // is fixed the cell is planned `todo` again instead of carrying our
+      // defect forward as a permanent property of the arm. No cost rows
+      // exist to persist -- the provider threw before reporting any tokens.
       account.fail(cell.key, "harness_error", `provider threw: ${err && err.message}`);
       continue;
     }
@@ -1256,24 +1339,68 @@ export async function runSpec(spec, opts) {
     } else {
       // response.terminalState === "failed" -- a classified provider
       // failure surfaces as a `failed` cell, never a missing one.
+      //
+      // ── Whether it also becomes a PERMANENT cell is the second, separate
+      // question (issue #90) ────────────────────────────────────────────────
+      // Both branches below `fail()` the cell on this invocation's account:
+      // a failure is a datum, it counts in summary.byKind, and reconcile()
+      // sees exactly one terminal state for this cell either way. What
+      // differs is PERSISTENCE, and the split is
+      // lib/accounting.mjs's INTRINSIC/TRANSIENT sets -- read that comment
+      // for why each kind sits where it does.
+      //
+      // The mechanism is the one already established for metrics failures
+      // just above (and for judge retries in evals/judge/gate.mjs's
+      // meterJudgeCall): keep `cell.key` out of the store so planRun() plans
+      // it `todo` again, and persist the money under an attempt-scoped key
+      // so nothing already paid for is lost. This branch is the generation
+      // counterpart the metrics defence was missing.
       account.fail(cell.key, response.failureKind, response.detail || "");
       const costRows = costRowsFor(cell.key, response.tokens, timestamp);
       for (const row of costRows) account.addCost(row);
       // issue #74 -- same store.put()-before-recordActualSpend reordering
       // as the completed branch above: a FAILED cell can still have
       // consumed real tokens (see costRowsFor's caller comment), and those
-      // must survive even if recordActualSpend then throws.
-      store.put({
-        key: cell.key,
-        armId: cell.armId,
-        briefId: cell.briefId,
-        replicate: cell.replicate,
-        cfg: cell.cfg,
-        result: { failed: true, failureKind: response.failureKind },
-        resolvedModels: resolvedModelsFor(arm),
-        accounting: { state: "failed", kind: response.failureKind, detail: response.detail || "" },
-        costRows,
-      });
+      // must survive even if recordActualSpend then throws. Both #90
+      // branches below preserve that ordering.
+      if (isTransientFailure(response.failureKind)) {
+        // Environmental fault. NOTHING is written under cell.key, so the
+        // next invocation re-attempts it (genuinely re-spending, which is
+        // correct and honest). The attempt -- its kind, its detail, and
+        // every token it consumed -- is durable under its own key.
+        //
+        // Tallied HERE, in the branch that actually declined to store the
+        // cell, rather than derived from summary.byKind at the end. byKind
+        // counts the reuse loop's failures too, and a LEGACY stored
+        // transient failure (written before this fix) lands in it -- so a
+        // notice driven off byKind would tell an operator to re-run a cell
+        // that is permanently `reuse` and will never be re-attempted. That
+        // is the exact ambiguity the notice exists to remove.
+        notStoredTransientByKind[response.failureKind] = (notStoredTransientByKind[response.failureKind] || 0) + 1;
+        recordGenerationAttemptFailure(store, {
+          cell,
+          costRows,
+          kind: response.failureKind,
+          detail: response.detail || "",
+          resolvedModels: resolvedModelsFor(arm),
+        });
+      } else {
+        // Cell-intrinsic observation about the arm (parse_failure,
+        // empty_pool, refusal). This IS the measurement; storing it under
+        // cell.key is the point, and re-attempting it would be resampling
+        // until the arm looks better than it is.
+        store.put({
+          key: cell.key,
+          armId: cell.armId,
+          briefId: cell.briefId,
+          replicate: cell.replicate,
+          cfg: cell.cfg,
+          result: { failed: true, failureKind: response.failureKind },
+          resolvedModels: resolvedModelsFor(arm),
+          accounting: { state: "failed", kind: response.failureKind, detail: response.detail || "" },
+          costRows,
+        });
+      }
       recordActualSpend(costRows);
       // No candidates on a failed generation cell -- nothing to judge.
     }
@@ -1368,5 +1495,22 @@ export async function runSpec(spec, opts) {
     `[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}` +
       (skipBreakdown ? ` (${skipBreakdown})` : ""),
   );
+  // Retryable-failure notice (issue #90). Built from the todo loop's own
+  // tally of cells it declined to store -- NOT from summary.byKind, which
+  // also counts legacy stored transient failures restored by the reuse loop
+  // and would therefore promise a re-attempt that can never happen. Kept out
+  // of reconcile()'s return so the summary shape every other caller reads is
+  // untouched. `failed=N` alone cannot tell an operator whether the night was
+  // lost to rate limits (re-run it) or to the arms genuinely refusing (that
+  // IS the result) -- the exact ambiguity that cost the #8 study a dataset.
+  const retryable = Object.entries(notStoredTransientByKind);
+  if (retryable.length) {
+    const n = retryable.reduce((a, [, count]) => a + count, 0);
+    log(
+      `[run] ${n} of those failure(s) were environmental (${retryable.map(([k, c]) => `${k}=${c}`).join(", ")}) ` +
+        `and were NOT stored under their cell keys -- re-run the same command to re-attempt them ` +
+        `(spend already incurred is preserved; see docs/retrying-failed-cells.md).`,
+    );
+  }
   return { summary, account };
 }
