@@ -228,7 +228,18 @@ test("Sentry HIGH finding (PR #76 fix round): judge spend also trips the GLOBAL 
   const anthropicJudge = new MockJudgeProvider();
 
   const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
-  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }], replicates: 1, config: CFG };
+  // issue #78 (coverage item, not a defect): widened from 2 briefs to 3.
+  // At n=2 the only possible outcomes are completed=1/skipped=1 whether
+  // `runningTotal` is bumped once per row or (via a doubling mutation)
+  // twice -- either way cell 2's admission check sees SOME positive
+  // over-ceiling amount and skips, so the test cannot see the counter's
+  // MAGNITUDE, only its sign. At n=3 the two behaviors are discriminable:
+  // correct single-counting admits cell 2 as well (completed=2/skipped=1),
+  // while a doubling mutation on the running total pushes cell 2 over too
+  // (completed=1/skipped=2) -- see the ceiling comment below for the exact
+  // arithmetic this depends on.
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }, { id: "b3" }], replicates: 1, config: CFG };
+  const corpus3 = [...CORPUS, { id: "b3", text: "Brief three: propose a third novel idea." }];
 
   // Same calibration technique as the per-provider ceiling test above:
   // learn the REAL per-cell generation cost empirically (MockProvider's
@@ -240,16 +251,45 @@ test("Sentry HIGH finding (PR #76 fix round): judge spend also trips the GLOBAL 
   const { summary: calibSummary } = await runSpec(calibSpec, { store: calibStore, armsConfig: soloArms, provider: new MockProvider(), log: silentLog });
   const perCellGenUsd = calibSummary.spendByProvider.anthropic;
   assert.ok(perCellGenUsd > 0);
+
+  // Calibrate the judge leg's real cost the SAME way, isolated by running
+  // generation + judging together with no ceiling and subtracting the known
+  // generation cost -- never hand-computed, for the same rate-drift reason
+  // as perCellGenUsd above.
+  const judgeCalibStore = new ResultsStore(tempDir(t));
+  const { summary: judgeCalibSummary } = await runSpec(calibSpec, {
+    store: judgeCalibStore,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: new MockJudgeProvider() },
+    corpus: CORPUS,
+    log: silentLog,
+  });
+  const perJudgeUsd = judgeCalibSummary.spendByProvider.anthropic - perCellGenUsd;
+  assert.ok(perJudgeUsd > 0, "sanity: the calibration run priced a positive judge cost distinct from generation");
+
   const exactPriceGrid = (plannedCells) => ({
     usd: plannedCells.length * perCellGenUsd,
     breakdown: plannedCells.map((c) => ({ cellKey: c.key, usd: perCellGenUsd, byProvider: { anthropic: perCellGenUsd } })),
   });
-  // GLOBAL ceiling (maxSpendUsd, not maxSpendByProviderUsd) covering BOTH
-  // cells' generation with zero room for anything else. If judge spend were
-  // excluded from the GLOBAL running total (the bug: `runningTotal` was
-  // bumped only by PROJECTED cellCost at admission time, never by actual
-  // spend afterward), both cells would complete.
-  const ceiling = perCellGenUsd * 2;
+  // Ceiling = all THREE cells' generation, PLUS ONE judge leg's worth, with
+  // zero room for anything beyond that (3g + j, g=perCellGenUsd,
+  // j=perJudgeUsd). Chosen so every admission comparison below clears by a
+  // margin of at least min(g, j) -- never an exact floating-point tie --
+  // and so the test catches BOTH the doubling mutation this fixture widening
+  // targets AND the original Sentry #76 bug (global runningTotal bumped by
+  // PROJECTED cellCost, never by actual spend) that the pre-widening 2-cell
+  // version already caught:
+  //   cell 2, correct:  (g+j) + g   =  2g+j   <= 3g+j  -> ADMITTED (margin g)
+  //   cell 3, correct:  (2g+2j) + g = 3g+2j   >  3g+j  -> SKIPPED  (margin j)
+  //     => completed=2, skipped=1
+  //   cell 2, DOUBLED runningTotal: (2g+2j) + g = 3g+2j > 3g+j -> SKIPPED
+  //     => completed=1, skipped=2 (RED against the assertions below)
+  //   cell 3, ORIGINAL bug (runningTotal = sum of PROJECTED cellCost only,
+  //     never bumped by actual judge spend): 3g <= 3g+j -> ADMITTED
+  //     => completed=3, skipped=0 (RED against the assertions below)
+  const ceiling = perCellGenUsd * 3 + perJudgeUsd;
 
   const { summary } = await runSpec(soloSpec, {
     store,
@@ -258,14 +298,14 @@ test("Sentry HIGH finding (PR #76 fix round): judge spend also trips the GLOBAL 
     priceGrid: exactPriceGrid,
     judgeModels: JUDGE_MODELS,
     judgeProviders: { anthropic: anthropicJudge }, // openai deferred, $0 -- isolates the trip to anthropic judge spend
-    corpus: CORPUS,
+    corpus: corpus3,
     maxSpendUsd: ceiling, // GLOBAL ceiling this time, not per-provider
     log: silentLog,
   });
 
-  assert.ok(anthropicJudge.calls.length >= 1, "sanity: the judge ran for the first cell before the second was admission-controlled");
-  assert.equal(summary.completed, 1, "only the FIRST cell's generation was admitted under the GLOBAL ceiling");
-  assert.equal(summary.skipped, 1, "the SECOND cell was skipped -- cell 1's judge spend pushed the GLOBAL running total over the ceiling");
+  assert.ok(anthropicJudge.calls.length >= 1, "sanity: the judge ran for at least one cell before a later cell was admission-controlled");
+  assert.equal(summary.completed, 2, "the FIRST TWO cells' generation were admitted under the GLOBAL ceiling -- this magnitude is what distinguishes correct single-counting from a doubling mutation");
+  assert.equal(summary.skipped, 1, "the THIRD cell was skipped -- cells 1 and 2's judge spend left no room under the GLOBAL running total");
 });
 
 // ── AC4: resumed runs project and meter judge cost for generated-but-unjudged pools ────

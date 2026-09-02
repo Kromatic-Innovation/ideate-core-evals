@@ -594,27 +594,34 @@ export async function runSpec(spec, opts) {
   // actual spend land correctly split across Anthropic and OpenAI instead of
   // wholly on whichever model happens to be listed first in the row.
   //
-  // Fail loud on a missing rate WHEN per-provider spend-gating is active
-  // (issue #62 MEDIUM): runnerPriceGrid's fail-loud-on-missing-rate guard
-  // (extended to judge legs too as of issue #63) only ever runs at PLAN
-  // time, against the PROJECTED grid -- it never sees a judge row's ACTUAL
-  // tokens_by_model. A judge call now DOES reach this function (issue #68
-  // wires runJudgeMatrix's costRows through the SAME recordActualSpend every
-  // generation cell uses -- see judgePoolIfEnabled below), so this guard is
-  // exactly what makes a rate-less judge model fail loud instead of silently
-  // contributing $0 to `runningTotalByProvider` (priceRowByProvider's
-  // documented, otherwise-correct default for re-pricing a recorded row),
-  // quietly undercounting real spend against the very ceiling this admission
-  // control exists to enforce. Only enforced when maxSpendByProviderUsd is
-  // supplied -- a run with no per-provider ceiling has nothing to gate, and
+  // Fail loud on a missing rate WHEN ANY spend ceiling is active -- global
+  // OR per-provider (issue #62 MEDIUM, widened by issue #78): runnerPriceGrid's
+  // fail-loud-on-missing-rate guard (extended to judge legs too as of issue
+  // #63) only ever runs at PLAN time, against the PROJECTED grid -- it never
+  // sees a judge row's ACTUAL tokens_by_model. A judge call now DOES reach
+  // this function (issue #68 wires runJudgeMatrix's costRows through the SAME
+  // recordActualSpend every generation cell uses -- see judgePoolIfEnabled
+  // below), so this guard is exactly what makes a rate-less judge model fail
+  // loud instead of silently contributing $0 to `runningTotal` /
+  // `runningTotalByProvider` (priceRowByProvider's documented, otherwise-
+  // correct default for re-pricing a recorded row), quietly undercounting
+  // real spend against the very ceiling this admission control exists to
+  // enforce. Issue #78: this guard used to check `maxSpendByProviderUsd`
+  // alone, so a run with ONLY a global `--max-spend` (no per-provider
+  // ceiling) primed a rate-less model at $0 into `runningTotal`, which the
+  // per-cell loop below DOES compare against `maxSpendUsd` -- the guard's
+  // coverage did not follow the pricing it was protecting. Gated on
+  // `anyCeilingActive` (same flag that decides whether `priorSpend` is even
+  // computed, above) so it fires whenever EITHER ceiling depends on
+  // per-row pricing. A run with NO ceiling at all has nothing to gate, and
   // priceRowByProvider's $0-and-continue default remains correct for it.
   function recordActualSpend(costRows) {
     for (const row of costRows) {
       const { byProvider, hasMissingRate, missingRateModels, excludedNonProviderUsd } = priceRowByProvider(row, rateTable, { batch });
-      if (maxSpendByProviderUsd && hasMissingRate) {
+      if (anyCeilingActive && hasMissingRate) {
         throw new Error(
           `runSpec: cell '${row.cellKey || row.key}' recorded actual spend for model(s) with no RATE_TABLE entry ` +
-            `(${missingRateModels.join(", ")}) -- per-provider --max-spend cannot gate spend it cannot price. ` +
+            `(${missingRateModels.join(", ")}) -- a spend ceiling cannot gate spend it cannot price. ` +
             `Add the missing model(s) to lib/price.mjs's RATE_TABLE.`,
         );
       }
