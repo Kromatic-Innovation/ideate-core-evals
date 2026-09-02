@@ -36,23 +36,26 @@
 // fit.test.mjs / analysis.main.test.mjs only — the latter injects one via
 // main()'s second argument, never used by the real CLI entrypoint below).
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { ResultsStore } from "../../lib/store.mjs";
 import { buildFrame, summarizeByArm } from "./frame.mjs";
 import { buildRarefiedFrame, PoolsUnavailableError } from "./rarefiedFrame.mjs";
+import { buildJudgeScoreFrame, JudgeScoresUnavailableError } from "./judgeScoreFrame.mjs";
 import { buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts } from "./contrasts.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
 import { paretoFrontier, costDiversityRatioByArm, seedFromString } from "./pareto.mjs";
 import { renderParetoSvg } from "./plot.mjs";
-import { runLadder, makeSidecarRunner, analysisHash as computeAnalysisHash } from "./fit.mjs";
+import { runLadder, runJudgeScoreLadder, makeSidecarRunner, analysisHash as computeAnalysisHash } from "./fit.mjs";
 import { RAREFACTION_TREATMENT } from "./rarefaction.mjs";
 import { renderAnalysisDataCsv, renderLme4FitR } from "./reproducibility.mjs";
 import { renderReport } from "./report.mjs";
+import { providerOf } from "../../lib/price.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(__dirname, "..", "..");
 
 function parseArgs(argv) {
   const args = { resultsDir: "results", outDir: join(__dirname, "out"), response: "distinct_k", referenceArm: "A", panelArms: null, delta: undefined, config: {}, poolField: "pool" };
@@ -194,25 +197,123 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     }
   }
 
-  const family = buildRegisteredFamily({ referenceArm: args.referenceArm, panelArms, delta: args.delta });
+  // ── Judge-score lane — H5's registered bias term (issue #80, Appendix B
+  // item 6). A THIRD, independent frame and ladder from both the full-pool
+  // and rarefied lanes above: H5 is evaluated against THIS fit alone, never
+  // `ladder.fit` or `rarefiedLadder.fit`. `opts.pools` (judgeScoreFrame.mjs)
+  // is derived here from the already-built full-pool `frame` (one pool per
+  // completed generation cell) joined against arms.config.json's own
+  // generator-provider set per arm (mirrors evals/judge/matrix.mjs's
+  // generatorProvidersOf) -- this file, not judgeScoreFrame.mjs, is the one
+  // that knows about arms.config.json, keeping that module decoupled from
+  // run configuration exactly as frame.mjs stays decoupled from it. ────────
+  let judgeScoreLadder = null;
+  let judgeScoreUnavailableReason = null;
+  let armsConfig = null;
+  try {
+    armsConfig = JSON.parse(readFileSync(join(REPO_ROOT, "arms.config.json"), "utf8"));
+  } catch (err) {
+    // arms.config.json is required to resolve a pool's generator-provider
+    // set, but its absence must degrade H5 to not-computed, never abort the
+    // whole run -- H1-H4 (and Pareto/cost) have nothing to do with it.
+    judgeScoreUnavailableReason = `could not read arms.config.json to resolve generator providers: ${err.message}`;
+  }
+  const judgeScorePools = armsConfig
+    ? frame.rows
+        .map((r) => {
+          const arm = armsConfig.arms && armsConfig.arms[r.armId];
+          const generatorProviders = [];
+          for (const slot of (arm && arm.slots) || []) {
+            // A model id this run doesn't recognize the provider prefix for
+            // (isNonProviderModel-style unknowns, e.g. a future embedder in
+            // `slots`) is skipped, not a hard crash for the whole analysis
+            // run -- providerOf() throws by design for anything it can't
+            // classify (lib/price.mjs), which is correct for pricing but too
+            // strict a gate for this best-effort provider-set derivation.
+            try {
+              generatorProviders.push(providerOf(slot.model));
+            } catch {
+              continue;
+            }
+          }
+          return { poolKey: r.cellKey, armId: r.armId, generatorProviders: Array.from(new Set(generatorProviders)) };
+        })
+        .filter((p) => p.generatorProviders.length > 0)
+    : [];
+
+  if (judgeScorePools.length === 0) {
+    judgeScoreUnavailableReason = judgeScoreUnavailableReason || "no frame row's arm resolved to a known generator provider via arms.config.json";
+  } else {
+    try {
+      const judgeScoreFrame = buildJudgeScoreFrame(store, { pools: judgeScorePools });
+      const ladderResult = await runJudgeScoreLadder({
+        rows: judgeScoreFrame.rows,
+        judgeProviderLevels: judgeScoreFrame.judgeProviderLevels,
+        referenceJudgeProvider: judgeScoreFrame.judgeProviderLevels[0],
+        runner,
+      });
+      if (ladderResult.fit) {
+        judgeScoreLadder = ladderResult;
+      } else {
+        // J2 (no confirmatory inference for the judge-score lane) must
+        // degrade H5 to not-computed, exactly like PoolsUnavailableError
+        // does for H1 -- it must NEVER abort the whole analysis run (H1-H4
+        // and Pareto/cost have nothing to do with H5's fit). This mirrors
+        // the brief's own convention: "a registered quantity that cannot be
+        // computed -> named error -> report as not-computed", not a crash.
+        judgeScoreUnavailableReason = `judge-score ladder reached ${ladderResult.rung} (no confirmatory inference for H5) — see history: ${JSON.stringify(ladderResult.history)}`;
+      }
+    } catch (err) {
+      if (err instanceof JudgeScoresUnavailableError) {
+        // Registered, expected state until real judging (#68/#77) has
+        // actually run against a study cell -- never silently fall through
+        // to a different estimand for H5 (same discipline as the rarefied
+        // lane's PoolsUnavailableError handling above).
+        judgeScoreUnavailableReason = err.message;
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  const family = buildRegisteredFamily({
+    referenceArm: args.referenceArm,
+    panelArms,
+    delta: args.delta,
+    h5Wired: Boolean(judgeScoreLadder && judgeScoreLadder.fit),
+  });
   // One evaluateSpec() result per hypothesis (H3's two sub-contrasts are
   // combined internally into a single IUT p-value -- see contrasts.mjs) --
   // registeredResults is therefore already flat, 5 entries, H1..H5. H1 is
-  // the ONE entry evaluated against the rarefied fit (when available) --
-  // every other entry keeps using the full-pool `ladder.fit`, unchanged.
+  // evaluated against the rarefied fit (when available); H5 against the
+  // judge-score fit (when available); every other entry keeps using the
+  // full-pool `ladder.fit`, unchanged.
   const registeredResults = family.map((spec) => {
-    if (spec.id !== "H1") return evaluateSpec(spec, ladder.fit);
-    if (rarefiedLadder && rarefiedLadder.fit) return evaluateSpec(spec, rarefiedLadder.fit);
-    // No rarefied fit available -- report H1 as NOT COMPUTED (the same
-    // `{unimplemented: true, p: 1}` shape H5 already uses) rather than
-    // fabricating a number or silently falling back to the full-pool fit.
-    return {
-      id: "H1",
-      description: spec.description,
-      unimplemented: true,
-      reason: rarefiedUnavailableReason || "rarefied lane did not run",
-      p: 1,
-    };
+    if (spec.id === "H1") {
+      if (rarefiedLadder && rarefiedLadder.fit) return evaluateSpec(spec, rarefiedLadder.fit);
+      // No rarefied fit available -- report H1 as NOT COMPUTED (the same
+      // `{unimplemented: true, p: 1}` shape H5 uses when its own fit is
+      // unavailable) rather than fabricating a number or silently falling
+      // back to the full-pool fit.
+      return {
+        id: "H1",
+        description: spec.description,
+        unimplemented: true,
+        reason: rarefiedUnavailableReason || "rarefied lane did not run",
+        p: 1,
+      };
+    }
+    if (spec.id === "H5") {
+      if (judgeScoreLadder && judgeScoreLadder.fit) return evaluateSpec(spec, judgeScoreLadder.fit);
+      return {
+        id: "H5",
+        description: spec.description,
+        unimplemented: true,
+        reason: judgeScoreUnavailableReason || "judge-score lane did not run",
+        p: 1,
+      };
+    }
+    return evaluateSpec(spec, ladder.fit);
   });
   const holmAdjusted = holmBonferroni(
     registeredResults.map((r) => r.p),
@@ -266,6 +367,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         rarefied: rarefiedLadder
           ? { rung: rarefiedLadder.rung, fit: rarefiedLadder.fit, history: rarefiedLadder.history, robustnessCheck: rarefiedLadder.robustnessCheck }
           : { unavailableReason: rarefiedUnavailableReason },
+        judgeScore: judgeScoreLadder
+          ? { rung: judgeScoreLadder.rung, fit: judgeScoreLadder.fit, history: judgeScoreLadder.history }
+          : { unavailableReason: judgeScoreUnavailableReason },
       },
       null,
       2,
@@ -299,6 +403,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     rarefiedFrame,
     rarefiedLadder,
     rarefiedUnavailableReason,
+    judgeScoreLadder,
+    judgeScoreUnavailableReason,
   };
 }
 

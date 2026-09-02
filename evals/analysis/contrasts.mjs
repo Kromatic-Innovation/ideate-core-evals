@@ -45,12 +45,20 @@
 // H4: same delta=0-default one-sided treatment as H2, for B >= D.
 // H5: same-provider judging inflates scores — a judge_provider /
 //     judge_provider x generator_provider bias term from the JUDGE-SCORE
-//     model (B6), which is a different frame than the distinct_k lane this
-//     issue builds. Represented here as contrast DATA (the coefficient name
-//     it targets) so the registered family always has 5 slots; wiring the
-//     fit that actually produces that coefficient is #45/B5's job.
+//     model (B6), which is a different frame than the distinct_k lane H1-H4
+//     use (evals/analysis/judgeScoreFrame.mjs, evals/analysis/fit.mjs's
+//     runJudgeScoreLadder()). buildRegisteredFamily() always returns the
+//     same 5-slot family; whether H5's entry is `unimplemented` depends on
+//     `opts.h5Wired` (default false, preserving the pre-#80 stub for any
+//     caller that hasn't built a judge-score fit for this run) -- wiring
+//     the fit changes only WHETHER this slot can reject, never how many
+//     slots exist (registeredFamilySlotCount() is independent of it; see
+//     contrasts.test.mjs). See evals/analysis/analysis.mjs's main() for the
+//     real (non-test) caller that builds the judge-score ladder and passes
+//     `h5Wired: true` when it succeeds.
 
 import { tQuantile, tTwoSidedP, tUpperTailP } from "./distributions.mjs";
+import { JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
 
 /**
  * Build a dense contrast vector aligned to `coefficientNames`, from a sparse
@@ -188,6 +196,11 @@ function zQuantile(p) {
  *     default — passing an explicit value is a deviation from that
  *     registration, recorded on the H2/H4 results as
  *     `deltaDeviatesFromRegistration: true`.
+ *   @param {boolean} [opts.h5Wired=false]  issue #80. When true, H5's entry
+ *     is a real weights-based spec (targeting JUDGE_SCORE_BIAS_COEFFICIENT)
+ *     instead of the `{unimplemented: true}` stub — the caller is asserting
+ *     it has a real judge-score fit ready to evaluateSpec() H5 against. Does
+ *     NOT change registeredFamilySlotCount()'s output either way (always 5).
  * @returns {Array<object>} 5 entries, H1..H5 in order
  */
 export function buildRegisteredFamily(opts = {}) {
@@ -283,19 +296,22 @@ export function buildRegisteredFamily(opts = {}) {
     },
     {
       id: "H5",
-      description: "same-provider judging inflates scores (judge_provider bias term)",
+      description: "same-provider judging inflates scores (judge_provider x generator_provider bias term, judge-score model, #80)",
       kind: "bias-term",
-      // Unimplemented, but still occupies a Holm family slot (see
-      // registeredFamilySlotCount() / evaluateSpec()) -- wiring this
-      // hypothesis's fit later must not change the OTHER four hypotheses'
-      // Holm multiplier, because the slot was never absent to begin with.
-      // Targets a coefficient from the JUDGE-SCORE model (a different frame
-      // — run-level (1|run), judge_provider, judge_provider x
-      // generator_provider — than the distinct_k lane this issue builds).
-      // Left as a named target rather than a weights map: wiring the frame
-      // and fit that produce this coefficient is #45/B5's follow-up.
-      targetCoefficient: "judge_provider[T.same]",
-      unimplemented: true,
+      // Always occupies a Holm family slot (see registeredFamilySlotCount()
+      // / evaluateSpec()) regardless of whether it is wired for THIS run --
+      // wiring this hypothesis's fit must not change the OTHER four
+      // hypotheses' Holm multiplier, because the slot was never absent to
+      // begin with. Targets the SINGLE derived bias coefficient
+      // judgeScoreFrame.mjs's buildJudgeScoreFrame()/fit.mjs's
+      // buildJudgeScoreDesignMatrix() produce for the judge_provider x
+      // generator_provider interaction (see judgeScoreFrame.mjs's header for
+      // why that interaction reduces to one coefficient for this study).
+      // `unimplemented: true` only when the caller has NO judge-score fit
+      // for this run (opts.h5Wired falsy, the default) -- see this module's
+      // header comment above buildRegisteredFamily() imports.
+      weights: { [JUDGE_SCORE_BIAS_COEFFICIENT]: 1 },
+      ...(opts.h5Wired ? {} : { unimplemented: true }),
     },
   ];
 }
@@ -369,7 +385,7 @@ function oneSidedUpperP(z, fit) {
  */
 export function evaluateSpec(spec, fit) {
   if (spec.unimplemented) {
-    return { id: spec.id, unimplemented: true, reason: "judge-score frame not wired in this issue (#45/B5)", p: 1 };
+    return { id: spec.id, unimplemented: true, reason: "judge-score model not available for this run (see #80) — no judge-score fit was supplied", p: 1 };
   }
   if (spec.kind === "iut-max-p") {
     const components = spec.components.map((comp) => {

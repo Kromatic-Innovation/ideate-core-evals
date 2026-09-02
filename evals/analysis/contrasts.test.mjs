@@ -2,8 +2,19 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { contrastVector, armCoefficientName, evaluateContrast, buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts } from "./contrasts.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
+import { JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
 
 const COEF_NAMES = ["Intercept", "arm[T.B]", "arm[T.D]", "arm[T.E]", "arm[T.G]", "arm[T.H]"];
+const JUDGE_SCORE_COEF_NAMES = ["Intercept", "judge_provider[T.openai]", JUDGE_SCORE_BIAS_COEFFICIENT];
+
+/** A judge-score-lane diagonal-vcov fit (issue #80) -- same shape as
+ *  diagonalFit() below but with the judge-score model's own coefficientNames,
+ *  never the arm lane's. */
+function judgeScoreDiagonalFit(coefficients, variances) {
+  const k = coefficients.length;
+  const vcov = Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) => (i === j ? variances[i] : 0)));
+  return { coefficients, coefficientNames: JUDGE_SCORE_COEF_NAMES, vcov };
+}
 
 test("armCoefficientName: Intercept for the reference arm, dummy name otherwise", () => {
   assert.equal(armCoefficientName("A", "A"), "Intercept");
@@ -165,6 +176,55 @@ test("buildRegisteredFamily: H5 is a named stub, evaluated as unimplemented but 
   assert.equal(h5.p, 1);
 });
 
+// ── H5 wired (issue #80): opts.h5Wired: true produces a REAL spec, evaluated
+//    against a judge-score fit -- the contrast must actually READ the fit's
+//    bias coefficient, not return a constant regardless of input. ──────────
+
+test("buildRegisteredFamily: opts.h5Wired produces a real spec (not unimplemented) targeting JUDGE_SCORE_BIAS_COEFFICIENT", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"], h5Wired: true });
+  const h5Spec = family[4];
+  assert.equal(h5Spec.id, "H5");
+  assert.equal(h5Spec.unimplemented, undefined);
+  assert.deepEqual(h5Spec.weights, { [JUDGE_SCORE_BIAS_COEFFICIENT]: 1 });
+});
+
+test("H5 (wired) goes RED when the bias coefficient is zeroed -- the contrast genuinely reads the fit, not a constant", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"], h5Wired: true });
+  const h5Spec = family[4];
+
+  // GREEN: a real, non-zero bias coefficient with a tight SE -- a clearly
+  // non-zero, significant estimate.
+  const realFit = judgeScoreDiagonalFit([5, 0.4, 0.9], [0.01, 0.01, 0.01]);
+  const realResult = evaluateSpec(h5Spec, realFit);
+  assert.equal(realResult.unimplemented, undefined);
+  assert.ok(Math.abs(realResult.estimate - 0.9) < 1e-9, "estimate must equal the fit's own bias coefficient, not a hardcoded number");
+  assert.ok(realResult.p < 0.01, "a large estimate with a tight SE must be far from p=1");
+
+  // RED (mutation): zero out ONLY the bias coefficient in the SAME fit
+  // shape -- if evaluateSpec() ever hardcoded H5's estimate/p instead of
+  // reading fit.coefficients, this mutation would have no effect.
+  const zeroedFit = judgeScoreDiagonalFit([5, 0.4, 0], [0.01, 0.01, 0.01]);
+  const zeroedResult = evaluateSpec(h5Spec, zeroedFit);
+  assert.equal(zeroedResult.estimate, 0, "zeroing the bias coefficient must zero H5's estimate");
+  assert.ok(zeroedResult.p > 0.9, `expected p near 1 when the bias coefficient is exactly 0, got ${zeroedResult.p}`);
+
+  // The two results must actually differ -- proving evaluateSpec() is
+  // sensitive to the fit's coefficients, the RED/GREEN pair this test's
+  // name promises.
+  assert.notEqual(realResult.estimate, zeroedResult.estimate);
+  assert.ok(realResult.p < zeroedResult.p);
+});
+
+test("H5 (wired) contrast targets ONLY the bias coefficient -- unrelated coefficients moving doesn't change H5's estimate", () => {
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"], h5Wired: true });
+  const h5Spec = family[4];
+  const fitA = judgeScoreDiagonalFit([5, 0.4, 0.9], [0.01, 0.01, 0.01]);
+  const fitB = judgeScoreDiagonalFit([50, 4.4, 0.9], [0.01, 0.01, 0.01]); // Intercept/judge_provider changed, bias term unchanged
+  const resultA = evaluateSpec(h5Spec, fitA);
+  const resultB = evaluateSpec(h5Spec, fitB);
+  assert.equal(resultA.estimate, resultB.estimate);
+});
+
 test("buildRegisteredFamily: requires panelArms", () => {
   assert.throws(() => buildRegisteredFamily({ referenceArm: "A" }), /panelArms is required/);
 });
@@ -236,6 +296,17 @@ test("registeredFamilySlotCount: independent of whether H5 is wired -- wiring it
   const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
   assert.equal(family.find((f) => f.id === "H5").unimplemented, true);
   assert.equal(registeredFamilySlotCount(family), 5);
+});
+
+test("registeredFamilySlotCount: still 5 with opts.h5Wired: true, and H5 is no longer unimplemented (issue #80)", () => {
+  // Wiring H5's fit must change ONLY whether its slot can reject, never how
+  // many slots exist -- the exact property this issue's brief demands.
+  const wired = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"], h5Wired: true });
+  assert.equal(wired.find((f) => f.id === "H5").unimplemented, undefined);
+  assert.equal(registeredFamilySlotCount(wired), 5);
+
+  const unwired = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
+  assert.equal(registeredFamilySlotCount(unwired), registeredFamilySlotCount(wired), "wiring H5 must not change the family size relative to the unwired family");
 });
 
 test("applyHolmVerdicts: a raw-significant contrast becomes not-supported once Holm's step-down correction catches up to it", () => {

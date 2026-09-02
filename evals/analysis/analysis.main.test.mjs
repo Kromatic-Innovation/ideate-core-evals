@@ -20,6 +20,7 @@ import { join } from "node:path";
 
 import { main } from "./analysis.mjs";
 import { ResultsStore } from "../../lib/store.mjs";
+import { recordJudgeScores } from "../judge/score.mjs";
 import { cellKey, configHash } from "../../lib/manifest.mjs";
 import { distinctK } from "../metrics/clustering.mjs";
 import { buildRegisteredFamily, evaluateSpec } from "./contrasts.mjs";
@@ -212,7 +213,15 @@ test("main(): wires the rarefied lane end to end -- H1 is fit on a DIFFERENT fit
 
     const reportMd = readFileSync(join(outDir, "REPORT.md"), "utf8");
     assert.match(reportMd, /## Rarefaction/);
-    assert.doesNotMatch(reportMd, /NOT COMPUTED/);
+    // Scoped to the Rarefaction section specifically (issue #80 fix round):
+    // this fixture seeds no judge-scores records, so H5's OWN, independent
+    // lane is expected to report itself not computed (its reason text
+    // legitimately contains "NOT COMPUTED") even though H1's rarefied lane
+    // above is fully computed -- the two lanes' not-computed states are
+    // unrelated (see fit.mjs's header on H1's rung and H2-H5's rung never
+    // being the same statement; H5's is a third, independent lane again).
+    const rarefactionSection = reportMd.slice(reportMd.indexOf("## Rarefaction"), reportMd.indexOf("## Cost / diversity"));
+    assert.doesNotMatch(rarefactionSection, /NOT COMPUTED/);
 
     assert.ok(existsSync(join(outDir, "analysis-data-rarefied.csv")), "rarefied reproducibility CSV must be written");
     assert.ok(existsSync(join(outDir, "lme4-fit-rarefied.R")), "rarefied reproducibility R script must be written");
@@ -345,6 +354,132 @@ test("main(): poolField on by default (issue #73 fix round, STATED DECISION) -- 
       /invalid pool/,
       "a malformed result.pool must hard-fail main() by default -- poolField defaulting to \"pool\" in analysis.mjs is a deliberate fail-loud choice, not a side effect of turning rarefaction on",
     );
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+// ── H5's judge-score lane, wired end to end (issue #80) ─────────────────────
+
+/** Runner that handles BOTH request shapes main() can send it: the arm
+ *  lane's R0/R1 (delegates to fakeSidecarRunner's logic) and the judge-score
+ *  lane's J0 (always reports non-converged, so runJudgeScoreLadder() falls
+ *  through to J1 -- fitJudgeScoreR1(), REAL production Node CR2, never
+ *  faked). */
+async function fakeSidecarRunnerWithJudgeScore(request) {
+  if (request.rung === "J0") {
+    return {
+      converged: false,
+      coefficients: request.coefficientNames.map(() => NaN),
+      coefficientNames: request.coefficientNames,
+      vcov: request.coefficientNames.map(() => request.coefficientNames.map(() => NaN)),
+      varianceComponents: {},
+      n: request.y.length,
+      toolchain: { fake: "analysis.main.test.mjs (J0, always non-converged)" },
+    };
+  }
+  return fakeSidecarRunner(request);
+}
+
+test("main(): H5's judge-score lane reaching J2 (no confirmatory inference) reports H5 not-computed, WITHOUT aborting the whole run -- H1-H4 still compute", async () => {
+  const config = configFor(true);
+  const resultsDir = seedStore(config, { withPools: true });
+  const store = new ResultsStore(resultsDir);
+  const cfg = configHash(config);
+
+  // Exactly 2 pools worth of judge-score records (2 runs -- fewer clusters
+  // than the judge-score design's 3 parameters), so fitJudgeScoreR1() (the
+  // REAL J1 fallback, not faked) genuinely cannot identify the CR2 sandwich
+  // and reports converged: false -- a true J2, not a contrived one.
+  for (const briefId of ["b1", "b2"]) {
+    const poolKey = cellKey({ armId: "A", briefId, replicate: 0, cfg });
+    recordJudgeScores(store, {
+      poolKey,
+      judgeModel: "claude-sonnet-5",
+      judgeProvider: "anthropic",
+      scores: [{ originality: 5, feasibility: 6 }],
+    });
+    recordJudgeScores(store, {
+      poolKey,
+      judgeModel: "gpt-5.6-terra",
+      judgeProvider: "openai",
+      scores: [{ originality: 4, feasibility: 5 }],
+    });
+  }
+
+  const outDir = tmpOutDir();
+  try {
+    const result = await main(
+      ["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A", "--cluster-distance-threshold", String(THRESHOLD)],
+      { runner: fakeSidecarRunnerWithJudgeScore },
+    );
+
+    const h1 = result.registeredResults.find((r) => r.id === "H1");
+    const h2 = result.registeredResults.find((r) => r.id === "H2");
+    const h5 = result.registeredResults.find((r) => r.id === "H5");
+    assert.ok(!h1.unimplemented, "H1 must still be computed -- H5's J2 must not take down the rest of the run");
+    assert.ok(!h2.unimplemented, "H2 must still be computed");
+    assert.equal(h5.unimplemented, true, "H5 must report not-computed when its ladder reaches J2");
+    assert.equal(h5.p, 1);
+    assert.match(h5.reason, /J2/, "the not-computed reason should name the rung reached, not a generic message");
+
+    const reportMd = readFileSync(join(outDir, "REPORT.md"), "utf8");
+    assert.match(reportMd, /\| H5 \|.*unimplemented \|/);
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test("main(): H5 is COMPUTED end to end when judge-score records cover every pool -- a real estimate/CI/verdict, sourced from arms.config.json's own generator-provider set", async () => {
+  const config = configFor(true);
+  const resultsDir = seedStore(config, { withPools: true });
+  const store = new ResultsStore(resultsDir);
+  const cfg = configHash(config);
+
+  // Every (arm x brief) pool gets both judge legs -- 6 arms x 4 briefs = 24
+  // runs, well over the judge-score design's 3 parameters, so J1 (real
+  // fitJudgeScoreR1(), never faked) converges. Scores vary by brief/arm so
+  // the fit isn't a degenerate constant.
+  let s = 0;
+  for (const armId of ARMS) {
+    for (const briefId of BRIEFS) {
+      const poolKey = cellKey({ armId, briefId, replicate: 0, cfg });
+      s += 1;
+      recordJudgeScores(store, {
+        poolKey,
+        judgeModel: "claude-sonnet-5",
+        judgeProvider: "anthropic",
+        scores: [{ originality: 4 + (s % 5), feasibility: 5 + (s % 3) }],
+      });
+      recordJudgeScores(store, {
+        poolKey,
+        judgeModel: "gpt-5.6-terra",
+        judgeProvider: "openai",
+        scores: [{ originality: 3 + (s % 4), feasibility: 6 + (s % 2) }],
+      });
+    }
+  }
+
+  const outDir = tmpOutDir();
+  try {
+    const result = await main(
+      ["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A", "--cluster-distance-threshold", String(THRESHOLD)],
+      { runner: fakeSidecarRunnerWithJudgeScore },
+    );
+
+    assert.ok(result.judgeScoreLadder && result.judgeScoreLadder.fit, "a judge-score fit must have been produced");
+    assert.equal(result.judgeScoreLadder.rung, "J1"); // J0 always non-converged in this fixture's runner
+
+    const h5 = result.registeredResults.find((r) => r.id === "H5");
+    assert.equal(h5.unimplemented, undefined, "H5 must be computed, not reported unimplemented, when judge scores are present");
+    assert.ok(Number.isFinite(h5.estimate));
+    assert.ok(Number.isFinite(h5.holmP));
+    assert.ok(h5.significant === true || h5.significant === false); // a real verdict was assigned, not left undefined
+
+    const reportMd = readFileSync(join(outDir, "REPORT.md"), "utf8");
+    assert.doesNotMatch(reportMd, /\| H5 \|.*unimplemented \|/);
   } finally {
     rmSync(resultsDir, { recursive: true, force: true });
     rmSync(outDir, { recursive: true, force: true });

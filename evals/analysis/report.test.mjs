@@ -116,6 +116,33 @@ test("renderReport: an unimplemented H5 entry renders without throwing", () => {
   assert.match(md, /unimplemented/);
 });
 
+// ── H5 computed (issue #80): when a judge-score fit was actually available,
+//    H5 must render as a NORMAL row alongside H1-H4 -- estimate, CI,
+//    Holm-adjusted p, verdict -- never the `unimplemented` row. report.mjs's
+//    table-rendering loop is generic over `registeredResults` (it never
+//    special-cases "H5"), so this pins that the LIVE path is exercised end to
+//    end for H5 specifically, the way it already is for H1/H3 above. ───────
+
+test("renderReport: a COMPUTED H5 entry (a real judge-score fit was available) renders as a normal row, not unimplemented", () => {
+  const input = baseInput();
+  input.registeredResults.push({
+    id: "H5",
+    description: "same-provider judging inflates scores (judge_provider x generator_provider bias term, judge-score model, #80)",
+    kind: "bias-term",
+    estimate: 0.62,
+    ci: [0.11, 1.13],
+    p: 0.017,
+    holmP: 0.034,
+    significant: true,
+  });
+  input.holmAdjusted.push(0.034);
+  const md = renderReport(input);
+
+  // The H5 row must carry real numbers, not the unimplemented placeholder.
+  assert.match(md, /\| H5 \|.*0\.620.*0\.034.*\| significant \|/);
+  assert.doesNotMatch(md, /\| H5 \|.*unimplemented \|/);
+});
+
 // ── Rarefaction (issue #73, Appendix C) ─────────────────────────────────────
 
 test("renderReport: rarefiedFrame present -- renders both full-pool and rarefied distinct_k per cell", () => {

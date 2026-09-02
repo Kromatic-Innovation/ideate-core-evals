@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fit_mixedlm.py -- the ENTIRE Python surface of evals/analysis/ (issue #46).
 
-Reads ONE JSON object from stdin, fits R0 or R1 with statsmodels' MixedLM,
+Reads ONE JSON object from stdin, fits R0/R1/J0 with statsmodels' MixedLM,
 and prints ONE JSON object to stdout: coefficients, the full vcov matrix,
 coefficientNames (echoed back so Node can verify alignment, never assumed
 positional), convergence + variance-component diagnostics, n, and the
@@ -10,12 +10,26 @@ contrasts. Every piece of registered inferential logic beyond "fit this
 formula and hand back the linear-model primitives" lives in Node
 (evals/analysis/fit.mjs, contrasts.mjs) so it runs inside `node --test`.
 
-stdin schema:
+stdin schema (R0/R1 -- the arm lane, fit.mjs's runLadder()):
   {
     "rung": "R0" | "R1",
     "rows": [{"arm": "<armId>", "brief": "<briefId>", "y": <number>}, ...],
     "armLevels": ["A", "B", ...],       # full, pinned level order
     "referenceArm": "A"
+  }
+
+stdin schema (J0 -- the judge-score lane, issue #80,
+fit.mjs's runJudgeScoreLadder()/fitJudgeScoreViaSidecar()). Unlike R0/R1, the
+design matrix arrives ALREADY MATERIALIZED (built in Node by
+buildJudgeScoreDesignMatrix()) rather than as a patsy formula string -- there
+is no arm/brief vocabulary here, just X/y/groups already aligned to
+coefficientNames, fit as a MixedLM random intercept on `groups` ((1|run)):
+  {
+    "rung": "J0",
+    "y": [<number>, ...],
+    "X": [[<number>, ...], ...],        # one row per y entry, one column per coefficientNames entry
+    "coefficientNames": ["Intercept", "judge_provider[T.openai]", "judge_provider:generator_provider[T.same]"],
+    "groups": ["<run id>", ...]         # one per row -- the (1|run) grouping factor
   }
 
 stdout schema (exactly one JSON object, nothing else on stdout -- diagnostics
@@ -61,14 +75,71 @@ def expected_coefficient_names(arm_levels, reference_arm):
     return ["Intercept"] + [f"arm[T.{a}]" for a in others]
 
 
+def fit_judge_score(request):
+    """J0 -- the judge-score lane (issue #80): a MixedLM random intercept on
+    `groups` ((1|run)) over an ALREADY-MATERIALIZED design matrix (X,
+    coefficientNames), never a formula string. Passing X as a pandas
+    DataFrame with columns named exactly `coefficientNames` means
+    result.fe_params.index already comes back in that vocabulary -- unlike
+    fit()'s R0/R1 path, there is no patsy-name remapping step here, because
+    there is no patsy formula in the first place.
+    """
+    import numpy as np
+    import pandas as pd
+    import statsmodels.api as sm
+
+    y = request["y"]
+    X = request["X"]
+    coefficient_names = request["coefficientNames"]
+    groups = request["groups"]
+
+    if not (len(y) == len(X) == len(groups)):
+        raise ValueError("fit_judge_score: y, X, and groups must all be the same length")
+    for row in X:
+        if len(row) != len(coefficient_names):
+            raise ValueError("fit_judge_score: every X row must have len(coefficientNames) columns")
+
+    exog = pd.DataFrame(X, columns=coefficient_names)
+    endog = pd.Series(y, name="y")
+    group_series = pd.Series(groups, name="run")
+
+    # exog_re intentionally omitted: statsmodels.MixedLM defaults an absent
+    # exog_re to a random INTERCEPT only -- exactly (1|run), the registered
+    # pseudoreplication fix (docs/PREREGISTRATION.md Appendix B item 6).
+    model = sm.MixedLM(endog, exog, groups=group_series)
+    result = model.fit(reml=True)
+
+    coefficients = [float(result.fe_params[name]) for name in coefficient_names]
+    cov = result.cov_params()
+    vcov = cov.loc[coefficient_names, coefficient_names].to_numpy().tolist()
+
+    variance_components = {}
+    try:
+        variance_components["run"] = float(np.asarray(result.cov_re)[0][0])
+    except Exception:
+        variance_components["run"] = None
+
+    return {
+        "converged": bool(getattr(result, "converged", False)),
+        "coefficients": coefficients,
+        "coefficientNames": coefficient_names,
+        "vcov": vcov,
+        "varianceComponents": variance_components,
+        "n": int(len(y)),
+        "toolchain": toolchain_versions(),
+    }
+
+
 def fit(request):
     import numpy as np
     import pandas as pd
     import statsmodels.formula.api as smf
 
     rung = request["rung"]
+    if rung == "J0":
+        return fit_judge_score(request)
     if rung not in ("R0", "R1"):
-        raise ValueError(f"fit_mixedlm.py only fits R0/R1 (R2 is pure-Node CR2, R3 is descriptive-only) -- got '{rung}'")
+        raise ValueError(f"fit_mixedlm.py only fits R0/R1/J0 (R2/J1 are pure-Node CR2, R3/J2 are descriptive-only) -- got '{rung}'")
 
     rows = request["rows"]
     arm_levels = request["armLevels"]
