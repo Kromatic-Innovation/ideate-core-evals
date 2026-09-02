@@ -188,6 +188,48 @@ test("a 429 on upload classifies as rate_limited", async () => {
   assert.equal(resp.failureKind, "rate_limited");
 });
 
+// ── payment_required (issue #88) ─────────────────────────────────────────────
+//
+// SIGNATURE PROVENANCE: unlike the Anthropic body in anthropic-batch.test.mjs,
+// this OpenAI body is DOCUMENTATION-DERIVED, not captured from a live refusal
+// -- no OpenAI quota-exhaustion response has ever been observed by this
+// harness. It encodes OpenAI's documented `insufficient_quota` type/code, and
+// the seam to correct if the real body differs is isBillingRefusal() alone.
+//
+// The ordering is the load-bearing half and does NOT depend on the exact
+// string: OpenAI delivers quota exhaustion as a 429, which without a
+// body-keyed check classifies `rate_limited` -- also transient -- so the same
+// march-into-an-unpayable-account exists here through a different door.
+const INSUFFICIENT_QUOTA_429 = {
+  error: {
+    message: "You exceeded your current quota, please check your plan and billing details.",
+    type: "insufficient_quota",
+    param: null,
+    code: "insufficient_quota",
+  },
+};
+
+test("issue #88: a 429 carrying insufficient_quota classifies payment_required, NOT rate_limited", async () => {
+  const provider = makeProvider({ fetchImpl: async () => jsonResponse(429, INSUFFICIENT_QUOTA_429), maxRetries: 2 });
+  const resp = await provider.generate(cellFor("H"), armsConfigJson.arms.H, { mode: "batch" });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "payment_required");
+});
+
+test("issue #88: an OpenAI quota refusal is not retried -- the 429 backoff ladder is skipped", async () => {
+  let calls = 0;
+  const provider = makeProvider({
+    fetchImpl: async () => {
+      calls++;
+      return jsonResponse(429, INSUFFICIENT_QUOTA_429);
+    },
+    maxRetries: 3,
+  });
+  const resp = await provider.generate(cellFor("H"), armsConfigJson.arms.H, { mode: "batch" });
+  assert.equal(resp.failureKind, "payment_required");
+  assert.equal(calls, 1);
+});
+
 test("a batch that reports status 'failed' classifies as transport_error", async () => {
   const provider = makeProvider({
     fetchImpl: async (url, opts) => {

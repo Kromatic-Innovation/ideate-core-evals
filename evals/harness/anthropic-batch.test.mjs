@@ -773,3 +773,79 @@ function routingFetch({ onSubmit, onResults }) {
     throw new Error(`routingFetch: unexpected URL ${u}`);
   };
 }
+
+// ── payment_required (issue #88) ─────────────────────────────────────────────
+//
+// The body below is VERBATIM what POST /v1/messages/batches returned on
+// 2026-09-02 (request_id req_011CeejUhYyYfutJc9YTHFnd) once the account's
+// credit balance hit zero. Before this fix `classifyTransportKind` keyed on
+// status alone and answered `transport_error` -- a TRANSIENT class -- so a dry
+// account read as "a bad afternoon on the wire" (#8's ledger literally said
+// `{transport_error: 20}`) and, post-#90, every cell stayed re-attemptable
+// into the same unpayable wall forever.
+const CREDIT_EXHAUSTED_400 = {
+  type: "error",
+  error: {
+    type: "invalid_request_error",
+    message:
+      "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+  },
+  request_id: "req_011CeejUhYyYfutJc9YTHFnd",
+};
+
+test("issue #88: the real credit-exhaustion 400 classifies payment_required, not transport_error", async () => {
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    fetchImpl: async () => jsonResponse(400, CREDIT_EXHAUSTED_400),
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    maxRetries: 2,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch", timestamp: "2026-08-02T00:00:00Z" });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "payment_required");
+});
+
+test("issue #88: a billing refusal is terminal on the first response -- the backoff ladder is never burned against an account that cannot pay", async () => {
+  let calls = 0;
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    // A 429 carrying the credit signature: retryable BY STATUS. The whole
+    // point of body-keyed detection is that the body overrules the status.
+    fetchImpl: async () => {
+      calls++;
+      return jsonResponse(429, CREDIT_EXHAUSTED_400);
+    },
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    maxRetries: 3,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch", timestamp: "2026-08-02T00:00:00Z" });
+  assert.equal(resp.failureKind, "payment_required", "the body's signature must outrank the 429 status");
+  assert.equal(calls, 1, "a billing refusal must not be retried");
+});
+
+test("issue #88: an ordinary 400 (oversized max_tokens) still classifies transport_error -- 400 alone is not the signal", async () => {
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    fetchImpl: async () =>
+      jsonResponse(400, { type: "error", error: { type: "invalid_request_error", message: "max_tokens: 999999 > 8192" } }),
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    maxRetries: 0,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), armsConfigJson.arms.A, { mode: "batch", timestamp: "2026-08-02T00:00:00Z" });
+  assert.equal(resp.failureKind, "transport_error");
+});

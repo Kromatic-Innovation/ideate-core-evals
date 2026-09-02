@@ -751,7 +751,7 @@ export class AnthropicBatchProvider {
   // ── single mode: POST /v1/messages directly, resolve immediately ─────────
   async #completeSingle(req, { addUsage, classification, diagnostics, cellMaxTokens }) {
     const params = buildAnthropicMessageParams(withCellMaxTokens(req, cellMaxTokens));
-    const { ok, status, json, error } = await anthropicFetchWithRetry(
+    const { ok, status, json, error, errorBody } = await anthropicFetchWithRetry(
       this.fetchImpl,
       "https://api.anthropic.com/v1/messages",
       anthropicHeaders(this.apiKey),
@@ -759,7 +759,7 @@ export class AnthropicBatchProvider {
       { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!ok) {
-      classifyTransportOutcome(status, error, classification);
+      classifyTransportOutcome(status, error, classification, errorBody);
       return { ok: false };
     }
     addUsage(req.model, json.usage);
@@ -857,9 +857,12 @@ export class AnthropicBatchProvider {
       { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!submit.ok) {
-      const kind = classifyTransportKind(submit.status, submit.error);
+      // NB (issue #88): the second argument is the response BODY, never
+      // `submit.error` (which is a thrown fetch Error, not a body) -- feeding
+      // an Error to the billing sniffer would be a category mistake.
+      const kind = classifyTransportKind(submit.status, submit.errorBody);
       for (const entry of batch) {
-        classifyTransportOutcome(submit.status, submit.error, entry.ctx.classification);
+        classifyTransportOutcome(submit.status, submit.error, entry.ctx.classification, submit.errorBody);
         entry.resolve({ ok: false, __failureKind: kind });
       }
       return;
@@ -889,8 +892,8 @@ export class AnthropicBatchProvider {
       );
       if (!poll.ok) {
         for (const entry of batch) {
-          classifyTransportOutcome(poll.status, poll.error, entry.ctx.classification);
-          entry.resolve({ ok: false, __failureKind: classifyTransportKind(poll.status, poll.error) });
+          classifyTransportOutcome(poll.status, poll.error, entry.ctx.classification, poll.errorBody);
+          entry.resolve({ ok: false, __failureKind: classifyTransportKind(poll.status, poll.errorBody) });
         }
         return;
       }
@@ -907,8 +910,8 @@ export class AnthropicBatchProvider {
     );
     if (!results.ok) {
       for (const entry of batch) {
-        classifyTransportOutcome(results.status, results.error, entry.ctx.classification);
-        entry.resolve({ ok: false, __failureKind: classifyTransportKind(results.status, results.error) });
+        classifyTransportOutcome(results.status, results.error, entry.ctx.classification, results.errorBody);
+        entry.resolve({ ok: false, __failureKind: classifyTransportKind(results.status, results.errorBody) });
       }
       return;
     }
@@ -943,9 +946,22 @@ export class AnthropicBatchProvider {
         );
       } else if (row.result && row.result.type === "errored") {
         const err = row.result.error || {};
-        if (err.type === "rate_limit_error") entry.ctx.classification.rateLimited = true;
+        // A per-row error carries the same `{type, message}` shape as a
+        // top-level one, so a credit refusal can surface HERE too (a batch
+        // submitted while funded whose rows are processed after the balance
+        // hits zero). Wrap it in the `{error: ...}` envelope isBillingRefusal
+        // reads (issue #88).
+        if (isBillingRefusal(undefined, { error: err })) entry.ctx.classification.paymentRequired = true;
+        else if (err.type === "rate_limit_error") entry.ctx.classification.rateLimited = true;
         else entry.ctx.classification.transportError = true;
-        entry.resolve({ ok: false, __failureKind: err.type === "rate_limit_error" ? "rate_limited" : "transport_error" });
+        entry.resolve({
+          ok: false,
+          __failureKind: isBillingRefusal(undefined, { error: err })
+            ? "payment_required"
+            : err.type === "rate_limit_error"
+              ? "rate_limited"
+              : "transport_error",
+        });
       } else {
         // "canceled" / "expired" / anything else Anthropic might add later --
         // treat as a transport-classified failure for this entry, never throw.
@@ -1100,41 +1116,162 @@ export async function anthropicFetchWithRetry(fetchImpl, url, headers, body, { m
     }
 
     lastStatus = res.status;
-    const retryable = res.status === 429 || res.status >= 500;
+    // issue #88: read the body BEFORE deciding whether to retry. A billing
+    // refusal can arrive on a status that is otherwise retryable (OpenAI's
+    // quota exhaustion is a 429), and burning the full backoff ladder against
+    // an account that cannot pay is exactly the futile retry this fixes.
+    const errorBody = await readErrorBody(res);
+    const billing = isBillingRefusal(res.status, errorBody);
+    const retryable = !billing && (res.status === 429 || res.status >= 500);
     if (retryable && attempt < maxRetries) {
       if (logger) logger(`anthropicFetchWithRetry: HTTP ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying`);
       await sleep(backoffMs(attempt));
       continue;
     }
-    return { ok: false, status: res.status, error: undefined };
+    if (billing && logger) logger(`anthropicFetchWithRetry: HTTP ${res.status} is a billing/credit refusal -- not retrying`);
+    return { ok: false, status: res.status, error: undefined, errorBody };
   }
   return { ok: false, status: lastStatus, error: lastError };
+}
+
+/**
+ * Best-effort read of a non-ok response's body (issue #88), so
+ * `isBillingRefusal()` has a signature to key on. A `Response` body is
+ * single-use, so exactly ONE read path is taken: `text()` when it exists
+ * (then parsed as JSON if it parses), otherwise `json()`.
+ *
+ * Never throws and never rejects: a fake fetch with neither method, a body
+ * already consumed, a truncated stream — all answer `undefined`, and the
+ * caller falls back to status-only classification exactly as before. Making a
+ * diagnostic read able to break a request would be a worse bug than the one
+ * it exists to fix.
+ */
+async function readErrorBody(res) {
+  try {
+    if (res && typeof res.text === "function") {
+      const text = await res.text();
+      if (typeof text !== "string" || text === "") return undefined;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    }
+    if (res && typeof res.json === "function") return await res.json();
+  } catch {
+    // fall through
+  }
+  return undefined;
 }
 
 function backoffMs(attempt) {
   return 2 ** attempt * 100; // 100ms, 200ms, 400ms, ... -- tests inject a no-op sleep so this never actually delays a test
 }
 
-/** Mutate `classification` in place based on a failed fetch's status/error. */
-export function classifyTransportOutcome(status, error, classification) {
-  if (status === 429) classification.rateLimited = true;
+// ── Billing / credit refusals (issue #88) ──────────────────────────────
+//
+// "The account cannot pay" arrives wearing an ordinary HTTP status. Observed
+// live 2026-09-02 on POST /v1/messages/batches (request_id
+// req_011CeejUhYyYfutJc9YTHFnd):
+//
+//   HTTP 400
+//   {"type":"error","error":{"type":"invalid_request_error",
+//    "message":"Your credit balance is too low to access the Anthropic API.
+//               Please go to Plans & Billing to upgrade or purchase credits."},
+//    "request_id":"req_011CeejUhYyYfutJc9YTHFnd"}
+//
+// 400 is far too overloaded to key on — a malformed request, an oversized
+// max_tokens and an unfunded account all land there — so detection reads the
+// response BODY's error signature. That is also why both fetch helpers below
+// now capture `errorBody` on a non-ok response: without it there is nothing to
+// key on and the refusal is indistinguishable from a 5xx.
+
+/** Lowercased message text out of an Anthropic- or OpenAI-shaped error body. */
+function errorBodyMessage(body) {
+  if (typeof body === "string") return body.toLowerCase();
+  if (!body || typeof body !== "object") return "";
+  const err = body.error;
+  const msg = err && typeof err === "object" ? err.message : body.message;
+  return typeof msg === "string" ? msg.toLowerCase() : "";
+}
+
+/** Lowercased `error.type` / `error.code` out of an error body, as one string. */
+function errorBodyCodes(body) {
+  if (!body || typeof body !== "object") return "";
+  const err = body.error;
+  if (!err || typeof err !== "object") return "";
+  return [err.type, err.code].filter((v) => typeof v === "string").join(" ").toLowerCase();
+}
+
+/**
+ * True when a failed response is the provider saying "this account cannot pay".
+ *
+ * Keyed on the body, never on `status` alone. Deliberately tolerant of junk
+ * input (an `Error` from a rejected fetch, a `undefined` body from a helper
+ * that could not read one, a raw text body) — every one of those answers
+ * `false` rather than throwing, because a detector that can crash the
+ * classifier is worse than the misclassification it exists to fix.
+ *
+ * @param {number|undefined} status
+ * @param {object|string|undefined} errorBody parsed JSON body, or raw text
+ */
+export function isBillingRefusal(status, errorBody) {
+  if (errorBody instanceof Error) return false;
+  const message = errorBodyMessage(errorBody);
+  const codes = errorBodyCodes(errorBody);
+
+  // ── Anthropic: CAPTURE-VERIFIED against the response quoted above. ──────
+  // `invalid_request_error` + a credit/billing message. Matching the message
+  // (not the type, which is generic) is what keeps an ordinary malformed-body
+  // 400 out of this bucket.
+  if (/credit balance is too low/.test(message)) return true;
+  if (/plans\s*&\s*billing/.test(message)) return true;
+
+  // ── OpenAI: DOCUMENTATION-DERIVED, NOT capture-verified. ────────────────
+  // No OpenAI quota-exhaustion response has been captured from this harness,
+  // and nothing in this repo's results/ holds one. OpenAI documents the
+  // condition as `type`/`code` `insufficient_quota` ("You exceeded your
+  // current quota, please check your plan and billing details"), delivered
+  // as HTTP **429** — which today classifies `rate_limited`, also transient,
+  // so the same march-into-the-wall exists on that side through a different
+  // door. This is the seam: if the real body turns out to differ, this is the
+  // one function to correct, and the runner/accounting halves need no change.
+  if (/insufficient_quota/.test(codes)) return true;
+  if (/exceeded your current quota/.test(message)) return true;
+  if (/check your plan and billing details/.test(message)) return true;
+
+  return false;
+}
+
+/**
+ * Mutate `classification` in place based on a failed fetch's status/error.
+ * `errorBody` (issue #88) is the parsed response body when the helper could
+ * read one; a billing refusal outranks every other signal.
+ */
+export function classifyTransportOutcome(status, error, classification, errorBody) {
+  if (isBillingRefusal(status, errorBody)) classification.paymentRequired = true;
+  else if (status === 429) classification.rateLimited = true;
   else classification.transportError = true;
 }
 
 /** Same signal as classifyTransportOutcome, but returned as a FAILURE_KINDS value. */
-export function classifyTransportKind(status) {
+export function classifyTransportKind(status, errorBody) {
+  if (isBillingRefusal(status, errorBody)) return "payment_required";
   return status === 429 ? "rate_limited" : "transport_error";
 }
 
 /**
  * Pick the most specific failure kind observed during this cell's calls,
  * falling back to `fallback` when nothing more specific was recorded.
- * Precedence: timeout > rate_limited > transport_error > fallback -- a
- * timeout is the most actionable/specific signal when multiple flags got
- * set (e.g. a batch that both saw a transient 429 AND then blew the poll
- * ceiling should report timeout, not rate_limited).
+ * Precedence: payment_required > timeout > rate_limited > transport_error >
+ * fallback. `payment_required` outranks even `timeout` (issue #88): every
+ * other flag describes the weather, while an unfunded account is the single
+ * fact that explains the whole run and is the one the runner aborts on. A
+ * cell that both blew the poll ceiling AND saw a credit refusal must report
+ * the refusal, or the abort never fires.
  */
 export function pickFailureKind(classification, fallback) {
+  if (classification.paymentRequired) return "payment_required";
   if (classification.timedOut) return "timeout";
   if (classification.rateLimited) return "rate_limited";
   if (classification.transportError) return "transport_error";
@@ -1295,7 +1432,7 @@ export class OpenAIBatchProvider {
   // ── single mode: POST /v1/chat/completions directly ──────────────────────
   async #completeSingle(req, { addUsage, classification, diagnostics, cellMaxTokens }) {
     const params = buildOpenAIChatParams(withCellMaxTokens(req, cellMaxTokens));
-    const { ok, status, json, error } = await openaiFetchWithRetry(
+    const { ok, status, json, error, errorBody } = await openaiFetchWithRetry(
       this.fetchImpl,
       "https://api.openai.com/v1/chat/completions",
       openaiHeaders(this.apiKey),
@@ -1303,7 +1440,7 @@ export class OpenAIBatchProvider {
       { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!ok) {
-      classifyTransportOutcome(status, error, classification);
+      classifyTransportOutcome(status, error, classification, errorBody);
       return { ok: false };
     }
     addUsage(req.model, json.usage);
@@ -1386,9 +1523,9 @@ export class OpenAIBatchProvider {
       { formData: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
     );
     if (!upload.ok) {
-      const kind = classifyTransportKind(upload.status);
+      const kind = classifyTransportKind(upload.status, upload.errorBody);
       for (const entry of batch) {
-        classifyTransportOutcome(upload.status, upload.error, entry.ctx.classification);
+        classifyTransportOutcome(upload.status, upload.error, entry.ctx.classification, upload.errorBody);
         entry.resolve({ ok: false, __failureKind: kind });
       }
       return;
@@ -1404,8 +1541,8 @@ export class OpenAIBatchProvider {
     );
     if (!create.ok) {
       for (const entry of batch) {
-        classifyTransportOutcome(create.status, create.error, entry.ctx.classification);
-        entry.resolve({ ok: false, __failureKind: classifyTransportKind(create.status) });
+        classifyTransportOutcome(create.status, create.error, entry.ctx.classification, create.errorBody);
+        entry.resolve({ ok: false, __failureKind: classifyTransportKind(create.status, create.errorBody) });
       }
       return;
     }
@@ -1437,8 +1574,8 @@ export class OpenAIBatchProvider {
       );
       if (!poll.ok) {
         for (const entry of batch) {
-          classifyTransportOutcome(poll.status, poll.error, entry.ctx.classification);
-          entry.resolve({ ok: false, __failureKind: classifyTransportKind(poll.status) });
+          classifyTransportOutcome(poll.status, poll.error, entry.ctx.classification, poll.errorBody);
+          entry.resolve({ ok: false, __failureKind: classifyTransportKind(poll.status, poll.errorBody) });
         }
         return;
       }
@@ -1455,8 +1592,8 @@ export class OpenAIBatchProvider {
     );
     if (!results.ok) {
       for (const entry of batch) {
-        classifyTransportOutcome(results.status, results.error, entry.ctx.classification);
-        entry.resolve({ ok: false, __failureKind: classifyTransportKind(results.status) });
+        classifyTransportOutcome(results.status, results.error, entry.ctx.classification, results.errorBody);
+        entry.resolve({ ok: false, __failureKind: classifyTransportKind(results.status, results.errorBody) });
       }
       return;
     }
@@ -1486,6 +1623,14 @@ export class OpenAIBatchProvider {
             diagnostics: entry.ctx.diagnostics,
           }),
         );
+      } else if (isBillingRefusal(resp && resp.status_code, (resp && resp.body) || row.error)) {
+        // issue #88 -- a per-row quota refusal. On the OpenAI side this is
+        // the SAME status (429) as an ordinary rate limit, so the body's
+        // signature is the only thing that tells them apart; see
+        // isBillingRefusal's own note that this signature is
+        // documentation-derived rather than capture-verified.
+        entry.ctx.classification.paymentRequired = true;
+        entry.resolve({ ok: false, __failureKind: "payment_required" });
       } else if (resp && resp.status_code === 429) {
         entry.ctx.classification.rateLimited = true;
         entry.resolve({ ok: false, __failureKind: "rate_limited" });
@@ -1601,13 +1746,20 @@ export async function openaiFetchWithRetry(fetchImpl, url, headers, body, { meth
       return raw ? { ok: true, text: await res.text() } : { ok: true, json: await res.json() };
     }
     lastStatus = res.status;
-    const retryable = res.status === 429 || res.status >= 500;
+    // issue #88 -- same body-before-retry order as anthropicFetchWithRetry,
+    // and it matters MORE here: OpenAI delivers quota exhaustion as a 429,
+    // which without this check retries the full ladder and then classifies
+    // `rate_limited` (transient), so every remaining cell marches into it.
+    const errorBody = await readErrorBody(res);
+    const billing = isBillingRefusal(res.status, errorBody);
+    const retryable = !billing && (res.status === 429 || res.status >= 500);
     if (retryable && attempt < maxRetries) {
       if (logger) logger(`openaiFetchWithRetry: HTTP ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying`);
       await sleep(backoffMs(attempt));
       continue;
     }
-    return { ok: false, status: res.status, error: undefined };
+    if (billing && logger) logger(`openaiFetchWithRetry: HTTP ${res.status} is a billing/quota refusal -- not retrying`);
+    return { ok: false, status: res.status, error: undefined, errorBody };
   }
   return { ok: false, status: lastStatus, error: lastError };
 }

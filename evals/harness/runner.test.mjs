@@ -2017,3 +2017,125 @@ test("issue #90: the run summary tells an operator that environmental failures a
   assert.match(notice, /rate_limited=1/);
   assert.match(notice, /re-run/, "and must say what to do about them");
 });
+
+// ── issue #88: a payment failure aborts the remaining plan ───────────────────
+//
+// Before this, an Anthropic credit-exhaustion 400 classified transport_error
+// -- a TRANSIENT kind -- so #8's ledger read `{transport_error: 20}` on a dry
+// account (a bad night on the wire, apparently) and, post-#90, none of those
+// cells were stored, so the next run cheerfully re-attempted all 20 into the
+// same unpayable wall. On a ~200-cell grid that is a loop, not a waste.
+//
+// The three properties under test, in the order they matter:
+//   1. the run STOPS -- the provider is not called again;
+//   2. every remaining cell still reaches exactly ONE terminal state, a
+//      classified skip, so reconcile() passes;
+//   3. money already spent by cells that completed BEFORE the wall survives.
+
+/** A 4-brief, 1-arm spec: enough cells to have a "before" and an "after". */
+const PAYMENT_SPEC = {
+  arms: [{ id: "A" }],
+  briefs: [{ id: "b1" }, { id: "b2" }, { id: "b3" }, { id: "b4" }],
+  replicates: 1,
+  config: CFG,
+};
+
+/** Override the SECOND planned todo cell (whatever planRun's order puts there)
+ *  with the provider-side classification of a credit refusal. */
+function paymentAbortFixture(store) {
+  const plan = planRun(PAYMENT_SPEC, store.keys());
+  const wallKey = plan.todo[1].key;
+  const overrides = new Map([
+    [
+      wallKey,
+      {
+        terminalState: "failed",
+        failureKind: "payment_required",
+        detail: "AnthropicBatchProvider: Your credit balance is too low to access the Anthropic API.",
+      },
+    ],
+  ]);
+  return { plan, wallKey, provider: new MockProvider({ overrides }) };
+}
+
+test("issue #88: a payment_required failure aborts the plan -- the provider is never called for the remaining cells", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const { plan, wallKey, provider } = paymentAbortFixture(store);
+  assert.equal(plan.todo.length, 4);
+
+  const { summary, account } = await runSpec(PAYMENT_SPEC, { store, armsConfig: ARMS_CONFIG, provider, log: silentLog });
+
+  // (1) THE assertion. Without it this test passes even if the runner marched
+  // every cell into the wall and merely relabelled the outcomes.
+  assert.deepEqual(
+    provider.calls.map((c) => c.key),
+    [plan.todo[0].key, wallKey],
+    "exactly two calls: the one that completed and the one that hit the wall -- nothing after",
+  );
+
+  // (2) Every planned cell is still terminal, so reconcile() passes.
+  assert.doesNotThrow(() => account.reconcile());
+  assert.equal(summary.planned, 4);
+  assert.equal(summary.completed, 1);
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.skipped, 2);
+  assert.deepEqual(summary.byKind, { payment_required: 1 });
+  // The skip category (RunAccount groups on the text before the first colon)
+  // keeps `skipped=2` from being an undifferentiated count.
+  assert.deepEqual(summary.skippedByReason, { payment_required: 2 });
+  assert.equal(summary.paymentAbort.cellKey, wallKey);
+  assert.equal(summary.paymentAbort.skipped, 2);
+});
+
+test("issue #88: the abort preserves the ledger -- spend from cells that completed before the wall, and from the failing attempt itself, both survive", async (t) => {
+  const dir = tempDir(t);
+  const store = new ResultsStore(dir);
+  const { plan, wallKey, provider } = paymentAbortFixture(store);
+  const completedKey = plan.todo[0].key;
+
+  const { account } = await runSpec(PAYMENT_SPEC, { store, armsConfig: ARMS_CONFIG, provider, log: silentLog });
+
+  // The completed cell is durable under its own key -- aborting must never
+  // roll back work already paid for.
+  assert.equal(store.has(completedKey), true, "the cell that completed before the wall is still stored");
+  assert.ok(store.get(completedKey).costRows.length > 0);
+  assert.ok(
+    account.ledger.some((r) => r.cellKey === completedKey),
+    "and its cost rows are on this invocation's ledger",
+  );
+
+  // The failing cell is store-ABSENT under cell.key (an empty credit balance
+  // is not a fact about the arm) but its spend is durable attempt-scoped.
+  assert.equal(store.has(wallKey), false, "a payment failure must not brick the cell");
+  const attempt = store.get(`generation-attempt|cell=${wallKey}|attempt=0`);
+  assert.equal(attempt.accounting.kind, "payment_required");
+
+  // Priced through the real cumulative reader, not by reading bodies -- the
+  // money has to be visible where ceilings are actually enforced.
+  assert.ok(spendToDate(store).totalUsd > 0, "the pre-abort spend is priced and counts against cumulative ceilings");
+
+  // And the skipped cells are store-absent too, so funding the account and
+  // re-running picks up exactly where this stopped.
+  const plan2 = planRun(PAYMENT_SPEC, new ResultsStore(dir).keys());
+  assert.deepEqual(
+    plan2.todo.map((c) => c.key).sort(),
+    plan.todo.slice(1).map((c) => c.key).sort(),
+    "every cell except the one that completed is planned todo again",
+  );
+});
+
+test("issue #88: the abort is announced separately from the 're-run the same command' retryable notice", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const { provider } = paymentAbortFixture(store);
+  const lines = [];
+  await runSpec(PAYMENT_SPEC, { store, armsConfig: ARMS_CONFIG, provider, log: (m) => lines.push(m) });
+
+  const abort = lines.find((l) => l.includes("ABORTED"));
+  assert.ok(abort, "an operator must be told the account went dry, not left to read `failed=1` and guess");
+  assert.match(abort, /billing\/credit/);
+  assert.match(abort, /2 remaining cell\(s\) were skipped/);
+  assert.match(abort, /fund the account/, "the action differs from a rate-limited night: fund, THEN re-run");
+  // The transient notice ("re-run the same command") must NOT claim this
+  // failure -- it is wrong advice while the balance is zero.
+  assert.equal(lines.some((l) => l.includes("were NOT stored under their cell keys")), false);
+});
