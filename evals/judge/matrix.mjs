@@ -141,3 +141,48 @@ export function buildJudgeMatrix(pools, { judgeModels } = {}) {
   }
   return rows;
 }
+
+/**
+ * `judgeLegsFor` (issue #63 fix round) — a `lib/price.mjs:runnerPriceGrid`
+ * `judgeLegsFor(cell, arm)` adapter. `lib/` cannot import this module (the
+ * lib-vs-evals layering rule lib/price.mjs's own header states), so the
+ * pre-flight pricer takes the resolved legs as an injected callback instead
+ * of re-deriving judge selection itself. This factory is that callback,
+ * built ONCE (closing over `judgeModels`/`panelConfig`) and handed to
+ * `runnerPriceGrid` — see evals/run.mjs's wiring.
+ *
+ * Resolves each planned cell's TWO judge legs via buildJudgeMatrix's own
+ * pickDistinctJudge selection (never a second, divergent selection rule) --
+ * a cell whose arm has already exhausted every candidate for a provider
+ * throws here exactly as it would in the real judging pass, so the
+ * pre-flight can't project a cost for a matrix that would fail to schedule.
+ *
+ * `candidateCount` estimates the pool size runnerPriceGrid's token-based
+ * judge pricing scales by: `panelConfig.size * panelConfig.ideasPerAgent`
+ * for a panel arm, or `arm.totalIdeasRequested` for a solo arm (both are 30
+ * in this study's arms.config.json today — the file's own header comment:
+ * every arm is "matched on total ideas requested"). This is the RAW
+ * generated idea count, not a validated post-dedup pool size — see
+ * lib/price.mjs's JUDGE_POOL_SIZE_FALLBACK comment for the same caveat.
+ *
+ * @param {object} o
+ *   @param {{anthropic:string[], openai:string[]}} o.judgeModels  same shape
+ *     buildJudgeMatrix takes -- candidate judge models per provider.
+ *   @param {{size:number, ideasPerAgent:number}} o.panelConfig  arms.config.json's
+ *     top-level `panel` block (fixed across every panel arm in this study).
+ * @returns {(cell:{key:string, armId:string}, arm:object) => Array<{model:string, provider:string, candidateCount:number}>}
+ */
+export function judgeLegsFor({ judgeModels, panelConfig }) {
+  if (!judgeModels || typeof judgeModels !== "object") {
+    throw new Error("judgeLegsFor: judgeModels ({ anthropic: [...], openai: [...] }) is required");
+  }
+  if (!panelConfig || typeof panelConfig.size !== "number" || typeof panelConfig.ideasPerAgent !== "number") {
+    throw new Error("judgeLegsFor: panelConfig ({ size, ideasPerAgent }, arms.config.json's top-level `panel` block) is required");
+  }
+  return function legsFor(cell, arm) {
+    const armWithId = { id: cell.armId, ...arm };
+    const rows = buildJudgeMatrix([{ poolKey: cell.key, arm: armWithId }], { judgeModels });
+    const candidateCount = arm.mode === "solo" && typeof arm.totalIdeasRequested === "number" ? arm.totalIdeasRequested : panelConfig.size * panelConfig.ideasPerAgent;
+    return rows.map((r) => ({ model: r.judge_model, provider: r.judge_provider, candidateCount }));
+  };
+}

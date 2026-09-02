@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { providerOf, buildJudgeMatrix } from "./matrix.mjs";
+import { providerOf, buildJudgeMatrix, judgeLegsFor } from "./matrix.mjs";
 import { providerOf as providerOfFromPrice } from "../../lib/price.mjs";
 import { assertEvaluatorDistinct } from "./distinct.mjs";
 import { JUDGE_MODELS as REGISTERED_JUDGE_MODELS } from "./config.mjs";
@@ -150,4 +150,43 @@ test("throws on malformed input", () => {
   assert.throws(() => buildJudgeMatrix("not-an-array", { judgeModels: JUDGE_MODELS }), /pools must be an array/);
   assert.throws(() => buildJudgeMatrix([{ poolKey: "x", arm: ARM_B }], {}), /judgeModels.*required/);
   assert.throws(() => buildJudgeMatrix([{ arm: ARM_B }], { judgeModels: JUDGE_MODELS }), /poolKey, arm/);
+});
+
+// ── judgeLegsFor: the lib/price.mjs runnerPriceGrid adapter (issue #63 fix round) ──
+const PANEL_CONFIG = ARMS_CONFIG.panel; // { size: 5, ideasPerAgent: 6, ... }
+
+test("judgeLegsFor resolves the SAME two legs buildJudgeMatrix would schedule for a pool, never a second selection rule", () => {
+  const legsFor = judgeLegsFor({ judgeModels: REGISTERED_JUDGE_MODELS, panelConfig: PANEL_CONFIG });
+  const cell = { key: "arm=B|brief=b1", armId: "B" };
+  const arm = ARMS_CONFIG.arms.B;
+  const legs = legsFor(cell, arm);
+
+  const expectedRows = buildJudgeMatrix([{ poolKey: cell.key, arm: { id: cell.armId, ...arm } }], { judgeModels: REGISTERED_JUDGE_MODELS });
+  assert.equal(legs.length, 2);
+  const byProvider = Object.fromEntries(legs.map((l) => [l.provider, l.model]));
+  const expectedByProvider = Object.fromEntries(expectedRows.map((r) => [r.judge_provider, r.judge_model]));
+  assert.deepEqual(byProvider, expectedByProvider);
+});
+
+test("judgeLegsFor's candidateCount matches panel.size x panel.ideasPerAgent for a panel arm", () => {
+  const legsFor = judgeLegsFor({ judgeModels: REGISTERED_JUDGE_MODELS, panelConfig: PANEL_CONFIG });
+  const legs = legsFor({ key: "arm=B|brief=b1", armId: "B" }, ARMS_CONFIG.arms.B);
+  const expected = PANEL_CONFIG.size * PANEL_CONFIG.ideasPerAgent;
+  for (const leg of legs) assert.equal(leg.candidateCount, expected);
+});
+
+test("judgeLegsFor's candidateCount uses totalIdeasRequested for a solo arm", () => {
+  const legsFor = judgeLegsFor({ judgeModels: REGISTERED_JUDGE_MODELS, panelConfig: PANEL_CONFIG });
+  const legs = legsFor({ key: "arm=A|brief=b1", armId: "A" }, ARMS_CONFIG.arms.A);
+  for (const leg of legs) assert.equal(leg.candidateCount, ARMS_CONFIG.arms.A.totalIdeasRequested);
+});
+
+test("judgeLegsFor throws for an arm that exhausts every candidate, exactly like buildJudgeMatrix (the pre-flight can't project a cost for a matrix that would fail to schedule)", () => {
+  const legsFor = judgeLegsFor({ judgeModels: { anthropic: ["claude-sonnet-5"], openai: ["gpt-5.6-terra"] }, panelConfig: PANEL_CONFIG });
+  assert.throws(() => legsFor({ key: "arm=H|brief=b1", armId: "H" }, ARMS_CONFIG.arms.H), /no distinct openai judge available/);
+});
+
+test("judgeLegsFor requires judgeModels and panelConfig", () => {
+  assert.throws(() => judgeLegsFor({ panelConfig: PANEL_CONFIG }), /judgeModels.*required/);
+  assert.throws(() => judgeLegsFor({ judgeModels: REGISTERED_JUDGE_MODELS }), /panelConfig.*required/);
 });
