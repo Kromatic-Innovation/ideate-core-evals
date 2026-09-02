@@ -40,9 +40,11 @@ The app takes an arbitrary user brief, so we cannot eval "the prompt." We hold t
 | --- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | B1  | **Audit finding IC-01** (duplicate candidate IDs when agents share a persona) | Mixed-tier arms (E, F, G) assign the same persona to different models. At the original SHA that collides IDs and **silently deletes candidates downstream** (verified: 7 in → 5 out). Every diversity metric would be computed on a silently truncated pool, biased _against_ the mixed arms — i.e. it would fake a result. Fix = the verified one-liner in the audit (`ctx.temperature` → `ctx.agentId`). **✅ CLOSED — `ideate-core#87`, 2026-07-31; shipped in `ideate-core@0.4.0`** (Appendix A, item 2). |
 | B2  | **`temperature` is rejected by current frontier models**                      | Opus 5, Sonnet 5, Opus 4.8/4.7 and Fable 5 return **HTTP 400** if `temperature` is sent. `DEFAULT_PERSONAS` sets `temperature: 0.4…1.0` and `safeComplete` forwards it. Haiku 4.5 still accepts it. So a mixed haiku/sonnet/opus panel **400s on 3 of 5 agents** unless the adapter strips the parameter per-model. See §3.3. **✅ CLOSED — `ideate-core#89`, 2026-07-31; `ideate-core@0.4.0` exports the strip-and-warn helper at `ideate-core/integrations/sampling-params`** (Appendix A, item 2).         |
-| B3  | **No token accounting in ideate-core**                                        | The cost ledger (§7) needs per-call token counts. The engine currently discards the provider's `usage` object entirely. The adapter must capture it (no core change required — the adapter owns the client). **⏳ Still OPEN — correctly homed in the adapter: closes when the generation adapter captures `usage`** (Appendix A, item 2).                                                                                                                                                                    |
+| B3  | **No token accounting in ideate-core**                                        | The cost ledger (§7) needs per-call token counts. The engine currently discards the provider's `usage` object entirely. The adapter must capture it (no core change required — the adapter owns the client). **✅ CLOSED, with two named exceptions — `#53`'s routing audit; see [Appendix B, item 4](#appendix-b--amendments-dated-2026-09-01)**.                                                                                                                                                            |
 
 B2 is also a **finding about the library**, not just the eval: ideate-core documents temperature as a per-agent diversity lever, and that lever is now unavailable on most current Anthropic models. Persona is the only surviving structural lever — which happens to be what the literature says is stronger anyway (Wang et al. 2023), but the docs should say "unavailable on current frontier models," not present it as a live knob. _(2026-08-02: `ideate-core` now has **zero** open issues — the 20-finding audit `ideate-core#86` that produced B1 and B2 is fully remediated, including its two cross-repo template items. See Appendix A, item 2.)_
+
+> _Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 4). B3 above is marked CLOSED, conditional on `#53`'s routing audit (merged `#56`) fixing a real judge-validation metering bypass. Two exceptions are named and remain residual threats, not closed: (1) a client-side batch-poll timeout can leave a still-billing server-side batch unaccounted; (2) `ideate-core`'s opt-in evaluator/embedder hooks are unwired today but would need explicit metering if enabled. See the appendix item for the full record._
 
 ---
 
@@ -94,6 +96,8 @@ Held constant across arms. Stratified so results generalize across task type, no
 
 Briefs are **frozen and hashed** into the run manifest. Adding a brief mid-study invalidates the pre-registration.
 
+> _Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 13). The corpus above (n = 12, 4/3/3/2 per stratum) is expanded to **24 briefs, 6 per stratum** (`evals/corpus/briefs.mjs`, issue #43), corpus hash `55e05c2811a7`. The 3 original scientific keywords are preserved as an exact prefix under the same seed — only 3 additional scientific briefs were appended, none re-rolled. Business and product-stratum briefs are authored by the product's owner — disclosed here. See the appendix for the full record._
+
 ### 3.3 Held constant (and the awkward part)
 
 Same prompt builders, same `ideasPerAgent`, same personas, same rounds, same embedder, same judge panel, same seed for all non-model randomness.
@@ -141,6 +145,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 | **Fluency / Flexibility**     | LiveIdeaBench axes: valid candidates emitted; distinct categories covered                      |
 
 > _Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), items 1–2). Novelty/Feasibility's registered scale was 1–5; the judge implementation (`evals/judge/prompt.mjs`) scores 1–10, and the code is kept (more resolution, the gate is rank-based) rather than narrowed to match this table. Fluency/Flexibility are POOL properties (count of valid candidates, breadth of distinct categories), not per-idea judgments — a per-idea judge scoring them was never coherent (it sees one candidate at a time, never the pool) — moved to §4.1 as operational metrics. See the appendix for the full record._
+>
+> _Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 11). The OCSAI row above is demoted: no longer a registered comparator with claimed calibration, registered instead as exploratory, relative-ordering only, obtained under a self-imposed conservative throttle (issue #17). Report request count, throttle, and date alongside any OCSAI number. See the appendix for the full record._
 
 ### 4.3 Operational (the ones that bite in production)
 
@@ -162,6 +168,8 @@ A study that can't fail its own sanity checks isn't measuring anything.
 | **Random-text pool** — 30 unrelated sentences                                   | `distinct_k` ≈ 30, diversity near max                | Metric saturation / clustering collapse |
 | **Shuffled-label control** — judge the same pool twice with arm labels permuted | No score difference                                  | Label leakage into the judge            |
 | **DAT replication**                                                             | Reproduces published DAT ordering on its normed data | Embedding pipeline validity (§2)        |
+
+> _Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 12). The shuffled-label control above is vacuous by construction — `deidentify.mjs` enforces that the judge never sees arm/model/persona labels, so permuting labels it never receives cannot change its score. Replaced with a judge test-retest repeatability control: the same de-identified pool scored twice, reporting test-retest ρ. See the appendix for the full record._
 
 ---
 
@@ -511,3 +519,165 @@ Per the amendment rule at the top of this document. **Nothing in §6 is changed 
 | After (`liveideabench-2axis-v2`)  | `6bd11b4fceb4`      |
 
 **Consequence, registered in advance.** `judgeHash` is a `CONFIG_FIELDS` entry (`lib/manifest.mjs`), so `judgePromptHash` feeding `computeJudgeHash` changes `judgeHash`, which changes every run's `configHash`, which changes every `cellKey` (§11). This is **correct and intended** — the rubric genuinely changed, and the whole point of hashing it into `configHash` is that a rubric change must not be silently pooled with cells scored under the old rubric. Per `planRun`, any pre-existing stored cell keyed under the old `configHash` becomes `stale` rather than being reused. **Impact today is nil** — no data has been collected under either hash — but the record is the deliverable: this is what a reader checking whether the code matches the registration should find.
+
+### Item 4 — §1: blocker B3 closed, with two named exceptions (issue #44 item B1)
+
+**What changed.** §1's blocker **B3** ("No token accounting in ideate-core") is marked **CLOSED**, conditional on **#53**'s routing audit, with two named exceptions carried forward as residual threats rather than closed away.
+
+**Why.** #53 traced provider calls into `ideate-core@0.4.0` and found a real, now-fixed bypass: `runJudgeValidation` (`evals/judge/validate.mjs`) called `judgeProvider.score()` without metering, so the §8.3 Phase 1 judge-validation spend would have been billed but absent from the ledger — fixed on every call path, including the failure path (merged **#53** → **#56**, commit `5a5e273`). Round-1/round-2 `safeComplete` calls inside `ideate-core` route through `deps.complete` → `addUsage`, so the multi-agent overhead H1 measures is accounted. The Anthropic adapter accumulates `input_tokens`/`output_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens` into `tokens_by_model` on every path including failures (`evals/harness/provider.mjs`), and `lib/accounting.mjs:costRow()` refuses a row that cannot be repriced.
+
+**Two named exceptions, not closed by the above:**
+
+1. **Batch-poll timeout.** A client-side batch-poll timeout can return control to the caller while a submitted batch is still billing server-side. That spend is real and eventually appears at the provider, but the harness's own ledger has no row for it until (if ever) it polls again. Not a defect in the fix above — a residual gap in what client-side polling can observe.
+2. **Unwired opt-in hooks.** `ideate-core`'s opt-in evaluator/embedder hooks are unwired in this study today (we call the generation path only). If they are ever enabled, they would need explicit metering of their own — nothing in the current audit covers a code path that isn't exercised.
+
+This entry does not independently re-verify #53's provider-call trace (reported from that PR's diff and its merge to `develop`, reproducible there).
+
+### Item 5 — §6.1/§6.2: H2 and H4 register the one-sided δ = 0 test; no margin is registered (issue #44 item B2)
+
+**What changed.** §6.1 registers H2 as **"E ≥ D"** and H4 as **"B ≥ D"** — a direction, with **no numeric margin anywhere in §6.1 or §6.2**. This entry registers the faithful reading of that text: the **one-sided δ = 0 test** (H0: difference ≤ 0), structurally identical to H3's IUT sub-contrasts, tested at α = 0.025 one-sided within the Holm family (§6.2). **No pilot-derived margin is registered here or implied by the existing text.** An earlier draft of this appendix treated a pilot-derived δ as though it were already the registered reading of "≥" — it was not; §6.1/§6.2 as written contain no margin. If a margin is ever wanted, that is a **separate, dated amendment**, made explicitly (the registration contained no margin, a margin is being added, with the derivation stated) — not folded into this entry.
+
+`evals/analysis/contrasts.mjs` implements this: `buildRegisteredFamily()` runs **δ = 0 as the registered default** for both H2 and H4. A caller-supplied non-zero δ is accepted but recorded on the result as `deltaDeviatesFromRegistration: true` (and rendered as "DEVIATES from registration" in `report.mjs`), so the artifact and the registration stay in agreement — a run with an explicit δ is legible as a deviation, never silently absorbed as the default.
+
+**H1 restated as a single registered contrast.** §6.1 registers H1 as "any panel arm > Arm A" — an uncorrected 8-way maximum, since a "best of 8" comparison is not a single test. H1 is restated here as **one registered contrast: mean(panel arms) − Arm A**, tested once within the Holm family. Per-arm comparisons (armX − Arm A for one arm at a time) move to the **exploratory** section (§6.3), Benjamini–Hochberg corrected, and are never folded into the confirmatory Holm family. `evals/analysis/contrasts.mjs` implements the single mean-of-panel-arms contrast as the registered H1 slot.
+
+**Why this mattered in practice.** With no δ passed, H2 and H4 previously fell into an unregistered two-sided Wald-vs-zero branch, which then contaminated the shared Holm family and drove every other hypothesis's verdict. Measured against the corrected one-sided δ = 0 test, H4's contaminating p-value was roughly 7× smaller than its correct value. This entry does not re-derive that measurement; it is reported from the #60 review pass and reproducible against that PR's diff.
+
+### Item 6 — §6.2: the Holm family is 5 hypotheses, not 6 — H3 is an intersection-union test (issue #44)
+
+**What changed.** Nothing in §6.2's text. §6.2 already states **"5 registered hypotheses"**, and that is correct as written. This entry records the reasoning so a future reviewer does not "fix" it back to 6, which an earlier (reverted) review pass had proposed.
+
+**Why m = 5, not 6.** H3 ("G > max(D, H)") is not one linear contrast — it compares G against the better of two arms. But it is still **one** registered hypothesis: the null is **"G ≤ D or G ≤ H"** (i.e. G does not beat _both_), and H3 is rejected only when **both** one-sided sub-contrasts (G − D, G − H) reject at level α. By **Berger's intersection-union test (IUT) result**, rejecting an intersection null if and only if every component test rejects at level α is _itself_ already a level-α test of that intersection null. No within-H3 multiplicity adjustment is required or applied. `evals/analysis/contrasts.mjs` computes H3's p-value as **`max(p_G-D, p_G-H)`**, and it consumes exactly **one** Holm slot — see `registeredFamilySlotCount()` and the file's header comment, which registers this exact reasoning at the point of implementation.
+
+### Item 7 — §5.1/§5 (judge validation): idea-level metrics are exploratory by construction; the human-human floor recomputation and its correction (issue #44 item B3)
+
+**What changed.** §5.1 point 4 already registers that a failed validation gate drops idea-level metrics to pool-level-only reporting — an acceptable, pre-registered outcome. This entry **reaches that outcome directly, for a stated pre-data reason, rather than through the gate**: **idea-level metrics (novelty, feasibility) are registered as exploratory by construction**, because the available answer key lacks the resolution to validate the judge at all. This supersedes the earlier framing in this appendix's issue thread (#44) that treated the gate itself as the mechanism; that framing is superseded, not the §5.1 point 4 consequence, which stands.
+
+**Why — the human-human floor cannot exclude chance at this slice size.** #47 recomputed human–human split-half balanced accuracy on our own 98-idea slice (Human + AI conditions, `AI_Rerank` excluded — see below — 228 reviews), under a construction registered before the run. The durable record is `docs/si-et-al-human-human-floor.json`; the corrected numbers, read directly from that artifact, are:
+
+| Construction parameter   | Value                                                                            |
+| ------------------------ | -------------------------------------------------------------------------------- |
+| `scoreColumn`            | `overall_score`                                                                  |
+| `quantile`               | 0.25                                                                             |
+| `splitRule`              | split-half of each idea's own reviews (no reviewer id in the anonymized release) |
+| `splitSeed`              | 1                                                                                |
+| `splitCount`             | 1000                                                                             |
+| `bootstrapSeed`          | 2                                                                                |
+| `bootstrapDraws`         | 2000                                                                             |
+| `bootstrapSplitsPerDraw` | 200                                                                              |
+
+| Result                                                   | Value                |
+| -------------------------------------------------------- | -------------------- |
+| Mean balanced accuracy                                   | **0.5534**           |
+| Split distribution p05 / p95                             | 0.500 / 0.625        |
+| Bootstrap 95% CI                                         | **[0.4483, 0.6702]** |
+| Overlaps the registered 56.1% floor (Appendix A item 4)? | Yes                  |
+| Excludes chance (0.50)?                                  | **No**               |
+
+**A correction to this appendix's own prior draft.** An earlier comment on issue #44 reported this bootstrap CI as `[0.4167, 0.7083]`, computed with a defective estimator (one split per bootstrap resample, compared against a point estimate that is itself a mean over 1000 splits). `docs/si-et-al-human-human-floor.json` carries the corrected construction and the corrected CI above. **Both of the earlier comment's conclusions are unchanged by the correction** — the interval still overlaps the registered floor and still does not exclude chance — but the appendix registers the corrected figure, not the stale one, so a reader checking the number against the durable artifact finds agreement.
+
+**What this means for validation.** At this slice size, 105 of the 147 Si et al. ideas carry exactly 2 reviews (#47-reported; this count is not itself a field in `docs/si-et-al-human-human-floor.json`), so a split-half on those is one reviewer against one. The interval **does not exclude chance (0.50)**. That is a stronger result than "the floor is the wrong constant": if the answer key itself is statistically indistinguishable from chance at this n, no comparison of a judge's accuracy against it is informative, and swapping in a recomputed floor would only relabel the problem rather than rescue the instrument.
+
+**Registered reporting (descriptive, not a gate).** Idea-level results are still reported, as **descriptive statistics with bootstrap CIs**, never as a pass/fail claim:
+
+- Judge-vs-expert balanced accuracy and Spearman ρ, with bootstrap CIs (resampling ideas).
+- The recomputed human–human distribution above (#47 / `docs/si-et-al-human-human-floor.json`).
+- The registered comparators, each **labelled as to population**:
+  - **56.1%** — Si et al.'s own paper-reported human-human figure. Labelled **"paper-reported, different population and different split scheme"** — 147 ideas / 3 conditions / 337 reviews, reviewer split-half — **never "reproduced."**
+  - **51.7%** (Claude-3.5 Direct, shape-matched to our judge) and **53.3%** (Claude-3.5 Pairwise, their best evaluator of any shape) — Si et al. Table 11, their paper population.
+
+**Why this exclusion.** `AI_Rerank` (49 files) is excluded from the recomputed slice: only 18 of its 49 files are recoverable by filename against the AI condition; the remaining 31 draw from a larger generated pool than the AI condition's 49 sampled ideas and cannot be recovered from the released `id_title_mapping.csv` at all. Including only the recoverable 18 would represent the condition by a non-random 37% subsample, so Human + AI (98 ideas, 228 reviews) is used instead (recorded in `docs/si-et-al-human-human-floor.json`'s `slice.exclusions`).
+
+**A reportable finding in its own right.** This is registered as a finding, not merely absorbed as a limitation: **the released anonymized Si et al. review data cannot support LLM-judge validation at useful precision**, because it ships no reviewer identifier and most ideas (105 of 147, #47-reported) carry exactly two reviews. It is checkable, it concerns a widely-cited public dataset, and — unlike the per-dollar model ranking this study produces — it does not expire when the model lineup changes.
+
+This entry does not independently re-run #47's bootstrap. The construction parameters and result numbers in the tables above are read verbatim from the committed `docs/si-et-al-human-human-floor.json`; the "105 of 147" review-count figure is not a field in that JSON (the Si et al. raw data itself is gitignored and not committed to this repo) and is reported here as #47's finding, not independently traceable to a committed artifact.
+
+**`MIN_IDEAS_N` is left unaddressed, deliberately.** §5's original B3 draft also asked to "raise and register" `MIN_IDEAS_N` (still `20`, `evals/judge/gate.mjs:106`) because the sampling SE on a binary pass/fail gate at n=20 is too large for the gate to mean anything. Once idea-level metrics are exploratory by construction (this item), there is no longer a pass/fail gate for `MIN_IDEAS_N` to gate the reliability of — raising it would be tuning a threshold on a mechanism this entry retires. `MIN_IDEAS_N` is therefore left at its current value, unraised, by the same reasoning that retires the gate itself.
+
+### Item 8 — §4.1/§3.4/§12: the equivalence threshold is calibrated in Voyage space, with numbers, hash, and disclosed provenance (issue #44 item B4)
+
+**What changed.** §4.1's `distinct_k` — the headline metric — is a direct function of `CLUSTER_DISTANCE_THRESHOLD`. §4.1 registers no numeric threshold, so this entry registers one, calibrated in the embedding space production actually uses (**Voyage-4-lite**), replacing the MiniLM-derived threshold that §4.1 never numerically pinned. Values below are read verbatim from the committed `evals/metrics/fixtures/voyage-calibration-result.json` (issue #42).
+
+| Field                                                  | Value                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Embedder ID                                            | `voyage-4-lite`                                                                                                                                                                                                                                       |
+| Selection rule                                         | midpoints of consecutive sorted observed pairwise distances; select the threshold maximising balanced accuracy (mean of sensitivity, specificity) on the same/different pair labels; ties broken by the midpoint of the widest run of tied candidates |
+| **Registered `clusterDistanceThreshold`**              | **0.23141118234233987**                                                                                                                                                                                                                               |
+| Calibration pair-set hash                              | `4be4622bfbad`                                                                                                                                                                                                                                        |
+| Calibration pair-set size                              | 108 pairs, all 4 strata                                                                                                                                                                                                                               |
+| Achieved balanced accuracy (Voyage-selected threshold) | **96.5%**                                                                                                                                                                                                                                             |
+
+**The empirical result the MiniLM-derived threshold was tested against.** The MiniLM threshold (0.49234346496597087, the midpoint used by the original 8-pair fixture) scores **58.3%** balanced accuracy on the same 108-pair hard-negative set — barely better than chance. Hard negatives in that set are _distinct ideas answering the same brief_, which is exactly what a 30-idea pool consists of, so the failing case is not an edge case — it is the entire measurement `distinct_k` performs in this study. The old 8-pair fixture passed because it compared ideas across unrelated topics, a much easier separation, which is why nothing caught the mismatch earlier.
+
+**Disclosure: the calibration pairs are model-generated, not human-labelled.** All 108 pairs (text and same/different label) were authored by an LLM (`claude-sonnet-5`, 2026-09-01), not collected from human raters (`voyage-calibration-result.json`'s `pairSetProvenance`). A threshold calibrated against model judgement is weaker evidence than one calibrated against human judgement, and this appendix states that plainly rather than presenting the pair set as ground truth. **#52's planned crowdsourced rating panel is the natural future anchor** for a human-labelled recalibration (see Item 13 below on why #52 itself is registered as exploratory).
+
+**Sensitivity and a threshold-free companion metric.** Register a **±0.05 sensitivity analysis**, reporting H1–H4 at threshold ± 0.05 around the value above (`evals/metrics/fixtures/voyage-calibration-result.json`'s `deviationNotes` records that the ±0.05 band is a MiniLM-era registered figure, not re-derived from the Voyage same/different gap — report it as a fraction of the observed gap alongside any sensitivity result, not as an independently-derived Voyage-space figure). Register **mean pairwise distance** as a threshold-free companion metric alongside `distinct_k`, so the headline number is never the only diversity signal reported.
+
+**Consequence, registered in advance.** `clusterDistanceThreshold` is now a `CONFIG_FIELDS` entry (`lib/manifest.mjs`), so a threshold change invalidates cells the same way a prompt or judge change does — it changes `configHash` (§11) and any pre-existing cell under the old threshold becomes `stale` rather than silently reused.
+
+### Item 9 — §6.2: judge-score model adds `(1|run)`; cost lane registered as descriptive (issue #44 item B6)
+
+**What changed.** Two defects in §6.2's model, both registered as corrections rather than §6.2 edits:
+
+1. **Pseudoreplication.** §5.2 scores every pool with two judges (2 rows per pool), but §6.2's model as written has no run-level intercept, so H5's bias-term CI is too narrow by roughly the within-pool correlation. Register **`(1|run)`** on the judge-score model, alongside the existing `judge_provider` and `judge_provider × generator_provider` terms. `evals/analysis/frame.mjs` and `evals/analysis/contrasts.mjs` document this in their header comments as the registered judge-score model shape. Wiring the actual fit that produces H5's coefficient (the judge-score model itself, as opposed to the `distinct_k` model H1–H4 use) is separate, not-yet-scheduled implementation work — no open issue currently tracks it; #45 (closed) covered the judge scale/axes repair, not this.
+2. **Cost is descriptive, not a Gaussian-offset term.** `log(cost)` as a model offset does not parse under a Gaussian identity link — an offset is a log-link concept — and cost varies negligibly _within_ an arm, so the offset would be effectively an arm-level constant contributing nothing. Register the cost lane instead as a **descriptive `distinct_k`/cost ratio per arm, with cluster-bootstrap CIs over briefs**, explicitly labelled descriptive because there is no within-arm cost variation to model. `evals/analysis/report.mjs` and `analysis.mjs` already carry a `costRatioByArm` field through the report, consistent with this registration.
+
+**Why.** Both are analysis-plan corrections that must be on record before any data exists, per the amendment rule — neither changes what is measured, only how it is modeled.
+
+### Item 10 — §6.2/§9: convergence-failure ladder, registered rung-by-rung (issue #44 item B7)
+
+**What changed.** Register a **machine-checkable convergence ladder**, selected from fit diagnostics alone, before any contrast is computed, per lane, and reported in `REPORT.md` with the criterion that triggered it:
+
+| Rung | Model                                                        | Descent criterion                                                          |
+| ---- | ------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| R0   | `y ~ arm + (1\|brief) + (1\|brief:arm)`                      | `converged === false` OR non-finite/≤0 vcov diagonal OR NaN coefficient SE |
+| R1   | `y ~ arm + (1\|brief)`                                       | same criteria                                                              |
+| R2   | OLS + CR2 cluster-robust SEs, cluster = brief                | reached only if R1 also fails                                              |
+| R3   | no confirmatory inference; study reported as **descriptive** | R0–R2 all fail                                                             |
+
+**A boundary variance component is a finding, not an error.** `(1|brief:arm)` estimating at zero means no arm×brief interaction — that is reported as a finding, and the analysis stays at R0. Descent happens only on non-convergence or NaN, never on a boundary estimate. **R2 is additionally a standing robustness check reported at every rung**, not only as the R1-failure fallback, since it changes the estimand weighting relative to the mixed-effects fit. Holm–Bonferroni (Item 6 above) is applied across the 5 registered hypotheses regardless of which rung each lane lands on.
+
+**Sidecar-unavailable is NOT R3 — it is a separate hard failure that produces no rung and no numbers.** This appendix's original draft (issue #44) worded R3's descent criterion as "R0–R2 all fail, or sidecar unavailable," which would make a missing Python venv silently degrade to a weaker-but-still-publishable descriptive result — exactly the failure mode a pre-registration exists to prevent. `evals/analysis/fit.mjs` (#46) resolves this the other way, and its resolution is the one registered here: when the sidecar cannot be reached at all, `fitViaSidecar`/`makeSidecarRunner` throw `SidecarUnavailableError` **before any rung is attempted** — no R0/R1/R2/R3 result is produced, and the run cannot proceed to a descriptive report on that basis alone. `runLadder` returns an **R3** result only after R0, R1, and R2 have each been attempted and each failed their descent criteria with the sidecar reachable throughout. The table above is corrected to match this: R3's criterion is "R0–R2 all fail" and sidecar-unavailability is out of the ladder entirely.
+
+**Verified.** `evals/analysis/fit.mjs` implements the ladder as corrected above (`runLadder`, `fitViaSidecar` for R0/R1, `fitR2` for the CR2 fallback, `SidecarUnavailableError` as the separate hard-fail path) — checked by reading `fit.mjs`'s header comment and `runLadder`'s body, not independently re-executed here. The CI job **"Analysis sidecar (ANALYSIS_SIDECAR=1)"** (`.github/workflows/ci.yml`) runs the real statsmodels REML fit against the closed-form ANOVA oracle (`evals/analysis/fit.integration.test.mjs`, `anova-oracle.mjs`) — confirmed present and `success` on the latest `develop` CI run via `gh run view --json jobs` at the time of this writing. That job is a **separate CI job with its own Python venv**, distinct from the default `node --test` job (which never sets `ANALYSIS_SIDECAR` and so never exercises the real sidecar comparison). With that job green, the statistical core is verified on every push to `develop`; without it, `node --test` alone would only verify "the code ran," not "the statistics were checked."
+
+### Item 11 — §4.2: OCSAI demoted to exploratory, relative-ordering only (issue #44 item B8)
+
+**What changed.** Remove OCSAI from §4.2's secondary-metric table as a registered comparator with claimed calibration; register it instead as **exploratory, relative-ordering only**. §4.2's current row ("OCSAI originality — AUT stratum only; instrument with published r = 0.81 to humans") is left in place, marked amended, per the amendment rule — the published r = 0.81 figure is from OCSAI's own training population, not verified against this study's AUT-stratum items.
+
+**Why.** OCSAI's free API publishes no numeric rate limit. Using it under a **self-imposed conservative throttle** (issue #17) is a reasonable operational choice, but it means OCSAI scores in this study are obtained under a constraint the published r = 0.81 correlation was not measured under. Report OCSAI as ordering only (does judge A rank higher than judge B), never as an absolute score compared against the published correlation. Report **request count, throttle, and date** alongside any OCSAI number, so a reader can see the operating conditions.
+
+### Item 12 — §4.4: negative control replaced — shuffled-label control is vacuous by construction (issue #44 item B9)
+
+**What changed.** §4.4's **shuffled-label control** ("judge the same pool twice with arm labels permuted → expect no score difference") is replaced with a **judge test-retest repeatability control**: the same pool scored twice, reporting **test-retest ρ**. §4.4's shuffled-label row is left in place, marked amended, per the amendment rule.
+
+**Why.** The shuffled-label control cannot catch anything: `deidentify.mjs` enforces that the judge never sees arm/model/persona labels in the first place (§5.3), so permuting labels the judge never receives cannot produce a different score by construction — the control tests nothing. Test-retest repeatability (score the same de-identified pool twice, independently) tests something real: whether the judge is a repeatable instrument at all, which is a precondition for every downstream comparison in §6.
+
+### Item 13 — §3.2/§0: corpus expanded to 24 briefs, 6 per stratum; provenance disclosed (issue #44, corpus)
+
+**What changed.** §3.2 registers **n = 12** briefs, 4/3/3/2 per stratum. The corpus has been expanded to **24 briefs, 6 per stratum** (business / product / scientific / classic divergent-thinking), landed in `evals/corpus/briefs.mjs` (#43). §3.2's table is left in place, marked amended.
+
+|                                                                                         | Value                                                                                        |
+| --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Brief count                                                                             | 24 (was 12)                                                                                  |
+| Per-stratum count                                                                       | 6/6/6/6 (was 4/3/3/2)                                                                        |
+| Corpus hash before expansion                                                            | `6b487e8470d5` (as reported when #43 landed; superseded, not independently re-verified here) |
+| Corpus hash after expansion (verified against `evals/corpus/index.mjs`'s `CORPUS_HASH`) | **`55e05c2811a7`**                                                                           |
+
+**The 3 original scientific keywords are preserved as a prefix under the same seed** — only 3 additional scientific briefs were appended, none of the original 3 were re-rolled — so the previously-registered scientific briefs are provably unchanged. The keywords are not hand-typed into `evals/corpus/briefs.mjs`; they are computed at module load by `sampleKeywords(LIVEIDEABENCH_KEYWORDS, SCIENTIFIC_SAMPLE_COUNT, SCIENTIFIC_SAMPLE_SEED)` (`evals/corpus/sample.mjs`, `SCIENTIFIC_SAMPLE_SEED = 20260731`, `SCIENTIFIC_SAMPLE_COUNT = 6`). To reproduce the claim: call `sampleKeywords` with `count = 3` under the same seed and confirm the result is the exact first-3 prefix of the `count = 6` result — the prefix property follows from the sampler's partial Fisher–Yates draw, and can be checked directly against `evals/corpus/sample.mjs`.
+
+**Disclosure.** The business and product-stratum briefs are authored by the product's owner (the same person driving this study), not sampled from an external corpus the way the scientific stratum is (LiveIdeaBench keyword set) or structurally fixed the way the AUT stratum is. This is disclosed here rather than left implicit, since it is a source of potential bias in what "business ideation" and "product ideation" look like in this study's corpus.
+
+### Item 14 — new: #52's crowdsourced human rating panel is registered as exploratory (issue #44)
+
+**What's registered.** The planned crowdsourced (Prolific) human distinct-idea rating panel (issue **#52**) runs **after** the confirmatory grid completes and is **exploratory, not confirmatory**. It is not part of the registered H1–H5 family (§6.1), is not Holm-corrected, and any comparison it produces is reported in the exploratory section (§6.3) with Benjamini–Hochberg correction, labelled exploratory.
+
+**Why this belongs in this appendix.** Everything else in #52 (design, cost, Prolific mechanics) is an implementation detail with no pre-data expiry — it can be decided at any time before the panel runs. Its **confirmatory-vs-exploratory status** is different: that is a pre-data decision, and per this document's own rule (§11, optional stopping), deciding it _after_ seeing any grid or panel result would not be legitimate. Registering it now, while no study data exists, is what makes "exploratory" mean something rather than being a label applied conveniently after the fact.
+
+### Item 15 — §10/§11: analysis toolchain pinned as `analysisHash`, separate from `configHash` (issue #44 item B10, scope note)
+
+**What changed.** §10/§11 register `configHash` as covering everything that changes **the measurement** (engine SHA, prompt hash, judge hash, embedder, panel shape, and now `corpusHash` / `clusterDistanceThreshold`, Items 13/8 above). This entry registers a **separate `analysisHash`** — the analysis toolchain's Python/numpy/scipy/statsmodels versions plus `sha256(fit_mixedlm.py)` — stamped in `REPORT.md` alongside `configHash`, explicitly **not folded into `configHash`**: a toolchain version bump changes how the numbers are _computed_, not what was _measured_, and folding it into `configHash` would falsely mark old cells `stale` on a pure tooling change. `evals/analysis/fit.mjs`'s `analysisHash()` and `report.mjs`'s rendered `analysisHash:` line implement exactly this separation.
+
+**Scope, population, and rate-table date (§10, remainder of B10).** Register the study's population as **the briefs actually tested** (§3.2, now 24 briefs, Item 13) — drop any claim of generalization across task type beyond per-stratum reporting (§10 already lists "12 briefs may not generalize" as a threat; this stands, updated for 24). Pin the dated rate table used for the ledger (§8.1) and record that **Sonnet 5's introductory rate ($2.00/$10.00) expired 2026-08-31** (§8.1's own text already states this expiry date; verify first-party against the live rate card before pinning a run that starts after that date, rather than assuming the intro rate still applies).
+
+---
