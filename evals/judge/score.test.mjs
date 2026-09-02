@@ -22,6 +22,7 @@ import { JUDGE_AXES, judgePromptHash } from "./prompt.mjs";
 import { validateJudge } from "./gate.mjs";
 import { configHash, cellKey } from "../../lib/manifest.mjs";
 import { makeTempStore } from "../../lib/store.mjs";
+import { JUDGE_MODELS as REGISTERED_JUDGE_MODELS } from "./config.mjs";
 
 const armsConfigJson = JSON.parse(
   await (await import("node:fs")).promises.readFile(new URL("../../arms.config.json", import.meta.url), "utf8"),
@@ -325,6 +326,113 @@ test("runJudgeMatrix stores per-axis scores and meters each judge call", async (
   const costRecord = store.get(`judge-call|cell=${poolKey}|judge=claude-sonnet-5`);
   assert.equal(costRecord.costRows.length, 1);
   assert.equal(costRecord.costRows[0].model, "claude-sonnet-5");
+});
+
+// ── issue #63: judge cost rows reach the ledger + per-provider attribution ──
+
+test("runJudgeMatrix returns a costRow for every completed judge call — this is RED on the pre-#63 code (no costRows field at all)", async () => {
+  const store = makeTempStore("judge-costrows-");
+  const anthropic = new MockJudgeProvider();
+  const openai = new MockJudgeProvider();
+  const poolKey = "arm=B|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "B", "b idea 1", "b idea 2")];
+  const { costRows } = await runJudgeMatrix({ pools, judgeModels: JUDGE_MODELS, providers: { anthropic, openai }, store, seed: 1, timestamp: "2026-08-02T00:00:00Z" });
+
+  assert.equal(costRows.length, 2, "one costRow per scheduled judge leg (anthropic + openai)");
+  for (const row of costRows) {
+    assert.equal(row.cellKey, poolKey);
+    assert.equal(row.billing_mode, "api");
+    assert.ok(typeof row.model === "string" && row.model.length > 0, "a judge row is single-model, per costRow()'s contract");
+    assert.ok(!("cost_usd" in row) && !("notional_usd" in row), "never a stored dollar figure");
+  }
+  // The SAME row objects the store actually persisted — never a second,
+  // independently-built row (double-count guard).
+  const stored = store.get(`judge-call|cell=${poolKey}|judge=${costRows[0].model}`);
+  assert.deepEqual(stored.costRows[0], costRows.find((r) => r.model === stored.costRows[0].model));
+});
+
+test("runJudgeMatrix attributes an OpenAI judge leg's spend to the openai bucket even when the pool's generating arm is all-Anthropic", async () => {
+  const store = makeTempStore("judge-provider-attr-");
+  const anthropic = new MockJudgeProvider();
+  const openai = new MockJudgeProvider();
+  // Arm B (arms.config.json) is homogeneous Haiku — 100% Anthropic generators.
+  // If provider attribution were ever derived from the GENERATING arm instead
+  // of the judge model itself, the openai judge leg's spend would wrongly
+  // land in (or be absent from) the anthropic bucket.
+  const poolKey = "arm=B|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "B", "b idea 1", "b idea 2")];
+  const { spendByProvider, hasMissingRate } = await runJudgeMatrix({
+    pools,
+    judgeModels: REGISTERED_JUDGE_MODELS,
+    providers: { anthropic, openai },
+    store,
+    seed: 1,
+    timestamp: "2026-08-02T00:00:00Z",
+  });
+
+  assert.equal(hasMissingRate, false, "the registered judge roster's preferred models all carry a RATE_TABLE row");
+  assert.ok(spendByProvider.anthropic > 0, "the Anthropic judge leg contributes to the anthropic bucket");
+  assert.ok(spendByProvider.openai > 0, "the OpenAI judge leg contributes to the openai bucket, driven by the JUDGE model, not the all-Anthropic generating arm");
+});
+
+test("runJudgeMatrix attributes a cross-provider generating arm (G) correctly — judge spend is independent of the arm's own provider mix", async () => {
+  const store = makeTempStore("judge-arm-g-");
+  const anthropic = new MockJudgeProvider();
+  const openai = new MockJudgeProvider();
+  const poolKey = "arm=G|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "G", "g idea 1", "g idea 2")];
+  const { costRows, spendByProvider } = await runJudgeMatrix({
+    pools,
+    judgeModels: REGISTERED_JUDGE_MODELS,
+    providers: { anthropic, openai },
+    store,
+    seed: 1,
+    timestamp: "2026-08-02T00:00:00Z",
+  });
+
+  assert.equal(costRows.length, 2);
+  assert.ok(spendByProvider.anthropic > 0 && spendByProvider.openai > 0, "both judge legs on the cross-provider arm G attribute correctly");
+});
+
+test("runJudgeMatrix surfaces a judge model with no RATE_TABLE row via hasMissingRate/missingRateModels — never silently prices it at $0", async () => {
+  const store = makeTempStore("judge-missing-rate-");
+  const anthropic = new MockJudgeProvider();
+  const openai = new MockJudgeProvider();
+  const poolKey = "arm=B|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "B", "b idea 1", "b idea 2")];
+  // JUDGE_MODELS (this file's local fixture) uses gpt-5.4 for the OpenAI leg —
+  // present in lib/price.mjs's OPENAI_PRICE_VERIFICATION record but NOT
+  // promoted to a RATE_TABLE row.
+  const { hasMissingRate, missingRateModels, spendByProvider } = await runJudgeMatrix({
+    pools,
+    judgeModels: JUDGE_MODELS,
+    providers: { anthropic, openai },
+    store,
+    seed: 1,
+    timestamp: "2026-08-02T00:00:00Z",
+  });
+
+  assert.equal(hasMissingRate, true);
+  assert.ok(missingRateModels.includes("gpt-5.4"));
+  // The rate-less model contributes NOTHING to openai's bucket (never a
+  // silent $0-and-continue folded invisibly into a real total) — the key is
+  // ABSENT entirely, not present-as-zero (priceRowByProvider `continue`s
+  // before touching the bucket for a missing-rate model).
+  assert.ok(!("openai" in spendByProvider), "a rate-less judge model contributes no bucket at all, not a zero-valued one");
+});
+
+test("runJudgeMatrix still meters (and returns a costRow for) a judge leg that FAILS after consuming tokens", async () => {
+  const store = makeTempStore("judge-failed-meters-");
+  const anthropic = new MockJudgeProvider({ failFor: new Map([["claude-sonnet-5", { failureKind: "parse_failure" }]]) });
+  const openai = new MockJudgeProvider();
+  const poolKey = "arm=B|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "B", "b idea 1", "b idea 2")];
+  const { results, costRows } = await runJudgeMatrix({ pools, judgeModels: JUDGE_MODELS, providers: { anthropic, openai }, store, seed: 1, timestamp: "2026-08-02T00:00:00Z" });
+
+  const failedLeg = results.find((r) => r.judge_model === "claude-sonnet-5");
+  assert.equal(failedLeg.state, "failed");
+  const failedRow = costRows.find((r) => r.model === "claude-sonnet-5");
+  assert.ok(failedRow, "a failed judge call that consumed tokens still contributes a costRow — spend is real regardless of the outcome");
 });
 
 // ── AC5 + AC7: validateJudge can be run against the scorer's output; judge

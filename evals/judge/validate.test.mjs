@@ -148,6 +148,15 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   assert.equal(costRecord.costRows[0].model, JUDGE_MODEL);
   assert.equal(costRecord.costRows[0].input_tokens, N * 10); // MockJudgeProvider: 10 * n input, 5 * n output
   assert.equal(costRecord.costRows[0].output_tokens, N * 5);
+
+  // Issue #63: the SAME row the store persisted is also surfaced on the
+  // composition's own return value, so a caller can see this run's judge
+  // spend without re-reading the store — and it is attributed to the
+  // anthropic provider bucket (claude-sonnet-5), never silently dropped.
+  assert.equal(out.costRows.length, 1);
+  assert.deepEqual(out.costRows[0], costRecord.costRows[0]);
+  assert.equal(out.hasMissingRate, false);
+  assert.ok(out.spendByProvider.anthropic > 0);
 });
 
 test("runJudgeValidation — a failed judge run still meters whatever tokens the judge consumed before failing", async () => {

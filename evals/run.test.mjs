@@ -11,6 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseArgs, main } from "./run.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
+import { JUDGE_MODELS } from "./judge/config.mjs";
 import armsConfigJson from "../arms.config.json" with { type: "json" };
 
 // A stand-in store: main()'s wiring is under test here, not ResultsStore
@@ -96,11 +97,26 @@ test("main() wires a REAL, RATE_TABLE-backed priceGrid (lib/price.mjs's runnerPr
   // Compare the wired priceGrid's output against a freshly-constructed
   // runnerPriceGrid() on an identical planned cell -- proves main() is
   // calling the real pinned-rate-table pricer, not merely SOME function.
+  // Also wired with JUDGE_MODELS (issue #63) -- main() passes the registered
+  // judge roster so the pre-flight prices planned judging too; dropping that
+  // wiring would make `actual` cheaper than `expected` and fail this test.
   const [armId, arm] = Object.entries(armsConfigJson.arms)[0];
   const cell = { key: "probe-cell", armId };
-  const expected = runnerPriceGrid()([cell], armsConfigJson.arms, { batch: true });
+  const expected = runnerPriceGrid(undefined, { judgeModels: JUDGE_MODELS })([cell], armsConfigJson.arms, { batch: true });
   const actual = priceGrid([cell], armsConfigJson.arms, { batch: true });
   assert.deepEqual(actual, expected);
+
+  // Pin the judge term ABSOLUTELY, not only by comparison to a second
+  // `runnerPriceGrid(undefined, { judgeModels: JUDGE_MODELS })` call that
+  // could be constructed the same wrong way -- dropping `judgeModels` from
+  // main()'s real wiring must fail THIS assertion even if `expected` above
+  // were (mistakenly) built the same way `actual` is. Arm A (the first arm
+  // in arms.config.json) is all-Anthropic (claude-sonnet-5, solo), so its
+  // projection carries an `openai` bucket ONLY if the judge roster's OpenAI
+  // leg was actually wired in.
+  const noJudge = runnerPriceGrid()([cell], armsConfigJson.arms, { batch: true });
+  assert.ok(actual.usd > noJudge.usd, "main() must wire the judge roster into the pre-flight (issue #63) -- dropping judgeModels makes this equal, not greater");
+  assert.ok(actual.breakdown[0].byProvider.openai > 0, "the OpenAI judge leg must reach the projection even for arm A, an all-Anthropic arm");
 });
 
 test("main() forwards --max-spend as maxSpendUsd and --arms/--briefs/--replicates through to runSpec", async () => {
