@@ -35,6 +35,8 @@ import { runSpec } from "./harness/runner.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
+import { JUDGE_MODELS } from "./judge/config.mjs";
+import { judgeLegsFor } from "./judge/matrix.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -283,7 +285,18 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     // runnerPriceGrid() here is the "follow-up PR" that module's own header
     // comment names as the way the CLI adopts it -- zero changes to
     // runner.mjs's own default were needed for this.
-    priceGrid: runnerPriceGrid(),
+    //
+    // judgeLegsFor (issue #63, revised in the fix round) -- the pre-flight
+    // must price the planned JUDGING too, not only the planned generation:
+    // docs/PREREGISTRATION.md §12 discloses that neither --max-spend nor
+    // --max-spend-<provider> could see the cross-judge matrix's spend, and
+    // that judge spend is the dominant OpenAI cost driver. Wires the SAME
+    // judge-selection logic the real matrix uses (evals/judge/matrix.mjs's
+    // judgeLegsFor factory, backed by buildJudgeMatrix's pickDistinctJudge)
+    // plus arms.config.json's own panel shape, so each planned cell's judge
+    // legs are priced per-model, batch-aware, and fail loud on a missing
+    // rate -- not a flat per-pool guess.
+    priceGrid: runnerPriceGrid(undefined, { judgeLegsFor: judgeLegsFor({ judgeModels: JUDGE_MODELS, panelConfig: armsConfig.panel }) }),
     maxSpendUsd: args.maxSpendUsd,
     maxSpendByProviderUsd: args.maxSpendByProviderUsd,
     armIds: args.arms,

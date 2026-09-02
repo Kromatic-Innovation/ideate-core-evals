@@ -71,6 +71,7 @@ import { judgeScoresForAxis, computeJudgeHash } from "./score.mjs";
 import { assertAxesNotCollapsed } from "./prompt.mjs";
 import { providerOf } from "./matrix.mjs";
 import { JUDGE_VALIDATION_AXIS, SI_ET_AL_EXPERT_SCORE_FIELD } from "./config.mjs";
+import { priceRowsByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
 
 /** Tiny stable string->int32 hash for deriving a per-topic order seed (same
  *  scheme as score.mjs's runJudgeMatrix per-leg seed derivation) — its only
@@ -132,8 +133,12 @@ export function judgeValidationSliceId({ axis, expertScoreField }) {
  *   @param {string}  o.timestamp      required — caller-supplied ISO 8601, forwarded to the
  *     provider and to every meterJudgeCall (replayability; mirrors score.mjs's
  *     runJudgeMatrix, which requires it for the same reason)
+ *   @param {object}  [o.rateTable]    lib/price.mjs RATE_TABLE override, used only to
+ *     compute `spendByProvider` from this run's own costRows (issue #63) — never
+ *     affects what is stored (store rows are always token counts, priced at READ time)
  * @returns {Promise<{ metric, construction, n, accuracy, floor, verdict, rho,
- *   axis, expertColumn, judgeHash, sliceId, exclusions }>}
+ *   axis, expertColumn, judgeHash, sliceId, exclusions, costRows,
+ *   spendByProvider, hasMissingRate, missingRateModels }>}
  */
 export async function runJudgeValidation({
   store,
@@ -147,6 +152,7 @@ export async function runJudgeValidation({
   seed = 1,
   mode = "batch",
   timestamp,
+  rateTable = DEFAULT_RATE_TABLE,
 }) {
   if (!store) throw new Error("runJudgeValidation: store is required");
   if (!judgeProvider || typeof judgeProvider.score !== "function") {
@@ -194,15 +200,22 @@ export async function runJudgeValidation({
     );
   }
   const sliceId = judgeValidationSliceId({ axis, expertScoreField });
+  // costRows (issue #63): collected across EVERY meterJudgeCall this
+  // composition makes (the override call, or one per topic group) so a
+  // caller can see this run's judge spend without re-reading the store —
+  // same discipline as score.mjs's runJudgeMatrix, and the same
+  // build-the-row-exactly-once rule via meterJudgeCall's `row` field.
+  const costRows = [];
   const meterCall = (topicTag, resp) => {
     if (resp && resp.tokens && (resp.tokens.input_tokens || resp.tokens.output_tokens)) {
-      meterJudgeCall({
+      const metered = meterJudgeCall({
         store,
         cellKey: `${sliceId}|topic=${topicTag}`,
         judgeModel,
         tokens: resp.tokens,
         timestamp,
       });
+      costRows.push(metered.row);
     }
   };
 
@@ -285,5 +298,11 @@ export async function runJudgeValidation({
     expertColumn: expertScoreField,
   });
 
-  return { ...result, axis, expertColumn: expertScoreField, judgeHash, sliceId, exclusions: slice.exclusions };
+  // spendByProvider/hasMissingRate/missingRateModels (issue #63): the same
+  // per-provider attribution runJudgeMatrix returns, over this composition's
+  // OWN costRows — a judge row is single-model, so this reduces to
+  // providerOf(judgeModel) regardless of which topic group produced it.
+  const { byProvider: spendByProvider, hasMissingRate, missingRateModels } = priceRowsByProvider(costRows, rateTable, { batch: mode === "batch" });
+
+  return { ...result, axis, expertColumn: expertScoreField, judgeHash, sliceId, exclusions: slice.exclusions, costRows, spendByProvider, hasMissingRate, missingRateModels };
 }

@@ -512,7 +512,14 @@ export function attachIdeaLevelScores({ store, judgeHash, pools, ideaLevelScores
  *   @param {string} o.judgeModel  judge model id
  *   @param {object} o.tokens      token usage: { input_tokens, output_tokens, ... }
  *   @param {string} o.timestamp   ISO 8601, caller-supplied (see lib/accounting.mjs costRow)
- * @returns {{key: string, written: boolean}}
+ *
+ * `row` (issue #63) is the SAME costRow() object stored in `costRows` below,
+ * handed back to the caller so it can be surfaced upward (e.g.
+ * runJudgeMatrix's own `costRows` return, or a caller's per-provider spend
+ * attribution via lib/price.mjs's priceRowsByProvider) WITHOUT building a
+ * second row for the same call — exactly one costRow() per judge call, ever.
+ *
+ * @returns {{key: string, written: boolean, row: object}}
  */
 export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp }) {
   if (!store) throw new Error("meterJudgeCall: store is required");
@@ -526,7 +533,7 @@ export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp }
     ...tokens,
   });
   const key = `judge-call|cell=${cellKey}|judge=${judgeModel}`;
-  return store.put({
+  const result = store.put({
     key,
     armId: "__judge-call__",
     briefId: cellKey,
@@ -537,4 +544,5 @@ export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp }
     accounting: { state: "completed" },
     costRows: [row],
   });
+  return { ...result, row };
 }
