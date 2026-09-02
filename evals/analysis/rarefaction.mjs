@@ -31,11 +31,15 @@
 // takes "the first n" of anything.
 //
 // ── R and the seed are named constants the appendix cites ───────────────────
-// RAREFACTION_R and RAREFACTION_SEED below are the single source of truth:
-// docs/PREREGISTRATION.md's Appendix C states these exact values by name
-// rather than restating the numbers, so the document and the code cannot
-// drift apart. Averaging over R draws only PARTLY recovers the information a
-// single full-pool measurement would have — rarefaction is registered as
+// RAREFACTION_R and RAREFACTION_SEED below are the single source of truth for
+// the CODE. docs/PREREGISTRATION.md's Appendix C item 2 also states the
+// numeric values in prose (1000 / 20260901), for a reader who isn't going to
+// open this file — the two are not automatically the same thing, so the
+// actual anti-drift mechanism is a test (rarefaction.test.mjs's "registered,
+// explicit, positive integers" test), not this comment. If the appendix and
+// this file ever disagree, the constants here are what evals/analysis/
+// actually runs. Averaging over R draws only PARTLY recovers the information
+// a single full-pool measurement would have — rarefaction is registered as
 // noisier than the full-pool comparison, not as a free lunch (Appendix C item
 // 6 / pilot consequences).
 //
@@ -57,12 +61,25 @@ export const RAREFACTION_R = 1000;
 export const RAREFACTION_SEED = 20260901;
 
 /** Which §4.1 primary metrics receive the rarefied treatment in an arm-A
- *  contrast, and why — the per-metric table in Appendix C item 3, as data. */
+ *  contrast, and why — the per-metric table in Appendix C item 3, as data.
+ *
+ *  poolFluency and collapseRate are "excluded", NOT "rarefied": an earlier
+ *  draft of this registration said poolFluency was rarefied "because it IS
+ *  the pool size" — backwards. poolFluency(pool) === pool.length exactly
+ *  (operational.mjs), so a "rarefied" poolFluency would just be rarefiedN
+ *  restated — a constant with zero variance, not a metric. collapseRate
+ *  needs the pre-dedup raw candidate list to rarefy coherently (spans
+ *  stage-3 clusters over stage-1 raw candidates), which the harness does not
+ *  retain today (Appendix C item 6) — rarefying only the post-dedup
+ *  numerator against the full raw-candidate denominator would spuriously
+ *  inflate the panel arm's collapse rate. Both are reported full-pool as
+ *  descriptives and excluded from Arm-A confirmatory contrasts instead. */
 export const RAREFACTION_TREATMENT = Object.freeze({
   distinct_k: "rarefied", // monotone non-decreasing in pool size
-  poolFluency: "rarefied", // it IS pool size
-  collapseRate: "rarefied", // a larger pool has more chances of internal duplication
-  poolDiversity: "full-pool", // mean pairwise distance — a mean, roughly n-robust
+  poolFlexibility: "rarefied", // identity pass-through of distinct_k (operational.mjs) — follows it exactly
+  poolFluency: "excluded-full-pool-descriptive", // === pool.length exactly; "rarefied" would just be rarefiedN restated
+  collapseRate: "excluded-full-pool-descriptive", // needs pre-dedup raw candidates the harness doesn't retain (Appendix C item 6)
+  poolDiversity: "full-pool", // mean pairwise distance — point estimate is a mean, roughly n-robust (its VARIANCE still scales ~1/n)
   distinctKPerDollar: "full-pool-self-correcting", // the extra generation is paid for on the cost side
 });
 

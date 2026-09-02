@@ -60,10 +60,22 @@ test("RAREFACTION_R and RAREFACTION_SEED are registered, explicit, positive inte
   assert.ok(Number.isInteger(RAREFACTION_SEED), "seed must be an explicit integer");
 });
 
+// Pins the EXACT values docs/PREREGISTRATION.md Appendix C item 2 states in
+// prose (RAREFACTION_R = 1000, RAREFACTION_SEED = 20260901). The test above
+// only checks shape (positive integer, integer) — mutating R to 137 or the
+// seed to 12345 leaves it green while silently disagreeing with the frozen
+// document. This is the actual anti-drift mechanism (see rarefaction.mjs's
+// header comment on why the code comment alone isn't one).
+test("RAREFACTION_R and RAREFACTION_SEED match the exact values registered in docs/PREREGISTRATION.md Appendix C item 2", () => {
+  assert.equal(RAREFACTION_R, 1000);
+  assert.equal(RAREFACTION_SEED, 20260901);
+});
+
 test("RAREFACTION_TREATMENT registers the per-metric decision from Appendix C item 3", () => {
   assert.equal(RAREFACTION_TREATMENT.distinct_k, "rarefied");
-  assert.equal(RAREFACTION_TREATMENT.poolFluency, "rarefied");
-  assert.equal(RAREFACTION_TREATMENT.collapseRate, "rarefied");
+  assert.equal(RAREFACTION_TREATMENT.poolFlexibility, "rarefied"); // identity pass-through of distinct_k — must follow it exactly
+  assert.equal(RAREFACTION_TREATMENT.poolFluency, "excluded-full-pool-descriptive"); // === pool.length; NOT rarefied
+  assert.equal(RAREFACTION_TREATMENT.collapseRate, "excluded-full-pool-descriptive"); // needs pre-dedup raw candidates the harness doesn't retain
   assert.equal(RAREFACTION_TREATMENT.poolDiversity, "full-pool");
   assert.equal(RAREFACTION_TREATMENT.distinctKPerDollar, "full-pool-self-correcting");
 });
@@ -123,13 +135,14 @@ test("rarefiedDistinctK: at n === vectors.length, every draw is a full permutati
 
 // R is registered because it controls the ESTIMATOR'S VARIANCE, not merely
 // because it's a number the API happens to accept — a mutation that quietly
-// stopped honoring `opts.r` (always drawing r=1 internally) would slip past a
-// test that only checks r is validated. This test makes r's effect on
-// variance itself the assertion: at the registered R, five independent seeds
-// on the SAME pool/n must agree tightly (rarefiedDistinctK is an AVERAGE, so
-// its spread across seeds shrinks as R grows); at r=1 (a single draw, no
-// averaging), the same five seeds disagree by several units. If a future
-// change silently ignores `opts.r`, this goes red on the r=RAREFACTION_R
+// stopped honoring `opts.r` (always drawing r=2 internally, the function's
+// floor) would slip past a test that only checks r is validated. This test
+// makes r's effect on variance itself the assertion: at the registered R,
+// five independent seeds on the SAME pool/n must agree tightly
+// (rarefiedDistinctK is an AVERAGE, so its spread across seeds shrinks as R
+// grows); at r=2 (barely an average at all), the same five seeds disagree by
+// several units. If a future change silently ignores `opts.r`, this goes red
+// on the r=RAREFACTION_R
 // assertion regardless of whether r's own input-validation guard survives.
 test("rarefiedDistinctK: R controls estimator variance — high R agrees tightly across seeds, r=1 does not", () => {
   const pool = makeCategoricalPool(50, 60, 4242);
