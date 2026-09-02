@@ -168,17 +168,27 @@ test("judgeLegsFor resolves the SAME two legs buildJudgeMatrix would schedule fo
   assert.deepEqual(byProvider, expectedByProvider);
 });
 
-test("judgeLegsFor's candidateCount matches panel.size x panel.ideasPerAgent for a panel arm", () => {
+test("judgeLegsFor's candidateCount matches panel.size x panel.ideasPerAgent x panel.maxRounds for a panel arm -- round 2 APPENDS to round 1, it does not replace it, so maxRounds is a required factor", () => {
   const legsFor = judgeLegsFor({ judgeModels: REGISTERED_JUDGE_MODELS, panelConfig: PANEL_CONFIG });
   const legs = legsFor({ key: "arm=B|brief=b1", armId: "B" }, ARMS_CONFIG.arms.B);
-  const expected = PANEL_CONFIG.size * PANEL_CONFIG.ideasPerAgent;
+  assert.equal(PANEL_CONFIG.maxRounds, 2, "this study's panel.maxRounds must be 2 for this test to actually exercise the factor (a dropped-maxRounds regression would under-project by exactly 2x)");
+  const expected = PANEL_CONFIG.size * PANEL_CONFIG.ideasPerAgent * PANEL_CONFIG.maxRounds;
   for (const leg of legs) assert.equal(leg.candidateCount, expected);
 });
 
-test("judgeLegsFor's candidateCount uses totalIdeasRequested for a solo arm", () => {
+test("judgeLegsFor's candidateCount uses totalIdeasRequested for a solo arm, NEVER the panel formula -- solo and panel diverge once maxRounds > 1", () => {
   const legsFor = judgeLegsFor({ judgeModels: REGISTERED_JUDGE_MODELS, panelConfig: PANEL_CONFIG });
   const legs = legsFor({ key: "arm=A|brief=b1", armId: "A" }, ARMS_CONFIG.arms.A);
-  for (const leg of legs) assert.equal(leg.candidateCount, ARMS_CONFIG.arms.A.totalIdeasRequested);
+  const panelFormula = PANEL_CONFIG.size * PANEL_CONFIG.ideasPerAgent * PANEL_CONFIG.maxRounds;
+  for (const leg of legs) {
+    assert.equal(leg.candidateCount, ARMS_CONFIG.arms.A.totalIdeasRequested);
+    // A mutant that drops the solo-arm branch entirely (always applying the
+    // panel formula) previously SURVIVED, because the old (maxRounds-less)
+    // panel formula (5 x 6 = 30) coincidentally equalled arm A's total (30).
+    // With maxRounds folded in, panel = 60 and solo = 30 genuinely diverge,
+    // so that mutant is caught here.
+    assert.notEqual(leg.candidateCount, panelFormula, "solo (30) must not equal the panel formula's result (60) -- a dropped solo-arm branch must be caught");
+  }
 });
 
 test("judgeLegsFor throws for an arm that exhausts every candidate, exactly like buildJudgeMatrix (the pre-flight can't project a cost for a matrix that would fail to schedule)", () => {

@@ -158,31 +158,48 @@ export function buildJudgeMatrix(pools, { judgeModels } = {}) {
  * pre-flight can't project a cost for a matrix that would fail to schedule.
  *
  * `candidateCount` estimates the pool size runnerPriceGrid's token-based
- * judge pricing scales by: `panelConfig.size * panelConfig.ideasPerAgent`
- * for a panel arm, or `arm.totalIdeasRequested` for a solo arm (both are 30
- * in this study's arms.config.json today — the file's own header comment:
- * every arm is "matched on total ideas requested"). This is the RAW
- * generated idea count, not a validated post-dedup pool size — see
- * lib/price.mjs's JUDGE_POOL_SIZE_FALLBACK comment for the same caveat.
+ * judge pricing scales by: `arm.totalIdeasRequested` for a solo arm, or
+ * `panelConfig.size * panelConfig.ideasPerAgent * panelConfig.maxRounds` for
+ * a panel arm. Solo and panel are NOT matched at pool level despite
+ * arms.config.json's arm-A comment ("5 x 6 = 30") reading that way -- that
+ * comment computes round 1 only. `resolveIdeateAgents`
+ * (evals/harness/provider.mjs) gives solo `maxRounds: 1` (so its round-1
+ * total IS its total) but a panel arm `panelConfig.maxRounds` (2 in this
+ * study), and round 2 APPENDS to round 1's candidates rather than replacing
+ * them (traced through the pinned ideate-core engine: round 1 accumulates,
+ * round 2 appends to the SAME array, and the final dedupe has no cap) --
+ * `evals/harness/prompts.mjs`'s round-2 prompt literally asks for `n` NEW
+ * ideas, not a rewrite. So a panel arm's real pool is `size * ideasPerAgent
+ * * maxRounds` (5 * 6 * 2 = 60 in this study), not 30. Omitting `maxRounds`
+ * here would under-project panel judging by exactly 2x -- the unsafe
+ * pre-flight direction lib/price.mjs's own JUDGE_TOKEN_ESTIMATE_PER_CANDIDATE
+ * comment names. This is the RAW generated idea count, not a validated
+ * post-dedup pool size -- see lib/price.mjs's JUDGE_POOL_SIZE_FALLBACK
+ * comment for the same caveat.
  *
  * @param {object} o
  *   @param {{anthropic:string[], openai:string[]}} o.judgeModels  same shape
  *     buildJudgeMatrix takes -- candidate judge models per provider.
- *   @param {{size:number, ideasPerAgent:number}} o.panelConfig  arms.config.json's
- *     top-level `panel` block (fixed across every panel arm in this study).
+ *   @param {{size:number, ideasPerAgent:number, maxRounds:number}} o.panelConfig
+ *     arms.config.json's top-level `panel` block (fixed across every panel
+ *     arm in this study).
  * @returns {(cell:{key:string, armId:string}, arm:object) => Array<{model:string, provider:string, candidateCount:number}>}
  */
 export function judgeLegsFor({ judgeModels, panelConfig }) {
   if (!judgeModels || typeof judgeModels !== "object") {
     throw new Error("judgeLegsFor: judgeModels ({ anthropic: [...], openai: [...] }) is required");
   }
-  if (!panelConfig || typeof panelConfig.size !== "number" || typeof panelConfig.ideasPerAgent !== "number") {
-    throw new Error("judgeLegsFor: panelConfig ({ size, ideasPerAgent }, arms.config.json's top-level `panel` block) is required");
+  if (!panelConfig || typeof panelConfig.size !== "number" || typeof panelConfig.ideasPerAgent !== "number" || typeof panelConfig.maxRounds !== "number") {
+    throw new Error("judgeLegsFor: panelConfig ({ size, ideasPerAgent, maxRounds }, arms.config.json's top-level `panel` block) is required");
   }
   return function legsFor(cell, arm) {
     const armWithId = { id: cell.armId, ...arm };
     const rows = buildJudgeMatrix([{ poolKey: cell.key, arm: armWithId }], { judgeModels });
-    const candidateCount = arm.mode === "solo" && typeof arm.totalIdeasRequested === "number" ? arm.totalIdeasRequested : panelConfig.size * panelConfig.ideasPerAgent;
+    // Solo (maxRounds: 1 -- see resolveIdeateAgents) is matched on
+    // totalIdeasRequested directly; a panel arm's pool spans EVERY round
+    // (round 2 appends, never replaces -- see the header comment above), so
+    // maxRounds is a required factor, not an optional refinement.
+    const candidateCount = arm.mode === "solo" && typeof arm.totalIdeasRequested === "number" ? arm.totalIdeasRequested : panelConfig.size * panelConfig.ideasPerAgent * panelConfig.maxRounds;
     return rows.map((r) => ({ model: r.judge_model, provider: r.judge_provider, candidateCount }));
   };
 }
