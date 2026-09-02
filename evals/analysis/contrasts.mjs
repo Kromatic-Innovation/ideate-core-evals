@@ -43,6 +43,46 @@
 //     p = max(p_G-D, p_G-H). Do not re-split this into two slots; see
 //     buildRegisteredFamily()'s H3 entry and registeredFamilySlotCount().
 // H4: same delta=0-default one-sided treatment as H2, for B >= D.
+//
+// ── ARM SUBSETS AND THE REGISTERED FAMILY (issue #97) ────────────────────
+// The registered family names arms D, E, G, H (H2: E vs D, H3: G vs D/H,
+// H4: B vs D). A run over an arm SUBSET -- the #8 smoke study (arms A/B),
+// the Phase 2 pilot, a single-arm debug pass, a re-analysis of a partial
+// store -- cannot estimate a contrast whose arms are absent. Three things
+// could be done about that, and only one of them is defensible:
+//
+//   1. SUBSTITUTE a present arm for the absent one. DEFINITELY WRONG: it
+//      answers a different question under a registered hypothesis's name.
+//      This is why no CLI flag for h2Pair/h3TargetVsBest/h4Pair exists --
+//      see analysis.mjs's parseArgs().
+//   2. DROP the entry from the family. Also wrong: it silently changes the
+//      registered family (docs/PREREGISTRATION.md §6.2 / Appendix B item 6
+//      register m = 5) with no record, and makes the family size a function
+//      of which cells happened to arrive -- a data-dependent family
+//      definition, exactly what §11 (optional stopping) forbids.
+//   3. RECORD it as NOT ESTIMABLE and keep its slot with p = 1. What this
+//      module does.
+//
+// (3) is not a new convention here: it is the SAME treatment H5 already
+// receives when no judge-score fit exists, and H1 when no rarefied fit
+// exists (analysis.mjs) -- "a registered quantity that cannot be computed
+// -> named record -> report as not-computed, still occupying its slot".
+// Keeping the slot is strictly CONSERVATIVE: Holm at m = 5 with p = 1
+// placeholders adjusts every real p-value by a LARGER factor than a
+// shrunken family would (5*p1 >= 2*p1), so FWER stays <= alpha. It costs
+// power, which is the correct direction to err for a run that is by
+// construction not the confirmatory analysis (§11: the confirmatory
+// analysis of H1-H5 runs ONCE, at the pre-registered n).
+//
+// H1 has one extra wrinkle. Its registered form is mean(panel arms) - A.
+// With exactly ONE panel arm present, that expression is arithmetically
+// (armX - A) -- a PER-ARM comparison, which docs/PREREGISTRATION.md
+// (Appendix B item 5) explicitly moves to the §6.3 EXPLORATORY section,
+// BH-corrected, and says is "never folded into the confirmatory Holm
+// family". Computing it would put an exploratory contrast inside the Holm
+// family wearing H1's registered name, so H1 is recorded NOT ESTIMABLE
+// whenever fewer than two panel arms are present.
+//
 // H5: same-provider judging inflates scores — a judge_provider /
 //     judge_provider x generator_provider bias term from the JUDGE-SCORE
 //     model (B6), which is a different frame than the distinct_k lane H1-H4
@@ -84,6 +124,43 @@ export function contrastVector(coefficientNames, weights) {
 /** The dummy-coded coefficient name for one arm's offset from the reference. */
 export function armCoefficientName(armId, referenceArm) {
   return armId === referenceArm ? "Intercept" : `arm[T.${armId}]`;
+}
+
+/** Inverse of armCoefficientName() for the offset case -- "arm[T.E]" -> "E".
+ *  Returns null for anything that is not an arm-offset coefficient name
+ *  ("Intercept", the judge-score bias term, a typo). Used to keep the
+ *  not-estimable path (issue #97) scoped to MISSING ARMS and to leave every
+ *  other unknown coefficient name a hard error, which is what
+ *  contrastVector()'s typo guard exists for. */
+export function armIdFromCoefficientName(name) {
+  const m = /^arm\[T\.(.+)\]$/.exec(name);
+  return m ? m[1] : null;
+}
+
+/**
+ * The record a registered hypothesis carries when this run's arm set cannot
+ * estimate it (issue #97). Shaped to reuse the `unimplemented` plumbing that
+ * already exists for H5-without-a-judge-fit and H1-without-a-rarefied-fit:
+ * evaluateSpec() returns p = 1, the entry KEEPS its Holm slot, and
+ * applyHolmVerdicts()/report.mjs render it without a verdict. `notEstimable`
+ * plus `missingArms`/`availableArms` make it machine-readable and
+ * distinguishable from "that lane's fit did not run".
+ */
+function notEstimableSpec({ id, description, kind, missingArms, availableArms, why }) {
+  return {
+    id,
+    description,
+    kind,
+    unimplemented: true,
+    notEstimable: true,
+    missingArms,
+    availableArms,
+    reason:
+      `NOT ESTIMABLE under this arm subset: the registered ${id} contrast (${description}) names ` +
+      `arm${missingArms.length === 1 ? "" : "s"} [${missingArms.join(", ")}], which ${missingArms.length === 1 ? "is" : "are"} not among the arms available in this run ` +
+      `[${availableArms.join(", ")}]. ${why} No substitute arm is used and the entry is NOT dropped -- it keeps its ` +
+      `Holm slot with p=1, so the registered family stays 5 slots (docs/PREREGISTRATION.md §6.2 / Appendix B item 6).`,
+  };
 }
 
 /**
@@ -196,6 +273,13 @@ function zQuantile(p) {
  *     default — passing an explicit value is a deviation from that
  *     registration, recorded on the H2/H4 results as
  *     `deltaDeviatesFromRegistration: true`.
+ *   @param {string[]} [opts.availableArms]  issue #97. The arm ids this run
+ *     can actually estimate, defaulting to `[referenceArm, ...panelArms]` --
+ *     which is the right default because `panelArms` is DEFINED as every
+ *     non-reference arm id present. Any registered entry naming an arm
+ *     outside this set is returned as a NOT-ESTIMABLE record (see
+ *     notEstimableSpec()) instead of a weights map that would blow up as
+ *     `contrastVector: unknown coefficient 'arm[T.E]'` four modules later.
  *   @param {boolean} [opts.h5Wired=false]  issue #80. When true, H5's entry
  *     is a real weights-based spec (targeting JUDGE_SCORE_BIAS_COEFFICIENT)
  *     instead of the `{unimplemented: true}` stub — the caller is asserting
@@ -248,27 +332,86 @@ export function buildRegisteredFamily(opts = {}) {
   const h1Weights = {};
   for (const arm of panelArms) h1Weights[armCoefficientName(arm, referenceArm)] = 1 / panelArms.length;
 
+  // ── Arm-subset scoping (issue #97) ────────────────────────────────────
+  // `panelArms` IS "every non-reference arm id" present in this run, so
+  // [referenceArm, ...panelArms] is the estimable arm set unless a caller
+  // says otherwise. Any registered entry naming an arm outside it is
+  // recorded not-estimable rather than emitting weights that cannot be
+  // aligned to the fit's coefficient names. See this module's header for
+  // why record-and-keep-the-slot, not drop and not substitute.
+  const availableArms = opts.availableArms || [referenceArm, ...panelArms];
+  const availableSet = new Set(availableArms);
+  const absentAmong = (arms) => Array.from(new Set(arms.filter((a) => !availableSet.has(a))));
+
+  const h1Description = `mean(panel arms) - ${referenceArm}`;
+  const h2Description = `${h2Challenger} >= ${h2Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`;
+  const h3Description = `${h3Challenger} > max(${h3Baselines.join(", ")}) -- intersection-union test (IUT): one Holm slot, p = max over the one-sided sub-contrast p-values (Berger's IUT result -- see module doc comment)`;
+  const h4Description = `${h4Challenger} >= ${h4Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`;
+
+  const h2Missing = absentAmong([h2Challenger, h2Baseline]);
+  const h3Missing = absentAmong([h3Challenger, ...h3Baselines]);
+  const h4Missing = absentAmong([h4Challenger, h4Baseline]);
+
   return [
-    {
-      id: "H1",
-      description: `mean(panel arms) - ${referenceArm}`,
-      kind: "superiority",
-      weights: h1Weights,
-    },
-    {
-      id: "H2",
-      description: `${h2Challenger} >= ${h2Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`,
-      kind: "one-sided-margin",
-      delta,
-      deltaDeviatesFromRegistration,
-      weights: {
-        [armCoefficientName(h2Challenger, referenceArm)]: 1,
-        [armCoefficientName(h2Baseline, referenceArm)]: -1,
-      },
-    },
-    {
+    // H1 is not estimable with fewer than TWO panel arms: mean(panel arms)
+    // over a single arm is arithmetically (armX - referenceArm), a PER-ARM
+    // comparison that Appendix B item 5 assigns to the §6.3 exploratory,
+    // BH-corrected section and says is never folded into the Holm family.
+    // Computing it would put an exploratory contrast inside the registered
+    // family under H1's name -- see this module's header.
+    panelArms.length < 2
+      ? notEstimableSpec({
+          id: "H1",
+          description: h1Description,
+          kind: "superiority",
+          missingArms: [],
+          availableArms,
+          why:
+            `H1 is registered as mean(panel arms) - ${referenceArm}; with only ${panelArms.length} panel arm ` +
+            `[${panelArms.join(", ")}] that mean collapses to a single PER-ARM comparison, which ` +
+            "docs/PREREGISTRATION.md Appendix B item 5 assigns to the §6.3 exploratory (BH-corrected) section and " +
+            "explicitly excludes from the confirmatory Holm family.",
+        })
+      : {
+          id: "H1",
+          description: h1Description,
+          kind: "superiority",
+          weights: h1Weights,
+        },
+    h2Missing.length
+      ? notEstimableSpec({
+          id: "H2",
+          description: h2Description,
+          kind: "one-sided-margin",
+          missingArms: h2Missing,
+          availableArms,
+          why: "H2 is registered as a comparison between those two specific arms.",
+        })
+      : {
+          id: "H2",
+          description: h2Description,
+          kind: "one-sided-margin",
+          delta,
+          deltaDeviatesFromRegistration,
+          weights: {
+            [armCoefficientName(h2Challenger, referenceArm)]: 1,
+            [armCoefficientName(h2Baseline, referenceArm)]: -1,
+          },
+        },
+    h3Missing.length
+      ? notEstimableSpec({
+          id: "H3",
+          description: h3Description,
+          kind: "iut-max-p",
+          missingArms: h3Missing,
+          availableArms,
+          why:
+            "H3 is an intersection-union test over ALL of its sub-contrasts -- dropping the sub-contrast whose " +
+            "baseline is missing would silently weaken the null from 'G beats both' to 'G beats the one that happened to be run'.",
+        })
+      : {
       id: "H3",
-      description: `${h3Challenger} > max(${h3Baselines.join(", ")}) -- intersection-union test (IUT): one Holm slot, p = max over the one-sided sub-contrast p-values (Berger's IUT result -- see module doc comment)`,
+      description: h3Description,
       kind: "iut-max-p",
       // Both sub-contrasts are evaluated, but by Berger's IUT result
       // "reject iff every component rejects" is itself a level-alpha test
@@ -283,17 +426,26 @@ export function buildRegisteredFamily(opts = {}) {
         },
       })),
     },
-    {
-      id: "H4",
-      description: `${h4Challenger} >= ${h4Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`,
-      kind: "one-sided-margin",
-      delta,
-      deltaDeviatesFromRegistration,
-      weights: {
-        [armCoefficientName(h4Challenger, referenceArm)]: 1,
-        [armCoefficientName(h4Baseline, referenceArm)]: -1,
-      },
-    },
+    h4Missing.length
+      ? notEstimableSpec({
+          id: "H4",
+          description: h4Description,
+          kind: "one-sided-margin",
+          missingArms: h4Missing,
+          availableArms,
+          why: "H4 is registered as a comparison between those two specific arms.",
+        })
+      : {
+          id: "H4",
+          description: h4Description,
+          kind: "one-sided-margin",
+          delta,
+          deltaDeviatesFromRegistration,
+          weights: {
+            [armCoefficientName(h4Challenger, referenceArm)]: 1,
+            [armCoefficientName(h4Baseline, referenceArm)]: -1,
+          },
+        },
     {
       id: "H5",
       description: "same-provider judging inflates scores (judge_provider x generator_provider bias term, judge-score model, #80)",
@@ -331,6 +483,31 @@ export function buildRegisteredFamily(opts = {}) {
  */
 export function registeredFamilySlotCount(family) {
   return family.length;
+}
+
+/**
+ * Summarize which registered slots this run could actually estimate (issue
+ * #97), for callers and reports that need the fact WITHOUT scanning five
+ * entries. Deliberately does NOT feed multiplicity: `slots` is and stays
+ * `registeredFamilySlotCount()`, i.e. 5. `estimated` is reported so a reader
+ * can see the family was only partly estimable -- it is never used to shrink
+ * the Holm multiplier, because a family size that depends on which cells
+ * happened to arrive is a data-dependent family definition
+ * (docs/PREREGISTRATION.md §11) and shrinking it is the anti-conservative
+ * direction. See this module's header.
+ *
+ * @param {Array<object>} results  evaluated family (or the specs themselves)
+ * @returns {{slots: number, estimated: number, notEstimable: Array<{id: string, missingArms: string[], reason: string}>}}
+ */
+export function familyEstimability(results) {
+  const notEstimable = results
+    .filter((r) => r && r.notEstimable)
+    .map((r) => ({ id: r.id, missingArms: r.missingArms || [], reason: r.reason }));
+  return {
+    slots: results.length,
+    estimated: results.length - results.filter((r) => r && r.unimplemented).length,
+    notEstimable,
+  };
 }
 
 /** One-sided upper-tail p-value: P(Z > z) — Student-t (fit.df) if a finite
@@ -385,8 +562,57 @@ function oneSidedUpperP(z, fit) {
  */
 export function evaluateSpec(spec, fit) {
   if (spec.unimplemented) {
-    return { id: spec.id, unimplemented: true, reason: "judge-score model not available for this run (see #80) — no judge-score fit was supplied", p: 1 };
+    return {
+      id: spec.id,
+      ...(spec.description ? { description: spec.description } : {}),
+      unimplemented: true,
+      // issue #97: carry the not-estimable record through verbatim so the
+      // report and any programmatic caller can tell "this run's arms cannot
+      // estimate the registered contrast" apart from "that lane's fit did
+      // not run". Absent for the H5 stub, which is the latter.
+      ...(spec.notEstimable
+        ? { notEstimable: true, missingArms: spec.missingArms || [], availableArms: spec.availableArms || [] }
+        : {}),
+      reason: spec.reason || "judge-score model not available for this run (see #80) — no judge-score fit was supplied",
+      p: 1,
+    };
   }
+
+  // Belt behind buildRegisteredFamily()'s arm-subset scoping (issue #97).
+  // A spec's arms are checked against `[referenceArm, ...panelArms]` at
+  // build time, but H1 is evaluated against the RAREFIED fit and H2-H4
+  // against the FULL-POOL fit (analysis.mjs), and those two fits' arm sets
+  // can differ. Rather than reconcile them upstream, catch a missing ARM
+  // coefficient here, at the only place that sees both the spec and the fit
+  // it is being evaluated against, and return the same not-estimable record.
+  //
+  // Scoped to ARM-shaped coefficient names on purpose: an unknown name that
+  // is NOT an arm offset (a typo, or H5's bias term against a fit that has
+  // no such column) still falls through to contrastVector()'s hard error,
+  // which is exactly the typo guard that error exists to be.
+  const specWeights = spec.kind === "iut-max-p" ? Object.assign({}, ...spec.components.map((c) => c.weights)) : spec.weights;
+  const missingArms = Object.keys(specWeights)
+    .filter((name) => !fit.coefficientNames.includes(name))
+    .map(armIdFromCoefficientName)
+    .filter((armId) => armId !== null);
+  if (missingArms.length) {
+    const availableArms = fit.coefficientNames.map(armIdFromCoefficientName).filter((a) => a !== null);
+    return {
+      id: spec.id,
+      description: spec.description,
+      unimplemented: true,
+      notEstimable: true,
+      missingArms,
+      availableArms,
+      reason:
+        `NOT ESTIMABLE against this fit: the registered ${spec.id} contrast (${spec.description}) names ` +
+        `arm${missingArms.length === 1 ? "" : "s"} [${missingArms.join(", ")}], which the fitted model does not carry ` +
+        `(fitted non-reference arms: [${availableArms.join(", ")}]; coefficients: [${fit.coefficientNames.join(", ")}]). ` +
+        "No substitute arm is used and the entry is NOT dropped -- it keeps its Holm slot with p=1.",
+      p: 1,
+    };
+  }
+
   if (spec.kind === "iut-max-p") {
     const components = spec.components.map((comp) => {
       const c = contrastVector(fit.coefficientNames, comp.weights);

@@ -71,7 +71,7 @@ import { buildFrame, summarizeByArm, assertCellsSelected } from "./frame.mjs";
 import { resolveStoreConfigHash } from "./storeConfig.mjs";
 import { buildRarefiedFrame, PoolsUnavailableError } from "./rarefiedFrame.mjs";
 import { buildJudgeScoreFrame, JudgeScoresUnavailableError } from "./judgeScoreFrame.mjs";
-import { buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts } from "./contrasts.mjs";
+import { buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts, familyEstimability } from "./contrasts.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
 import { paretoFrontier, costDiversityRatioByArm, seedFromString } from "./pareto.mjs";
 import { renderParetoSvg } from "./plot.mjs";
@@ -102,6 +102,22 @@ function parseArgs(argv) {
     else if (a === "--out-dir") args.outDir = argv[++i];
     else if (a === "--response") args.response = argv[++i];
     else if (a === "--reference-arm") args.referenceArm = argv[++i];
+    // --panel-arms scopes BOTH the model fit and the registered contrast
+    // family (issue #97). Before that issue it scoped only the fit, so a
+    // subset run built a family naming arms D/E/G/H that the fit did not
+    // carry and died as `contrastVector: unknown coefficient 'arm[T.E]'`.
+    // Left off, it is derived from the frame's own armLevels below, which
+    // is the path an operator actually takes.
+    //
+    // There is deliberately NO --h2-pair / --h3-target-vs-best / --h4-pair
+    // flag, and adding one is not a missing feature. buildRegisteredFamily()
+    // accepts those options, but exposing them on the CLI would let a subset
+    // run SUBSTITUTE a present arm for an absent one -- answering a
+    // different question under a pre-registered hypothesis's name. What a
+    // subset run needs is SCOPING (which this flag gives) and an explicit
+    // not-estimable record for what it cannot reach (which
+    // buildRegisteredFamily() gives); it does not need re-pairing. See
+    // contrasts.mjs's "ARM SUBSETS AND THE REGISTERED FAMILY" header.
     else if (a === "--panel-arms") args.panelArms = argv[++i].split(",");
     // H2/H4's registered default is delta=0 (buildRegisteredFamily()) -- this
     // flag exists ONLY to register an explicit margin later (§B2's pilot),
@@ -216,8 +232,21 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // regardless of rarefaction. Skip the attempt here rather than let
   // buildRarefiedFrame()'s unrelated "must name at least two arms" guard
   // fire first and obscure that this was never a rarefaction problem.
+  //
+  // `panelArms.length < 2` (issue #97) is the same "don't even try" gate one
+  // step wider: H1's registered contrast is mean(panel arms) - referenceArm,
+  // and with fewer than two panel arms buildRegisteredFamily() records H1 as
+  // NOT ESTIMABLE (a single panel arm collapses it to a per-arm comparison,
+  // which Appendix B item 5 assigns to the §6.3 exploratory section). There
+  // is then nothing for the rarefied lane to fit, so skip it rather than
+  // spend a rarefaction + ladder on a contrast that will not be evaluated.
   if (panelArms.length === 0) {
     rarefiedUnavailableReason = "no panel arms present in this frame — H1 is undefined without at least one panel arm";
+  } else if (panelArms.length < 2) {
+    rarefiedUnavailableReason =
+      `only one panel arm present in this frame ([${panelArms.join(", ")}]) — H1 (mean(panel arms) - ${args.referenceArm}) is ` +
+      "recorded NOT ESTIMABLE for this arm subset rather than computed as a per-arm comparison under H1's registered name " +
+      "(docs/PREREGISTRATION.md Appendix B item 5), so the rarefied lane has nothing to fit";
   } else if (RAREFACTION_TREATMENT[args.response] === "rarefied") {
     try {
       rarefiedFrame = buildRarefiedFrame(frame, {
@@ -349,6 +378,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // judge-score fit (when available); every other entry keeps using the
   // full-pool `ladder.fit`, unchanged.
   const registeredResults = family.map((spec) => {
+    // Arm-subset not-estimable (issue #97): evaluateSpec() returns the
+    // record without touching a fit, so this must come BEFORE the per-lane
+    // fit routing below -- H1's entry in particular has no rarefied fit to
+    // be evaluated against when it was never estimable in the first place.
+    if (spec.notEstimable) return evaluateSpec(spec, null);
     if (spec.id === "H1") {
       if (rarefiedLadder && rarefiedLadder.fit) return evaluateSpec(spec, rarefiedLadder.fit);
       // No rarefied fit available -- report H1 as NOT COMPUTED (the same
@@ -375,6 +409,18 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     }
     return evaluateSpec(spec, ladder.fit);
   });
+  // Multiplicity (issue #97 AC). The Holm family is `registeredFamilySlotCount(family)`
+  // -- 5 -- WHATEVER this run could estimate. Every not-estimable entry is
+  // still in `registeredResults` carrying p=1, so the count matches and the
+  // `familySize` assertion holds. This is deliberate, not an oversight:
+  // shrinking m to the number of contrasts actually estimated would make the
+  // correction LESS conservative (Holm's first step multiplies by m, so
+  // 5*p >= 2*p) and would make the registered family size a function of
+  // which cells happened to arrive -- a data-dependent family definition,
+  // which is exactly what §11 forbids. Keeping m=5 costs power and cannot
+  // inflate FWER. `estimability` records what was and was not reachable so
+  // the loss is visible rather than implicit.
+  const estimability = familyEstimability(registeredResults);
   const holmAdjusted = holmBonferroni(
     registeredResults.map((r) => r.p),
     { familySize: registeredFamilySlotCount(family) },
@@ -449,6 +495,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       rarefiedFrame,
       rarefiedLadder,
       rarefiedUnavailableReason,
+      estimability,
     }),
   );
 
@@ -456,6 +503,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     frame,
     ladder,
     registeredResults: verdicts,
+    estimability,
     holmAdjusted,
     paretoPoints,
     costRatioByArm,

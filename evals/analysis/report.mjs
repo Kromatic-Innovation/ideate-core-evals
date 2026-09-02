@@ -47,6 +47,12 @@ function ciStr(ci, digits = 3) {
  *     registers reporting both, never the rarefied number alone.
  *   @param {{rung: string}|null} [input.rarefiedLadder]  runLadder() result
  *     for the rarefied lane, for the rung line.
+ *   @param {{slots: number, estimated: number, notEstimable: Array<object>}} [input.estimability]
+ *     contrasts.mjs's familyEstimability() (issue #97). When any registered
+ *     entry is not estimable under this run's arm subset, a banner naming
+ *     each one is rendered above the hypothesis table -- a partly-estimable
+ *     registered family is a fact about the run that must be legible at a
+ *     glance, not something a reader has to infer from "unimplemented" rows.
  *   @param {string} [input.rarefiedUnavailableReason]  set when
  *     `rarefiedFrame` is null — printed verbatim rather than silently
  *     omitting the section (never let a reader assume rarefaction ran).
@@ -66,6 +72,7 @@ export function renderReport(input) {
     rarefiedFrame = null,
     rarefiedLadder = null,
     rarefiedUnavailableReason,
+    estimability = null,
   } = input;
 
   const lines = [];
@@ -93,6 +100,27 @@ export function renderReport(input) {
 
   lines.push("## Registered hypotheses (Holm-Bonferroni, family of 5 slots across H1-H5 -- H3 is a single intersection-union test)");
   lines.push("");
+  // Arm-subset banner (issue #97). The Holm family stays 5 slots whatever
+  // this run could estimate -- shrinking it to the estimated count would be
+  // the anti-conservative direction AND a data-dependent family definition
+  // (§11). What a reader needs instead is to SEE that some registered
+  // hypotheses were unreachable, and why.
+  if (estimability && estimability.notEstimable && estimability.notEstimable.length) {
+    lines.push(
+      `**REGISTERED FAMILY ONLY PARTLY ESTIMABLE** — ${estimability.notEstimable.length} of ${estimability.slots} registered ` +
+        "hypotheses cannot be estimated from this run's arm subset. This is an ARM-SUBSET run (a smoke study, a pilot, or a " +
+        "re-analysis of a partial store), not the confirmatory analysis of §6.1. No substitute arm was used for any absent " +
+        "arm, and no entry was dropped from the family: each is reported below with p=1, still occupying its Holm slot, so " +
+        "the correction remains over all 5 registered slots (§6.2 / Appendix B item 6). Keeping m=5 is CONSERVATIVE — it " +
+        "costs power and cannot inflate the false-positive rate — and it keeps the family size a pre-registered constant " +
+        "rather than a function of which cells happened to arrive (§11).",
+    );
+    lines.push("");
+    for (const entry of estimability.notEstimable) {
+      lines.push(`- **${entry.id}** — ${entry.reason}`);
+    }
+    lines.push("");
+  }
   lines.push("| ID | Description | Estimate | 95% CI | Holm-adjusted p | Verdict |");
   lines.push("|---|---|---|---|---|---|");
   const flatRegistered = registeredResults.flat();
@@ -173,11 +201,25 @@ export function renderReport(input) {
       lines.push(`| ${r.cellKey} | ${r.armId} | ${r.poolSize} | ${r.rarefiedN} | ${fmt(r.responseFullPool)} | ${fmt(r.response)} |`);
     }
   } else {
-    lines.push(
-      `**Rarefied \`distinct_k\` NOT COMPUTED** — ${rarefiedUnavailableReason || "no per-cell pools in the store yet"}. ` +
-        "H1 above is reported `unimplemented` (p=1, occupies its Holm slot) rather than falling back to the full-pool contrast, " +
-        "per Appendix C item 5: rarefied distinct_k is H1's registered estimand and the full-pool value is never a silent substitute for it.",
-    );
+    // Two DIFFERENT reasons land here and they must not be conflated
+    // (issue #97): either H1's rarefied ESTIMAND was unavailable (no pools
+    // in the store yet — Appendix C item 5), or H1 was never ESTIMABLE for
+    // this arm subset in the first place (fewer than two panel arms), in
+    // which case a rarefaction reason would be misleading.
+    const h1Entry = flatRegistered.find((r) => r.id === "H1");
+    if (h1Entry && h1Entry.notEstimable) {
+      lines.push(
+        `**Rarefied \`distinct_k\` NOT COMPUTED** — ${rarefiedUnavailableReason || "the rarefied lane did not run"}. ` +
+          "Note this is NOT a rarefaction failure: H1 is reported not-estimable for this run's arm subset (see the banner " +
+          "above), so there was no H1 contrast for the rarefied lane to fit.",
+      );
+    } else {
+      lines.push(
+        `**Rarefied \`distinct_k\` NOT COMPUTED** — ${rarefiedUnavailableReason || "no per-cell pools in the store yet"}. ` +
+          "H1 above is reported `unimplemented` (p=1, occupies its Holm slot) rather than falling back to the full-pool contrast, " +
+          "per Appendix C item 5: rarefied distinct_k is H1's registered estimand and the full-pool value is never a silent substitute for it.",
+      );
+    }
   }
   lines.push("");
 
