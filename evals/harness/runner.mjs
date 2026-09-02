@@ -47,7 +47,13 @@ import {
   isTransientFailure,
   isPaymentFailure,
 } from "../../lib/accounting.mjs";
-import { assertValidProviderResponse } from "./provider.mjs";
+// realizedAgents (issue #102): ideate-core's own realized-agent bookkeeping,
+// normalized and validated. Imported rather than re-derived so the runner's
+// backstop and the providers' own guard agree by construction on what "an
+// attempted agent that did not contribute" means -- see provider.mjs's "THE
+// UNDERSIZED-POOL RULE" block for the rule itself and for why the denominator
+// is ideate-core's attempted count rather than arm.slots.length.
+import { assertValidProviderResponse, realizedAgents } from "./provider.mjs";
 // providerOf/priceRowByProvider (issue #51, per-provider --max-spend): pure
 // data-shape utilities, not the interim estimator this module owns -- see
 // lib/price.mjs's own header for why the RATE_TABLE-backed pricer stays a
@@ -999,6 +1005,29 @@ function salvageEvictedCellSpend(store, evicted) {
     return { key, reused: false };
   }
   throw new Error(`salvageEvictedCellSpend: 1000 salvage records already exist for cell '${evicted.key}' -- refusing to write another`);
+}
+
+/**
+ * The realized-agent fields retained on a STORED cell (issue #102 AC2), in a
+ * flat, self-describing shape rather than only nested inside whatever `meta`
+ * the engine happened to emit. `{}` when the provider reported nothing usable
+ * -- "cannot verify", never "nothing failed"; the absence of the fields is what
+ * says so, which is why this returns an empty object rather than zeros.
+ *
+ * Retained on BOTH a completed cell and a stored intrinsic failure, so the
+ * question "how many agents actually contributed to this pool?" has an answer
+ * on the record either way. It is a DIAGNOSTIC, not the safety mechanism: the
+ * cell's own accounting state already tells the truth about an undersized pool
+ * (see provider.mjs's rule block on why an unread field cannot be the fix).
+ */
+function agentCountFields(source) {
+  const realized = realizedAgents(source);
+  if (!realized) return {};
+  return {
+    agentsAttempted: realized.attempted,
+    agentsFailed: realized.failed,
+    agentsRealized: realized.realized,
+  };
 }
 
 /** A candidate is either a bare string or an object carrying `.text` (same
@@ -1969,6 +1998,65 @@ export async function runSpec(spec, opts) {
     if (response.terminalState === "completed") {
       const genCostRows = costRowsFor(cell.key, response.tokens, timestamp);
 
+      // ── UNDERSIZED-POOL BACKSTOP (issue #102) ────────────────────────────
+      // A cell whose pool was assembled from fewer agents than its arm
+      // specifies must not be stored `completed`. The full rule -- what it is,
+      // the two alternatives rejected, and why the shortfall test is
+      // `meta.agentsFailed > 0` rather than a comparison against
+      // `arm.slots.length` -- lives in provider.mjs above `classifyUndersizedPool`.
+      // It is stated ONCE, there, because that is where the evidence to
+      // classify the CAUSE lives (transport signals, per-reply diagnostics).
+      //
+      // This is the provider-agnostic BACKSTOP, not the primary enforcement:
+      // both shipped providers already refuse to return `completed` for a
+      // short pool, so in practice this branch is unreachable through them.
+      // It exists so the rule is a property of the harness rather than of two
+      // adapters -- a third provider, or a regression in one of the two, is
+      // caught here instead of quietly writing a biased cell.
+      //
+      // LIMITATION, stated rather than papered over: this can only check a
+      // provider that REPORTS its realized agent counts. `realizedAgents`
+      // returns null for a response carrying no usable `meta` (MockProvider,
+      // and any future adapter that omits it), and this branch then passes the
+      // cell through. "Cannot verify" is not "verified fine" -- the guarantee
+      // for such a provider rests entirely on the provider itself.
+      //
+      // Placed BEFORE computeCellMetrics deliberately: embedding a pool we
+      // have already decided to discard would spend real Voyage tokens on a
+      // cell that is never stored -- the same waste #92's #completeBatched
+      // short-circuit exists to prevent one layer down.
+      const realized = realizedAgents(response.result);
+      if (realized && realized.failed > 0) {
+        const detail =
+          `runSpec: provider returned a COMPLETED response for cell '${cell.key}' whose pool was assembled from ` +
+          `fewer agents than arm '${cell.armId}' specifies -- agents_attempted=${realized.attempted} ` +
+          `agents_failed=${realized.failed} agents_realized=${realized.realized}. Storing it would silently ` +
+          `under-report this cell's pool size (issue #102). A provider must classify this itself; this is the ` +
+          `harness backstop.`;
+        // harness_error, and the choice is not incidental: the runner cannot
+        // see WHY those agents dropped out (that evidence is the provider's
+        // diagnostics), so it must not assert an intrinsic cause it has no
+        // basis for. harness_error is transient, so #90 keeps cell.key out of
+        // the store and the next invocation re-plans this cell -- and it names
+        // the right culprit, which is a provider not honouring the contract.
+        account.fail(cell.key, "harness_error", detail);
+        for (const row of genCostRows) account.addCost(row);
+        // Money-first, exactly as the transient branch below: the generation
+        // call already succeeded and already spent real money. Nothing goes
+        // under cell.key (so planRun re-plans it); the spend goes under an
+        // attempt-scoped key so it is never lost.
+        notStoredTransientByKind.harness_error = (notStoredTransientByKind.harness_error || 0) + 1;
+        recordGenerationAttemptFailure(store, {
+          cell,
+          costRows: genCostRows,
+          kind: "harness_error",
+          detail,
+          resolvedModels: resolvedModelsFor(arm),
+        });
+        recordActualSpend(genCostRows);
+        continue; // no metrics, no store.put, no judging -- this pool is discarded
+      }
+
       // ── Pool metrics (issue #85), computed BEFORE the single store.put()
       // for this cell -- lib/store.mjs is append-only, so distinct_k/pool
       // must already be part of `result` at the moment this cell is FIRST
@@ -2030,7 +2118,17 @@ export async function runSpec(spec, opts) {
         continue; // no candidates survive to judge -- nothing was ever stored
       }
 
-      const finalResult = metrics ? { ...response.result, ...metrics.resultPatch } : response.result;
+      // agentCountFields (issue #102 AC2): the realized agent count is retained
+      // on the stored cell in a flat, self-describing shape -- `{}` (no fields
+      // at all) when the provider reported nothing usable, so "we could not
+      // verify" never reads as "nothing failed". By construction every cell
+      // reaching here has agentsFailed === 0 or unverifiable counts; the fields
+      // are retained anyway so a reader can tell those two apart on the record
+      // rather than by knowing which provider ran.
+      const finalResult = {
+        ...(metrics ? { ...response.result, ...metrics.resultPatch } : response.result),
+        ...agentCountFields(response.result),
+      };
       account.complete(cell.key, finalResult);
       for (const row of costRows) account.addCost(row);
       // issue #74 -- store.put() BEFORE recordActualSpend(): the API call
@@ -2156,7 +2254,15 @@ export async function runSpec(spec, opts) {
           briefId: cell.briefId,
           replicate: cell.replicate,
           cfg: cell.cfg,
-          result: { failed: true, failureKind: response.failureKind },
+          // agentCountFields (issue #102 AC2): a stored INTRINSIC failure is
+          // the one failure that becomes a permanent record of the arm, and a
+          // partial refusal / partial parse_failure now lands here (it used to
+          // complete with an undersized pool). Retaining the counts is what
+          // lets a reader of the store tell "every agent refused" from "two of
+          // five refused and we discarded the other three's ideas" -- read off
+          // the provider response's own `meta`, which the undersized-pool
+          // branches carry for exactly this purpose.
+          result: { failed: true, failureKind: response.failureKind, ...agentCountFields(response) },
           resolvedModels: resolvedModelsFor(arm),
           accounting: { state: "failed", kind: response.failureKind, detail: response.detail || "" },
           costRows,
