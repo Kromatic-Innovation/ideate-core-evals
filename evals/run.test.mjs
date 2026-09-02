@@ -13,6 +13,8 @@ import { parseArgs, main, formatSpendSummary, formatPhase0Report } from "./run.m
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
+import { AnthropicJudgeProvider } from "./judge/score.mjs";
+import { CORPUS } from "./corpus/index.mjs";
 import armsConfigJson from "../arms.config.json" with { type: "json" };
 
 // A stand-in store: main()'s wiring is under test here, not ResultsStore
@@ -139,6 +141,35 @@ test("main() wires a REAL, RATE_TABLE-backed priceGrid (lib/price.mjs's runnerPr
   const actualNoBatch = priceGrid([cell], armsConfigJson.arms, { batch: false });
   assert.notEqual(actualNoBatch.usd, actual.usd, "dropping the batch discount from the judge term must fail this assertion");
   assert.ok(actualNoBatch.usd > actual.usd, "batch=false must project MORE than batch=true, for judging same as generation");
+});
+
+// ── issue #68: judging must be wired into a REAL CLI invocation ────────────
+// The verification bar calls out exactly this failure shape from tonight's
+// PRs: "a wiring assertion that passed even when the wiring was removed".
+// This asserts main() passes a REAL AnthropicJudgeProvider instance (not
+// just "some object"), the registered JUDGE_MODELS roster, and the real
+// CORPUS through to runSpec -- delete any one of the three lines that wire
+// them in evals/run.mjs and this test must fail.
+
+test("main() wires a REAL AnthropicJudgeProvider + the registered JUDGE_MODELS roster + CORPUS through to runSpec (issue #68) -- judging is reachable from a real invocation, not only from a test", async (t) => {
+  const runSpecFn = spyRunSpec();
+  const priorKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "test-key-not-real";
+  t.after(() => {
+    if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = priorKey;
+  });
+
+  // Deliberately NOT --dry-run: dry-run's early return in runSpec() never
+  // reaches the judging pass, so main() must wire real judge providers for a
+  // GENUINE invocation regardless -- runSpecFn is a spy, so the network is
+  // never actually touched even though main() takes the real-run branch.
+  await main(["--max-spend", "999"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  const { opts } = runSpecFn.calls[0];
+  assert.deepEqual(opts.judgeModels, JUDGE_MODELS, "the registered judge-model roster (evals/judge/config.mjs) reaches runSpec unchanged");
+  assert.deepEqual(opts.corpus, CORPUS, "the real CORPUS (brief text) reaches runSpec, so a pool's judge call has something to score against");
+  assert.ok(opts.judgeProviders && opts.judgeProviders.anthropic instanceof AnthropicJudgeProvider, "a REAL AnthropicJudgeProvider instance is wired for the anthropic leg -- not a stub, not omitted");
 });
 
 test("main() forwards --max-spend as maxSpendUsd and --arms/--briefs/--replicates through to runSpec", async () => {

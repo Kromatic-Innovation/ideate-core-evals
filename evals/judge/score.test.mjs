@@ -323,7 +323,7 @@ test("runJudgeMatrix stores per-axis scores and meters each judge call", async (
   assert.equal(rec.result.scores.length, 2);
   assert.ok(rec.result.scores.every((s) => typeof s.originality === "number" && typeof s.feasibility === "number"));
   // A judge-call cost record was written too (meterJudgeCall).
-  const costRecord = store.get(`judge-call|cell=${poolKey}|judge=claude-sonnet-5`);
+  const costRecord = store.get(`judge-call|cell=${poolKey}|judge=claude-sonnet-5|attempt=0`);
   assert.equal(costRecord.costRows.length, 1);
   assert.equal(costRecord.costRows[0].model, "claude-sonnet-5");
 });
@@ -347,7 +347,7 @@ test("runJudgeMatrix returns a costRow for every completed judge call — this i
   }
   // The SAME row objects the store actually persisted — never a second,
   // independently-built row (double-count guard).
-  const stored = store.get(`judge-call|cell=${poolKey}|judge=${costRows[0].model}`);
+  const stored = store.get(`judge-call|cell=${poolKey}|judge=${costRows[0].model}|attempt=0`);
   assert.deepEqual(stored.costRows[0], costRows.find((r) => r.model === stored.costRows[0].model));
 });
 

@@ -37,6 +37,14 @@ import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
+// AnthropicJudgeProvider (issue #68): the real judging LEG this CLI wires
+// into runSpec's per-pool judging pass -- the pre-flight already priced
+// judging (issue #63's judgeLegsFor above), but nothing actually CALLED a
+// judge until this. There is no OpenAIJudgeProvider yet (unlike
+// OpenAIBatchProvider, which is the GENERATION adapter for arms G/H, issue
+// #22) -- the OpenAI judge leg is deferred (runJudgeMatrix's own documented,
+// non-dropping behavior; see evals/judge/score.mjs) until that lands.
+import { AnthropicJudgeProvider } from "./judge/score.mjs";
 import { runPhase0 } from "./metrics/phase0.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -453,12 +461,32 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     provider = new AnthropicBatchProvider({ apiKey, corpus: CORPUS, armsConfig });
   }
 
+  // judgeProviders (issue #68): the real Anthropic judge leg, sharing the
+  // SAME ANTHROPIC_API_KEY already validated above -- constructed only for a
+  // real (non-dry-run) invocation, mirroring the generation `provider`
+  // construction immediately above (dry-run's early return in runSpec()
+  // never reaches the judging pass, so this is unused but harmless there).
+  // No `openai` entry: there is no OpenAIJudgeProvider yet (see the import
+  // comment above) -- runJudgeMatrix records that leg `deferred`, never
+  // dropped, until a future issue supplies one.
+  const judgeProviders = args.dryRun ? {} : { anthropic: new AnthropicJudgeProvider({ apiKey: process.env.ANTHROPIC_API_KEY }) };
+
   const runSpecOpts = {
     store,
     armsConfig,
     provider,
     batch: !args.noBatch,
     dryRun: args.dryRun,
+    // judgeModels/judgeProviders/corpus (issue #68): THE wiring that makes
+    // judging reachable from a real CLI run at all -- before this, nothing
+    // outside a test ever called runJudgeMatrix/runJudgeValidation (see the
+    // issue: "runJudgeMatrix has no non-test caller"). judgeModels is the
+    // SAME registered roster (evals/judge/config.mjs) the pre-flight
+    // (judgeLegsFor below) already prices judging against, so what gets
+    // JUDGED and what gets PRICED can never silently diverge.
+    judgeModels: JUDGE_MODELS,
+    judgeProviders,
+    corpus: CORPUS,
     // --max-spend-anthropic/--max-spend-openai (issue #51) need real,
     // pinned-rate-table pricing to be meaningful pre-flight -- the interim
     // estimator runSpec() falls back to when no priceGrid is injected has no

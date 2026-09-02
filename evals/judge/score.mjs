@@ -625,9 +625,19 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
 
     if (resp.terminalState === "completed") {
       for (const s of resp.scores) assertAxesNotCollapsed(s); // defense: never store a collapsed score
-      recordJudgeScores(store, { poolKey: row.poolKey, judgeModel: row.judge_model, judgeProvider: row.judge_provider, scores: resp.scores });
+      // Money-first (PR #76 fix round, mirrors issue #74's generation-loop
+      // ordering): meter BEFORE recording scores. Real tokens were already
+      // spent by the call above; if the process dies between these two
+      // writes, money-first means the SURVIVING write is the spend record
+      // (meterJudgeCall's attempt-scoped judge-call row -- see gate.mjs),
+      // never the scores. A resumed run (evals/harness/runner.mjs's
+      // judgePoolIfEnabled) decides "already judged" purely from whether
+      // SCORES exist, so a crash here is recoverable by re-scoring (cheap,
+      // recomputable) -- the alternative ordering risked losing the ALREADY-
+      // SPENT judge-call row instead (not recomputable; real money gone).
       const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
       costRows.push(metered.row);
+      recordJudgeScores(store, { poolKey: row.poolKey, judgeModel: row.judge_model, judgeProvider: row.judge_provider, scores: resp.scores });
       results.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, state: "completed", scores: resp.scores });
     } else {
       // A classified judge failure is a datum, surfaced — never a silent drop.
