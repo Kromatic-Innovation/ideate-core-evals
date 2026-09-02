@@ -19,25 +19,38 @@
 //     PER-ARM breakdown (armX - referenceArm for one arm at a time) is a
 //     SEPARATE, exploratory contrast — BH-corrected, never folded into the
 //     Holm-corrected registered family.
-// H2: E >= D, restated as non-inferiority: CI-lower-bound(E - D) > -delta.
-//     delta is a REGISTERED margin with NO built-in default (§B2: "delta is
-//     derived from the Phase 2 pilot variance estimate and registered before
-//     the confirmatory grid runs") — callers must supply it explicitly. If
-//     omitted, the contrast is still estimated (point + CI) but flagged
-//     `deltaUnregistered: true` instead of a pass/fail non-inferiority
-//     verdict, since a non-inferiority claim with no margin is not a claim.
-// H3: G > max(D, H) is NOT one linear contrast. Registered here as TWO
-//     contrasts (G-D, G-H); H3 is "supported" only if BOTH lower bounds
-//     (after Holm adjustment, since both are part of the registered family)
-//     exceed 0. This is a registered decision, not an implementation
-//     shortcut — see buildRegisteredFamily()'s H3 entry.
-// H4: same non-inferiority treatment as H2, for B >= D.
+// H2: E >= D. docs/PREREGISTRATION.md §6.1/§6.2 registers a DIRECTION only —
+//     no numeric margin appears anywhere in the registration. The faithful
+//     reading is the one-sided delta=0 test (H0: E - D <= 0), structurally
+//     identical to H3's IUT sub-tests. delta=0 is therefore the REGISTERED
+//     DEFAULT here. A caller may still pass an explicit delta (a margin may
+//     be registered later via the pilot per §B2), but that is a DEVIATION
+//     from the current registration, not the registered test itself — it is
+//     recorded on the result as `deltaDeviatesFromRegistration: true` rather
+//     than silently absorbed. (Previously this was framed as
+//     "non-inferiority" with no default, which meant the delta=0 test never
+//     actually ran; every real invocation fell through to a two-sided
+//     Wald-vs-zero p that was never registered. See #46 QA re-review.)
+// H3: G > max(D, H) is NOT one linear contrast, but it IS a single
+//     registered hypothesis (docs/PREREGISTRATION.md:223: "5 registered
+//     hypotheses ... Holm-Bonferroni on the registered set"). Modeled as an
+//     intersection-union test (IUT): the null is "G <= D OR G <= H"; reject
+//     only if BOTH one-sided sub-contrasts (G-D, G-H) reject. By Berger's
+//     IUT result, rejecting the intersection null iff every component
+//     rejects at level alpha is ITSELF a level-alpha test of that
+//     intersection null — so H3 needs no within-hypothesis multiplicity
+//     adjustment and legitimately consumes exactly ONE Holm slot, with
+//     p = max(p_G-D, p_G-H). Do not re-split this into two slots; see
+//     buildRegisteredFamily()'s H3 entry and registeredFamilySlotCount().
+// H4: same delta=0-default one-sided treatment as H2, for B >= D.
 // H5: same-provider judging inflates scores — a judge_provider /
 //     judge_provider x generator_provider bias term from the JUDGE-SCORE
 //     model (B6), which is a different frame than the distinct_k lane this
 //     issue builds. Represented here as contrast DATA (the coefficient name
 //     it targets) so the registered family always has 5 slots; wiring the
 //     fit that actually produces that coefficient is #45/B5's job.
+
+import { tQuantile, tTwoSidedP, tUpperTailP } from "./distributions.mjs";
 
 /**
  * Build a dense contrast vector aligned to `coefficientNames`, from a sparse
@@ -50,7 +63,6 @@
  * @param {Record<string, number>} weights
  * @returns {number[]}
  */
-import { tQuantile, tTwoSidedP, tUpperTailP } from "./distributions.mjs";
 
 export function contrastVector(coefficientNames, weights) {
   for (const name of Object.keys(weights)) {
@@ -171,7 +183,11 @@ function zQuantile(p) {
  *   @param {[string,string]} [opts.h2Pair=["E","D"]]
  *   @param {[string,string]} [opts.h4Pair=["B","D"]]
  *   @param {[string,string]} [opts.h3TargetVsBest=["G","D","H"]]  [challenger, ...bestOf]
- *   @param {number} [opts.delta]           non-inferiority margin (H2/H4); no default
+ *   @param {number} [opts.delta=0]         H2/H4 margin. The registration
+ *     (§6.1/§6.2) supplies no numeric margin, so 0 is the REGISTERED
+ *     default — passing an explicit value is a deviation from that
+ *     registration, recorded on the H2/H4 results as
+ *     `deltaDeviatesFromRegistration: true`.
  * @returns {Array<object>} 5 entries, H1..H5 in order
  */
 export function buildRegisteredFamily(opts = {}) {
@@ -180,10 +196,14 @@ export function buildRegisteredFamily(opts = {}) {
   if (!Array.isArray(panelArms) || panelArms.length === 0) {
     throw new Error("buildRegisteredFamily: opts.panelArms is required (every non-reference arm id)");
   }
+  if (new Set(panelArms).size !== panelArms.length) {
+    throw new Error(`buildRegisteredFamily: opts.panelArms contains duplicates [${panelArms.join(", ")}] -- a duplicate silently rescales H1's weights (1/panelArms.length no longer matches the deduped coefficient set)`);
+  }
   const [h2Challenger, h2Baseline] = opts.h2Pair || ["E", "D"];
   const [h4Challenger, h4Baseline] = opts.h4Pair || ["B", "D"];
   const [h3Challenger, ...h3Baselines] = opts.h3TargetVsBest || ["G", "D", "H"];
-  const delta = opts.delta;
+  const deltaDeviatesFromRegistration = opts.delta !== undefined && opts.delta !== null;
+  const delta = deltaDeviatesFromRegistration ? opts.delta : 0;
 
   // Guard against the H1-intercept bug's unguarded siblings (issue #46 QA
   // MUST #3): armCoefficientName(referenceArm, referenceArm) resolves to
@@ -224,9 +244,10 @@ export function buildRegisteredFamily(opts = {}) {
     },
     {
       id: "H2",
-      description: `${h2Challenger} >= ${h2Baseline} (non-inferiority, margin delta)`,
-      kind: "non-inferiority",
+      description: `${h2Challenger} >= ${h2Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`,
+      kind: "one-sided-margin",
       delta,
+      deltaDeviatesFromRegistration,
       weights: {
         [armCoefficientName(h2Challenger, referenceArm)]: 1,
         [armCoefficientName(h2Baseline, referenceArm)]: -1,
@@ -234,13 +255,14 @@ export function buildRegisteredFamily(opts = {}) {
     },
     {
       id: "H3",
-      description: `${h3Challenger} > max(${h3Baselines.join(", ")}) — two contrasts, both lower bounds must exceed 0`,
-      kind: "pairwise-max",
-      // Two sub-contrasts, evaluated and Holm-adjusted together (each
-      // consumes one slot's worth of the family's multiplicity budget —
-      // see fit.mjs / report.mjs for how the 5-slot family expands H3 into
-      // 2 p-values while H1/H2/H4/H5 each contribute 1).
-      subcontrasts: h3Baselines.map((baseline) => ({
+      description: `${h3Challenger} > max(${h3Baselines.join(", ")}) -- intersection-union test (IUT): one Holm slot, p = max over the one-sided sub-contrast p-values (Berger's IUT result -- see module doc comment)`,
+      kind: "iut-max-p",
+      // Both sub-contrasts are evaluated, but by Berger's IUT result
+      // "reject iff every component rejects" is itself a level-alpha test
+      // of the intersection null, so this occupies exactly ONE Holm slot
+      // (p = max(component p)), not two -- see registeredFamilySlotCount()
+      // and evaluateSpec()'s `kind === "iut-max-p"` branch.
+      components: h3Baselines.map((baseline) => ({
         id: `H3:${h3Challenger}-${baseline}`,
         weights: {
           [armCoefficientName(h3Challenger, referenceArm)]: 1,
@@ -250,9 +272,10 @@ export function buildRegisteredFamily(opts = {}) {
     },
     {
       id: "H4",
-      description: `${h4Challenger} >= ${h4Baseline} (non-inferiority, margin delta)`,
-      kind: "non-inferiority",
+      description: `${h4Challenger} >= ${h4Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`,
+      kind: "one-sided-margin",
       delta,
+      deltaDeviatesFromRegistration,
       weights: {
         [armCoefficientName(h4Challenger, referenceArm)]: 1,
         [armCoefficientName(h4Baseline, referenceArm)]: -1,
@@ -279,18 +302,19 @@ export function buildRegisteredFamily(opts = {}) {
 
 /**
  * How many Holm family slots `buildRegisteredFamily()`'s output occupies --
- * one p-value per hypothesis, except H3, which expands to
- * `spec.subcontrasts.length` (both sub-contrasts share H3's multiplicity
- * budget; see H3's own doc comment). Computed from the family DATA rather
- * than hardcoded, so wiring H5 (removing `unimplemented`) or changing H3's
- * baseline count can never silently change the family size out from under
- * multiplicity.mjs's own assertion.
+ * ONE p-value per hypothesis, H3 included: H3's two sub-contrasts (G-D, G-H)
+ * are combined into a single IUT p-value (p = max) at evaluation time (see
+ * evaluateSpec()'s `kind === "iut-max-p"` branch and the module doc comment
+ * on Berger's IUT result), so H3 never expands past its one registered slot.
+ * Computed from the family DATA rather than hardcoded, so wiring H5
+ * (removing `unimplemented`) can never silently change the family size out
+ * from under multiplicity.mjs's own assertion.
  *
  * @param {Array<object>} family  buildRegisteredFamily() output
  * @returns {number}
  */
 export function registeredFamilySlotCount(family) {
-  return family.reduce((n, spec) => n + (spec.subcontrasts ? spec.subcontrasts.length : 1), 0);
+  return family.length;
 }
 
 /** One-sided upper-tail p-value: P(Z > z) — Student-t (fit.df) if a finite
@@ -303,26 +327,35 @@ function oneSidedUpperP(z, fit) {
 
 /**
  * Evaluate one contrast spec (from buildRegisteredFamily, or an ad hoc
- * exploratory one) against a fit. For an H3-shaped spec (subcontrasts),
- * evaluates both and returns an array; for everything else, returns a
- * single result.
+ * exploratory one) against a fit. For an H3-shaped spec (`kind ===
+ * "iut-max-p"`), evaluates both components internally but returns a SINGLE
+ * result (one Holm slot) -- see the `components` field for the two
+ * underlying sub-contrasts.
  *
  * The `p` this returns is ALWAYS the p-value for the hypothesis actually
  * being registered, not a one-size-fits-all two-sided test against zero --
  * that is what lets a single Holm-Bonferroni correction over the flattened
  * family (see multiplicity.mjs / applyHolmVerdicts()) drive every verdict:
  *   - superiority (H1): two-sided p against 0 (kind: "superiority").
- *   - non-inferiority (H2/H4, kind: "non-inferiority"): when `delta` is
- *     registered, a ONE-SIDED margin-test p against -delta (H0: estimate
- *     <= -delta), matching "CI lower bound > -delta" at alpha=0.025 --
- *     the one-sided equivalent of a 95% two-sided CI's exclusion test.
- *     `oneSided: true` so applyHolmVerdicts() knows the threshold is 0.025,
- *     not 0.05. With no `delta`, still estimation-only (`deltaUnregistered:
- *     true`) -- no confirmatory p is computed or fed to Holm as a
- *     directional claim.
- *   - H3 subcontrasts (kind: "pairwise-max", `oneSided: true`): a ONE-SIDED
- *     p against 0 (H0: estimate <= 0) -- "challenger > baseline", matching
- *     the spec's own "both lower bounds ... exceed 0" wording.
+ *   - one-sided margin (H2/H4, kind: "one-sided-margin"): a ONE-SIDED
+ *     margin-test p against -delta (H0: estimate <= -delta), matching
+ *     "CI lower bound > -delta" at alpha=0.025 -- the one-sided equivalent
+ *     of a 95% two-sided CI's exclusion test. delta defaults to 0 (the
+ *     registered default -- see buildRegisteredFamily()); a caller-supplied
+ *     nonzero delta is carried through as `deltaDeviatesFromRegistration:
+ *     true` so it is never silently absorbed into what looks like the
+ *     registered test. `oneSided: true` so applyHolmVerdicts() knows the
+ *     threshold is 0.025, not 0.05.
+ *   - H3 (kind: "iut-max-p", `oneSided: true`): both one-sided sub-contrast
+ *     p-values (H0: estimate <= 0 for each) are computed, and the result's
+ *     `p` is their MAX -- the intersection-union test (Berger): rejecting
+ *     iff both components reject at level alpha is itself a level-alpha
+ *     test of the intersection null "G <= D OR G <= H", so this needs no
+ *     separate multiplicity correction and stays ONE Holm slot. The result's
+ *     `estimate`/`se`/`ci` are the BINDING component's (the one with the
+ *     larger p -- the weaker sub-claim, whose rejection status determines
+ *     H3's own verdict); both components are still available in `components`
+ *     for transparency.
  *   - H5 (unimplemented): still occupies its Holm slot with p = 1 (an
  *     untested hypothesis cannot be rejected), so wiring it later changes
  *     only ITS OWN result, never the other four's adjusted p-values.
@@ -332,29 +365,50 @@ function oneSidedUpperP(z, fit) {
  *
  * @param {object} spec    one entry from buildRegisteredFamily()
  * @param {{coefficients: number[], coefficientNames: string[], vcov: number[][]}} fit
- * @returns {object|object[]}
+ * @returns {object}
  */
 export function evaluateSpec(spec, fit) {
   if (spec.unimplemented) {
     return { id: spec.id, unimplemented: true, reason: "judge-score frame not wired in this issue (#45/B5)", p: 1 };
   }
-  if (spec.subcontrasts) {
-    return spec.subcontrasts.map((sub) => {
-      const c = contrastVector(fit.coefficientNames, sub.weights);
+  if (spec.kind === "iut-max-p") {
+    const components = spec.components.map((comp) => {
+      const c = contrastVector(fit.coefficientNames, comp.weights);
       const result = evaluateContrast(fit, c);
       const p = oneSidedUpperP(result.estimate / result.se, fit);
-      return { id: sub.id, parentId: spec.id, kind: "pairwise-max", oneSided: true, ...result, p };
+      return { id: comp.id, oneSided: true, ...result, p };
     });
+    // Binding component = the one with the LARGER p (the weaker sub-claim);
+    // H3 as a whole is rejected only once every component is, so this is
+    // the component whose own rejection is the last to clear.
+    const binding = components.reduce((worst, r) => (r.p > worst.p ? r : worst));
+    return {
+      id: spec.id,
+      description: spec.description,
+      kind: spec.kind,
+      oneSided: true,
+      components,
+      estimate: binding.estimate,
+      se: binding.se,
+      ci: binding.ci,
+      p: binding.p,
+    };
   }
 
   const c = contrastVector(fit.coefficientNames, spec.weights);
   const result = evaluateContrast(fit, c);
-  if (spec.kind === "non-inferiority") {
-    if (spec.delta === undefined || spec.delta === null) {
-      return { id: spec.id, description: spec.description, kind: spec.kind, ...result, deltaUnregistered: true };
-    }
+  if (spec.kind === "one-sided-margin") {
     const marginP = oneSidedUpperP((result.estimate + spec.delta) / result.se, fit);
-    return { id: spec.id, description: spec.description, kind: spec.kind, oneSided: true, ...result, p: marginP, delta: spec.delta };
+    return {
+      id: spec.id,
+      description: spec.description,
+      kind: spec.kind,
+      oneSided: true,
+      ...result,
+      p: marginP,
+      delta: spec.delta,
+      deltaDeviatesFromRegistration: spec.deltaDeviatesFromRegistration || false,
+    };
   }
   return { id: spec.id, description: spec.description, kind: spec.kind, ...result };
 }
@@ -365,14 +419,17 @@ export function evaluateSpec(spec, fit) {
  * deliberately leaves undone, so a verdict can never be computed from a raw
  * (un-corrected) p-value or CI. Mutates nothing; returns new objects.
  *
- * Threshold: alpha=0.05 two-sided (kind !== oneSided, e.g. H1) or
- * alpha=0.025 one-sided (`oneSided: true` -- H2/H4 with delta, H3's
- * subcontrasts), matching the exact alpha each entry's `p` in evaluateSpec()
- * was already computed at (a two-sided 95% CI's exclusion test IS a
- * two-sided alpha=0.05 test; a one-sided "CI lower bound exceeds a
- * threshold" test is alpha=0.025 one-sided) -- so the ONLY thing this
- * function changes relative to the old CI-based check is that the
- * comparison happens at the Holm-adjusted p, not the raw one.
+ * Threshold: alpha=0.05 two-sided (`oneSided` falsy, e.g. H1) or alpha=0.025
+ * one-sided (`oneSided: true` -- H2/H4, H3), matching the exact alpha each
+ * entry's `p` in evaluateSpec() was already computed at (a two-sided 95% CI's
+ * exclusion test IS a two-sided alpha=0.05 test; a one-sided "CI lower bound
+ * exceeds a threshold" test is alpha=0.025 one-sided). Note this is mixed
+ * alphas on a single Holm sequence, not textbook (unweighted) Holm -- the
+ * step-down algebra is still valid (the rejection set is a strict subset of
+ * Holm-at-0.05, so FWER <= 0.05), but a reader should not assume this reduces
+ * to the textbook single-alpha procedure. This is the ONLY thing this
+ * function changes relative to the old CI-based check: the comparison
+ * happens at the Holm-adjusted p, not the raw one.
  *
  * @param {Array<object>} flatResults    registeredResults.flat() -- same
  *                                        order fed to holmBonferroni()
@@ -384,7 +441,7 @@ export function applyHolmVerdicts(flatResults, holmAdjusted) {
     throw new Error(`applyHolmVerdicts: flatResults length ${flatResults.length} does not match holmAdjusted length ${holmAdjusted.length}`);
   }
   return flatResults.map((r, i) => {
-    if (r.unimplemented || r.deltaUnregistered) return r;
+    if (r.unimplemented) return r;
     const holmP = holmAdjusted[i];
     const alpha = r.oneSided ? 0.025 : 0.05;
     const rejected = holmP < alpha;

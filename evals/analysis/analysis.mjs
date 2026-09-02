@@ -31,7 +31,7 @@ import { renderReport } from "./report.mjs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv) {
-  const args = { resultsDir: "results", outDir: join(__dirname, "out"), response: "distinct_k", referenceArm: "A", panelArms: null, config: {} };
+  const args = { resultsDir: "results", outDir: join(__dirname, "out"), response: "distinct_k", referenceArm: "A", panelArms: null, delta: undefined, config: {} };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--results-dir") args.resultsDir = argv[++i];
@@ -39,6 +39,12 @@ function parseArgs(argv) {
     else if (a === "--response") args.response = argv[++i];
     else if (a === "--reference-arm") args.referenceArm = argv[++i];
     else if (a === "--panel-arms") args.panelArms = argv[++i].split(",");
+    // H2/H4's registered default is delta=0 (buildRegisteredFamily()) -- this
+    // flag exists ONLY to register an explicit margin later (§B2's pilot),
+    // and doing so is recorded as a deviation from the current registration
+    // (see contrasts.mjs's `deltaDeviatesFromRegistration`), never silently
+    // absorbed as if it were always the registered test.
+    else if (a === "--delta") args.delta = Number(argv[++i]);
     else throw new Error(`analysis.mjs: unrecognized argument '${a}'`);
   }
   return args;
@@ -63,24 +69,16 @@ export async function main(argv = process.argv.slice(2)) {
     throw new Error(`analysis.mjs: ladder reached ${ladder.rung} (no confirmatory inference) — see history: ${JSON.stringify(ladder.history)}`);
   }
 
-  const family = buildRegisteredFamily({ referenceArm: args.referenceArm, panelArms });
-  const evaluated = family.map((spec) => evaluateSpec(spec, ladder.fit));
-  const flat = evaluated.flat();
+  const family = buildRegisteredFamily({ referenceArm: args.referenceArm, panelArms, delta: args.delta });
+  // One evaluateSpec() result per hypothesis (H3's two sub-contrasts are
+  // combined internally into a single IUT p-value -- see contrasts.mjs) --
+  // registeredResults is therefore already flat, 5 entries, H1..H5.
+  const registeredResults = family.map((spec) => evaluateSpec(spec, ladder.fit));
   const holmAdjusted = holmBonferroni(
-    flat.map((r) => r.p),
+    registeredResults.map((r) => r.p),
     { familySize: registeredFamilySlotCount(family) },
   );
-  // applyHolmVerdicts() needs the SAME flattened order/shape it was fed to
-  // holmBonferroni() with -- rebuild registeredResults preserving the
-  // original per-spec grouping (H3's two sub-contrasts stay a nested array)
-  // so report.mjs's H3 handling is unaffected.
-  const verdictByFlatIndex = applyHolmVerdicts(flat, holmAdjusted);
-  let cursor = 0;
-  const registeredResults = evaluated.map((entry) =>
-    Array.isArray(entry)
-      ? entry.map(() => verdictByFlatIndex[cursor++])
-      : verdictByFlatIndex[cursor++],
-  );
+  const verdicts = applyHolmVerdicts(registeredResults, holmAdjusted);
 
   const armSummaries = summarizeByArm(frame);
   const paretoPoints = paretoFrontier(armSummaries.map((a) => ({ armId: a.armId, meanCostUsd: a.meanCostUsd, meanResponse: a.meanResponse })));
@@ -94,10 +92,10 @@ export async function main(argv = process.argv.slice(2)) {
   writeFileSync(join(args.outDir, "pareto.svg"), renderParetoSvg(paretoPoints));
   writeFileSync(
     join(args.outDir, "REPORT.md"),
-    renderReport({ frame, ladder, registeredResults, holmAdjusted, paretoPoints, costRatioByArm, analysisHash: hash }),
+    renderReport({ frame, ladder, registeredResults: verdicts, holmAdjusted, paretoPoints, costRatioByArm, analysisHash: hash }),
   );
 
-  return { frame, ladder, registeredResults, holmAdjusted, paretoPoints, costRatioByArm, analysisHash: hash };
+  return { frame, ladder, registeredResults: verdicts, holmAdjusted, paretoPoints, costRatioByArm, analysisHash: hash };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

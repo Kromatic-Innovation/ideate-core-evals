@@ -14,12 +14,23 @@ function baseInput() {
     ladder: { rung: "R0", history: [{ rung: "R0", descended: false }] },
     registeredResults: [
       { id: "H1", description: "mean(panel) - A", kind: "superiority", estimate: 2.1, ci: [0.5, 3.7], p: 0.01, holmP: 0.02, significant: true },
-      [
-        { id: "H3:G-D", kind: "pairwise-max", oneSided: true, estimate: 1.0, ci: [0.1, 1.9], p: 0.03, holmP: 0.06, supported: true },
-        { id: "H3:G-H", kind: "pairwise-max", oneSided: true, estimate: -0.5, ci: [-1.2, 0.2], p: 0.2, holmP: 0.2, supported: false },
-      ],
+      {
+        id: "H3",
+        description: "G > max(D, H) -- IUT",
+        kind: "iut-max-p",
+        oneSided: true,
+        estimate: -0.5,
+        ci: [-1.2, 0.2],
+        p: 0.2,
+        holmP: 0.2,
+        supported: false,
+        components: [
+          { id: "H3:G-D", oneSided: true, estimate: 1.0, ci: [0.1, 1.9], p: 0.03 },
+          { id: "H3:G-H", oneSided: true, estimate: -0.5, ci: [-1.2, 0.2], p: 0.2 },
+        ],
+      },
     ],
-    holmAdjusted: [0.02, 0.06, 0.2],
+    holmAdjusted: [0.02, 0.2],
     paretoPoints: [{ armId: "A", meanCostUsd: 0.5, meanResponse: 8, onFrontier: true }],
     costRatioByArm: { A: { ratio: 16, ciLower: 12, ciUpper: 20 } },
     analysisHash: "hash456",
@@ -44,9 +55,16 @@ test("renderReport: an R3 rung is explicitly labeled descriptive-only", () => {
   assert.match(md, /no confirmatory inference/i);
 });
 
-test("renderReport: registered hypotheses table lists every flattened entry (H3 expands to 2)", () => {
+test("renderReport: registered hypotheses table lists one ROW per hypothesis (H3 is a single IUT row/verdict, not two)", () => {
   const md = renderReport(baseInput());
-  assert.match(md, /H1/);
+  assert.match(md, /\| H1 \|/);
+  // exactly one H3 table row (one leading "| H3 |" cell) -- the row count is
+  // what BLOCKER 2 fixed (one Holm slot, one verdict), not whether the
+  // underlying component estimates are visible (§6.2: effect sizes are the
+  // headline, not p-values) -- both component estimates/CIs are still
+  // rendered inside that single row's cells.
+  const h3Rows = md.split("\n").filter((line) => /^\| H3 \|/.test(line));
+  assert.equal(h3Rows.length, 1, `expected exactly one H3 row, got ${h3Rows.length}`);
   assert.match(md, /H3:G-D/);
   assert.match(md, /H3:G-H/);
 });
@@ -70,12 +88,25 @@ test("renderReport: verdict reads the Holm-adjusted result, not a raw CI/p (regr
   // applyHolmVerdicts() would actually produce after multiplicity
   // correction wipes out the raw significance.
   input.registeredResults = [
-    { id: "H2", description: "E >= D", kind: "non-inferiority", oneSided: true, estimate: 1.0, ci: [0.2, 1.8], p: 0.001, holmP: 0.5, supported: false },
+    { id: "H2", description: "E >= D", kind: "one-sided-margin", oneSided: true, estimate: 1.0, ci: [0.2, 1.8], p: 0.001, holmP: 0.5, supported: false },
   ];
   input.holmAdjusted = [0.5];
   const md = renderReport(input);
   assert.match(md, /not supported/);
   assert.doesNotMatch(md, /\| supported \|/);
+});
+
+test("renderReport: verdict is keyed off r.oneSided, not r.kind (regression for #46 QA SHOULD)", () => {
+  // A hypothetical future two-sided hypothesis with a kind other than
+  // "superiority" must still read `significant`, not `supported` -- keying
+  // off r.kind (as before) would silently misread this as "not supported".
+  const input = baseInput();
+  input.registeredResults = [
+    { id: "HX", description: "some future two-sided hypothesis", kind: "some-other-kind", estimate: 1.0, ci: [0.2, 1.8], p: 0.001, holmP: 0.01, significant: true },
+  ];
+  input.holmAdjusted = [0.01];
+  const md = renderReport(input);
+  assert.match(md, /\| significant \|/);
 });
 
 test("renderReport: an unimplemented H5 entry renders without throwing", () => {

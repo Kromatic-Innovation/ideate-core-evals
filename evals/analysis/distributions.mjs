@@ -76,9 +76,17 @@ export function tCdf(t, df) {
   return t >= 0 ? 1 - half : half;
 }
 
-/** One-sided upper-tail probability: P(T > t) for `df` degrees of freedom. */
+/** One-sided upper-tail probability: P(T > t) for `df` degrees of freedom.
+ *  Computed as tCdf(-t, df) (exact, by symmetry) rather than `1 - tCdf(t,
+ *  df)` -- the latter is catastrophic cancellation once tCdf(t, df) is
+ *  itself computed as `1 - half` and `half` drops below ~1e-16 (#46 QA
+ *  SHOULD; measured at t=20, df=11: `1 - tCdf` gives 2.6721624913e-10 vs the
+ *  true 2.6721625393e-10). tCdf(-t, df) hits the `half` branch directly, with
+ *  no subtraction, and is the function every one-sided H2/H3/H4 p-value goes
+ *  through. */
 export function tUpperTailP(t, df) {
-  return 1 - tCdf(t, df);
+  if (!(df > 0)) throw new Error(`tUpperTailP: df must be > 0, got ${df}`);
+  return tCdf(-t, df);
 }
 
 /** Two-sided p-value: P(|T| > |t|) for `df` degrees of freedom. */

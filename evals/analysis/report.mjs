@@ -19,14 +19,17 @@ function ciStr(ci, digits = 3) {
  *   @param {ReturnType<typeof import("./frame.mjs").buildFrame>} input.frame
  *   @param {{rung: string, fit: object|null}} input.ladder     runLadder() result
  *   @param {Array<object>} input.registeredResults    evaluateSpec() output for
- *                                                       H1..H5 (H3 expands to 2),
- *                                                       already run through
+ *                                                       H1..H5 (one entry each —
+ *                                                       H3's two sub-contrasts
+ *                                                       are combined into a
+ *                                                       single IUT entry, see
+ *                                                       contrasts.mjs), already
+ *                                                       run through
  *                                                       contrasts.mjs's
  *                                                       applyHolmVerdicts() —
  *                                                       every entry (besides
- *                                                       unimplemented/
- *                                                       deltaUnregistered)
- *                                                       carries `holmP` and
+ *                                                       unimplemented) carries
+ *                                                       `holmP` and
  *                                                       `supported`/`significant`;
  *                                                       renderReport() never
  *                                                       recomputes a verdict
@@ -56,7 +59,7 @@ export function renderReport(input) {
   }
   lines.push("");
 
-  lines.push("## Registered hypotheses (Holm-Bonferroni, family of 6 slots across H1-H5 -- H3 expands to 2)");
+  lines.push("## Registered hypotheses (Holm-Bonferroni, family of 5 slots across H1-H5 -- H3 is a single intersection-union test)");
   lines.push("");
   lines.push("| ID | Description | Estimate | 95% CI | Holm-adjusted p | Verdict |");
   lines.push("|---|---|---|---|---|---|");
@@ -71,13 +74,31 @@ export function renderReport(input) {
     // r.supported/r.significant) -- never recomputed here from a raw CI or
     // a bare `holmAdjusted[i]` lookup, which is exactly the bug (#46 QA
     // MUST #1) that let H2/H3/H4's verdicts escape multiplicity correction.
+    // Keyed off `r.oneSided`, the SAME discriminator applyHolmVerdicts() used
+    // to WRITE `supported` vs `significant` -- not `r.kind`, which is only
+    // accidentally correct today (H1 is the sole "superiority"/two-sided
+    // entry; any future two-sided hypothesis with a different `kind` would
+    // read the wrong field silently -- #46 QA SHOULD).
     const adj = r.holmP ?? (holmAdjusted ? holmAdjusted[i] : undefined);
-    const verdict = r.deltaUnregistered
-      ? "estimation only (delta unregistered)"
-      : r.kind === "superiority"
-        ? (r.significant ? "significant" : "not significant")
-        : (r.supported ? "supported" : "not supported");
-    lines.push(`| ${r.id} | ${r.description || ""} | ${fmt(r.estimate)} | ${ciStr(r.ci)} | ${fmt(adj, 4)} | ${verdict} |`);
+    const verdict = r.oneSided
+      ? (r.supported ? "supported" : "not supported")
+      : (r.significant ? "significant" : "not significant");
+    const deviationNote = r.deltaDeviatesFromRegistration ? ` (delta=${r.delta}, DEVIATES from registration)` : "";
+    // H3 (kind: "iut-max-p") consumes exactly ONE Holm slot/verdict, but
+    // §6.2 makes effect sizes with 95% CIs the headline, not p-values -- so
+    // both underlying sub-contrast estimates/CIs (the ones that actually
+    // determine the binding component) still need to be visible, not just
+    // the single one that happened to bind. Rendered as extra lines inside
+    // the Estimate cell (GFM table cells support <br>) rather than as
+    // separate table rows, since separate rows would silently resurrect the
+    // two-slot framing BLOCKER 2 reverted.
+    const estimateCell = r.components
+      ? [`binding: ${fmt(r.estimate)}`, ...r.components.map((c) => `${c.id}: ${fmt(c.estimate)} (raw p=${fmt(c.p, 4)})`)].join("<br>")
+      : fmt(r.estimate);
+    const ciCell = r.components
+      ? [`binding: ${ciStr(r.ci)}`, ...r.components.map((c) => `${c.id}: ${ciStr(c.ci)}`)].join("<br>")
+      : ciStr(r.ci);
+    lines.push(`| ${r.id} | ${(r.description || "")}${deviationNote} | ${estimateCell} | ${ciCell} | ${fmt(adj, 4)} | ${verdict} |`);
   }
   lines.push("");
 

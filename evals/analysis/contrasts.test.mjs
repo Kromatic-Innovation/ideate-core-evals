@@ -114,41 +114,48 @@ test("buildRegisteredFamily: H1 estimate is correctly signed against a fit where
   assert.equal(result.estimate, 3);
 });
 
-test("buildRegisteredFamily: H2/H4 without delta are estimation-only when evaluated", () => {
+test("buildRegisteredFamily: H2/H4 default to delta=0 (registered default), not estimation-only", () => {
   const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E"] });
   const fit = diagonalFit([10, 1, 2, 3, 4, 5], [0.1, 0.25, 0.25, 0.25, 0.25, 0.25]);
   const h2 = evaluateSpec(family[1], fit);
-  assert.equal(h2.deltaUnregistered, true);
-  assert.equal(h2.supported, undefined);
+  assert.equal(h2.delta, 0);
+  assert.equal(h2.deltaDeviatesFromRegistration, false);
+  assert.equal(h2.oneSided, true);
+  assert.ok(Number.isFinite(h2.p));
+  assert.equal(h2.supported, undefined); // not until Holm-corrected
 });
 
-test("buildRegisteredFamily: H2 with delta computes a one-sided margin p, no verdict until Holm-corrected", () => {
+test("buildRegisteredFamily: H2 with an explicit delta computes a one-sided margin p and is flagged as a registration deviation", () => {
   const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E"], delta: 0.5 });
   const fit = diagonalFit([10, 1, 2, 3, 4, 5], [0.1, 0.01, 0.01, 0.01, 0.01, 0.01]);
   const h2 = evaluateSpec(family[1], fit); // E - D = 3 - 2 = 1, se small -> well above -0.5
-  assert.equal(h2.deltaUnregistered, undefined);
+  assert.equal(h2.delta, 0.5);
+  assert.equal(h2.deltaDeviatesFromRegistration, true);
   assert.equal(h2.oneSided, true);
   assert.ok(h2.p < 0.001, `margin p ${h2.p} should be tiny (estimate well clear of -delta)`);
   // evaluateSpec never sets a verdict directly -- see applyHolmVerdicts().
   assert.equal(h2.supported, undefined);
 });
 
-test("buildRegisteredFamily: H3 expands to two subcontrasts, each a one-sided p against 0", () => {
+test("buildRegisteredFamily: H3 combines its two sub-contrasts into ONE intersection-union-test p-value (Berger's IUT)", () => {
   const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"], h3TargetVsBest: ["G", "D", "H"] });
   const h3 = family[2];
-  assert.equal(h3.subcontrasts.length, 2);
-  assert.deepEqual(h3.subcontrasts.map((s) => s.id), ["H3:G-D", "H3:G-H"]);
+  assert.equal(h3.kind, "iut-max-p");
+  assert.equal(h3.components.length, 2);
+  assert.deepEqual(h3.components.map((s) => s.id), ["H3:G-D", "H3:G-H"]);
 
   // G (coeff 4) beats D (2) but not H (5) -- G-H should have a large p (not
-  // small), G-D a tiny one.
+  // small), G-D a tiny one; H3's own p must be the MAX (the binding, weaker
+  // sub-claim), not the min and not a separately Holm-adjusted pair.
   const fit = diagonalFit([10, 1, 2, 3, 4, 5], [0.1, 0.001, 0.001, 0.001, 0.001, 0.001]);
-  const results = evaluateSpec(h3, fit);
-  assert.equal(results.length, 2);
-  const gMinusD = results.find((r) => r.id === "H3:G-D");
-  const gMinusH = results.find((r) => r.id === "H3:G-H");
+  const result = evaluateSpec(h3, fit);
+  assert.equal(result.oneSided, true);
+  const gMinusD = result.components.find((r) => r.id === "H3:G-D");
+  const gMinusH = result.components.find((r) => r.id === "H3:G-H");
   assert.ok(gMinusD.p < 0.001, `G-D p ${gMinusD.p} should be tiny (2 SDs above 0)`);
   assert.ok(gMinusH.p > 0.99, `G-H p ${gMinusH.p} should be ~1 (estimate far below 0)`);
-  assert.equal(gMinusD.supported, undefined); // not until Holm-corrected
+  assert.equal(result.p, gMinusH.p, "H3's p should be the MAX (binding) component's p, i.e. G-H's");
+  assert.equal(result.supported, undefined); // not until Holm-corrected
 });
 
 test("buildRegisteredFamily: H5 is a named stub, evaluated as unimplemented but still occupies a Holm slot (p=1)", () => {
@@ -160,6 +167,17 @@ test("buildRegisteredFamily: H5 is a named stub, evaluated as unimplemented but 
 
 test("buildRegisteredFamily: requires panelArms", () => {
   assert.throws(() => buildRegisteredFamily({ referenceArm: "A" }), /panelArms is required/);
+});
+
+// ── #46 QA SHOULD: panelArms duplicates are the unguarded sibling of the
+//    reference-arm footgun -- h1Weights is keyed by coefficient name, so a
+//    duplicate silently collapses while 1/panelArms.length does not. ──────
+
+test("buildRegisteredFamily: refuses duplicate panelArms (the H1-weights-collapse footgun)", () => {
+  assert.throws(
+    () => buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "B", "D"] }),
+    /duplicates/,
+  );
 });
 
 // ── MUST #3 (#46 QA): the reference arm must never sneak into a contrast
@@ -199,13 +217,16 @@ test("buildRegisteredFamily: refuses a reference arm in h3TargetVsBest (challeng
   );
 });
 
-// ── registeredFamilySlotCount() / applyHolmVerdicts(): the family is 6
-//    SLOTS (H1+H2+H4+H5=1 each, H3=2), and verdicts only exist after Holm
-//    correction over exactly that many p-values (#46 QA MUST #1 + #2). ────
+// ── registeredFamilySlotCount() / applyHolmVerdicts(): the family is 5
+//    SLOTS (H1+H2+H3+H4+H5=1 each -- H3's two sub-contrasts combine into one
+//    IUT p-value, per docs/PREREGISTRATION.md:223's "5 registered
+//    hypotheses"), and verdicts only exist after Holm correction over
+//    exactly that many p-values (#46 QA MUST #1 + #2; QA re-review
+//    BLOCKER 2). ──────────────────────────────────────────────────────────
 
-test("registeredFamilySlotCount: 6 slots across 5 hypotheses (H3 expands to 2)", () => {
+test("registeredFamilySlotCount: 5 slots across 5 hypotheses (H3 is one IUT slot, not two)", () => {
   const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
-  assert.equal(registeredFamilySlotCount(family), 6);
+  assert.equal(registeredFamilySlotCount(family), 5);
 });
 
 test("registeredFamilySlotCount: independent of whether H5 is wired -- wiring it later does not change the count", () => {
@@ -214,7 +235,7 @@ test("registeredFamilySlotCount: independent of whether H5 is wired -- wiring it
   // later cannot silently change m from what it already was.
   const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
   assert.equal(family.find((f) => f.id === "H5").unimplemented, true);
-  assert.equal(registeredFamilySlotCount(family), 6);
+  assert.equal(registeredFamilySlotCount(family), 5);
 });
 
 test("applyHolmVerdicts: a raw-significant contrast becomes not-supported once Holm's step-down correction catches up to it", () => {
@@ -222,17 +243,23 @@ test("applyHolmVerdicts: a raw-significant contrast becomes not-supported once H
   // p, not a raw CI/p, when deciding `supported`. H2's own raw p (0.01)
   // clears the raw one-sided 0.025 threshold comfortably -- but it is only
   // the family's SECOND-smallest p-value, so Holm's step-down running-max
-  // (rank-1 multiplier 5, carrying forward rank-0's already-adjusted floor)
-  // pushes its ADJUSTED p to 0.05, above threshold.
+  // (rank-1 multiplier, carrying forward rank-0's already-adjusted floor)
+  // pushes its ADJUSTED p above threshold.
+  //
+  // This is a synthetic 5-slot family exercising applyHolmVerdicts()'s pure
+  // step-down mechanics, not buildRegisteredFamily()'s actual output --
+  // `kind` here is a placeholder string, not "one-sided-margin". Sized to 5
+  // (H1..H5, one slot each -- see registeredFamilySlotCount()) so this stays
+  // consistent with the real registered family and cannot be mistaken for
+  // license to reintroduce H3's old 2-slot split (#46 QA re-review BLOCKER 2).
   const flat = [
     { id: "OTHER-SMALLEST", p: 0.0001, oneSided: true },
-    { id: "H2", kind: "non-inferiority", oneSided: true, p: 0.01 },
+    { id: "H2", kind: "synthetic-one-sided", oneSided: true, p: 0.01 },
     { id: "OTHER-1", p: 0.9, oneSided: true },
     { id: "OTHER-2", p: 0.9, oneSided: true },
     { id: "OTHER-3", p: 0.9, oneSided: true },
-    { id: "OTHER-4", p: 0.9, oneSided: true },
   ];
-  const familySize = 6;
+  const familySize = 5;
   const holmAdjusted = holmBonferroni(flat.map((r) => r.p), { familySize });
   const verdicts = applyHolmVerdicts(flat, holmAdjusted);
   const h2 = verdicts.find((r) => r.id === "H2");

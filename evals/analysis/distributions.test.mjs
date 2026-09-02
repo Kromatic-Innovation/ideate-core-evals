@@ -52,6 +52,14 @@ test("tCdf: is a valid CDF (0 at -Infinity-ish, 1 at +Infinity-ish, monotone)", 
   const df = 6;
   assert.ok(tCdf(-100, df) < 1e-4);
   assert.ok(tCdf(100, df) > 1 - 1e-4);
-  assert.ok(tCdf(0, df) - 0.5 < 1e-9);
+  assert.ok(Math.abs(tCdf(0, df) - 0.5) < 1e-9);
   assert.ok(tCdf(1, df) < tCdf(2, df));
+});
+
+// #46 QA SHOULD: tUpperTailP via `1 - tCdf(t, df)` degrades to exactly 0 in
+// the far tail (catastrophic cancellation once tCdf's internal `half` drops
+// below ~1e-16). tCdf(-t, df) is exact and free -- this pins the true value.
+test("tUpperTailP: far-tail precision survives (regression for #46 QA SHOULD)", () => {
+  const trueValue = 2.6721625393e-10; // reference: scipy.stats.t.sf(20, 11)
+  assert.ok(Math.abs(tUpperTailP(20, 11) - trueValue) / trueValue < 1e-6);
 });

@@ -3,19 +3,21 @@
 //
 // §6.2 / B7 (closing line): "Holm-Bonferroni is applied across the 5
 // registered hypotheses regardless of which rung each lane landed on." The
-// family Holm corrects is FIXED IN SLOT COUNT, not hypothesis count — H1,
-// H2, H4, H5 each contribute one p-value slot, but H3 is registered as TWO
-// sub-contrasts (G-D, G-H; see contrasts.mjs's H3 doc comment), so the
-// REGISTERED family is 6 SLOTS across 5 hypotheses (1+1+2+1+1), not 5 or 6
-// hypotheses. H5 stays unimplemented but still occupies its slot with p=1
-// (contrasts.mjs's evaluateSpec()) precisely so wiring it later changes
-// only its own result, never rescales the other four. Callers must pass
-// exactly `registeredFamilySlotCount()`'s worth of p-values (in H1..H5
-// order, H3 expanded) — pass `familySize` (from contrasts.mjs's
-// `registeredFamilySlotCount(family)`) to have holmBonferroni() ENFORCE
-// this itself rather than trusting the caller got the count right.
-// Exploratory contrasts (per-arm-vs-A breakdowns, etc.) get their own,
-// separately-sized BH family — see benjaminiHochberg().
+// REGISTERED family is exactly 5 SLOTS, one per hypothesis (H1, H2, H4, H5
+// each one p-value; H3 is registered as G > max(D, H) -- an
+// intersection-union test over its two sub-contrasts (G-D, G-H), combined
+// into ONE p-value = max(p_G-D, p_G-H) at evaluation time (see contrasts.mjs
+// evaluateSpec()'s `kind === "iut-max-p"` branch and its Berger's-IUT-result
+// doc comment), so it never expands past its single slot. H5 stays
+// unimplemented but still occupies its slot with p=1 (contrasts.mjs's
+// evaluateSpec()) precisely so wiring it later changes only its own result,
+// never rescales the other four. Callers must pass exactly
+// `registeredFamilySlotCount()`'s worth of p-values (in H1..H5 order) —
+// pass `familySize` (from contrasts.mjs's `registeredFamilySlotCount(family)`)
+// to have holmBonferroni() ENFORCE this itself rather than trusting the
+// caller got the count right. Exploratory contrasts (per-arm-vs-A
+// breakdowns, etc.) get their own, separately-sized BH family — see
+// benjaminiHochberg().
 
 /**
  * Holm-Bonferroni step-down correction. Returns ADJUSTED p-values in the
