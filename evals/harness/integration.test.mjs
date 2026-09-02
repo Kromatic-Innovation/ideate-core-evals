@@ -168,6 +168,69 @@ test("full path: plan -> generate -> account -> store -> reconcile, including a 
   assert.equal(provider2.calls.length, 6, "only the newly-added replicate's cells hit the provider");
 });
 
+// ── issue #102: an UNDERSIZED cell inside a real grid ───────────────────────
+//
+// The unit-level coverage lives in undersized-pool.test.mjs. What only an
+// integration test can show is the CONSEQUENCE the issue actually cares about:
+// that one cell whose pool came back short does not quietly become a data point
+// in a grid where every other cell is fine, and that the next session picks it
+// up rather than inheriting the hole. The damage in the issue is arm-correlated
+// under-counting, which is a property of the GRID, not of one response.
+test("issue #102: an undersized cell in a full grid is failed and retryable, and the rest of the grid is unaffected", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+
+  // Arm E is the 3-slot mixed-tier arm. One of its cells comes back `completed`
+  // from a provider that did not self-police, carrying a pool built from 2 of
+  // its 3 agents -- the exact shape a partially rate-limited round produces.
+  const shortKey = cellKey({ armId: "E", briefId: "biz-02", replicate: 1, cfg: CFG_HASH });
+  const overrides = new Map([
+    [
+      shortKey,
+      {
+        terminalState: "completed",
+        result: { candidates: ["one surviving idea"], latencyMs: 1, meta: { agentsAttempted: 3, agentsFailed: 1 } },
+      },
+    ],
+  ]);
+
+  const { summary, account } = await runSpec(SPEC, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider: new MockProvider({ overrides }),
+    log: () => {},
+  });
+
+  // Every planned cell still reaches exactly one terminal state -- the new
+  // branch does not drop a cell out of the account.
+  assert.doesNotThrow(() => account.reconcile());
+  assert.equal(summary.planned, 12);
+  assert.equal(summary.completed, 11);
+  assert.equal(summary.failed, 1);
+  assert.deepEqual(summary.byKind, { harness_error: 1 });
+
+  // The undersized cell is NOT in the store -- so it is not counted as data,
+  // and (being transient) it is not a permanent verdict on the arm either.
+  assert.equal(store.has(shortKey), false);
+  // Its money is, though: the generation call really happened.
+  const attemptKeys = store.keys().filter((k) => k.startsWith(`generation-attempt|cell=${shortKey}|`));
+  assert.equal(attemptKeys.length, 1);
+  assert.ok(store.get(attemptKeys[0]).costRows.length > 0);
+
+  // The other 11 cells are untouched by the rule, including arm E's own.
+  assert.ok(store.has(cellKey({ armId: "E", briefId: "biz-02", replicate: 0, cfg: CFG_HASH })));
+  assert.ok(store.has(cellKey({ armId: "B", briefId: "biz-02", replicate: 1, cfg: CFG_HASH })));
+
+  // RESUME: a second session against the same store re-plans exactly the one
+  // discarded cell and nothing else. THIS is what makes "fail the cell" cost a
+  // delay rather than a hole in the grid -- the argument the rule rests on.
+  const store2 = new ResultsStore(store.dir);
+  const provider2 = new MockProvider();
+  const { summary: resumed } = await runSpec(SPEC, { store: store2, armsConfig: ARMS_CONFIG, provider: provider2, log: () => {} });
+  assert.equal(provider2.calls.length, 1, "only the discarded cell is re-attempted");
+  assert.equal(provider2.calls[0].key, shortKey);
+  assert.equal(resumed.completed, 12, "the grid is whole once the transient cause clears");
+});
+
 // Composition-root wiring test for the JUDGE seam (issue #25). Before #21 there
 // was no pool -> scores path to wire at all (gate.mjs took judgeScores as an
 // input array); now runJudgeMatrix is that composition root. This proves a
