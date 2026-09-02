@@ -898,3 +898,37 @@ test("issue #101: clusterDistanceThreshold is stamped into spec.config, uncondit
   // project a different configHash than the real run it exists to project.
   assert.equal(runSpecFn.calls[0].opts.embedder, undefined, "sanity: --dry-run wires no embedder");
 });
+
+test("issue #101: --arms scoping does NOT move armsConfigHash -- the hash is over the FILE, not over spec.arms", async () => {
+  // The reassuring half of the whole-file hash, and what makes its costly
+  // half tolerable (adding an arm invalidates EVERY arm's cells -- registered
+  // as Appendix D item 1, pinned in lib/manifest.test.mjs): running a SUBSET
+  // of arms is not a config change, so a scoped run's cells stay comparable
+  // to an unscoped run's. Were the hash taken over the arms a spec happens to
+  // run, arm A's cells from `--arms A,B` would be incomparable to arm A's
+  // cells from `--arms A,C` -- which would break the additive design far more
+  // severely than over-invalidation does.
+  const unscoped = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn: unscoped, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  const scoped = spyRunSpec();
+  await main(["--dry-run", "--arms", "A,B"], { runSpecFn: scoped, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  // Sanity, and worth naming because it is not the obvious seam: `--arms`
+  // never narrows `spec.arms` (which is always every arm in the file). It is
+  // a runSpec() OPTION, applied downstream. So arm scoping cannot reach
+  // configHash by that route either -- the two independent reasons the hash
+  // is unmoved happen to agree.
+  assert.deepEqual(scoped.calls[0].opts.armIds, ["A", "B"], "sanity: the scoped run really did narrow the arms runSpec will execute");
+  assert.equal(unscoped.calls[0].opts.armIds, undefined, "sanity: the unscoped run narrows nothing");
+  assert.equal(
+    scoped.calls[0].spec.config.armsConfigHash,
+    unscoped.calls[0].spec.config.armsConfigHash,
+    "arm scoping is not a config change",
+  );
+  assert.equal(
+    configHash(scoped.calls[0].spec.config),
+    configHash(unscoped.calls[0].spec.config),
+    "and so the whole configHash is unmoved -- a scoped run's cells remain comparable to a full run's",
+  );
+});
