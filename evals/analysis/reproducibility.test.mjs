@@ -31,3 +31,27 @@ test("renderLme4FitR: never executed, just generated text — embeds the actual 
   assert.match(r, /relevel\(data\$arm, ref = "A"\)/);
   assert.match(r, /c\("A", "B", "D"\)/);
 });
+
+// — dataFile (issue #73 fix round, BLOCKING) —————————————————————————————
+// A rarefied-lane script that reads the full-pool CSV would silently
+// reproduce the wrong estimand under H1's label (analysis.mjs writes BOTH
+// lme4-fit.R and lme4-fit-rarefied.R from this same renderer). These tests
+// pin the parameter that stops that from recurring.
+
+test("renderLme4FitR: dataFile defaults to analysis-data.csv -- every caller that predates the rarefied lane is unaffected", () => {
+  const r = renderLme4FitR({ responseField: "distinct_k", armLevels: ["A", "B"], referenceArm: "A" });
+  assert.match(r, /read\.csv\("analysis-data\.csv"\)/);
+});
+
+test("renderLme4FitR: an explicit dataFile is what the generated script actually reads, not a hardcoded default", () => {
+  const r = renderLme4FitR({ responseField: "distinct_k_rarefied", armLevels: ["A", "B"], referenceArm: "A", dataFile: "analysis-data-rarefied.csv" });
+  assert.match(r, /read\.csv\("analysis-data-rarefied\.csv"\)/);
+  assert.doesNotMatch(r, /read\.csv\("analysis-data\.csv"\)/);
+  assert.match(r, /distinct_k_rarefied ~ arm/);
+});
+
+test("renderLme4FitR: a full-pool script and a rarefied script rendered from the SAME armLevels/referenceArm still differ -- distinguishable by dataFile/responseField, not accidentally identical", () => {
+  const full = renderLme4FitR({ responseField: "distinct_k", armLevels: ["A", "B"], referenceArm: "A" });
+  const rarefied = renderLme4FitR({ responseField: "distinct_k_rarefied", armLevels: ["A", "B"], referenceArm: "A", dataFile: "analysis-data-rarefied.csv" });
+  assert.notEqual(full, rarefied, "a rarefied-lane script must not be byte-identical to the full-pool script it sits alongside");
+});

@@ -44,6 +44,22 @@
 // `result`, e.g. "distinct_k") rather than assuming it. Building the actual
 // judge-score frame (extra columns: run id, judge_provider,
 // generator_provider) is out of scope here — follow-up per #45/B5.
+//
+// ── The pool column is OPTIONAL and off by default (issue #73) ─────────────
+// docs/PREREGISTRATION.md Appendix C registers rarefied `distinct_k` as H1's
+// estimand, which needs the per-cell EMBEDDED POOL (the vectors), not just
+// the stored scalar response. No stored cell carries one today — Appendix C
+// item 5 and this module's own header above both say so: populating it is
+// #49/#50/#8 (Phase 2a)'s job, not this frame's. `buildFrame()` therefore
+// takes an OPTIONAL `poolField` (dotted path into a completed cell's
+// `result`, e.g. "pool") — omitted, every row is unchanged from before this
+// issue. When supplied, a completed row's `pool` is read the same way
+// `response` is, but unlike `response` it is allowed to be ABSENT (undefined)
+// on any given row, since no cell has one yet; only a PRESENT-but-malformed
+// value (not a non-empty array) is a hard error. Deciding what to do about
+// partial/absent pool coverage is the rarefied-frame builder's job
+// (evals/analysis/rarefiedFrame.mjs), not this one's — buildFrame() only
+// ever reports what it found.
 
 import { priceRows } from "../../lib/price.mjs";
 import { configHash as computeConfigHash } from "../../lib/manifest.mjs";
@@ -92,6 +108,15 @@ function getPath(obj, path) {
  *   @param {string} [opts.responseField="distinct_k"]  dotted path into a
  *                                         completed cell's `result` naming
  *                                         the numeric response to fit
+ *   @param {string} [opts.poolField]     dotted path into a completed cell's
+ *                                         `result` naming its embedded pool
+ *                                         (vectors), for rarefaction (issue
+ *                                         #73). Omitted by default — no
+ *                                         existing caller's rows gain a
+ *                                         `pool` field. When given, a row's
+ *                                         `pool` is present only if the cell
+ *                                         actually has one (no cell does
+ *                                         today; see this module's header).
  *   @param {string[]} [opts.armLevels]   explicit, pinned arm id order. If
  *                                         omitted, derived from the arm ids
  *                                         actually present in `included`,
@@ -105,10 +130,12 @@ function getPath(obj, path) {
  *   @param {object} [opts.rateTable]     forwarded to lib/price.mjs:priceRows
  * @returns {{
  *   rows: Array<{cellKey: string, armId: string, briefId: string,
- *     replicate: number, cfg: string, response: number, costUsd: number}>,
+ *     replicate: number, cfg: string, response: number, costUsd: number,
+ *     pool?: number[][]}>,
  *   armLevels: string[],
  *   briefLevels: string[],
  *   responseField: string,
+ *   poolField: string|undefined,
  *   configHash: string,
  *   excluded: {
  *     failed: Array<{key: string, armId: string, briefId: string, kind: string}>,
@@ -124,6 +151,7 @@ export function buildFrame(store, opts = {}) {
     throw new Error("buildFrame: opts.store must be a ResultsStore (or duck-typed equivalent with .list()/.get())");
   }
   const responseField = opts.responseField || "distinct_k";
+  const poolField = opts.poolField;
   const cfg = computeConfigHash(opts.config || {});
 
   const rows = [];
@@ -181,7 +209,7 @@ export function buildFrame(store, opts = {}) {
     const priced = priceRows(body.costRows || [], opts.rateTable, { batch: false });
     const costUsd = priced.totalUsd;
 
-    rows.push({
+    const row = {
       cellKey: entry.key,
       armId: entry.armId,
       briefId: entry.briefId,
@@ -189,7 +217,20 @@ export function buildFrame(store, opts = {}) {
       cfg: entry.cfg,
       response,
       costUsd,
-    });
+    };
+
+    if (poolField) {
+      const pool = getPath(body.result, poolField);
+      if (pool !== undefined && (!Array.isArray(pool) || pool.length === 0)) {
+        throw new Error(
+          `buildFrame: completed cell '${entry.key}' has an invalid ${poolField} — expected a non-empty array ` +
+            `of embedded vectors, or the field entirely absent (no cell carries one until #8/Phase 2a), got ${JSON.stringify(pool)}`,
+        );
+      }
+      row.pool = pool; // undefined on any row whose cell predates #8 — allowed
+    }
+
+    rows.push(row);
   }
 
   const armLevels = opts.armLevels || Array.from(seenArms).sort();
@@ -217,6 +258,7 @@ export function buildFrame(store, opts = {}) {
     armLevels,
     briefLevels,
     responseField,
+    poolField,
     configHash: cfg,
     excluded,
     failuresByArm,

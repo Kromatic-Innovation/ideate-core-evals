@@ -8,7 +8,7 @@ const CONFIG = { harnessVersion: "0.0.1", engineSha: "abc", promptHash: "p1" };
 const CFG = configHash(CONFIG);
 const STALE_CFG = configHash({ ...CONFIG, promptHash: "p2" });
 
-function put(store, { armId, briefId, replicate, cfg = CFG, state = "completed", distinctK = 3, costs = [] }) {
+function put(store, { armId, briefId, replicate, cfg = CFG, state = "completed", distinctK = 3, costs = [], pool = undefined }) {
   const key = cellKey({ armId, briefId, replicate, cfg });
   const costRows = costs.map((c, i) => ({
     cellKey: key,
@@ -29,6 +29,7 @@ function put(store, { armId, briefId, replicate, cfg = CFG, state = "completed",
   };
   if (state === "completed") {
     record.result = { distinct_k: distinctK };
+    if (pool !== undefined) record.result.pool = pool;
     record.accounting = { state: "completed" };
   } else if (state === "failed") {
     record.result = { failed: true, failureKind: "parse_failure" };
@@ -190,4 +191,71 @@ test("buildFrame: a caller-pinned armLevel the store has NO cells for at all is 
   // (existing behavior this fix must not regress).
   const frame = buildFrame(store, { config: CONFIG, armLevels: ["A", "C"] });
   assert.deepEqual(frame.armLevels, ["A", "C"]);
+});
+
+// ── poolField (issue #73): OPTIONAL, off by default ─────────────────────────
+
+test("buildFrame: without opts.poolField, rows carry no `pool` at all (existing callers unaffected)", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 });
+  const frame = buildFrame(store, { config: CONFIG });
+  assert.equal(frame.poolField, undefined);
+  assert.ok(!("pool" in frame.rows[0]), "a row must not gain a `pool` key when poolField was never requested");
+});
+
+test("buildFrame: opts.poolField reads the embedded pool when a cell has one", () => {
+  const store = makeTempStore();
+  const vectors = [[1, 0], [0, 1]];
+  put(store, { armId: "A", briefId: "b1", replicate: 0, pool: vectors });
+  const frame = buildFrame(store, { config: CONFIG, poolField: "pool" });
+  assert.equal(frame.poolField, "pool");
+  assert.deepEqual(frame.rows[0].pool, vectors);
+});
+
+test("buildFrame: opts.poolField on a cell that predates #8 (no pool stored) leaves that row's pool undefined -- never a hard failure", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 }); // no `pool`
+  const frame = buildFrame(store, { config: CONFIG, poolField: "pool" });
+  assert.equal(frame.rows[0].pool, undefined);
+});
+
+test("buildFrame: opts.poolField on a PRESENT but malformed pool (not a non-empty array) is a hard error", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0, pool: [] });
+  assert.throws(() => buildFrame(store, { config: CONFIG, poolField: "pool" }), /invalid pool/);
+});
+
+// ── clusterDistanceThreshold and configHash (issue #73 fix round) ──────────
+// clusterDistanceThreshold is a lib/manifest.mjs CONFIG_FIELDS entry (issue
+// #42) -- it was ALREADY comparability-relevant before this issue; #73 only
+// added a CLI flag (analysis.mjs's --cluster-distance-threshold) that feeds
+// it into the SAME opts.config buildFrame() has always hashed. Pinning this
+// here because a flag whose only visible effect (until #8 lands pools) is a
+// changed cell-selection outcome is easy to add without ever seeing it
+// exercised -- the flag was, until this test, untested at the frame
+// boundary it actually touches.
+
+test("buildFrame: clusterDistanceThreshold changes configHash -- passing it (or changing its value) reclassifies previously-included cells as stale", () => {
+  const store = makeTempStore();
+  const configWithThreshold = { ...CONFIG, clusterDistanceThreshold: 0.2314 };
+  const cfgWithThreshold = configHash(configWithThreshold);
+  assert.notEqual(cfgWithThreshold, CFG, "supplying clusterDistanceThreshold at all must change configHash (lib/manifest.mjs CONFIG_FIELDS)");
+
+  // Seed one cell under the NO-threshold config, one under the WITH-threshold config.
+  put(store, { armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  put(store, { armId: "A", briefId: "b2", replicate: 0, cfg: cfgWithThreshold });
+
+  const frameNoThreshold = buildFrame(store, { config: CONFIG });
+  assert.equal(frameNoThreshold.rows.length, 1, "only the no-threshold cell is included when the caller's config omits clusterDistanceThreshold");
+  assert.equal(frameNoThreshold.excluded.stale.length, 1, "the with-threshold cell must be reported stale, never silently pooled");
+
+  const frameWithThreshold = buildFrame(store, { config: configWithThreshold });
+  assert.equal(frameWithThreshold.rows.length, 1, "only the with-threshold cell is included once the caller's config supplies the SAME clusterDistanceThreshold");
+  assert.equal(frameWithThreshold.excluded.stale.length, 1, "the no-threshold cell becomes stale from the with-threshold config's point of view");
+});
+
+test("buildFrame: two DIFFERENT clusterDistanceThreshold values are two different configHashes, not silently pooled together", () => {
+  const a = configHash({ ...CONFIG, clusterDistanceThreshold: 0.2314 });
+  const b = configHash({ ...CONFIG, clusterDistanceThreshold: 0.4923 });
+  assert.notEqual(a, b, "a changed clusterDistanceThreshold must change configHash -- already asserted at the manifest.mjs unit level (manifest.test.mjs); this pins the SAME property reachable through the frame.mjs boundary analysis.mjs's --cluster-distance-threshold flag actually calls");
 });
