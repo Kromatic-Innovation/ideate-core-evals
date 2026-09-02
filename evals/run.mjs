@@ -4,6 +4,7 @@
 // Usage:
 //   node evals/run.mjs --dry-run
 //   node evals/run.mjs --max-spend 50 --arms A,B --briefs biz-01,biz-02 --replicates 2
+//   node evals/run.mjs --max-spend-anthropic 300 --max-spend-openai 150
 //   node evals/run.mjs --phase 0
 //
 // This file is intentionally thin: it parses argv, loads the corpus + arm
@@ -31,6 +32,7 @@ import { createRequire } from "node:module";
 import { CORPUS, CORPUS_HASH } from "./corpus/index.mjs";
 import { ResultsStore } from "../lib/store.mjs";
 import { runSpec } from "./harness/runner.mjs";
+import { runnerPriceGrid } from "../lib/price.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
 
@@ -101,6 +103,19 @@ export function parseArgs(argv) {
       case "--max-spend":
         args.maxSpendUsd = parseRequiredNumber(argv, ++i, "--max-spend");
         break;
+      case "--max-spend-anthropic":
+        // Per-provider ceiling (issue #51) -- §12 registers a single global
+        // --max-spend, but the operator's actual constraint is asymmetric
+        // (substantial Anthropic headroom, a firm preference against
+        // comparable OpenAI spend), which a single ceiling cannot express.
+        // Stored under args.maxSpendByProviderUsd (a { anthropic?, openai? }
+        // map), keyed the same way lib/price.mjs's providerOf() names a
+        // provider, so main() can hand it to runSpec with no translation.
+        args.maxSpendByProviderUsd = { ...args.maxSpendByProviderUsd, anthropic: parseRequiredNumber(argv, ++i, "--max-spend-anthropic") };
+        break;
+      case "--max-spend-openai":
+        args.maxSpendByProviderUsd = { ...args.maxSpendByProviderUsd, openai: parseRequiredNumber(argv, ++i, "--max-spend-openai") };
+        break;
       case "--arms":
         args.arms = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
         break;
@@ -123,8 +138,32 @@ export function parseArgs(argv) {
   return args;
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+// argv/deps are injectable (issue #62 BLOCKER 2): main() previously always
+// read process.argv and always constructed the real runSpec/ResultsStore,
+// so nothing outside a real CLI invocation could exercise its WIRING --
+// e.g. mutating away `priceGrid: runnerPriceGrid()` or
+// `maxSpendByProviderUsd: args.maxSpendByProviderUsd` from the runSpec call
+// below left every test green, because run.test.mjs only ever called
+// parseArgs(), never main(). `deps.runSpecFn`/`deps.store` let a test inject
+// a spy in place of the real runSpec and a hermetic temp store in place of
+// the real `results/` directory, so main()'s actual call site can be
+// asserted against directly. Both default to the real implementations, so a
+// genuine CLI invocation (`main()`, no args) is unchanged.
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  const {
+    runSpecFn = runSpec,
+    store: injectedStore,
+    // getEngineVersion is injectable (issue #62 CI break): the real
+    // implementation does `require.resolve("ideate-core")`, a genuine
+    // dependency lookup that only succeeds when node_modules exists. CI runs
+    // bare `node --test` with no `npm ci` (deliberately -- see the hermetic
+    // rationale on getInstalledEngineVersion above), so a test that calls
+    // main() without stubbing this seam fails in CI even though it passes
+    // locally on a machine that happens to have `npm install`ed. Defaults to
+    // the real resolver, so a genuine CLI invocation is unchanged.
+    getEngineVersion = getInstalledEngineVersion,
+  } = deps;
+  const args = parseArgs(argv);
 
   // --phase is accepted (per §12's flag table) but NOT YET wired to a
   // phase->arms/briefs mapping: docs/PREREGISTRATION.md §8.3 defines phases
@@ -175,7 +214,7 @@ async function main() {
   // `package.json` via plain `fs` (bypassing the exports map entirely, since
   // this is a filesystem read, not a module resolution) until it finds the
   // one whose `name` is "ideate-core".
-  const engineVersion = getInstalledEngineVersion();
+  const engineVersion = getEngineVersion();
   const engineSha = process.env.IDEATE_CORE_ENGINE_SHA || `ideate-core@${engineVersion}`;
 
   // embedderId (issue #20, AC5): lib/manifest.mjs's CONFIG_FIELDS already
@@ -204,7 +243,7 @@ async function main() {
     },
   };
 
-  const store = new ResultsStore(join(REPO_ROOT, "results"));
+  const store = injectedStore || new ResultsStore(join(REPO_ROOT, "results"));
 
   // Provider wiring: --dry-run calls nothing (provider: undefined, unchanged
   // from before #19 -- runSpec() only requires a provider when !dryRun -- see
@@ -230,17 +269,28 @@ async function main() {
     provider = new AnthropicBatchProvider({ apiKey, corpus: CORPUS, armsConfig });
   }
 
-  await runSpec(spec, {
+  const runSpecOpts = {
     store,
     armsConfig,
     provider,
     batch: !args.noBatch,
     dryRun: args.dryRun,
+    // --max-spend-anthropic/--max-spend-openai (issue #51) need real,
+    // pinned-rate-table pricing to be meaningful pre-flight -- the interim
+    // estimator runSpec() falls back to when no priceGrid is injected has no
+    // per-model rate for every model and is explicitly labelled a
+    // placeholder (see runner.mjs's own header). Wiring lib/price.mjs's
+    // runnerPriceGrid() here is the "follow-up PR" that module's own header
+    // comment names as the way the CLI adopts it -- zero changes to
+    // runner.mjs's own default were needed for this.
+    priceGrid: runnerPriceGrid(),
     maxSpendUsd: args.maxSpendUsd,
+    maxSpendByProviderUsd: args.maxSpendByProviderUsd,
     armIds: args.arms,
     briefIds: args.briefs,
     replicates: args.replicates,
-  });
+  };
+  await runSpecFn(spec, runSpecOpts);
 }
 
 // Only auto-run when this file is the actual entry point (`node evals/run.mjs

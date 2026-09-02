@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { providerOf, buildJudgeMatrix } from "./matrix.mjs";
+import { providerOf as providerOfFromPrice } from "../../lib/price.mjs";
 import { assertEvaluatorDistinct } from "./distinct.mjs";
 import { JUDGE_MODELS as REGISTERED_JUDGE_MODELS } from "./config.mjs";
 
@@ -28,6 +29,10 @@ test("providerOf infers anthropic / openai from model id prefix", () => {
   assert.equal(providerOf("gpt-4.1"), "openai");
   assert.throws(() => providerOf("mystery-model"), /cannot infer a provider/);
   assert.throws(() => providerOf(""), /non-empty string/);
+});
+
+test("issue #62 HIGH: matrix.mjs's providerOf IS lib/price.mjs's providerOf, not a second implementation that could silently diverge", () => {
+  assert.equal(providerOf, providerOfFromPrice, "matrix.mjs re-exports the single canonical implementation rather than re-deriving the prefix rule");
 });
 
 test("AC6 — the matrix schedules exactly 2 judge calls per pool with distinct providers", () => {

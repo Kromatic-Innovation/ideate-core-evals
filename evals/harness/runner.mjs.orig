@@ -576,24 +576,10 @@ export async function runSpec(spec, opts) {
   // none computed in this module, but the summary below is derived from
   // reconcile()'s own tally, so it is definitionally post-gate.
   const summary = account.reconcile();
-  // spendByProvider: the ACTUAL per-provider total THIS INVOCATION spent,
-  // derived from real tokens_by_model (issue #51) -- exposed on the summary
-  // so a caller (report, next --max-spend-<provider> invocation) can see
+  // spendByProvider: the ACTUAL per-provider total this run spent, derived
+  // from real tokens_by_model (issue #51) -- exposed on the summary so a
+  // caller (report, next --max-spend-<provider> invocation) can see exactly
   // what this session cost per provider, not just the pre-flight estimate.
-  //
-  // NOT cumulative across a resumed study (issue #62 MEDIUM):
-  // `runningTotalByProvider` is seeded at `{}` on every runSpec() call and
-  // never persisted or read back from the store -- a reused cell is
-  // acknowledged via account.complete()/account.fail() above but never
-  // repriced into it, and a budget-skipped cell is deliberately never
-  // written to the store at all (see the skip comment below), so it can
-  // never be repriced on a later invocation either. So `spendByProvider` on
-  // a fully-reused run is `{}` despite genuinely having cost money in an
-  // earlier session, and --max-spend-<provider> on a resumed run only ever
-  // gates THIS invocation's spend against the ceiling, not the study's
-  // cumulative spend across every invocation that has run so far. See
-  // docs/PREREGISTRATION.md §12 for the disclosed, not-fixed-here,
-  // implication.
   summary.spendByProvider = runningTotalByProvider;
   log(`[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
   return { summary, account };
