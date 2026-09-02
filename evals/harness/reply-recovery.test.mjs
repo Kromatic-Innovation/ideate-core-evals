@@ -43,6 +43,7 @@ import {
   buildAnthropicMessageParams,
   buildOpenAIChatParams,
   classifyPoolFailure,
+  MAX_DETAIL_CHARS,
   maxTokensForCell,
   normalizeOpenAIFinishReason,
   resolveIdeateAgents,
@@ -448,7 +449,7 @@ test("#93 AC3: the detail stays single-line, bounded, and greppable even for a p
     salvage: salvageCandidateArray(huge),
   });
   const { detail } = classifyPoolFailure([diag], { providerName: "AnthropicBatchProvider" });
-  assert.ok(detail.length <= 1400, `detail was ${detail.length} chars`);
+  assert.ok(detail.length <= MAX_DETAIL_CHARS, `detail was ${detail.length} chars`);
   assert.ok(!detail.includes("\n"), "raw newlines would break a line-oriented grep over the ledger");
   assert.match(detail, /^AnthropicBatchProvider: .* cause=truncated kind=parse_failure replies=1 /);
 });
