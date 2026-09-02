@@ -76,10 +76,17 @@ import { costRow } from "../../lib/accounting.mjs";
  * this task: an LLM judge that clears it tracks humans at least as well as
  * humans track each other on the very metric the paper uses.
  *
- * This value is REGISTERED (not recomputed here): reproducing it from Si et
- * al.'s released reviews is the human-gated real-data run (#16) — see
- * balancedAccuracySplitHalf and docs/fetching-si-et-al.md. If that reproduction
- * fails, this constant is revisited (#16), not silently kept.
+ * This value is REGISTERED and PAPER-REPORTED ONLY — it is never recomputed
+ * or revised from our own data. #47's evals/judge/reproduce-si-et-al.mjs
+ * computes a human-human balanced accuracy on OUR 98-idea slice (Human + AI
+ * conditions; 147-idea/3-condition AI_Rerank population excluded) using a
+ * different split rule (halves of each idea's REVIEWS — the anonymized
+ * release carries no reviewer id to split by, unlike Si et al.'s own
+ * reviewer-split-half). That is a same-construction, DIFFERENT-population
+ * comparator, structurally incapable of reproducing this exact figure even
+ * with a perfect implementation — see docs/fetching-si-et-al.md and the
+ * header comment of reproduce-si-et-al.mjs. It is reported alongside this
+ * constant for context, never treated as a pass/fail reproduction of it.
  */
 export const SI_ET_AL_BALANCED_ACCURACY_FLOOR = 0.561;
 

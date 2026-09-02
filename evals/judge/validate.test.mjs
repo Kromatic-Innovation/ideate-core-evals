@@ -16,6 +16,7 @@ const HUMAN = 12;
 const AI = 12;
 const N = HUMAN + AI; // 24 >= MIN_IDEAS_N (20)
 const JUDGE_MODEL = "claude-sonnet-5";
+const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
 const pad = (i) => String(i).padStart(2, "0");
 
@@ -99,7 +100,7 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   // Judge originality perfectly aligned with expert overall_score → accuracy 1.0.
   const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
 
-  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
 
   // Defaults are the registered mapping.
   assert.equal(out.axis, JUDGE_VALIDATION_AXIS); // "originality"
@@ -129,6 +130,46 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   assert.equal(stored.result.expertColumn, "overall_score");
   assert.equal(stored.result.verdict, "pass");
   assert.equal(stored.result.n, N);
+
+  // Issue #53 (B3): a validation run makes a REAL judge call and its usage
+  // must reach lib/accounting.mjs, not just the validation verdict. This is
+  // the accounting fix — previously nothing here ever called meterJudgeCall,
+  // so a live #16 run's judge tokens were silently dropped.
+  //
+  // The expectation is derived INDEPENDENTLY of the implementation's own call
+  // log (never `provider.calls[0].n`, issue #53/#56 QA finding: deriving the
+  // expected total from the implementation's own recorded calls lets the
+  // assertion stay green even when metering silently drops calls, since it's
+  // comparing the implementation to itself). N is the fixture's own known,
+  // independently-computed idea count.
+  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
+  assert.ok(costRecord, "a judge-call cost record must be written for the validation run's judge call");
+  assert.equal(costRecord.costRows.length, 1);
+  assert.equal(costRecord.costRows[0].model, JUDGE_MODEL);
+  assert.equal(costRecord.costRows[0].input_tokens, N * 10); // MockJudgeProvider: 10 * n input, 5 * n output
+  assert.equal(costRecord.costRows[0].output_tokens, N * 5);
+});
+
+test("runJudgeValidation — a failed judge run still meters whatever tokens the judge consumed before failing", async () => {
+  const root = tmpRoot("fail-meters");
+  writeValidationFixture(root);
+  const store = makeTempStore("judge-validate-fail-meters-");
+  // MockJudgeProvider computes `tokens` before checking `failFor`, mirroring
+  // the real AnthropicJudgeProvider (tokens accumulate as replies come in,
+  // then the pool is judged failed) — so a forced failure still carries
+  // non-zero tokens that must not be dropped on the floor.
+  const provider = new MockJudgeProvider({ failFor: new Map([[JUDGE_MODEL, { failureKind: "transport_error" }]]) });
+
+  await assert.rejects(
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
+    /did not complete scoring/,
+  );
+
+  const sliceId = judgeValidationSliceId({ axis: JUDGE_VALIDATION_AXIS, expertScoreField: SI_ET_AL_EXPERT_SCORE_FIELD });
+  const costRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
+  assert.ok(costRecord, "tokens consumed by a failed validation judge call must still be metered");
+  assert.equal(costRecord.costRows[0].input_tokens, N * 10);
+  assert.equal(costRecord.costRows[0].output_tokens, N * 5);
 });
 
 test("runJudgeValidation — end-to-end DROP: an anti-aligned judge fails the floor and is recorded 'drop'", async () => {
@@ -139,7 +180,7 @@ test("runJudgeValidation — end-to-end DROP: an anti-aligned judge fails the fl
   const reversed = EXPERT_BY_INDEX.slice().reverse();
   const provider = mockWithOriginality(reversed);
 
-  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
   assert.equal(out.verdict, "drop");
   assert.ok(out.accuracy < out.floor);
 
@@ -161,6 +202,7 @@ test("runJudgeValidation — a non-default (axis, expert column) is threaded int
     judgeModel: JUDGE_MODEL,
     axis: "feasibility",
     sliceRoot: root,
+    timestamp: TIMESTAMP,
   });
   assert.equal(out.axis, "feasibility");
   assert.equal(out.expertColumn, "overall_score");
@@ -178,7 +220,7 @@ test("runJudgeValidation — a failed judge run throws, never records a validati
   const provider = new MockJudgeProvider({ failFor: new Map([[JUDGE_MODEL, { failureKind: "transport" }]]) });
 
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
     /did not complete scoring/,
   );
   // No validation record was written.
@@ -200,7 +242,7 @@ test("runJudgeValidation — a score/idea count mismatch throws rather than vali
     },
   };
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
     /misaligned/,
   );
 });
@@ -226,7 +268,7 @@ test("runJudgeValidation — supplies the non-empty RESEARCH BRIEF the real judg
       return { terminalState: "completed", scores, tokens: { model: judgeModel, input_tokens: 1, output_tokens: 1 } };
     },
   };
-  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
   assert.equal(out.verdict, "pass");
   assert.ok(seenBrief && seenBrief.length > 0, "the judge must receive a non-empty research brief");
   // Default (no explicit briefText override): the brief is the idea's own
@@ -235,7 +277,7 @@ test("runJudgeValidation — supplies the non-empty RESEARCH BRIEF the real judg
 
   // An explicitly empty briefText is rejected rather than sent to the judge.
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, briefText: "" }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, briefText: "", timestamp: TIMESTAMP }),
     /briefText must be a non-empty string/,
   );
 });
@@ -282,7 +324,7 @@ test("runJudgeValidation — DEFAULT groups by each idea's own topic: one judge.
     },
   };
 
-  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root });
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
 
   // Exactly one call per distinct topic, never one call for the whole slice.
   assert.equal(provider.calls.length, 2, "two distinct topics -> two judge.score() calls");
@@ -301,13 +343,47 @@ test("runJudgeValidation — DEFAULT groups by each idea's own topic: one judge.
   assert.equal(out.verdict, "pass");
 });
 
+test("runJudgeValidation — metering: each topic-group judge call is metered under its own key, and the summed tokens equal the true independently-computed total (issue #56 x #61)", async () => {
+  const root = tmpRoot("multi-topic-meter");
+  writeValidationFixture(root, { topicFor: (i) => (i % 2 === 0 ? "bias" : "coding") });
+  const store = makeTempStore("judge-validate-multitopic-meter-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+
+  await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
+
+  const sliceId = judgeValidationSliceId({ axis: JUDGE_VALIDATION_AXIS, expertScoreField: SI_ET_AL_EXPERT_SCORE_FIELD });
+
+  // Two distinct topic groups -> two distinct judge-call cost records, never
+  // colliding on the same store key. Before the key carried a topic tag,
+  // every topic-group call collided on `judge-call|cell=${sliceId}|judge=...`
+  // and store.put's byte-identical-or-throw rule either silently dropped
+  // every group after the first or threw outright (the #56 x #61 bug).
+  const biasRecord = store.get(`judge-call|cell=${sliceId}|topic=bias|judge=${JUDGE_MODEL}`);
+  const codingRecord = store.get(`judge-call|cell=${sliceId}|topic=coding|judge=${JUDGE_MODEL}`);
+  assert.ok(biasRecord, "the 'bias' topic group's judge call must be metered under its own key");
+  assert.ok(codingRecord, "the 'coding' topic group's judge call must be metered under its own key");
+
+  // The independently-computed true total: N ideas total, MockJudgeProvider
+  // reports 10 input / 5 output tokens per idea scored, regardless of how
+  // many judge.score() calls that work was split across.
+  const totalInput = biasRecord.costRows[0].input_tokens + codingRecord.costRows[0].input_tokens;
+  const totalOutput = biasRecord.costRows[0].output_tokens + codingRecord.costRows[0].output_tokens;
+  assert.equal(totalInput, N * 10);
+  assert.equal(totalOutput, N * 5);
+
+  // Exactly the two topic groups' records — nothing collapsed, nothing
+  // duplicated.
+  const allJudgeCallRecords = store.list().filter((e) => e.key.startsWith(`judge-call|cell=${sliceId}|`));
+  assert.equal(allJudgeCallRecords.length, 2);
+});
+
 test("runJudgeValidation — a missing topic on an included idea fails loud (no silent fallback to a generic brief)", async () => {
   const root = tmpRoot("no-topic");
   writeValidationFixture(root, { topicFor: (i) => (i === 0 ? "" : "bias") }); // idea 0 has no topic
   const store = makeTempStore("judge-validate-notopic-");
   const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
   await assert.rejects(
-    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP }),
     /has no non-empty 'topic'/,
   );
 });
@@ -318,4 +394,19 @@ test("runJudgeValidation — validates its arguments", async () => {
   await assert.rejects(() => runJudgeValidation({ judgeProvider: provider, judgeModel: JUDGE_MODEL }), /store is required/);
   await assert.rejects(() => runJudgeValidation({ store, judgeModel: JUDGE_MODEL }), /judgeProvider with a \.score/);
   await assert.rejects(() => runJudgeValidation({ store, judgeProvider: provider }), /judgeModel is required/);
+});
+
+test("runJudgeValidation — a missing timestamp throws rather than substituting wall-clock (issue #53 SHOULD; consistent with score.mjs runJudgeMatrix)", async () => {
+  const root = tmpRoot("no-timestamp");
+  writeValidationFixture(root);
+  const store = makeTempStore("judge-validate-no-timestamp-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+  // No `timestamp` supplied — a wall-clock substitution here would make a
+  // re-run of this function non-idempotent (store.put() throws on a same-key
+  // row that isn't byte-identical to what's already stored), so this must
+  // fail loud instead, exactly like score.mjs's runJudgeMatrix.
+  await assert.rejects(
+    () => runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root }),
+    /timestamp is required/,
+  );
 });

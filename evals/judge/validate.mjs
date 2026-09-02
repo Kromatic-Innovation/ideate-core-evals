@@ -66,7 +66,7 @@
 // registered in docs/PREREGISTRATION.md Appendix A item 7.
 
 import { readSiEtAlSlice, sliceToJudgePool } from "./slice.mjs";
-import { validateJudge, recordValidation } from "./gate.mjs";
+import { validateJudge, recordValidation, meterJudgeCall } from "./gate.mjs";
 import { judgeScoresForAxis, computeJudgeHash } from "./score.mjs";
 import { assertAxesNotCollapsed } from "./prompt.mjs";
 import { providerOf } from "./matrix.mjs";
@@ -129,7 +129,9 @@ export function judgeValidationSliceId({ axis, expertScoreField }) {
  *   @param {object}  [o.config]       forwarded to validateJudge (accuracyFloor/quantile overrides)
  *   @param {number}  [o.seed]         judge presentation seed (default 1)
  *   @param {"batch"|"single"} [o.mode]  default "batch"
- *   @param {string}  [o.timestamp]    forwarded to the provider when it meters
+ *   @param {string}  o.timestamp      required — caller-supplied ISO 8601, forwarded to the
+ *     provider and to every meterJudgeCall (replayability; mirrors score.mjs's
+ *     runJudgeMatrix, which requires it for the same reason)
  * @returns {Promise<{ metric, construction, n, accuracy, floor, verdict, rho,
  *   axis, expertColumn, judgeHash, sliceId, exclusions }>}
  */
@@ -165,11 +167,51 @@ export async function runJudgeValidation({
 
   // 3. Judge scores the pool. The real judge scoring prompt requires a non-empty
   //    RESEARCH BRIEF per call (score.mjs buildJudgeScoringPrompt).
+  //
+  // Metering (issue #56 x #61 interaction): #56 metered this composition's
+  // ONE judge call into lib/accounting.mjs like any other cell (AC10). #61
+  // turned "this composition's judge call" into "1 + N calls" (the override
+  // branch, or one call per topic group), so metering now happens at EVERY
+  // call site, not once after a single call — and each call's store key is
+  // tagged with the topic (or "__all__" for the single-call override) so
+  // same-run calls never share a store key. Without the tag, every topic-group
+  // call would collide on `judge-call|cell=${sliceId}|judge=${judgeModel}` and
+  // lib/store.mjs's put() (byte-identical-or-throw on a key collision) would
+  // either silently drop all but one group's tokens or throw mid-run.
+  //
+  // Metering happens BEFORE each call's completion check, exactly like #56's
+  // original ordering — tokens consumed by a failed call must still reach the
+  // ledger, extended here to every call site (override + each topic group).
+  //
+  // `timestamp` is required (not defaulted to wall-clock): score.mjs's
+  // runJudgeMatrix already requires it for the same reason (meterJudgeCall
+  // replayability) — a caller-substituted wall-clock timestamp would make a
+  // re-run of this function non-idempotent, since store.put() throws on a
+  // same-key row that isn't byte-identical to what's already there.
+  if (!timestamp) {
+    throw new Error(
+      "runJudgeValidation: timestamp is required (caller-supplied ISO 8601, for meterJudgeCall replayability)",
+    );
+  }
+  const sliceId = judgeValidationSliceId({ axis, expertScoreField });
+  const meterCall = (topicTag, resp) => {
+    if (resp && resp.tokens && (resp.tokens.input_tokens || resp.tokens.output_tokens)) {
+      meterJudgeCall({
+        store,
+        cellKey: `${sliceId}|topic=${topicTag}`,
+        judgeModel,
+        tokens: resp.tokens,
+        timestamp,
+      });
+    }
+  };
+
   const scores = new Array(slice.ideas.length);
   if (briefText !== undefined) {
     // Explicit override: score the WHOLE slice in one call against one
     // shared brief (the pre-#45 behavior).
     const resp = await judgeProvider.score({ briefText, candidates: pool }, { judgeModel, mode, seed, timestamp });
+    meterCall("__all__", resp);
     if (!resp || resp.terminalState !== "completed") {
       const detail = resp ? (resp.detail || resp.failureKind || resp.terminalState) : "no response";
       throw new Error(
@@ -205,6 +247,7 @@ export async function runJudgeValidation({
       // score.mjs runJudgeMatrix's per-leg seed derivation).
       const groupSeed = (seed ^ hashToInt(topic)) | 0;
       const resp = await judgeProvider.score({ briefText: topic, candidates: groupCandidates }, { judgeModel, mode, seed: groupSeed, timestamp });
+      meterCall(topic, resp);
       if (!resp || resp.terminalState !== "completed") {
         const detail = resp ? (resp.detail || resp.failureKind || resp.terminalState) : "no response";
         throw new Error(
@@ -233,7 +276,6 @@ export async function runJudgeValidation({
 
   // 6. Record — self-describing: the axis + expert column actually used.
   const judgeHash = computeJudgeHash({ judgeModels: { [providerOf(judgeModel)]: [judgeModel] } });
-  const sliceId = judgeValidationSliceId({ axis, expertScoreField });
   recordValidation(store, {
     judgeHash,
     sliceId,
