@@ -10,25 +10,51 @@
 //     --response distinct_k --reference-arm A --panel-arms A2,B,C,D,E,F,G,H \
 //     --cluster-distance-threshold 0.23141118234233987
 //
-// --cluster-distance-threshold (issue #73): two distinct effects, both real:
-//   1. It is REQUIRED to actually compute H1's rarefied estimand (Appendix
-//      C) once stored cells carry embedded pools (#8/Phase 2a) — this
-//      study's registered clusterDistanceThreshold (lib/manifest.mjs
-//      CONFIG_FIELDS; docs/PREREGISTRATION.md's registered value is
-//      0.23141118234233987). Omitting it is safe TODAY (no cell has a pool
-//      yet, so the rarefied lane reports H1 as not-computed regardless —
-//      see main()'s PoolsUnavailableError handling) but will start
-//      hard-failing runs the moment pools exist and this flag is still
-//      missing.
-//   2. It ALSO feeds args.config, which is the SAME config buildFrame()
-//      hashes into configHash (frame.mjs) — clusterDistanceThreshold has
-//      been a CONFIG_FIELDS entry since issue #42, independent of
-//      rarefaction. Passing this flag (or changing its value) therefore
-//      changes WHICH stored cells this run selects: cells stored under a
-//      different clusterDistanceThreshold (including "none supplied")
-//      become `stale`, not silently pooled in. See frame.test.mjs's
-//      "clusterDistanceThreshold changes configHash" tests for this
-//      exact effect pinned at the frame boundary.
+// Add --config-hash <hash> only when the store holds more than one
+// configHash; the error you get in that case names every candidate.
+//
+// --cluster-distance-threshold (issue #73) is REQUIRED to actually compute
+// H1's rarefied estimand (Appendix C) once stored cells carry embedded pools
+// (#8/Phase 2a) — this study's registered clusterDistanceThreshold
+// (docs/PREREGISTRATION.md's registered value is 0.23141118234233987).
+// Omitting it is safe TODAY (no cell has a pool yet, so the rarefied lane
+// reports H1 as not-computed regardless — see main()'s PoolsUnavailableError
+// handling) but will start hard-failing runs the moment pools exist and this
+// flag is still missing.
+//
+// It used to have a SECOND effect: it fed `args.config`, the object
+// buildFrame() hashed into the configHash that decides which stored cells
+// this run selects. That is gone as of issue #91, and its removal is the
+// point of that issue, not a side effect — see "which cells this run
+// selects" below.
+//
+// ── Which cells this run selects (issue #91) ────────────────────────────────
+// This CLI no longer COMPUTES a configHash. It reads the hash off the store's
+// own index (evals/analysis/storeConfig.mjs) and hands it to buildFrame()
+// verbatim.
+//
+// Before, it computed one from `args.config` — an object it had flags for
+// exactly ONE of lib/manifest.mjs's nine CONFIG_FIELDS. The hash it reached
+// (560d764366bc) therefore could never equal the one evals/run.mjs stamps on
+// every cell (5ce5478956e5), so every cell was excluded as `stale` and the
+// study's whole dataset was invisible to its own analysis.
+//
+// The fix is deliberately NOT "add the other eight flags". Two reasons.
+// First, a config the operator retypes on every invocation is a config that
+// drifts. Second, the two sides genuinely DISAGREED about the field set:
+// `clusterDistanceThreshold` is a CONFIG_FIELDS entry that this file set and
+// run.mjs does not, so adding the five missing flags would have swapped one
+// mismatch for another. Reading the hash off the store removes the second
+// derivation entirely, so there is nothing left for the two sides to disagree
+// about — whatever run.mjs stamps is what this selects, today and after any
+// future change to run.mjs's field set.
+//
+// The never-silently-pool guarantee is untouched: buildFrame() still fits
+// only cells whose stored `cfg` equals the declared hash, and a store holding
+// two hashes is REFUSED (--config-hash names the one you mean), never
+// silently merged. See frame.test.mjs's "clusterDistanceThreshold changes
+// configHash" tests, which still pin that effect at the frame boundary for
+// callers who pass `opts.config`.
 //
 // Requires ANALYSIS_SIDECAR-independent setup: the sidecar venv must exist
 // at evals/analysis/sidecar/.venv (see sidecar/requirements.txt) — this CLI
@@ -41,7 +67,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { ResultsStore } from "../../lib/store.mjs";
-import { buildFrame, summarizeByArm } from "./frame.mjs";
+import { buildFrame, summarizeByArm, assertCellsSelected } from "./frame.mjs";
+import { resolveStoreConfigHash } from "./storeConfig.mjs";
 import { buildRarefiedFrame, PoolsUnavailableError } from "./rarefiedFrame.mjs";
 import { buildJudgeScoreFrame, JudgeScoresUnavailableError } from "./judgeScoreFrame.mjs";
 import { buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts } from "./contrasts.mjs";
@@ -58,7 +85,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
 
 function parseArgs(argv) {
-  const args = { resultsDir: "results", outDir: join(__dirname, "out"), response: "distinct_k", referenceArm: "A", panelArms: null, delta: undefined, config: {}, poolField: "pool" };
+  const args = {
+    resultsDir: "results",
+    outDir: join(__dirname, "out"),
+    response: "distinct_k",
+    referenceArm: "A",
+    panelArms: null,
+    delta: undefined,
+    clusterDistanceThreshold: undefined,
+    configHash: undefined,
+    poolField: "pool",
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--results-dir") args.resultsDir = argv[++i];
@@ -76,7 +113,14 @@ function parseArgs(argv) {
     // registered estimand needs the SAME clusterDistanceThreshold distinct_k
     // was originally measured at (lib/manifest.mjs CONFIG_FIELDS) — there is
     // no default (rarefiedFrame.mjs refuses to guess one).
-    else if (a === "--cluster-distance-threshold") args.config.clusterDistanceThreshold = Number(argv[++i]);
+    else if (a === "--cluster-distance-threshold") args.clusterDistanceThreshold = Number(argv[++i]);
+    // --config-hash (issue #91): the DISAMBIGUATOR, not the normal path. Left
+    // off, the hash is read off the store, which is right whenever the store
+    // holds one experiment. Supply it only when the store holds more than one
+    // configHash and you must say which is yours. It is validated against the
+    // store (storeConfig.mjs) rather than passed through to produce an empty
+    // frame.
+    else if (a === "--config-hash") args.configHash = argv[++i];
     else if (a === "--pool-field") args.poolField = argv[++i];
     else throw new Error(`analysis.mjs: unrecognized argument '${a}'`);
   }
@@ -121,7 +165,23 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // Disagree with this call? It is exactly `poolField: args.poolField`
   // below, gated by parseArgs()'s default -- flip that default, not this
   // comment, if the decision should go the other way.
-  const frame = buildFrame(store, { config: args.config, responseField: args.response, poolField: args.poolField });
+  //
+  // The configHash comes from the STORE, never recomputed here (issue #91 —
+  // see this file's header). resolveStoreConfigHash() throws a named,
+  // actionable error for each way this can fail: an empty store, a store
+  // holding several incomparable experiments (it refuses to choose), and a
+  // --config-hash the store does not carry — the last being exactly the state
+  // that used to surface four modules downstream as `armLevels []`.
+  const { configHash: selectedCfg } = resolveStoreConfigHash(store, {
+    configHash: args.configHash,
+    resultsDir: args.resultsDir,
+  });
+  const frame = buildFrame(store, { configHash: selectedCfg, responseField: args.response, poolField: args.poolField });
+  // Belt-and-braces behind the resolver: a frame that selected nothing is
+  // reported as the exclusion outcome it is, with the expected hash and what
+  // the store holds, instead of travelling on to become a contrasts.mjs
+  // complaint about --reference-arm.
+  assertCellsSelected(frame);
   const panelArms = args.panelArms || frame.armLevels.filter((a) => a !== args.referenceArm);
 
   // ── Full-pool ladder — the response every hypothesis EXCEPT H1 is fit
@@ -162,7 +222,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     try {
       rarefiedFrame = buildRarefiedFrame(frame, {
         armIds: [args.referenceArm, ...panelArms],
-        threshold: args.config.clusterDistanceThreshold,
+        threshold: args.clusterDistanceThreshold,
         metric: args.response,
       });
     } catch (err) {
