@@ -13,7 +13,7 @@ import { parseArgs, main, formatSpendSummary, formatPhase0Report } from "./run.m
 import { runnerPriceGrid } from "../lib/price.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
-import { AnthropicJudgeProvider } from "./judge/score.mjs";
+import { AnthropicJudgeProvider, OpenAIJudgeProvider } from "./judge/score.mjs";
 import { CORPUS } from "./corpus/index.mjs";
 import armsConfigJson from "../arms.config.json" with { type: "json" };
 
@@ -151,13 +151,17 @@ test("main() wires a REAL, RATE_TABLE-backed priceGrid (lib/price.mjs's runnerPr
 // CORPUS through to runSpec -- delete any one of the three lines that wire
 // them in evals/run.mjs and this test must fail.
 
-test("main() wires a REAL AnthropicJudgeProvider + the registered JUDGE_MODELS roster + CORPUS through to runSpec (issue #68) -- judging is reachable from a real invocation, not only from a test", async (t) => {
+test("main() wires a REAL AnthropicJudgeProvider + OpenAIJudgeProvider + the registered JUDGE_MODELS roster + CORPUS through to runSpec (issue #68 anthropic leg, #77 openai leg) -- judging is reachable from a real invocation, not only from a test", async (t) => {
   const runSpecFn = spyRunSpec();
   const priorKey = process.env.ANTHROPIC_API_KEY;
+  const priorOpenaiKey = process.env.OPENAI_API_KEY;
   process.env.ANTHROPIC_API_KEY = "test-key-not-real";
+  process.env.OPENAI_API_KEY = "test-openai-key-not-real";
   t.after(() => {
     if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = priorKey;
+    if (priorOpenaiKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = priorOpenaiKey;
   });
 
   // Deliberately NOT --dry-run: dry-run's early return in runSpec() never
@@ -170,6 +174,13 @@ test("main() wires a REAL AnthropicJudgeProvider + the registered JUDGE_MODELS r
   assert.deepEqual(opts.judgeModels, JUDGE_MODELS, "the registered judge-model roster (evals/judge/config.mjs) reaches runSpec unchanged");
   assert.deepEqual(opts.corpus, CORPUS, "the real CORPUS (brief text) reaches runSpec, so a pool's judge call has something to score against");
   assert.ok(opts.judgeProviders && opts.judgeProviders.anthropic instanceof AnthropicJudgeProvider, "a REAL AnthropicJudgeProvider instance is wired for the anthropic leg -- not a stub, not omitted");
+  assert.ok(opts.judgeProviders && opts.judgeProviders.openai instanceof OpenAIJudgeProvider, "a REAL OpenAIJudgeProvider instance is wired for the openai leg -- not a stub, not omitted");
+  // Each leg must be constructed with ITS OWN provider's key -- not the other
+  // provider's key, and not a silently-dropped empty string. Without this, a
+  // mutation swapping ANTHROPIC_API_KEY<->OPENAI_API_KEY (or blanking either)
+  // at the construction site in run.mjs is invisible to an instanceof-only check.
+  assert.equal(opts.judgeProviders.anthropic.apiKey, "test-key-not-real", "the anthropic judge leg must be constructed with ANTHROPIC_API_KEY, not the openai key or blank");
+  assert.equal(opts.judgeProviders.openai.apiKey, "test-openai-key-not-real", "the openai judge leg must be constructed with OPENAI_API_KEY, not the anthropic key or blank");
 });
 
 test("main() forwards --max-spend as maxSpendUsd and --arms/--briefs/--replicates through to runSpec", async () => {

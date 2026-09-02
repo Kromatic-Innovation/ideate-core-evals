@@ -65,6 +65,11 @@ import {
   classifyTransportOutcome,
   classifyTransportKind,
   pickFailureKind,
+  buildOpenAIChatParams,
+  openaiHeaders,
+  openaiAuthOnlyHeaders,
+  extractOpenAIText,
+  openaiFetchWithRetry,
 } from "../harness/provider.mjs";
 
 /** A score-only reply is a tiny JSON object; 256 tokens is generous headroom
@@ -420,6 +425,271 @@ export class AnthropicJudgeProvider {
   }
 }
 
+/** Sum an OpenAI usage object ({prompt_tokens, completion_tokens}) into a FLAT
+ *  { input_tokens, output_tokens } accumulator (the SAME shape
+ *  AnthropicJudgeProvider.score() returns and meterJudgeCall/costRow requires
+ *  — issue #77's own trap: OpenAIBatchProvider.generate() returns a NESTED
+ *  tokens_by_model shape because a generation cell can span many models, but
+ *  a judge call is always ONE judge model, so this provider must translate
+ *  OpenAI's native prompt_tokens/completion_tokens into input_tokens/
+ *  output_tokens and accumulate them FLAT — never forward the native OpenAI
+ *  field names, and never nest under tokens_by_model. */
+function addOpenAIUsageInto(acc, usage) {
+  if (!usage) return;
+  acc.input_tokens += usage.prompt_tokens || 0;
+  acc.output_tokens += usage.completion_tokens || 0;
+}
+
+/**
+ * OpenAIJudgeProvider — the real judge scorer for `gpt-*` judge models
+ * (issue #77). Mirrors AnthropicJudgeProvider's INTERFACE and metering
+ * contract (score(payload, opts) -> { terminalState, scores?, tokens,
+ * failureKind?, detail? }, tokens FLAT — { model, input_tokens,
+ * output_tokens } — never nested), but its TRANSPORT is OpenAI's: single
+ * mode POSTs /v1/chat/completions directly (openaiFetchWithRetry +
+ * openaiHeaders, from evals/harness/provider.mjs — the shared transport
+ * OpenAIBatchProvider already uses, not re-implemented here); batch mode
+ * follows OpenAIBatchProvider's own sequence — upload a JSONL input file
+ * (multipart, purpose=batch), create the batch job over that file, poll
+ * until terminal, then download and parse the output file by custom_id —
+ * because OpenAI's Batch API is structurally unlike Anthropic's
+ * inline-requests batch. Never throws for a transport/parse failure.
+ */
+export class OpenAIJudgeProvider {
+  /**
+   * @param {object} [opts]  same seams as AnthropicJudgeProvider.
+   *   @param {string}   [opts.apiKey]        defaults to OPENAI_API_KEY; a
+   *     missing key returns a classified harness_error on the first call.
+   *   @param {typeof fetch} [opts.fetchImpl] injected in tests; defaults to global fetch.
+   *   @param {Function} [opts.sleep]         (ms)=>Promise; injectable for instant retry/poll tests.
+   *   @param {number}   [opts.pollIntervalMs] batch-poll interval (live default 2000ms).
+   *   @param {number}   [opts.maxPollMs]      poll ceiling before classifying `timeout` (live default 15 min).
+   *   @param {number}   [opts.maxRetries]     429/5xx retry budget (default 3).
+   *   @param {(msg:string)=>void} [opts.logger] defaults to console.error; tests inject a silent logger.
+   */
+  constructor({
+    apiKey = process.env.OPENAI_API_KEY,
+    fetchImpl = globalThis.fetch,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    pollIntervalMs = 2000,
+    maxPollMs = 15 * 60 * 1000,
+    maxRetries = 3,
+    logger = (msg) => console.error(msg),
+  } = {}) {
+    this.apiKey = apiKey;
+    this.fetchImpl = fetchImpl;
+    this.sleep = sleep;
+    this.pollIntervalMs = pollIntervalMs;
+    this.maxPollMs = maxPollMs;
+    this.maxRetries = maxRetries;
+    this.logger = logger;
+  }
+
+  /**
+   * @param {{briefText:string, candidates:Array<{text:string}>}} payload  from assembleJudgePayload
+   * @param {object} opts
+   *   @param {string}  opts.judgeModel  the judge model id (a `gpt-*` id here)
+   *   @param {"batch"|"single"} [opts.mode]  batch-first, like the generation path
+   *   @param {number}  opts.seed        explicit integer seed for presentation order
+   *   @param {string}  [opts.timestamp] ISO 8601, forwarded for symmetry (unused in the call itself)
+   */
+  async score(payload, { judgeModel, mode = "batch", seed } = {}) {
+    const tokens = { model: judgeModel, input_tokens: 0, output_tokens: 0 };
+    if (!this.apiKey) {
+      return { terminalState: "failed", failureKind: "harness_error", detail: "OpenAIJudgeProvider: no apiKey (OPENAI_API_KEY unset) — refusing to call the network with no credential", tokens };
+    }
+    if (!judgeModel || typeof judgeModel !== "string") {
+      return { terminalState: "failed", failureKind: "harness_error", detail: "OpenAIJudgeProvider: judgeModel is required", tokens };
+    }
+    if (!payload || !Array.isArray(payload.candidates)) {
+      return { terminalState: "failed", failureKind: "harness_error", detail: "OpenAIJudgeProvider: payload.candidates must be an array (from assembleJudgePayload)", tokens };
+    }
+    if (payload.candidates.length === 0) {
+      // Nothing to score — the upstream pool was empty. Classified, not thrown,
+      // so it reconciles like any other cell rather than crashing the matrix.
+      return { terminalState: "failed", failureKind: "empty_pool", detail: "OpenAIJudgeProvider: empty candidate pool — nothing to score", tokens };
+    }
+    if (!Number.isInteger(seed)) {
+      return { terminalState: "failed", failureKind: "harness_error", detail: `OpenAIJudgeProvider: seed must be an explicit integer (an unseeded presentation order can't be replayed), got ${JSON.stringify(seed)}`, tokens };
+    }
+
+    let requests;
+    try {
+      requests = buildJudgeRequests(payload, seed);
+    } catch (err) {
+      return { terminalState: "failed", failureKind: "harness_error", detail: `OpenAIJudgeProvider: could not build judge requests: ${err && err.message}`, tokens };
+    }
+
+    const classification = { transportError: false, rateLimited: false, timedOut: false };
+    // origIndex -> reply text (or a marker), collected in whatever order calls resolve.
+    const replies = new Map();
+    try {
+      if (mode === "single") {
+        await this.#scoreSingle(requests, judgeModel, { tokens, classification, replies });
+      } else {
+        await this.#scoreBatched(requests, judgeModel, { tokens, classification, replies });
+      }
+    } catch (err) {
+      // Any escape from the transport layer is our bug (the helpers are
+      // no-throw), so classify it rather than crashing the matrix.
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, "harness_error"), detail: `OpenAIJudgeProvider: ${err && err.message}`, tokens };
+    }
+
+    // A transport failure on ANY candidate fails the whole pool's scoring: a
+    // partially-scored pool is exactly the silent-truncation bias the rest of
+    // this harness refuses (a mean over "the candidates that happened to score"
+    // is a biased sample). Report the most specific classification observed.
+    if (replies.size < requests.length) {
+      return { terminalState: "failed", failureKind: pickFailureKind(classification, "transport_error"), detail: `OpenAIJudgeProvider: only ${replies.size}/${requests.length} candidates returned a reply`, tokens };
+    }
+
+    // Parse every reply; any unparseable/collapsed reply fails the pool with a
+    // classified parse_failure (never a thrown error), tokens preserved.
+    const scores = new Array(requests.length);
+    for (let i = 0; i < requests.length; i++) {
+      const origIndex = i; // scores are stored in INPUT order (un-permuted)
+      const replyText = replies.get(origIndex);
+      try {
+        scores[origIndex] = parseAxisScores(replyText);
+      } catch (err) {
+        return { terminalState: "failed", failureKind: "parse_failure", detail: `OpenAIJudgeProvider: candidate ${origIndex} — ${err && err.message}`, tokens };
+      }
+    }
+
+    return { terminalState: "completed", scores, tokens };
+  }
+
+  // ── single mode: one POST /v1/chat/completions per candidate ────────────────
+  async #scoreSingle(requests, judgeModel, { tokens, classification, replies }) {
+    await Promise.all(
+      requests.map(async (req) => {
+        const params = buildOpenAIChatParams({ model: judgeModel, prompt: req.prompt, maxTokens: MAX_JUDGE_TOKENS });
+        const { ok, status, json, error } = await openaiFetchWithRetry(
+          this.fetchImpl,
+          "https://api.openai.com/v1/chat/completions",
+          openaiHeaders(this.apiKey),
+          params,
+          { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+        );
+        if (!ok) {
+          classifyTransportOutcome(status, error, classification);
+          return; // absent from `replies` — counted as a missing reply above
+        }
+        addOpenAIUsageInto(tokens, json && json.usage);
+        // A refusal (empty/missing content) yields an empty reply here, which
+        // parseAxisScores rejects as a parse_failure below — the pool's
+        // scoring fails, classified, rather than silently scoring it as 0s.
+        replies.set(req.origIndex, extractOpenAIText(json));
+      }),
+    );
+  }
+
+  // ── batch mode: upload -> create batch -> poll -> download (OpenAI's shape) ──
+  async #scoreBatched(requests, judgeModel, { tokens, classification, replies }) {
+    const lines = requests.map((req) => ({
+      custom_id: req.customId,
+      method: "POST",
+      url: "/v1/chat/completions",
+      body: buildOpenAIChatParams({ model: judgeModel, prompt: req.prompt, maxTokens: MAX_JUDGE_TOKENS }),
+    }));
+    const byCustomId = new Map(requests.map((req) => [req.customId, req]));
+    const jsonl = lines.map((l) => JSON.stringify(l)).join("\n");
+
+    // 1. Upload the JSONL as a batch input file (multipart/form-data).
+    const form = new FormData();
+    form.append("purpose", "batch");
+    form.append("file", new Blob([jsonl], { type: "application/jsonl" }), "judge-batch-input.jsonl");
+    const upload = await openaiFetchWithRetry(
+      this.fetchImpl,
+      "https://api.openai.com/v1/files",
+      openaiAuthOnlyHeaders(this.apiKey),
+      form,
+      { formData: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!upload.ok) {
+      classifyTransportOutcome(upload.status, upload.error, classification);
+      return;
+    }
+
+    // 2. Create the batch job over that file.
+    const create = await openaiFetchWithRetry(
+      this.fetchImpl,
+      "https://api.openai.com/v1/batches",
+      openaiHeaders(this.apiKey),
+      { input_file_id: upload.json.id, endpoint: "/v1/chat/completions", completion_window: "24h" },
+      { maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!create.ok) {
+      classifyTransportOutcome(create.status, create.error, classification);
+      return;
+    }
+
+    const batchId = create.json.id;
+    const deadline = Date.now() + this.maxPollMs;
+    let batchStatus = create.json;
+    // Terminal OpenAI batch states: completed | failed | expired | cancelled.
+    while (batchStatus.status !== "completed") {
+      if (batchStatus.status === "failed" || batchStatus.status === "expired" || batchStatus.status === "cancelled") {
+        classification.transportError = true;
+        return;
+      }
+      if (Date.now() > deadline) {
+        classification.timedOut = true;
+        return;
+      }
+      await this.sleep(this.pollIntervalMs);
+      const poll = await openaiFetchWithRetry(
+        this.fetchImpl,
+        `https://api.openai.com/v1/batches/${batchId}`,
+        openaiHeaders(this.apiKey),
+        undefined,
+        { method: "GET", maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+      );
+      if (!poll.ok) {
+        classifyTransportOutcome(poll.status, poll.error, classification);
+        return;
+      }
+      batchStatus = poll.json;
+    }
+
+    // 3. Download the output file (JSONL, keyed by custom_id — never line position).
+    const results = await openaiFetchWithRetry(
+      this.fetchImpl,
+      `https://api.openai.com/v1/files/${batchStatus.output_file_id}/content`,
+      openaiHeaders(this.apiKey),
+      undefined,
+      { method: "GET", raw: true, maxRetries: this.maxRetries, sleep: this.sleep, logger: this.logger },
+    );
+    if (!results.ok) {
+      classifyTransportOutcome(results.status, results.error, classification);
+      return;
+    }
+
+    for (const line of results.text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        continue; // a malformed JSONL line is a per-result hiccup, not a whole-batch failure
+      }
+      const req = byCustomId.get(row.custom_id);
+      if (!req) continue;
+      const resp = row.response;
+      if (!row.error && resp && resp.status_code >= 200 && resp.status_code < 300 && resp.body) {
+        addOpenAIUsageInto(tokens, resp.body.usage);
+        replies.set(req.origIndex, extractOpenAIText(resp.body));
+      } else if (resp && resp.status_code === 429) {
+        classification.rateLimited = true;
+        // absent from `replies` — a missing reply, classified above
+      } else {
+        classification.transportError = true;
+      }
+    }
+  }
+}
+
 /**
  * MockJudgeProvider — the hermetic double for runJudgeMatrix tests. No network.
  * Records every call (a spy the matrix tests assert against) and returns
@@ -546,11 +816,11 @@ export function computeJudgeHash({ judgeModels, promptObject } = {}) {
  *   3. on success: stores the per-axis scores (recordJudgeScores) and meters the
  *      call's tokens (meterJudgeCall) — a judge call is accounted like any other.
  *
- * The OpenAI leg's PROVIDER is supplied by the caller (issue #22 implements
- * OpenAIJudgeProvider). If a leg's provider is absent, the row is recorded as
- * `deferred` with a reason — NEVER silently dropped, because H5's self-preference
- * bias term needs both legs (#21's own note: "do not silently drop the OpenAI
- * leg"). The Anthropic leg lands now; the OpenAI leg lands with #22.
+ * The OpenAI leg's PROVIDER is supplied by the caller (OpenAIJudgeProvider,
+ * defined above — issue #77). If a leg's provider is absent (e.g. not wired by
+ * the caller, or --dry-run), the row is recorded as `deferred` with a reason —
+ * NEVER silently dropped, because H5's self-preference bias term needs both
+ * legs (#21's own note: "do not silently drop the OpenAI leg").
  *
  * @param {object} o
  *   @param {Array<{poolKey:string, arm:object, briefText:string, candidates:Array}>} o.pools
@@ -611,7 +881,7 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
 
     const provider = providers && providers[row.judge_provider];
     if (!provider) {
-      const reason = `no ${row.judge_provider} judge provider wired — this leg is deferred (issue #22 supplies OpenAIJudgeProvider). NOT dropped: H5's self-preference bias term needs both legs.`;
+      const reason = `no ${row.judge_provider} judge provider wired — this leg is deferred (issue #77 supplies OpenAIJudgeProvider). NOT dropped: H5's self-preference bias term needs both legs.`;
       deferred.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, reason });
       continue;
     }

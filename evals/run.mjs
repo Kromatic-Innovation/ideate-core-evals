@@ -37,14 +37,14 @@ import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
-// AnthropicJudgeProvider (issue #68): the real judging LEG this CLI wires
-// into runSpec's per-pool judging pass -- the pre-flight already priced
-// judging (issue #63's judgeLegsFor above), but nothing actually CALLED a
-// judge until this. There is no OpenAIJudgeProvider yet (unlike
-// OpenAIBatchProvider, which is the GENERATION adapter for arms G/H, issue
-// #22) -- the OpenAI judge leg is deferred (runJudgeMatrix's own documented,
-// non-dropping behavior; see evals/judge/score.mjs) until that lands.
-import { AnthropicJudgeProvider } from "./judge/score.mjs";
+// AnthropicJudgeProvider (issue #68) + OpenAIJudgeProvider (issue #77): the
+// real judging LEGS this CLI wires into runSpec's per-pool judging pass --
+// the pre-flight already priced judging (issue #63's judgeLegsFor above), but
+// nothing actually CALLED a judge until #68 landed the Anthropic leg. #77
+// supplies the OpenAI leg (a JudgeProvider distinct from OpenAIBatchProvider,
+// the GENERATION adapter for arms G/H, issue #22) -- both legs are now wired
+// below, so a fully-wired arm produces zero deferrals.
+import { AnthropicJudgeProvider, OpenAIJudgeProvider } from "./judge/score.mjs";
 import { runPhase0 } from "./metrics/phase0.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -461,15 +461,24 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     provider = new AnthropicBatchProvider({ apiKey, corpus: CORPUS, armsConfig });
   }
 
-  // judgeProviders (issue #68): the real Anthropic judge leg, sharing the
-  // SAME ANTHROPIC_API_KEY already validated above -- constructed only for a
-  // real (non-dry-run) invocation, mirroring the generation `provider`
-  // construction immediately above (dry-run's early return in runSpec()
-  // never reaches the judging pass, so this is unused but harmless there).
-  // No `openai` entry: there is no OpenAIJudgeProvider yet (see the import
-  // comment above) -- runJudgeMatrix records that leg `deferred`, never
-  // dropped, until a future issue supplies one.
-  const judgeProviders = args.dryRun ? {} : { anthropic: new AnthropicJudgeProvider({ apiKey: process.env.ANTHROPIC_API_KEY }) };
+  // judgeProviders (issue #68 anthropic leg, issue #77 openai leg): the real
+  // judge legs, constructed only for a real (non-dry-run) invocation,
+  // mirroring the generation `provider` construction immediately above
+  // (dry-run's early return in runSpec() never reaches the judging pass, so
+  // this is unused but harmless there). The Anthropic leg shares the SAME
+  // ANTHROPIC_API_KEY already validated above. The OpenAI leg reads
+  // OPENAI_API_KEY directly -- unlike the Anthropic key, this CLI does not
+  // pre-flight-check it (a run using only Anthropic-judged arms should not be
+  // blocked by an unset OpenAI credential); OpenAIJudgeProvider's own
+  // constructor guard returns a classified harness_error per call if it is
+  // unset, mirroring AnthropicJudgeProvider's no-apiKey behavior, never a
+  // thrown error.
+  const judgeProviders = args.dryRun
+    ? {}
+    : {
+        anthropic: new AnthropicJudgeProvider({ apiKey: process.env.ANTHROPIC_API_KEY }),
+        openai: new OpenAIJudgeProvider({ apiKey: process.env.OPENAI_API_KEY }),
+      };
 
   const runSpecOpts = {
     store,
