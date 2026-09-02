@@ -41,7 +41,13 @@ import { planRun } from "../../lib/manifest.mjs";
 // module because evals/judge/gate.mjs needs the identical next-attempt
 // derivation and cannot import THIS module without closing a cycle -- see
 // that block's own comment in lib/store.mjs.
-import { ATTEMPT_FAMILIES, parseAttemptKey, nextAttemptNumber } from "../../lib/store.mjs";
+import {
+  ATTEMPT_FAMILIES,
+  parseAttemptKey,
+  nextAttemptNumber,
+  readBatchResumeRecord,
+  writeBatchResumeRecord,
+} from "../../lib/store.mjs";
 import {
   RunAccount,
   costRow,
@@ -279,6 +285,78 @@ function recordMetricsAttemptFailure(store, { cell, costRows, detail }) {
     accounting: { state: "failed", kind: "harness_error", detail },
     costRows,
   });
+}
+
+// ── Batch-resume state, runner side (issue #103) ──────────────────────────
+//
+// The store I/O half of resume. The provider does none of its own: it is
+// handed `{replies, outstanding}` and hands back an updated copy, the same way
+// it is handed a cell and hands back tokens.
+
+/** The pricing LEVER a given invocation's spend lands under. Not `billing_mode`
+ *  -- see lib/store.mjs's #103 header for why those are different axes and why
+ *  conflating them mis-attributes spend by roughly 2x. */
+function pricingLeverFor(batch) {
+  return batch ? "batch" : "single";
+}
+
+/**
+ * The replay state to hand the provider for `cell`, or null to start clean.
+ *
+ * Returns null -- deliberately choosing to RE-SPEND -- when the stored replies
+ * were produced under a different pricing lever than this invocation runs
+ * under. That is the AC4 hazard in its sharpest form: `lib/price.mjs` resolves
+ * batch-vs-single from a flag the CALLER passes, not from anything on the row,
+ * and `spendToDate()` passes ONE flag for the whole store. Replaying
+ * batch-produced replies into a `--no-batch` run would therefore attribute
+ * that spend at roughly TWICE what it cost -- not double-counted, which a
+ * reconciliation would catch, but priced at the wrong RATE, which looks
+ * entirely plausible in a total. Money accounted correctly beats money saved,
+ * so the mismatch declines to replay and says so out loud.
+ */
+function loadBatchResumeState(store, cell, pricingLever, log) {
+  const record = readBatchResumeRecord(store, cell.key);
+  if (!record || record.retired) return null;
+  if (record.pricingLever !== pricingLever) {
+    log(
+      `[resume] cell '${cell.key}' has ${Object.keys(record.replies).length} recoverable repl(y/ies) recorded under ` +
+        `pricingLever='${record.pricingLever}', but this invocation is running '${pricingLever}'. NOT replaying them: ` +
+        "batch and non-batch spend price ~2x apart and the ledger carries no per-row record of which lever a row ran " +
+        `under, so replaying across the boundary would mis-attribute real spend. Re-run without --no-batch to use them.`,
+    );
+    return null;
+  }
+  const replyCount = Object.keys(record.replies).length;
+  if (replyCount || record.outstanding.length) {
+    log(
+      `[resume] cell '${cell.key}': ${replyCount} already-paid-for repl(y/ies) available for replay, ` +
+        `${record.outstanding.length} batch handle(s) to re-poll.`,
+    );
+  }
+  return { replies: record.replies, outstanding: record.outstanding };
+}
+
+/** Append this cell's updated replay state. No-op when there is nothing worth
+ *  replaying, so a cell that failed before any reply landed writes nothing. */
+function persistBatchResumeState(store, cell, resume, pricingLever, log) {
+  if (!resume || typeof resume !== "object") return;
+  const replies = resume.replies || {};
+  const outstanding = Array.isArray(resume.outstanding) ? resume.outstanding : [];
+  if (!Object.keys(replies).length && !outstanding.length) return;
+  writeBatchResumeRecord(store, {
+    cellKey: cell.key,
+    cfg: cell.cfg,
+    replies,
+    outstanding,
+    pricingLever,
+    detail:
+      `${Object.keys(replies).length} recoverable repl(y/ies), ${outstanding.length} outstanding batch handle(s) ` +
+      "-- replayed instead of re-submitted on the next invocation (issue #103)",
+  });
+  log(
+    `[resume] cell '${cell.key}': recorded ${Object.keys(replies).length} repl(y/ies) and ${outstanding.length} ` +
+      "batch handle(s) so the next invocation does not pay for them again.",
+  );
 }
 
 /**
@@ -691,7 +769,16 @@ export function planPrune(store, opts = {}) {
     for (const entry of entries) {
       const parsed = parseAttemptKey(entry.key);
       if (!parsed) continue;
-      const gk = `${parsed.family} ${parsed.cellKey}`;
+      // Compaction is scoped to ATTEMPT_FAMILIES, not to "every family that
+      // uses the attempt-key grammar" (issue #103). `batch-replay` shares the
+      // grammar -- and therefore parseAttemptKey and nextAttemptNumber's max+1
+      // discipline -- but its body is a batch handle and a set of recovered
+      // replies, not cost rows. Compaction rewrites a record's body as the SUM
+      // OF ITS COST ROWS and nothing else, so folding one would destroy
+      // precisely the handle resume exists to re-poll: the feature would
+      // degrade, silently, into a slower way to pay twice.
+      if (!ATTEMPT_FAMILIES.includes(parsed.family)) continue;
+      const gk = `${parsed.family} ${parsed.cellKey}`;
       if (!byCellFamily.has(gk)) byCellFamily.set(gk, []);
       byCellFamily.get(gk).push({ ...parsed, key: entry.key });
     }
@@ -1258,6 +1345,11 @@ export async function runSpec(spec, opts) {
     provider,
     priceGrid = interimPriceGrid,
     batch = true, // batch-first: the DEFAULT is true, not a flag callers must set
+    // Issue #103: re-poll a batch this study already paid for, and replay its
+    // replies, instead of submitting a fresh one. Default true for the same
+    // reason `batch` is -- paying twice for the same replies is never the
+    // behaviour anyone wants, so it should not need a flag to avoid.
+    resume = true,
     dryRun = false,
     maxSpendUsd,
     maxSpendByProviderUsd,
@@ -1410,6 +1502,12 @@ export async function runSpec(spec, opts) {
       );
     }
   }
+
+  // Resume is batch-only by construction (see loadBatchResumeState): a
+  // single-mode invocation produces no batch handle to re-poll, and replaying
+  // batch-produced replies into one would price them at the wrong rate.
+  const pricingLever = pricingLeverFor(batch);
+  const resumeEnabled = !!resume && !!batch;
 
   const plannedKeys = [...plan.reuse.map((c) => c.key), ...plan.todo.map((c) => c.key)];
   const account = new RunAccount(plannedKeys);
@@ -1977,9 +2075,15 @@ export async function runSpec(spec, opts) {
     if (!arm) throw new Error(`runSpec: cell '${cell.key}' references unknown arm '${cell.armId}'`);
 
     const timestamp = new Date().toISOString();
+    // ── Batch resume (issue #103) ──────────────────────────────────────
+    // Hand the provider whatever this cell has already paid for. All store
+    // I/O stays HERE: the provider is handed a plain state object and hands
+    // one back, exactly as it does for tokens and diagnostics, so nothing in
+    // provider.mjs needs to know what a ResultsStore is.
+    const resumeState = resumeEnabled ? loadBatchResumeState(store, cell, pricingLever, log) : null;
     let response;
     try {
-      response = await provider.generate(cell, arm, { mode: batch ? "batch" : "single", timestamp });
+      response = await provider.generate(cell, arm, { mode: batch ? "batch" : "single", timestamp, resume: resumeState });
       // Validate the shape regardless of whether the provider is our own
       // MockProvider (which already self-validates) or a future real
       // adapter -- a malformed response from ANY provider must surface as a
@@ -2001,6 +2105,26 @@ export async function runSpec(spec, opts) {
       // exist to persist -- the provider threw before reporting any tokens.
       account.fail(cell.key, "harness_error", `provider threw: ${err && err.message}`);
       continue;
+    }
+
+    // The rule: persist the replay state for any cell that will be RE-PLANNED,
+    // and for no cell that will be stored `completed`.
+    //
+    // A stored `completed` cell is classified `reuse` by `planRun` forever
+    // after, so it can never re-enter this loop and has nothing to replay --
+    // writing a record for it would be pure bloat on the happy path, and
+    // these records carry full reply text. Everything else is re-planned
+    // `todo` per #90, and every one of those is a cell that would otherwise
+    // pay a second time for replies the provider already produced.
+    //
+    // That is two call sites, not one, and deliberately so: the second is the
+    // undersized-pool backstop below, which is the one case where generation
+    // COMPLETED (and was paid for) but the cell is discarded anyway. It is
+    // called out there rather than folded in here because "completed" and
+    // "stored" are not the same predicate, and collapsing them is exactly the
+    // mistake that would silently re-spend that cell's generation.
+    if (resumeEnabled && response.terminalState !== "completed") {
+      persistBatchResumeState(store, cell, response.resume, pricingLever, log);
     }
 
     if (response.terminalState === "completed") {
@@ -2061,6 +2185,11 @@ export async function runSpec(spec, opts) {
           detail,
           resolvedModels: resolvedModelsFor(arm),
         });
+        // The second of the two resume call sites (#103) -- see the first,
+        // just after provider.generate(). Generation COMPLETED and was paid
+        // for, and this cell is still being re-planned, so its replies must
+        // survive or the next invocation buys them again.
+        if (resumeEnabled) persistBatchResumeState(store, cell, response.resume, pricingLever, log);
         recordActualSpend(genCostRows);
         continue; // no metrics, no store.put, no judging -- this pool is discarded
       }

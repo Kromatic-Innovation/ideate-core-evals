@@ -7,6 +7,12 @@
 harness records from now on. The rest of this page explains why, what the
 exception is, and how to tell which case you are in.
 
+> A cell lost to the **batch poll ceiling** (`timeout`) is a transient failure
+> like any other on this page — but as of issue #103 the re-run does not
+> re-spend for it. The abandoned batch is re-polled and its already-paid-for
+> replies are replayed. See **`docs/resuming-batches.md`** for that mechanism,
+> its two off-switches, and the accounting rules it turns on.
+
 ## The rule
 
 A failed cell is one of three things, and the harness treats them differently:

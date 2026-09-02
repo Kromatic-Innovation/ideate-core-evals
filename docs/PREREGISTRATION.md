@@ -44,6 +44,8 @@ The app takes an arbitrary user brief, so we cannot eval "the prompt." We hold t
 
 B2 is also a **finding about the library**, not just the eval: ideate-core documents temperature as a per-agent diversity lever, and that lever is now unavailable on most current Anthropic models. Persona is the only surviving structural lever — which happens to be what the literature says is stronger anyway (Wang et al. 2023), but the docs should say "unavailable on current frontier models," not present it as a live knob. _(2026-08-02: `ideate-core` now has **zero** open issues — the 20-finding audit `ideate-core#86` that produced B1 and B2 is fully remediated, including its two cross-repo template items. See Appendix A, item 2.)_
 
+> _Amended 2026-09-02 ([Appendix D](#appendix-d--amendments-dated-2026-09-02), item 2). Exception (1) below is **narrowed**, not closed: issue #103 makes the harness re-poll a surrendered batch handle on a later invocation and meter its recovered replies, so an abandoned batch's spend is now absent from the ledger only until it is re-polled rather than permanently. The same item registers a second, distinct hazard resume makes reachable — batch-produced spend priced at the single-call rate — and how it is made unreachable._
+>
 > _Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 4). B3 above is marked CLOSED, conditional on `#53`'s routing audit (merged `#56`) fixing a real judge-validation metering bypass. Two exceptions are named and remain residual threats, not closed: (1) a client-side batch-poll timeout can leave a still-billing server-side batch unaccounted; (2) `ideate-core`'s opt-in evaluator/embedder hooks are unwired today but would need explicit metering if enabled. See the appendix item for the full record._
 
 ---
@@ -829,7 +831,8 @@ See the §4.4 marker for the registered summary of this item.
 
 Per the amendment rule at the top of this document. This appendix registers a
 **change to `configHash`'s field set** (§11) and the invalidation it causes,
-in advance of the run that will carry it. Nothing in §6 is changed.
+in advance of the run that will carry it (item 1), and a **narrowing of one of
+§1's named residual threats** (item 2). Nothing in §6 is changed.
 
 ### Item 1 — §3.1/§11: `arms.config.json` now participates in `configHash` as `armsConfigHash`; `ideasPerAgent`/`maxRounds` are retired (issue #101)
 
@@ -940,3 +943,82 @@ Every pre-existing stored cell becomes `stale` rather than being reused, per
 the only data in any store is the #8 smoke study, whose results are discarded
 from confirmatory analysis by construction (§8.3). Absorbing the invalidation
 now costs one smoke run; after Phase 2's grid exists it would cost the grid.
+
+### Item 2 — §1/Appendix B item 4: the batch-poll-timeout exception is NARROWED, not closed (issue #103)
+
+**What this item does.** Appendix B item 4 closed blocker **B3** ("no token
+accounting in ideate-core") with two named exceptions carried forward as
+residual threats. Exception 1 read:
+
+> **Batch-poll timeout.** A client-side batch-poll timeout can return control
+> to the caller while a submitted batch is still billing server-side. That
+> spend is real and eventually appears at the provider, but the harness's own
+> ledger has no row for it **until (if ever) it polls again**.
+
+Issue #103 builds the "polls again". This item registers what that changes
+about the exception and, equally, what it does not.
+
+**What changed in the code.** `evals/harness/provider.mjs` persists the durable
+batch handle of every batch surrendered at the poll ceiling, together with a
+map from each submitted `custom_id` back to a **content-derived** id and the
+model it was billed against. A later invocation re-polls that handle before
+re-entering the engine, downloads whatever the provider still holds, and
+**meters every recovered `succeeded` reply into `tokens_by_model` at the moment
+of recovery** — not at the moment the reply is later replayed into a prompt.
+The distinction is deliberate and is the part that matters for accounting: a
+reply the harness pulled down but the engine never asked for is still money the
+provider charged, and metering on replay would silently drop it. The recovered
+tokens then flow through the same `costRowsFor` → `store.put` path as any other
+spend, so `spendToDate()` sees them.
+
+**The exception is narrowed to a strictly smaller set.** Before #103, an
+abandoned batch's spend was *unconditionally* absent from the ledger, because
+nothing ever re-polled. After #103 it is absent only while it has not yet been
+re-polled — and a re-poll happens automatically on the next invocation that
+plans the cell. What remains outside the ledger is therefore:
+
+1. **The window between abandonment and the next invocation.** Real, and
+   unchanged in kind: client-side polling cannot observe server-side billing it
+   is not watching. It is now a delay rather than a permanent hole.
+2. **A batch never re-polled at all** — the cell is never re-planned (the grid
+   was reduced, the `configHash` moved), the handle passes the provider's
+   results-retention window (**29 days** Anthropic, **30 days** OpenAI —
+   verified 2026-09-02 against `platform.claude.com/docs/en/build-with-claude/batch-processing`
+   and `developers.openai.com/api/docs/guides/batch`, and note that the 24-hour
+   figure both APIs document is the **processing** window, not the results
+   window), or `--no-resume` was passed.
+3. **`--no-batch` invocations replaying nothing.** See the next paragraph.
+
+**A second, distinct accounting hazard, registered because #103 is what makes
+it reachable.** §7 point 2 stores `billing_mode` on every cost row, and §7
+point 3 fixes it to `"api"` for this study. `billing_mode` is the metering
+REGIME. Batch-vs-single is a different axis: a **pricing lever within the "api"
+regime**, applied by `lib/price.mjs`'s `priceRow(row, table, { batch })` from a
+flag the CALLER passes, because the ledger carries no per-row record of which
+lever a row ran under. `spendToDate()` consequently passes ONE flag for the
+whole store. That is survivable while a whole invocation is one mode, which it
+has been. Resume is the first mechanism that could straddle the boundary:
+replies produced under the batch API, replayed into a `--no-batch` invocation,
+would be priced at roughly **twice** what they cost — not double-counted, which
+a reconciliation would catch, but attributed at the **wrong rate**, which looks
+entirely plausible in a total.
+
+This is made **unreachable rather than detected**: each durable replay record
+carries the `pricingLever` its replies were produced under, and the loader
+declines to replay across a mismatch (choosing to re-spend over to mis-price),
+while resume is inert in single mode on the provider side as well. Pinned by
+test in `evals/harness/batch-resume.test.mjs`.
+
+**What is NOT done here, and what it would take.** The principled fix is a
+per-row pricing lever on `lib/accounting.mjs`'s `costRow()`, so `priceRows` can
+read the lever off each row instead of being told once for the whole store.
+That is a ledger schema change, it is not made by #103, and until it is made
+**any store that mixes batch and non-batch spend is priced at a single lever
+for all of it** — a pre-existing property of `--no-batch`, not something resume
+introduced. Recorded here so a reader checking the code against the
+registration finds the gap named rather than discovering it.
+
+**Registered impact.** Nil on any hypothesis, metric, or analysis. This item
+touches §7's accounting mechanics and §1's residual-threat list only. It is
+recorded because Appendix B item 4 put the exception on the record, and an
+exception that has changed shape must say so in the same place.
