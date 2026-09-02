@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { buildRarefiedFrame, PoolsUnavailableError, MixedPoolCoverageError } from "./rarefiedFrame.mjs";
 import { distinctK } from "../metrics/clustering.mjs";
-import { RAREFACTION_SEED } from "./rarefaction.mjs";
+import { rarefyPools, RAREFACTION_R, RAREFACTION_SEED } from "./rarefaction.mjs";
 
 // ── Local PRNG for TEST FIXTURE construction only, matching
 // rarefaction.test.mjs's own vendored copy and comment (never rarefaction.mjs's
@@ -213,6 +213,42 @@ test("buildRarefiedFrame: never carries the base frame's excluded/failuresByArm/
   assert.ok(!("excluded" in out), "excluded must not be spread from the base frame onto a contrast-scoped subset");
   assert.ok(!("failuresByArm" in out), "failuresByArm must not be spread from the base frame onto a contrast-scoped subset");
   assert.ok(!("skippedByArm" in out), "skippedByArm must not be spread from the base frame onto a contrast-scoped subset");
+});
+
+test("buildRarefiedFrame: with NO opts.rarefyOpts, uses the REGISTERED RAREFACTION_R/RAREFACTION_SEED -- never a smaller/faster override (docs/PREREGISTRATION.md Appendix C item 2 pins R=1000 by name)", () => {
+  // The bug this pins: buildRarefiedFrame forwards `opts.rarefyOpts || {}` to
+  // rarefyPools(), which itself defaults r/seed to RAREFACTION_R/
+  // RAREFACTION_SEED when they're absent (rarefiedDistinctK's `opts.r ??
+  // RAREFACTION_R`). Nothing PINS that forwarding -- a mutation that
+  // hardcodes a smaller r (e.g. {r: 2}) INSIDE buildRarefiedFrame's own call
+  // to rarefyPools, discarding whatever the caller passed (or didn't pass),
+  // would silently drift the pipeline away from the registered R with every
+  // existing test still green, because every OTHER test here deliberately
+  // passes a small r for speed. This is the one test that calls
+  // buildRarefiedFrame with rarefyOpts OMITTED ENTIRELY, at the real
+  // registered R=1000 (verified fast: ~0.2s for a pool of this size), and
+  // checks the result against an independently computed rarefyPools() call
+  // using the EXPLICIT registered constants on the exact same inputs.
+  const poolA = makeCategoricalPool(50, 30, 11);
+  const poolP = makeCategoricalPool(50, 60, 22);
+  const rows = [
+    row({ cellKey: "A|b1", armId: "A", briefId: "b1", pool: poolA }),
+    row({ cellKey: "P|b1", armId: "P", briefId: "b1", pool: poolP }),
+  ];
+  const frame = baseFrame(rows, ["A", "P"]);
+
+  const out = buildRarefiedFrame(frame, { armIds: ["A", "P"], threshold: THRESHOLD }); // no rarefyOpts at all
+
+  const expected = rarefyPools(
+    { "A|b1": poolA, "P|b1": poolP },
+    THRESHOLD,
+    { r: RAREFACTION_R, seed: RAREFACTION_SEED }, // explicit, matching the registered constants by name
+  );
+
+  const aRow = out.rows.find((r) => r.cellKey === "A|b1");
+  const pRow = out.rows.find((r) => r.cellKey === "P|b1");
+  assert.equal(aRow.response, expected["A|b1"].distinctKRarefied, "omitting rarefyOpts must use RAREFACTION_R/RAREFACTION_SEED exactly, not a smaller/faster override");
+  assert.equal(pRow.response, expected["P|b1"].distinctKRarefied, "omitting rarefyOpts must use RAREFACTION_R/RAREFACTION_SEED exactly, not a smaller/faster override");
 });
 
 test("buildRarefiedFrame: poolFlexibility is derived from distinct_k's own rarefaction, not independently recomputed", () => {

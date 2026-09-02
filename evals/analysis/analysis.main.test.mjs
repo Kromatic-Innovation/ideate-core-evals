@@ -276,3 +276,57 @@ test("main(): pool-less store, documented CLI invocation (NO --cluster-distance-
     rmSync(outDir, { recursive: true, force: true });
   }
 });
+
+/** Same fixture as seedStore(..., {withPools: true}), except one cell's
+ *  `result.pool` is PRESENT but malformed (`[]`, not a non-empty array) --
+ *  a corrupt cell claiming to have a pool, distinct from the ordinary
+ *  pre-#8 "no pool at all" state seedStore(..., {withPools:false}) builds. */
+function seedStoreMalformedPool(config) {
+  const dir = mkdtempSync(join(tmpdir(), "ideate-store-main-malformed-"));
+  const store = new ResultsStore(dir);
+  const cfg = configHash(config);
+  let seed = 50000;
+  for (const briefId of BRIEFS) {
+    for (const armId of ARMS) {
+      const n = armId === "A" ? N_A : N_PANEL;
+      const pool = makeCategoricalPool(CATEGORY_COUNT, n, seed++);
+      const key = cellKey({ armId, briefId, replicate: 0, cfg });
+      const result = { distinct_k: distinctK(pool, THRESHOLD) };
+      result.pool = armId === "H" && briefId === "b1" ? [] : pool; // one deliberately malformed pool
+      const costRows = [
+        { cellKey: key, timestamp: "2026-09-01T00:00:00Z", billing_mode: "api", model: "claude-haiku-4-5", input_tokens: 500, output_tokens: 200 },
+      ];
+      store.put({
+        key,
+        armId,
+        briefId,
+        replicate: 0,
+        cfg,
+        resolvedModels: { proposer: "claude-haiku-4-5" },
+        costRows,
+        result,
+        accounting: { state: "completed" },
+      });
+    }
+  }
+  return dir;
+}
+
+test("main(): poolField on by default (issue #73 fix round, STATED DECISION) -- a malformed pool on a completed cell is a hard failure on the DEFAULT analysis path, not something a caller must opt into --pool-field to discover", async () => {
+  const config = configFor(true);
+  const resultsDir = seedStoreMalformedPool(config);
+  const outDir = tmpOutDir();
+  try {
+    await assert.rejects(
+      () =>
+        main(["--results-dir", resultsDir, "--out-dir", outDir, "--reference-arm", "A", "--cluster-distance-threshold", String(THRESHOLD)], {
+          runner: fakeSidecarRunner,
+        }),
+      /invalid pool/,
+      "a malformed result.pool must hard-fail main() by default -- poolField defaulting to \"pool\" in analysis.mjs is a deliberate fail-loud choice, not a side effect of turning rarefaction on",
+    );
+  } finally {
+    rmSync(resultsDir, { recursive: true, force: true });
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});

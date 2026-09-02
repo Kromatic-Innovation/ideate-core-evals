@@ -10,14 +10,25 @@
 //     --response distinct_k --reference-arm A --panel-arms A2,B,C,D,E,F,G,H \
 //     --cluster-distance-threshold 0.23141118234233987
 //
-// --cluster-distance-threshold (issue #73): REQUIRED to actually compute
-// H1's rarefied estimand (Appendix C) once stored cells carry embedded
-// pools (#8/Phase 2a) — this study's registered clusterDistanceThreshold
-// (lib/manifest.mjs CONFIG_FIELDS; docs/PREREGISTRATION.md's registered
-// value is 0.23141118234233987). Omitting it is safe TODAY (no cell has a
-// pool yet, so the rarefied lane reports H1 as not-computed regardless —
-// see main()'s PoolsUnavailableError handling) but will start hard-failing
-// runs the moment pools exist and this flag is still missing.
+// --cluster-distance-threshold (issue #73): two distinct effects, both real:
+//   1. It is REQUIRED to actually compute H1's rarefied estimand (Appendix
+//      C) once stored cells carry embedded pools (#8/Phase 2a) — this
+//      study's registered clusterDistanceThreshold (lib/manifest.mjs
+//      CONFIG_FIELDS; docs/PREREGISTRATION.md's registered value is
+//      0.23141118234233987). Omitting it is safe TODAY (no cell has a pool
+//      yet, so the rarefied lane reports H1 as not-computed regardless —
+//      see main()'s PoolsUnavailableError handling) but will start
+//      hard-failing runs the moment pools exist and this flag is still
+//      missing.
+//   2. It ALSO feeds args.config, which is the SAME config buildFrame()
+//      hashes into configHash (frame.mjs) — clusterDistanceThreshold has
+//      been a CONFIG_FIELDS entry since issue #42, independent of
+//      rarefaction. Passing this flag (or changing its value) therefore
+//      changes WHICH stored cells this run selects: cells stored under a
+//      different clusterDistanceThreshold (including "none supplied")
+//      become `stale`, not silently pooled in. See frame.test.mjs's
+//      "clusterDistanceThreshold changes configHash" tests for this
+//      exact effect pinned at the frame boundary.
 //
 // Requires ANALYSIS_SIDECAR-independent setup: the sidecar venv must exist
 // at evals/analysis/sidecar/.venv (see sidecar/requirements.txt) — this CLI
@@ -90,6 +101,23 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // reports H1 as not computed -- see PoolsUnavailableError handling. Once
   // #8 (Phase 2a) starts writing embedded pools, this same CLI wiring picks
   // them up with no further change.
+  //
+  // STATED DECISION (issue #73 fix round): turning this on by default also
+  // puts frame.mjs's malformed-pool guard on the default analysis path -- a
+  // completed cell whose `result.pool` is PRESENT but malformed (not a
+  // non-empty array, e.g. `[]`) now hard-fails buildFrame() on every real
+  // run, not just a caller who opted in with `--pool-field`. This is
+  // deliberate, not a side effect of turning the flag on: a malformed pool
+  // on a cell that claims to have one is exactly the kind of silent-drift
+  // risk this issue exists to close, and failing loud beats quietly
+  // treating it as "absent" -- which would BIAS the rarefied comparison by
+  // silently dropping whichever arm's cells happen to be corrupted, rather
+  // than surfacing the corruption. See frame.test.mjs's "opts.poolField on
+  // a PRESENT but malformed pool ... is a hard error" test and
+  // analysis.main.test.mjs's matching test at the CLI/main() boundary.
+  // Disagree with this call? It is exactly `poolField: args.poolField`
+  // below, gated by parseArgs()'s default -- flip that default, not this
+  // comment, if the decision should go the other way.
   const frame = buildFrame(store, { config: args.config, responseField: args.response, poolField: args.poolField });
   const panelArms = args.panelArms || frame.armLevels.filter((a) => a !== args.referenceArm);
 
