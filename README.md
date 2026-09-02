@@ -28,9 +28,29 @@ Both providers offer 50% Batch API discounts and evals are latency-insensitive, 
 
 Cost rows conform to the CFO contract (cwc#1639 / cron-fleet#75): they record **tokens × model × timestamp × billing regime** and never a derived dollar figure. Pricing is applied at read time from a pinned, dated rate table, so a rate change is a re-price, not a re-collection.
 
+## Phase 0 — negative controls + DAT replication (issue #48)
+
+§8.3 registers Phase 0 as the study's first gate: **"all controls pass, or stop."** It is wired and has been run against the live Voyage-4-lite embedder:
+
+```bash
+VOYAGE_API_KEY=$(op read "op://Infrastructure/voyage-api-key/credential") node evals/run.mjs --phase 0
+```
+
+`VOYAGE_API_KEY` is required and never invented/defaulted; `--dry-run` and every arms/briefs/spend flag are rejected in combination with `--phase 0` (it is a fixed, embeddings-only run — see `evals/run.mjs`). It runs the THREE controls in the table below against the registered Voyage-calibrated threshold (issue #42, read from `evals/metrics/voyage-calibration.mjs`, never hardcoded) and writes both results to the results store (`results/`, gitignored) as first-class rows, not console-only output — see `evals/metrics/phase0.mjs` for the store schema (run-discriminated keys, token-based cost rows, index-visible `cfg.passed`).
+
+| Control | Expected |
+| --- | --- |
+| Duplicate pool — 30 copies of one idea | `distinct_k = 1`, diversity < 0.05 |
+| Random-text pool — 30 unrelated sentences | `distinct_k` ≥ 90% of pool, diversity clears the live DAT-high floor |
+| DAT replication | Reproduces the published DAT ordering (low < average < high) |
+
+The fourth control in §4.4's table (judge test-retest, Appendix B item 12) is **not** run by `--phase 0` — it needs #63/#64 (judge cost accounting + cumulative spend ceiling) landed first so judge spend is fully observable.
+
+A passing Phase 0 is validity evidence for the embedding *pipeline*, not evidence that the threshold itself is correct — that is issue #42's claim, not Phase 0's.
+
 ## Status
 
-Scaffold. The accounting and manifest layers are implemented and tested; the runner, metrics, judge, and analysis are tracked as issues. Nothing has been run — every number in the pre-registration is a projection.
+Scaffold. The accounting and manifest layers are implemented and tested; Phase 0 has been run (above); the rest of the runner, metrics, judge, and analysis are tracked as issues.
 
 ## Development
 

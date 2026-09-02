@@ -37,6 +37,7 @@ import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
 import { JUDGE_MODELS } from "./judge/config.mjs";
 import { judgeLegsFor } from "./judge/matrix.mjs";
+import { runPhase0 } from "./metrics/phase0.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -151,6 +152,60 @@ export function parseArgs(argv) {
 // the real `results/` directory, so main()'s actual call site can be
 // asserted against directly. Both default to the real implementations, so a
 // genuine CLI invocation (`main()`, no args) is unchanged.
+// Phase 0 (docs/PREREGISTRATION.md §8.3, issue #48): negative controls + DAT
+// replication against the live Voyage embedder. Pure formatter for
+// runPhase0()'s summary, separated from console.log the same way the
+// now-deleted live-validation.mjs's renderRandomPoolReport was -- so the
+// report content is hermetically testable without a live embedder (see
+// run.test.mjs).
+//
+// Deliberately reports on THREE controls only (duplicate pool, random-text
+// pool, DAT replication) -- the fourth control in §4.4's table (judge
+// test-retest, replacing the vacuous shuffled-label control per Appendix B
+// item 12) needs #63/#64 landed first and is out of scope for --phase 0
+// today; see phase0.mjs's header for the full reasoning. This formatter
+// never claims "all controls" passed -- only the three it actually names.
+export function formatPhase0Report(summary) {
+  const { dat, controls, duplicatePassed, randomVerdict, allPassed, embedderId, totalTokens, threshold, runId, gitSha, datKey, controlsKey } = summary;
+  const fmt = (n) => (Number.isFinite(n) ? n.toFixed(4) : String(n));
+  const lines = [];
+  lines.push(`[phase0] embedder: ${embedderId} (live Voyage API)`);
+  lines.push(`[phase0] Voyage-calibrated clustering threshold: ${threshold} (issue #42 / Appendix B item 8)`);
+  if (runId) lines.push(`[phase0] run: ${runId}${gitSha ? ` (git ${gitSha})` : ""}`);
+  if (datKey) lines.push(`[phase0] stored keys: ${datKey}, ${controlsKey}`);
+  lines.push("");
+  lines.push("[phase0] DAT replication:");
+  lines.push(`  low=${fmt(dat.low)} average=${fmt(dat.average)} high=${fmt(dat.high)}`);
+  lines.push(`  margin (high-low, DESCRIPTIVE ONLY -- not compared against any registered bound)=${fmt(dat.margin)}`);
+  lines.push(dat.orderingHolds ? "  PASS: ordering low < average < high holds" : "  FAIL: published ordering did not hold");
+  lines.push("");
+  lines.push("[phase0] duplicate pool (30 copies):");
+  lines.push(
+    `  distinct_k=${controls.duplicate.distinctK} diversity=${fmt(controls.duplicate.diversity)} collapseRate=${fmt(controls.duplicate.collapseRate)}`,
+  );
+  lines.push(duplicatePassed ? "  PASS: collapses to distinct_k=1 / near-zero diversity" : "  FAIL: did not collapse as expected");
+  lines.push("");
+  lines.push("[phase0] random-text pool (30 unrelated sentences):");
+  lines.push(
+    `  distinct_k=${controls.random.distinctK} diversity=${fmt(controls.random.diversity)} collapseRate=${fmt(controls.random.collapseRate)}`,
+  );
+  lines.push(`  distinct_k check: ${randomVerdict.distinctKPass ? "PASS" : "FAIL"}`);
+  lines.push(`  diversity-floor check: ${randomVerdict.floorVerdict.toUpperCase()}`);
+  lines.push("");
+  lines.push(`[phase0] usage: ${totalTokens} total_tokens (Voyage embeddings; covered by the free-token allocation)`);
+  lines.push(
+    `[phase0] NOTE: the duplicate-pool and random-text-pool controls pass under almost any threshold -- this ` +
+      "result is NOT evidence the threshold itself is right (see issue #42 for that). It only shows the embedding " +
+      "pipeline is wired correctly.",
+  );
+  lines.push(
+    `[phase0] NOTE: judge test-retest (§4.4's 4th control, Appendix B item 12) is NOT run by --phase 0 -- it needs ` +
+      "#63/#64 landed first (see issue #48/#49).",
+  );
+  lines.push(`[phase0] THREE-CONTROL RESULT: ${allPassed ? "ALL PASS" : "AT LEAST ONE FAILED -- stop, per §8.3"}`);
+  return { lines, allPassed };
+}
+
 export async function main(argv = process.argv.slice(2), deps = {}) {
   const {
     runSpecFn = runSpec,
@@ -164,23 +219,76 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     // locally on a machine that happens to have `npm install`ed. Defaults to
     // the real resolver, so a genuine CLI invocation is unchanged.
     getEngineVersion = getInstalledEngineVersion,
+    // runPhase0Fn is injectable for the exact same reason: a real --phase 0
+    // invocation calls the live Voyage API (see phase0.mjs), and a test that
+    // exercises main()'s --phase 0 WIRING (not just phase0.mjs's own logic,
+    // already covered in phase0.test.mjs) must never touch the network.
+    runPhase0Fn = runPhase0,
   } = deps;
   const args = parseArgs(argv);
 
-  // --phase is accepted (per §12's flag table) but NOT YET wired to a
-  // phase->arms/briefs mapping: docs/PREREGISTRATION.md §8.3 defines phases
-  // (0 negative-controls, 1 judge validation, 2 pilot, 3 full grid, 4
-  // analysis) as a HUMAN-GATED sequence ("no phase starts without an
-  // explicit go"), and nothing in this repo yet codifies which arms/briefs
-  // belong to which phase -- that mapping is a judgment call for whoever
-  // runs the study, made via --arms/--briefs/--replicates directly. Failing
-  // loudly here (rather than silently ignoring --phase or guessing a
-  // mapping) keeps a mistaken "I passed --phase so I'm scoped correctly"
-  // assumption from quietly running the full grid.
+  // --phase is accepted (per §12's flag table). Phase 0 (docs/PREREGISTRATION.md
+  // §8.3: negative controls + DAT replication, issue #48) is now REAL --
+  // it runs the three in-scope controls (see phase0.mjs header for why the
+  // §4.4 table's 4th control, judge test-retest, is deferred) against the
+  // live Voyage embedder and persists results to the store. No other phase
+  // has a mapping yet -- docs/PREREGISTRATION.md §8.3 defines phases 1-4 as
+  // a HUMAN-GATED sequence ("no phase starts without an explicit go"), and
+  // nothing in this repo yet codifies which arms/briefs belong to phases
+  // 1-3 -- that mapping is a judgment call for whoever runs the study, made
+  // via --arms/--briefs/--replicates directly for now. Failing loudly for
+  // phase != 0 (rather than silently ignoring --phase or guessing a mapping)
+  // keeps a mistaken "I passed --phase so I'm scoped correctly" assumption
+  // from quietly running the full grid.
+  if (args.phase === 0) {
+    if (args.dryRun) {
+      throw new Error(
+        "run.mjs: --dry-run is not supported with --phase 0 -- Phase 0 has no arms/briefs cost projection to " +
+          "dry-run; it makes real (free-tier) Voyage embedding calls. Run `node evals/run.mjs --phase 0` directly.",
+      );
+    }
+    // Phase 0 is a fixed, embeddings-only run (three controls, no arms/briefs
+    // grid, no batching, effectively free) -- every other flag parseArgs
+    // accepts is meaningless here. REJECT them explicitly rather than
+    // silently ignoring them (as a prior version of this branch did, simply
+    // by returning before reading them): a budget-safety flag
+    // (--max-spend[-anthropic|-openai]) silently dropped on a live code path
+    // is the wrong pattern to leave in place on the branch phases 1-3 (which
+    // DO spend real money) will land on.
+    const ignoredFlags = [];
+    if (args.maxSpendUsd !== undefined) ignoredFlags.push("--max-spend");
+    if (args.maxSpendByProviderUsd !== undefined) ignoredFlags.push("--max-spend-anthropic/--max-spend-openai");
+    if (args.arms !== undefined) ignoredFlags.push("--arms");
+    if (args.briefs !== undefined) ignoredFlags.push("--briefs");
+    if (args.replicates !== undefined) ignoredFlags.push("--replicates");
+    if (args.noBatch) ignoredFlags.push("--no-batch");
+    if (ignoredFlags.length > 0) {
+      throw new Error(
+        `run.mjs: --phase 0 does not accept ${ignoredFlags.join(", ")} -- Phase 0 is a fixed three-control run ` +
+          "with no arms/briefs grid and no spend ceiling to enforce (embeddings only, covered by Voyage's free-token " +
+          "allocation). Run `node evals/run.mjs --phase 0` with no other flags.",
+      );
+    }
+    const apiKey = process.env.VOYAGE_API_KEY;
+    if (!apiKey) {
+      throw new Error(
+        "run.mjs: VOYAGE_API_KEY is not set. --phase 0 calls the live Voyage embedding API (negative controls + " +
+          "DAT replication, docs/PREREGISTRATION.md §8.3) and requires a real API key -- this harness never " +
+          "invents or defaults one. Set VOYAGE_API_KEY in the environment and re-run:\n" +
+          "  VOYAGE_API_KEY=... node evals/run.mjs --phase 0",
+      );
+    }
+    const store = injectedStore || new ResultsStore(join(REPO_ROOT, "results"));
+    const summary = await runPhase0Fn({ apiKey, store });
+    const { lines, allPassed } = formatPhase0Report(summary);
+    for (const line of lines) console.log(line);
+    if (!allPassed) process.exitCode = 1;
+    return;
+  }
   if (args.phase !== undefined) {
     throw new Error(
-      "run.mjs: --phase is accepted by the flag parser (pre-registration §12) but no phase->arms/briefs " +
-        "mapping exists yet in this repo -- use --arms/--briefs/--replicates directly to scope a phase " +
+      "run.mjs: --phase is accepted by the flag parser (pre-registration §12) but only --phase 0 is wired to a " +
+        "real mapping today (issue #48) -- use --arms/--briefs/--replicates directly to scope any other phase " +
         "manually (see docs/PREREGISTRATION.md §8.3 for what each phase should cover).",
     );
   }

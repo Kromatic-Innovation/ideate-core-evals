@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { fixtureEmbedder } from "./embedder.mjs";
-import { datReplication, negativeControls, randomPoolVerdict } from "./validation.mjs";
+import { datReplication, negativeControls, randomPoolVerdict, duplicatePoolVerdict, DUPLICATE_DIVERSITY_MAX } from "./validation.mjs";
 import { distinctK } from "./clustering.mjs";
 import { poolDiversity, collapseRate } from "./diversity.mjs";
 import { CLUSTER_DISTANCE_THRESHOLD } from "./calibration.mjs";
@@ -108,4 +108,39 @@ test("randomPoolVerdict: distinct_k below the 90% bound fails regardless of the 
   assert.equal(v.distinctKPass, false); // Math.ceil(30 * 0.9) = 27, 25 < 27
   assert.equal(v.floorVerdict, "pass");
   assert.equal(v.failed, true);
+});
+
+// ── duplicatePoolVerdict (extracted from evals/metrics/phase0.mjs / the
+// now-deleted live-validation.mjs, PR #69 fix round) ──────────────────────
+// Both conjuncts (distinct_k === 1 AND diversity < DUPLICATE_DIVERSITY_MAX)
+// are pinned INDEPENDENTLY -- a prior version of this rule was duplicated,
+// unpinned, and only ever exercised with distinctK far from 1 (so the
+// diversity bound was never actually reached by any test).
+
+test("duplicatePoolVerdict: distinct_k=1 and diversity well under the bound -> passes", () => {
+  const v = duplicatePoolVerdict({ distinctK: 1, diversity: 0 });
+  assert.equal(v.distinctKPass, true);
+  assert.equal(v.diversityPass, true);
+  assert.equal(v.passed, true);
+});
+
+test("duplicatePoolVerdict: distinct_k=1 but diversity at or above DUPLICATE_DIVERSITY_MAX -> fails on the diversity conjunct alone", () => {
+  const v = duplicatePoolVerdict({ distinctK: 1, diversity: DUPLICATE_DIVERSITY_MAX });
+  assert.equal(v.distinctKPass, true);
+  assert.equal(v.diversityPass, false, "the bound is strict (<), so diversity exactly AT the max must fail");
+  assert.equal(v.passed, false);
+});
+
+test("duplicatePoolVerdict: distinct_k != 1 but diversity near zero -> fails on the distinct_k conjunct alone", () => {
+  const v = duplicatePoolVerdict({ distinctK: 2, diversity: 0.001 });
+  assert.equal(v.distinctKPass, false);
+  assert.equal(v.diversityPass, true);
+  assert.equal(v.passed, false);
+});
+
+test("duplicatePoolVerdict: both conjuncts fail -> passed is false", () => {
+  const v = duplicatePoolVerdict({ distinctK: 5, diversity: 0.5 });
+  assert.equal(v.distinctKPass, false);
+  assert.equal(v.diversityPass, false);
+  assert.equal(v.passed, false);
 });
