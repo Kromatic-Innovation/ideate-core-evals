@@ -954,14 +954,19 @@ export function buildOpenAIChatParams(req) {
   };
 }
 
-function openaiHeaders(apiKey) {
+// Exported (issue #77): OpenAIJudgeProvider (evals/judge/score.mjs) drives the
+// SAME OpenAI transport as OpenAIBatchProvider above — these two header
+// builders are the shared seam, imported rather than re-implemented, so the
+// judge path can never drift from the generation path's auth/content-type
+// handling.
+export function openaiHeaders(apiKey) {
   return { authorization: `Bearer ${apiKey}`, "content-type": "application/json" };
 }
 
 /** Auth-only headers for a multipart upload — fetch sets the multipart
  *  Content-Type (with boundary) itself when the body is a FormData, so we must
  *  NOT set content-type here or the boundary is lost. */
-function openaiAuthOnlyHeaders(apiKey) {
+export function openaiAuthOnlyHeaders(apiKey) {
   return { authorization: `Bearer ${apiKey}` };
 }
 

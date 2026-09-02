@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 
 import {
   AnthropicJudgeProvider,
+  OpenAIJudgeProvider,
   MockJudgeProvider,
   buildJudgeScoringPrompt,
   parseAxisScores,
@@ -259,6 +260,167 @@ test("an unseeded (non-integer) seed is a classified harness_error — an unseed
   assert.equal(resp.failureKind, "harness_error");
 });
 
+// ── OpenAIJudgeProvider (issue #77) ──────────────────────────────────────────
+// Same interface + FLAT metering contract as AnthropicJudgeProvider, but the
+// OpenAI Batches transport: upload -> create -> poll -> download, keyed by
+// custom_id. Deliberately a REAL provider driven through an injected
+// fetchImpl (never MockJudgeProvider), so a regression that returns OpenAI's
+// generation-shaped `tokens_by_model` instead of flat input_tokens/
+// output_tokens fails these tests -- MockJudgeProvider always returns the
+// flat shape regardless of what the real provider does, which is exactly the
+// blind spot issue #77 flags in the runJudgeMatrix tests above.
+
+function openaiJudgeResultLine(custom_id, contentObj, usage = { prompt_tokens: 10, completion_tokens: 5 }) {
+  return { custom_id, response: { status_code: 200, body: { choices: [{ message: { content: JSON.stringify(contentObj) } }], usage } }, error: null };
+}
+
+/**
+ * A batch fetchImpl for the OpenAI judge transport: submit (upload+create)
+ * reports "completed" immediately; the output file echoes, per custom_id
+ * `cand-<i>`, a score whose originality encodes i — returned in REVERSED
+ * order, so the test proves the provider keys by custom_id (not line
+ * position) AND maps scores back to input order.
+ */
+function openaiJudgeBatchFetch({ usage } = {}) {
+  let submitted = [];
+  return async (url, opts) => {
+    const u = String(url);
+    if (u === "https://api.openai.com/v1/files" && opts.method === "POST") {
+      const text = await opts.body.get("file").text(); // FormData -> Blob -> JSONL
+      submitted = text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      return jsonResponse(200, { id: "ofile_1" });
+    }
+    if (u === "https://api.openai.com/v1/batches" && opts.method === "POST") {
+      return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    }
+    if (u.startsWith("https://api.openai.com/v1/batches/")) {
+      return jsonResponse(200, { id: "obatch_1", status: "completed", output_file_id: "oout_1" });
+    }
+    if (u === "https://api.openai.com/v1/files/oout_1/content") {
+      const lines = submitted
+        .map((r) => {
+          const i = Number(r.custom_id.replace("cand-", ""));
+          return openaiJudgeResultLine(r.custom_id, JSON.parse(scoreJsonForIndex(i)), usage);
+        })
+        .reverse();
+      return textResponse(lines.map((l) => JSON.stringify(l)).join("\n"));
+    }
+    throw new Error(`openaiJudgeBatchFetch: unexpected URL ${u}`);
+  };
+}
+
+test("OpenAIJudgeProvider.score (batch) turns a pool into per-axis scores, un-permuted to INPUT order", async () => {
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: openaiJudgeBatchFetch(), sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b", "c") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 3 });
+  assert.equal(resp.terminalState, "completed");
+  assert.equal(resp.scores.length, 3);
+  resp.scores.forEach((s, i) => assert.equal(s.originality, i + 1, `score ${i} must be un-permuted back to input order`));
+});
+
+test("OpenAIJudgeProvider tokens are FLAT (model,input_tokens,output_tokens) — never tokens_by_model — and prompt_tokens/completion_tokens are TRANSLATED, never forwarded under their native names", async () => {
+  const provider = new OpenAIJudgeProvider({
+    apiKey: "k",
+    fetchImpl: openaiJudgeBatchFetch({ usage: { prompt_tokens: 100, completion_tokens: 50 } }),
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "completed");
+  assert.equal(resp.tokens.model, "gpt-5.6-terra");
+  assert.equal(resp.tokens.input_tokens, 200, "2 candidates x 100 prompt_tokens each");
+  assert.equal(resp.tokens.output_tokens, 100, "2 candidates x 50 completion_tokens each");
+  assert.ok(!("tokens_by_model" in resp.tokens), "the judge tokens shape must be flat, never nested under tokens_by_model");
+  assert.ok(!("prompt_tokens" in resp.tokens) && !("completion_tokens" in resp.tokens), "OpenAI's native field names must never be forwarded verbatim");
+});
+
+test("OpenAIJudgeProvider score (single) hits /v1/chat/completions directly, not the Batches API", async () => {
+  const calledUrls = [];
+  const fetchImpl = async (url) => {
+    calledUrls.push(String(url));
+    return jsonResponse(200, { choices: [{ message: { content: scoreJsonForIndex(0) } }], usage: { prompt_tokens: 7, completion_tokens: 3 } });
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "single", seed: 1 });
+  assert.equal(resp.terminalState, "completed");
+  assert.deepEqual(calledUrls, ["https://api.openai.com/v1/chat/completions"]);
+  assert.equal(resp.tokens.input_tokens, 7);
+  assert.equal(resp.tokens.output_tokens, 3);
+});
+
+test("no apiKey: OpenAIJudgeProvider.score() returns a classified harness_error rather than throwing", async () => {
+  const provider = new OpenAIJudgeProvider({ apiKey: undefined, fetchImpl: async () => { throw new Error("must not be called"); }, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "harness_error");
+});
+
+test("OpenAIJudgeProvider: an empty candidate pool classifies as empty_pool (nothing to score), never throws", async () => {
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: async () => { throw new Error("must not be called"); }, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: [] }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "empty_pool");
+});
+
+test("OpenAIJudgeProvider: an unseeded (non-integer) seed is a classified harness_error", async () => {
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: async () => { throw new Error("must not be called"); }, sleep: noopSleep, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch" });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "harness_error");
+});
+
+test("OpenAIJudgeProvider: a 500 on file upload classifies as transport_error, never throws; tokens shape still present and flat", async () => {
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: async () => jsonResponse(500, {}), sleep: noopSleep, maxRetries: 0, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a", "b") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "transport_error");
+  assert.deepEqual(resp.tokens, { model: "gpt-5.6-terra", input_tokens: 0, output_tokens: 0 });
+});
+
+test("OpenAIJudgeProvider: a persistent 429 classifies as rate_limited", async () => {
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: async () => jsonResponse(429, {}), sleep: noopSleep, maxRetries: 1, logger: silentLogger });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "rate_limited");
+});
+
+test("OpenAIJudgeProvider: a batch that never completes before the poll ceiling classifies as timeout", async () => {
+  const provider = new OpenAIJudgeProvider({
+    apiKey: "k",
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u === "https://api.openai.com/v1/files" && opts.method === "POST") return jsonResponse(200, { id: "f1" });
+      return jsonResponse(200, { id: "b1", status: "in_progress" });
+    },
+    sleep: noopSleep,
+    maxPollMs: -1, // deadline already past on the first check
+    logger: silentLogger,
+  });
+  const resp = await provider.score({ briefText: BRIEF, candidates: poolOf("a") }, { judgeModel: "gpt-5.6-terra", mode: "batch", seed: 1 });
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "timeout");
+});
+
+test("OpenAIJudgeProvider: a failed leg that consumed tokens before failing still reports those tokens (failure paths meter)", async () => {
+  // single mode, 2 candidates: one succeeds (consumes tokens) and one hits a
+  // persistent 500 — the pool still fails overall (partial-reply guard), but
+  // the tokens actually spent by the succeeding call must survive on `tokens`
+  // so the caller can still meter real spend for a failed leg.
+  const fetchImpl = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    if (body.messages[0].content.includes("fail-me")) return jsonResponse(500, {});
+    return jsonResponse(200, { choices: [{ message: { content: scoreJsonForIndex(0) } }], usage: { prompt_tokens: 20, completion_tokens: 10 } });
+  };
+  const provider = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl, sleep: noopSleep, maxRetries: 0, logger: silentLogger });
+  const resp = await provider.score(
+    { briefText: BRIEF, candidates: poolOf("succeeds fine", "fail-me please") },
+    { judgeModel: "gpt-5.6-terra", mode: "single", seed: 1 },
+  );
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "transport_error");
+  assert.equal(resp.tokens.input_tokens, 20, "the succeeding call's real spend is still reported on a failed leg");
+  assert.equal(resp.tokens.output_tokens, 10);
+});
+
 // ── AC3: the cross-judge matrix schedule is actually EXECUTED, and
 //    assertEvaluatorDistinct is enforced at CALL time ─────────────────────────
 
@@ -295,7 +457,7 @@ test("runJudgeMatrix does NOT silently drop the OpenAI leg when its provider is 
   assert.equal(results.filter((r) => r.state === "completed" && r.judge_provider === "anthropic").length, 1);
   assert.equal(deferred.length, 1);
   assert.equal(deferred[0].judge_provider, "openai");
-  assert.match(deferred[0].reason, /issue #22|not dropped/i);
+  assert.match(deferred[0].reason, /issue #77/i);
 });
 
 test("runJudgeMatrix enforces distinctness at CALL time: the guarantee holds end-to-end", async () => {
@@ -433,6 +595,82 @@ test("runJudgeMatrix still meters (and returns a costRow for) a judge leg that F
   assert.equal(failedLeg.state, "failed");
   const failedRow = costRows.find((r) => r.model === "claude-sonnet-5");
   assert.ok(failedRow, "a failed judge call that consumed tokens still contributes a costRow — spend is real regardless of the outcome");
+});
+
+// ── issue #77's specific trap: a REAL OpenAIJudgeProvider run through
+//    runJudgeMatrix must persist FLAT token counts, never the generation
+//    path's nested tokens_by_model shape. This is deliberately NOT
+//    MockJudgeProvider — Mock always returns the flat shape regardless of
+//    what OpenAIJudgeProvider itself does, so it cannot catch this defect.
+//    Expected totals are computed from the KNOWN usage-per-candidate fixture
+//    below, never from provider.calls[0].n (OpenAIJudgeProvider carries no
+//    such call log at all — that would be reading the implementation's own
+//    account of itself).
+
+test("runJudgeMatrix + a REAL OpenAIJudgeProvider persists FLAT input_tokens/output_tokens on the store's cost row, and spendByProvider.openai is non-zero", async () => {
+  const store = makeTempStore("judge-openai-real-");
+  const USAGE_PER_CANDIDATE = { prompt_tokens: 100, completion_tokens: 50 };
+  const N_CANDIDATES = 2;
+  // Independently-derived expectation — NOT read from the provider's own call log.
+  const EXPECTED_INPUT = USAGE_PER_CANDIDATE.prompt_tokens * N_CANDIDATES;
+  const EXPECTED_OUTPUT = USAGE_PER_CANDIDATE.completion_tokens * N_CANDIDATES;
+
+  const anthropic = new MockJudgeProvider();
+  const openai = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: openaiJudgeBatchFetch({ usage: USAGE_PER_CANDIDATE }), sleep: noopSleep, logger: silentLogger });
+  const poolKey = "arm=B|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "B", "b idea 1", "b idea 2")];
+  const { results, costRows, spendByProvider } = await runJudgeMatrix({
+    pools,
+    judgeModels: REGISTERED_JUDGE_MODELS,
+    providers: { anthropic, openai },
+    store,
+    seed: 1,
+    timestamp: "2026-08-02T00:00:00Z",
+  });
+
+  const openaiResult = results.find((r) => r.judge_provider === "openai");
+  assert.equal(openaiResult.state, "completed");
+
+  // The PERSISTED store row — not the in-memory costRows return value — must
+  // carry flat, non-zero token counts.
+  const stored = store.get(`judge-call|cell=${poolKey}|judge=${openaiResult.judge_model}|attempt=0`);
+  const storedRow = stored.costRows[0];
+  assert.equal(storedRow.model, openaiResult.judge_model);
+  assert.equal(storedRow.input_tokens, EXPECTED_INPUT, "persisted row must carry FLAT input_tokens, translated from OpenAI's prompt_tokens");
+  assert.equal(storedRow.output_tokens, EXPECTED_OUTPUT, "persisted row must carry FLAT output_tokens, translated from OpenAI's completion_tokens");
+  assert.ok(!("tokens_by_model" in storedRow), "a judge row must never carry the generation path's nested tokens_by_model shape");
+
+  // The SAME row is what runJudgeMatrix returned (double-count guard).
+  const returnedRow = costRows.find((r) => r.model === openaiResult.judge_model);
+  assert.deepEqual(returnedRow, storedRow);
+
+  assert.ok(spendByProvider.openai > 0, "spendByProvider.openai must be non-zero — a row carrying model+tokens_by_model-but-no-flat-counts would silently price to $0 here");
+});
+
+// ── AC: a pool judged by both providers produces two legs, ZERO deferrals,
+//    for a fully-wired arm (narrowed scope: not the H5 model-fit itself,
+//    which is out of scope for this issue — see the issue's own note) ──────
+
+test("a cross-provider generating arm (G) judges cleanly on BOTH legs with REAL providers — zero deferrals, both legs metered", async () => {
+  const store = makeTempStore("judge-arm-g-real-");
+  const anthropic = new AnthropicJudgeProvider({ apiKey: "k", fetchImpl: judgeBatchFetch(), sleep: noopSleep, logger: silentLogger });
+  const openai = new OpenAIJudgeProvider({ apiKey: "k", fetchImpl: openaiJudgeBatchFetch(), sleep: noopSleep, logger: silentLogger });
+  const poolKey = "arm=G|brief=biz-01|rep=0|cfg=x";
+  const pools = [poolEntry(poolKey, "G", "g idea 1", "g idea 2")];
+  const { results, deferred, costRows, spendByProvider } = await runJudgeMatrix({
+    pools,
+    judgeModels: REGISTERED_JUDGE_MODELS,
+    providers: { anthropic, openai },
+    store,
+    seed: 7,
+    timestamp: "2026-08-02T00:00:00Z",
+  });
+
+  assert.equal(deferred.length, 0, "a fully-wired arm (both providers present) must produce zero deferrals");
+  assert.equal(results.length, 2, "both the anthropic and openai legs were scheduled and executed");
+  assert.ok(results.every((r) => r.state === "completed"), "both legs complete end to end against the real providers");
+  assert.equal(costRows.length, 2, "both legs are metered — a cost row for each");
+  assert.ok(spendByProvider.anthropic > 0 && spendByProvider.openai > 0, "both legs' spend is attributed to their own provider bucket");
 });
 
 // ── AC5 + AC7: validateJudge can be run against the scorer's output; judge
