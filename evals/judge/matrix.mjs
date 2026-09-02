@@ -17,9 +17,11 @@
 // ── providerOf: the model-id -> provider inference the whole study relies on ──
 // arms.config.json's own header comment states the convention this codifies:
 // "Provider is inferred from the model id prefix: claude-* -> anthropic,
-// openai-* (and gpt-*) -> openai." This is the ONE place that mapping is
-// implemented; matrix.mjs and any future module needing it should import
-// `providerOf` rather than re-deriving the prefix rule.
+// openai-* (and gpt-*) -> openai." lib/price.mjs's `providerOf` is now the ONE
+// place that mapping is implemented (issue #62 HIGH -- a second copy lived
+// here until then); this module re-exports it below rather than re-deriving
+// the prefix rule, and any future module needing it should import from
+// lib/price.mjs directly.
 //
 // ── issue #45 item 5: what H5's bias term actually measures ─────────────────
 // H5's regression term is `judge_provider × generator_provider` — PROVIDER
@@ -52,19 +54,19 @@
 // dropping that provider's leg of the matrix.
 
 import { assertEvaluatorDistinct } from "./distinct.mjs";
-
-/** Infer a model id's provider from its prefix — the one place this mapping
- *  lives (see header). Throws on anything else rather than guessing, because
- *  a silently-mis-attributed provider would corrupt the very
- *  judge_provider × generator_provider analysis this matrix exists to feed. */
-export function providerOf(modelId) {
-  if (typeof modelId !== "string" || modelId.length === 0) {
-    throw new Error(`providerOf: modelId must be a non-empty string, got ${JSON.stringify(modelId)}`);
-  }
-  if (modelId.startsWith("claude-")) return "anthropic";
-  if (modelId.startsWith("openai-") || modelId.startsWith("gpt-")) return "openai";
-  throw new Error(`providerOf: cannot infer a provider for model id '${modelId}' (expected a 'claude-*' or 'openai-*'/'gpt-*' prefix)`);
-}
+// providerOf now lives in lib/price.mjs (issue #62 HIGH): #51 added a SECOND
+// copy there on lib/-vs-evals/ layering grounds (lib/ must not import from
+// evals/), which left two implementations of the SAME prefix rule with
+// nothing pinning them to agreement -- a divergence (e.g. adding `gemini-`,
+// or changing the OpenAI prefix set in one file but not the other) would
+// silently produce wrong per-provider numbers, the exact failure this study's
+// spend ceilings and judge_provider analysis both depend on getting right.
+// Re-exported here so this module and every existing caller of
+// `providerOf` from "./matrix.mjs" keep working unchanged, but there is now
+// exactly ONE implementation -- lib/price.mjs's -- and lib/price.test.mjs's
+// dedicated providerOf suite is the single place its behavior is pinned.
+import { providerOf } from "../../lib/price.mjs";
+export { providerOf };
 
 /** The set of providers represented among an arm's generator slots. */
 function generatorProvidersOf(arm) {

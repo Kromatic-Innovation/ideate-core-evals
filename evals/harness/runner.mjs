@@ -420,9 +420,28 @@ export async function runSpec(spec, opts) {
   // NEVER a flat per-cell/per-run assignment. This is what makes arm G's
   // actual spend land correctly split across Anthropic and OpenAI instead of
   // wholly on whichever model happens to be listed first in the row.
+  //
+  // Fail loud on a missing rate WHEN per-provider spend-gating is active
+  // (issue #62 MEDIUM): runnerPriceGrid already throws pre-flight on a model
+  // absent from RATE_TABLE, but that guard only ever sees arm-slot models --
+  // it never runs for judge rows, since JUDGE_MODELS models don't pass
+  // through runnerPriceGrid. Without this check, a rate-less model would
+  // silently contribute $0 to `runningTotalByProvider` (priceRowByProvider's
+  // documented, otherwise-correct default for re-pricing a recorded row),
+  // quietly undercounting real spend against the very ceiling this admission
+  // control exists to enforce. Only enforced when maxSpendByProviderUsd is
+  // supplied -- a run with no per-provider ceiling has nothing to gate, and
+  // priceRowByProvider's $0-and-continue default remains correct for it.
   function recordActualSpend(costRows) {
     for (const row of costRows) {
-      const { byProvider } = priceRowByProvider(row, rateTable, { batch });
+      const { byProvider, hasMissingRate, missingRateModels } = priceRowByProvider(row, rateTable, { batch });
+      if (maxSpendByProviderUsd && hasMissingRate) {
+        throw new Error(
+          `runSpec: cell '${row.cellKey || row.key}' recorded actual spend for model(s) with no RATE_TABLE entry ` +
+            `(${missingRateModels.join(", ")}) -- per-provider --max-spend cannot gate spend it cannot price. ` +
+            `Add the missing model(s) to lib/price.mjs's RATE_TABLE.`,
+        );
+      }
       for (const [provider, usd] of Object.entries(byProvider)) {
         runningTotalByProvider[provider] = (runningTotalByProvider[provider] || 0) + usd;
       }
@@ -446,12 +465,23 @@ export async function runSpec(spec, opts) {
     // `already-actually-spent + this-cell's-projected-share`, so the decision
     // uses REAL spend for every prior cell and only estimates the one cell
     // about to run (its actual cost isn't known until after the call).
+    //
+    // Walk the providers THIS CELL actually spends under (cellByProvider),
+    // never the full set of configured ceilings -- a cell that doesn't touch
+    // a given provider projects $0 for it, and once that OTHER provider's
+    // ceiling has already been exceeded by real spend, `already > ceiling`
+    // alone would wrongly trip on every subsequent cell regardless of which
+    // provider it actually uses (issue #62 BLOCKER 1). Skipping only when the
+    // cell's own projected share is positive AND pushes that provider over
+    // its ceiling keeps the skip -- and the recorded `trippedProvider` name --
+    // tied to a provider the cell genuinely spends under.
     let trippedProvider = null;
     if (maxSpendByProviderUsd) {
       const cellByProvider = providerByKey.get(cell.key) || {};
-      for (const [provider, ceiling] of Object.entries(maxSpendByProviderUsd)) {
+      for (const [provider, projected] of Object.entries(cellByProvider)) {
+        if (!(provider in maxSpendByProviderUsd) || !(projected > 0)) continue;
+        const ceiling = maxSpendByProviderUsd[provider];
         const already = runningTotalByProvider[provider] || 0;
-        const projected = cellByProvider[provider] || 0;
         if (already + projected > ceiling) {
           trippedProvider = provider;
           break;
