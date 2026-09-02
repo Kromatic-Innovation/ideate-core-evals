@@ -76,8 +76,16 @@ test("full path: plan -> generate -> account -> store -> reconcile, including a 
   // Force one specific cell in the mixed-provider arm E to fail, to prove the
   // full path handles a classified failure alongside normal completions in
   // the SAME run (not an isolated single-cell test, per AC5's "full path").
+  //
+  // The forced kind is `refusal` -- a CELL-INTRINSIC failure (issue #90) --
+  // because step 5 below asserts the failed cell is durably stored and step 7
+  // asserts it is reused rather than re-run. Those are the correct
+  // expectations for an observation about the arm; a TRANSIENT failure
+  // (rate_limited, which this test forced before #90) is deliberately NOT
+  // stored under its cell key and IS re-attempted on the next run -- covered
+  // end to end in runner.test.mjs's "#90" tests.
   const forcedFailKey = cellKey({ armId: "E", briefId: "biz-01", replicate: 0, cfg: CFG_HASH });
-  const overrides = new Map([[forcedFailKey, { terminalState: "failed", failureKind: "rate_limited", detail: "429 after retries" }]]);
+  const overrides = new Map([[forcedFailKey, { terminalState: "failed", failureKind: "refusal", detail: "stop_reason: refusal" }]]);
   const provider = new MockProvider({ overrides });
 
   // 1. PLAN — confirm the plan step sees the full 12-cell grid (2 arms x 3
@@ -100,7 +108,7 @@ test("full path: plan -> generate -> account -> store -> reconcile, including a 
   assert.equal(summary.planned, 12);
   assert.equal(summary.completed, 11);
   assert.equal(summary.failed, 1);
-  assert.deepEqual(summary.byKind, { rate_limited: 1 });
+  assert.deepEqual(summary.byKind, { refusal: 1 });
 
   // 3. The provider actually saw BOTH arms and their distinct model slots --
   // proof the mixed-tier arm E's per-persona model resolution flowed through
@@ -121,12 +129,13 @@ test("full path: plan -> generate -> account -> store -> reconcile, including a 
   );
   assert.deepEqual(new Set(Object.keys(eRecord.costRows[0].tokens_by_model)), new Set(["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]));
 
-  // 5. The failed cell is ALSO in the store (not dropped), with a `failed`
-  // accounting state and a costRows array (possibly carrying partial token
-  // usage the mock still reports for a classified failure).
+  // 5. The cell-intrinsic failure is ALSO in the store (not dropped), with a
+  // `failed` accounting state and a costRows array (possibly carrying partial
+  // token usage the mock still reports for a classified failure). A refusal
+  // is a real datum about the arm, so it persists under its own cell key.
   const failedRecord = store.get(forcedFailKey);
   assert.equal(failedRecord.accounting.state, "failed");
-  assert.equal(failedRecord.accounting.kind, "rate_limited");
+  assert.equal(failedRecord.accounting.kind, "refusal");
 
   // 6. Downstream metrics (evals/metrics/operational.mjs, issue #3) can
   // consume this RunAccount directly once reconciled -- proving the harness's

@@ -1785,3 +1785,235 @@ test("issue #85 fix round 2: in a single invocation, a budget_exceeded skip and 
     "a metrics-failure wave must stay visibly distinct from a budget stop -- never conflated into one undifferentiated skip count",
   );
 });
+
+// ── issue #90: a transient GENERATION failure must not brick its cell ────────
+// The metrics-failure defence above (PR #86 review) had no generation
+// counterpart: every classified provider failure was written under cell.key,
+// and planRun -- which sees only KEYS -- then classified it `reuse` forever.
+// A cell lost to a 429, a 5xx, a timeout, or a zero credit balance could
+// never be re-attempted by re-running, resuming, or anything short of
+// hand-deleting the append-only store. The #8 study reproduced
+// completed=11/failed=9 at $0 on every re-run because of it.
+//
+// The split (lib/accounting.mjs's INTRINSIC_FAILURE_KINDS /
+// TRANSIENT_FAILURE_KINDS) is the design decision under test here, from both
+// sides: a transient kind must come back as todo, an intrinsic kind must stay
+// stored as a terminal datum about the arm.
+
+test("issue #90: a transient generation failure leaves the cell ABSENT from the store, and a subsequent planRun classifies it todo, not reuse", async (t) => {
+  const dir = tempDir(t);
+  const store = new ResultsStore(dir);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const overrides = new Map([[key, { terminalState: "failed", failureKind: "rate_limited", detail: "429 after retries" }]]);
+  const provider = new MockProvider({ overrides });
+
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const { summary, account } = await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, log: silentLog });
+
+  // Still terminal FOR THIS INVOCATION -- a transient failure is a failure,
+  // it is `fail`ed on the account, it counts in byKind, and reconcile()
+  // passes. What it is NOT is durable under cell.key.
+  assert.equal(summary.failed, 1, "the failure is a datum for this invocation, not a silent drop");
+  assert.deepEqual(summary.byKind, { rate_limited: 1 });
+  assert.doesNotThrow(() => account.reconcile(), "a not-stored transient failure still reconciles -- exactly one terminal state per planned cell");
+
+  assert.throws(() => store.get(key), /no stored record/, "cell.key must be completely absent from the store");
+
+  // The assertion this test exists for: planRun's ACTUAL output over a FRESH
+  // store instance re-reading index.jsonl from disk, exactly like a real
+  // resumed session.
+  const store2 = new ResultsStore(dir);
+  const plan = planRun(oneCellSpec, store2.keys());
+  assert.deepEqual(plan.todo.map((c) => c.key), [key], "the cell must be planned as todo again");
+  assert.deepEqual(plan.reuse, [], "the cell must NOT be classified reuse -- that is the permanent brick this issue is about");
+});
+
+test("issue #90: a cell-intrinsic generation failure IS stored as a terminal datum and is reused, never retried into silence", async (t) => {
+  const dir = tempDir(t);
+  const store = new ResultsStore(dir);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const overrides = new Map([[key, { terminalState: "failed", failureKind: "parse_failure", detail: "extractCandidates recovered nothing" }]]);
+  const provider = new MockProvider({ overrides });
+
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const { summary } = await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, log: silentLog });
+  assert.equal(summary.failed, 1);
+
+  const record = store.get(key);
+  assert.equal(record.accounting.state, "failed");
+  assert.equal(record.accounting.kind, "parse_failure");
+  assert.equal(record.result.failed, true);
+
+  // A second session must NOT re-roll it. An arm that emits unparseable
+  // output is a real measurement; retrying until it happens to parse would
+  // report a failure rate of zero for a genuine behaviour of the model.
+  const store2 = new ResultsStore(dir);
+  const plan = planRun(oneCellSpec, store2.keys());
+  assert.deepEqual(plan.reuse.map((c) => c.key), [key], "an intrinsic failure is reused, not re-planned");
+  assert.deepEqual(plan.todo, []);
+
+  const provider2 = new MockProvider();
+  const { summary: resumed } = await runSpec(oneCellSpec, { store: store2, armsConfig: ARMS_CONFIG, provider: provider2, log: silentLog });
+  assert.equal(provider2.calls.length, 0, "no provider call -- the arm's parse failure is not resampled");
+  assert.equal(resumed.failed, 1, "and it is still reported as the failure it was");
+  assert.deepEqual(resumed.byKind, { parse_failure: 1 });
+});
+
+test("issue #90: END TO END -- a run lost to a transient generation fault is re-attempted and completes on the next invocation, with the first attempt's spend preserved", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // ── Session 1: the provider rate-limits. Real tokens were still consumed
+  // before it gave up, and that money must survive.
+  const store1 = new ResultsStore(dir);
+  const overrides = new Map([[key, { terminalState: "failed", failureKind: "rate_limited", detail: "429 after retries" }]]);
+  const failingProvider = new MockProvider({ overrides });
+  const { summary: first } = await runSpec(oneCellSpec, { store: store1, armsConfig: ARMS_CONFIG, provider: failingProvider, log: silentLog });
+  assert.equal(first.failed, 1);
+  assert.equal(first.completed, 0);
+  assert.equal(store1.has(key), false, "nothing under cell.key");
+
+  const attemptKey = `generation-attempt|cell=${key}|attempt=0`;
+  const attemptRecord = store1.get(attemptKey);
+  assert.equal(attemptRecord.accounting.state, "failed");
+  assert.equal(attemptRecord.accounting.kind, "rate_limited", "the attempt record carries the REAL kind -- it is the only durable answer to 'why is this cell todo again?'");
+  assert.equal(attemptRecord.accounting.detail, "429 after retries");
+  assert.ok(attemptRecord.costRows.length > 0, "tokens the failed call actually consumed are durably metered");
+  assert.deepEqual(
+    attemptRecord.resolvedModels,
+    { solo: "claude-sonnet-5" },
+    "the attempt record says exactly what ran, so the preserved spend is attributable",
+  );
+
+  // Priced through the REAL reader that enforces cumulative ceilings -- not
+  // by reading the body directly -- so this proves the money is visible
+  // where it has to be, not merely present on disk.
+  const spentAfterFailure = spendToDate(store1).totalUsd;
+  assert.ok(spentAfterFailure > 0, "the failed attempt's spend is real, priced, and counts against cumulative ceilings");
+
+  // ── Session 2: same store, same spec, the fault has cleared. The whole
+  // point of the issue: this must actually re-run.
+  const store2 = new ResultsStore(dir);
+  const workingProvider = new MockProvider();
+  const { summary: second } = await runSpec(oneCellSpec, { store: store2, armsConfig: ARMS_CONFIG, provider: workingProvider, log: silentLog });
+
+  assert.equal(workingProvider.calls.length, 1, "the cell was genuinely re-attempted -- a real provider call, honestly re-spending");
+  assert.equal(second.completed, 1, "and it completes this time");
+  assert.equal(second.failed, 0);
+  assert.equal(store2.has(key), true, "the successful result is now stored under cell.key");
+  assert.equal(store2.get(key).accounting.state, "completed");
+
+  // The first attempt's record is untouched (append-only), and its spend is
+  // added to -- never replaced by, never double-counted with -- the retry's.
+  assert.deepEqual(store2.get(attemptKey), attemptRecord, "a later successful retry never mutates the failed attempt's record");
+  assert.ok(spendToDate(store2).totalUsd > spentAfterFailure, "the retry's own spend is ADDED on top of the preserved first-attempt spend");
+});
+
+test("issue #90: a second transient failure on the same cell gets its own attempt key -- attempts never collide, so the store is never bricked by a retry", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const overrides = new Map([[key, { terminalState: "failed", failureKind: "transport_error", detail: "5xx after retries" }]]);
+
+  // Two separate sessions (fresh store instances, as a real resumed run
+  // does) both fail transiently on the same cell. The attempt counter is
+  // derived from store.keys(), so it must keep counting across the process
+  // boundary rather than restarting at 0 and colliding.
+  for (const _attempt of [0, 1]) {
+    const store = new ResultsStore(dir);
+    await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider: new MockProvider({ overrides }), log: silentLog });
+  }
+
+  const store = new ResultsStore(dir);
+  assert.equal(store.has(`generation-attempt|cell=${key}|attempt=0`), true);
+  assert.equal(store.has(`generation-attempt|cell=${key}|attempt=1`), true);
+  assert.equal(store.has(key), false, "still retryable after two transient failures");
+  assert.deepEqual(planRun(oneCellSpec, store.keys()).todo.map((c) => c.key), [key]);
+});
+
+test("issue #90: an attempt-scoped generation record is invisible to planRun -- it never masquerades as a planned cell", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const overrides = new Map([[key, { terminalState: "failed", failureKind: "budget_exceeded", detail: "provider-side cap" }]]);
+
+  const store = new ResultsStore(dir);
+  await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider: new MockProvider({ overrides }), log: silentLog });
+
+  // The attempt key embeds the full cell key, which itself contains
+  // `arm=...|brief=...|rep=...|cfg=...`. planRun's key regex is anchored, so
+  // the leading `generation-attempt|` prefix keeps it out -- assert that
+  // rather than trusting it, because a regex that accidentally matched would
+  // silently invent a phantom stale/reuse cell.
+  const store2 = new ResultsStore(dir);
+  const plan = planRun(oneCellSpec, store2.keys());
+  assert.deepEqual(plan.todo.map((c) => c.key), [key]);
+  assert.deepEqual(plan.reuse, []);
+  assert.deepEqual(plan.stale, [], "the attempt record must not surface as a stale prior-config cell either");
+});
+
+test("issue #90: a LEGACY store holding a transient failure under cell.key still runs, warns that it cannot be re-attempted, and is NOT promised as re-runnable", async (t) => {
+  const dir = tempDir(t);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // The issue is explicit that a fix must not assume the store is empty:
+  // stores written BEFORE this change put every classified generation
+  // failure under cell.key, transient ones included. Construct exactly that
+  // shape by hand -- nothing in the runner can produce one any more.
+  const legacyStore = new ResultsStore(dir);
+  legacyStore.put({
+    key,
+    armId: "A",
+    briefId: "b1",
+    replicate: 0,
+    cfg: CFG_HASH,
+    result: { failed: true, failureKind: "rate_limited" },
+    resolvedModels: { solo: "claude-sonnet-5" },
+    accounting: { state: "failed", kind: "rate_limited", detail: "429 after retries" },
+    costRows: [],
+  });
+
+  const store = new ResultsStore(dir);
+  const provider = new MockProvider();
+  const lines = [];
+  const { summary, account } = await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider, log: (m) => lines.push(m) });
+
+  // A pre-#90 store must still RUN -- the fix must not turn an operator's
+  // existing results directory into a hard error.
+  assert.doesNotThrow(() => account.reconcile());
+  assert.equal(summary.failed, 1);
+  assert.equal(provider.calls.length, 0, "the legacy record is reuse -- planRun sees the key and there is nothing this run can do about it");
+
+  const warning = lines.find((l) => l.includes("WARNING") && l.includes(key));
+  assert.ok(warning, "a legacy transient failure the harness cannot retry must be said out loud, not hidden inside a plausible failed=1");
+  assert.match(warning, /rate_limited/);
+  assert.match(warning, /docs\/retrying-failed-cells\.md/, "and must point at the one-time remediation");
+
+  // The load-bearing assertion: the re-runnable notice must NOT fire. It is
+  // driven by the todo loop's own tally of cells it declined to store, so a
+  // reused legacy failure -- which IS stored and will never be re-attempted
+  // -- can never be advertised as "re-run the same command to fix this".
+  assert.equal(
+    lines.some((l) => l.includes("were NOT stored under their cell keys")),
+    false,
+    "a legacy stored transient failure must never be reported as re-runnable -- summary.byKind counts it, which is exactly why the notice is not derived from summary.byKind",
+  );
+});
+
+test("issue #90: the run summary tells an operator that environmental failures are re-runnable, so failed=N is never ambiguous", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const overrides = new Map([[key, { terminalState: "failed", failureKind: "rate_limited", detail: "429 after retries" }]]);
+  const lines = [];
+
+  const oneCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  await runSpec(oneCellSpec, { store, armsConfig: ARMS_CONFIG, provider: new MockProvider({ overrides }), log: (m) => lines.push(m) });
+
+  const notice = lines.find((l) => l.includes("were NOT stored under their cell keys"));
+  assert.ok(notice, "the summary must name environmental failures explicitly");
+  assert.match(notice, /environmental/);
+  assert.match(notice, /rate_limited=1/);
+  assert.match(notice, /re-run/, "and must say what to do about them");
+});
