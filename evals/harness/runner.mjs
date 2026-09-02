@@ -262,9 +262,32 @@ function subsetSpec(spec, { arms, briefs, replicates } = {}) {
  */
 export function spendToDate(store, rateTable = DEFAULT_RATE_TABLE, { batch = true } = {}) {
   if (!store) throw new Error("spendToDate: store is required");
+  // COST NOTE (PR #72 review): this reads and JSON-parses EVERY stored
+  // body -- store.get() is the only method that touches bodies/ (see
+  // lib/store.mjs's own header), and index.jsonl carries no per-cell cost
+  // rows of its own, so there is no cheaper path to "every cost row in the
+  // store" than this. On a large grid (hundreds of cells, each body
+  // potentially carrying a full provider reply) this is real work -- see
+  // runSpec()'s own comment at the call site for why it is now paid ONLY
+  // when a ceiling is actually requested, never on every invocation.
   const allCostRows = [];
   for (const entry of store.list()) {
-    const body = store.get(entry.key);
+    let body;
+    try {
+      body = store.get(entry.key);
+    } catch (err) {
+      // A truncated/missing body (readFileSync/JSON.parse have no tolerance
+      // -- see lib/store.mjs) must not surface as a bare SyntaxError/ENOENT
+      // three stack frames from here. Name the offending key so whoever
+      // hits this has something to act on -- inspect or repair
+      // <store.dir>/bodies/, or accept the loss and manually strip the
+      // index.jsonl line for this key if the body is genuinely gone.
+      throw new Error(
+        `spendToDate: could not read the stored body for key '${entry.key}' (bodyFile '${entry.bodyFile}') -- ` +
+          `a spend ceiling cannot be enforced against a ledger entry it cannot read. Original error: ${err && err.message}. ` +
+          `Inspect '${store.bodiesDir}' for a truncated or missing file, or repair/remove the corresponding line in '${store.indexPath}' if the record is unrecoverable.`,
+      );
+    }
     if (Array.isArray(body.costRows)) allCostRows.push(...body.costRows);
   }
   const totals = priceRows(allCostRows, rateTable, { batch });
@@ -403,18 +426,26 @@ export async function runSpec(spec, opts) {
   // what it does and does not measure given issues #68 and the resume
   // judging blind spot.
   //
-  // Always computed -- `summary.cumulativeSpendByProvider`/
-  // `cumulativeSpendUsd` below must be accurate whether or not a ceiling is
-  // active, so a report or a future --max-spend invocation can trust them.
-  // Only FAIL-LOUD on an unpriceable stored row when a ceiling is actually
-  // active, though -- a run with no --max-spend/--max-spend-<provider> has
-  // nothing to gate, so it should not be blocked from running by a rate gap
-  // in old history it isn't relying on for admission control. This mirrors
-  // `recordActualSpend`'s existing "only enforced when maxSpendByProviderUsd
-  // is supplied" precedent for the same failure shape.
+  // Computed ONLY when a ceiling is actually active (PR #72 review, MEDIUM):
+  // `spendToDate` reads and JSON-parses EVERY stored body (see that
+  // function's own cost note) -- on a real grid that is real work, and
+  // `store.get()` has no tolerance for a truncated/missing body file
+  // (readFileSync + JSON.parse, no try/catch of its own -- see
+  // lib/store.mjs). Computing this unconditionally would make EVERY
+  // invocation -- including one with no --max-spend/--max-spend-<provider>
+  // at all -- pay that cost and inherit that fragility for a number nothing
+  // is gating against. A run with no ceiling has nothing to enforce
+  // cumulative spend against, so it neither reads the full store history
+  // nor can be broken by damage to a body a plain generation run would
+  // never otherwise touch. The tradeoff: `summary.cumulativeSpendByProvider`/
+  // `cumulativeSpendUsd`/`cumulativeNonProviderSpendUsd`/
+  // `cumulativeNonProviderModels` below are `null` -- NOT `{}`/`0`, which
+  // would read as "checked, and it's zero" -- whenever no ceiling was
+  // requested this invocation. Call `spendToDate(store)` directly to get
+  // those figures on demand outside a ceiling-gated run.
   const anyCeilingActive = maxSpendUsd !== undefined || !!maxSpendByProviderUsd;
-  const priorSpend = spendToDate(store, rateTable, { batch });
-  if (anyCeilingActive && priorSpend.hasMissingRate) {
+  const priorSpend = anyCeilingActive ? spendToDate(store, rateTable, { batch }) : null;
+  if (priorSpend && priorSpend.hasMissingRate) {
     throw new Error(
       `runSpec: cumulative spend-to-date cannot be priced -- the store already holds cost row(s) for model(s) with no RATE_TABLE entry ` +
         `(${priorSpend.missingRateModels.join(", ")}) -- a spend ceiling cannot be enforced against a ledger it cannot fully price. ` +
@@ -735,46 +766,59 @@ export async function runSpec(spec, opts) {
   // that way (see runner.test.mjs's issue #62 BLOCKER 2 test, which asserts
   // it against an independently-computed per-session expectation).
   summary.spendByProvider = runningTotalByProvider;
-  // cumulativeSpendByProvider / cumulativeSpendUsd (issue #64): the study's
-  // TOTAL spend to date -- every dollar the store's cost rows account for,
-  // across every configHash and every invocation that ever ran, PLUS this
-  // invocation's own actual spend -- reconstructed from durable data, not
-  // an in-memory counter. This is what a resumed run's ceiling is actually
-  // enforced against above (see `priorSpend` + the per-cell admission loop);
-  // these fields expose the same total for a report or the next invocation,
-  // rather than making a caller re-derive it. See `spendToDate`'s own header
-  // comment for the full "what this measures given #68 and the resume
-  // blind spot" caveat -- it applies identically to these fields, since they
-  // are `priorSpend` plus this run's own real spend and nothing more.
-  const cumulativeSpendByProvider = { ...priorSpend.byProvider };
-  for (const [provider, usd] of Object.entries(runningTotalByProvider)) {
-    cumulativeSpendByProvider[provider] = (cumulativeSpendByProvider[provider] || 0) + usd;
+  // cumulativeSpendByProvider / cumulativeSpendUsd / cumulativeNonProviderSpendUsd
+  // / cumulativeNonProviderModels (issue #64, revised per PR #72 review): the
+  // study's TOTAL spend to date -- every dollar the store's cost rows
+  // account for, across every configHash and every invocation that ever
+  // ran, PLUS this invocation's own actual spend -- reconstructed from
+  // durable data, not an in-memory counter. This is what a resumed run's
+  // ceiling is actually enforced against above (see `priorSpend` + the
+  // per-cell admission loop); these fields expose the same totals for a
+  // report or the next invocation, rather than making a caller re-derive
+  // them. See `spendToDate`'s own header comment for the full "what this
+  // measures given #68 and the resume blind spot" caveat -- it applies
+  // identically to these fields, since they are `priorSpend` plus this
+  // run's own real spend and nothing more.
+  //
+  // `null` when no ceiling was requested this invocation (`priorSpend` is
+  // `null` -- see its own comment above): the store's full history was
+  // deliberately never read, so there is nothing honest to report here.
+  // `null` here means "not computed", never "computed as zero" -- call
+  // `spendToDate(store)` directly for these figures outside a ceiling-gated
+  // run.
+  //
+  // BASIS (PR #72 review, HIGH -- previously two fields both called
+  // "cumulative spend" disagreed on whether non-provider/embedder spend
+  // counted): `--max-spend` has ALWAYS admission-controlled against
+  // `priorSpend.totalUsd` (see the per-cell loop above), which is
+  // `priceRows().totalUsd` -- ALL priced spend, embedder included, because
+  // a GLOBAL ceiling is a total-dollars backstop, not scoped to any one
+  // provider (this predates issue #64 and is unchanged here). So
+  // `cumulativeSpendUsd` below is defined to match that basis exactly:
+  // provider spend PLUS non-provider spend, the same total `--max-spend`
+  // gates on. `cumulativeSpendByProvider`/`cumulativeNonProviderSpendUsd`
+  // are its breakdown, on the SAME (provider-only vs. non-provider-only)
+  // split `--max-spend-<provider>` gates on -- so every reported figure now
+  // matches the admission control it corresponds to, and
+  // `cumulativeSpendUsd === sum(cumulativeSpendByProvider) + cumulativeNonProviderSpendUsd`
+  // always holds. See docs/PREREGISTRATION.md §12 for the same decision
+  // stated for an operator reading the CLI output, not the code.
+  if (priorSpend) {
+    const cumulativeSpendByProvider = { ...priorSpend.byProvider };
+    for (const [provider, usd] of Object.entries(runningTotalByProvider)) {
+      cumulativeSpendByProvider[provider] = (cumulativeSpendByProvider[provider] || 0) + usd;
+    }
+    const cumulativeNonProviderSpendUsd = priorSpend.excludedNonProviderUsd + runningNonProviderTotal;
+    summary.cumulativeSpendByProvider = cumulativeSpendByProvider;
+    summary.cumulativeNonProviderSpendUsd = cumulativeNonProviderSpendUsd;
+    summary.cumulativeNonProviderModels = [...new Set(priorSpend.excludedNonProviderModels)];
+    summary.cumulativeSpendUsd = Object.values(cumulativeSpendByProvider).reduce((a, b) => a + b, 0) + cumulativeNonProviderSpendUsd;
+  } else {
+    summary.cumulativeSpendByProvider = null;
+    summary.cumulativeNonProviderSpendUsd = null;
+    summary.cumulativeNonProviderModels = null;
+    summary.cumulativeSpendUsd = null;
   }
-  summary.cumulativeSpendByProvider = cumulativeSpendByProvider;
-  // NOTE: derived from `cumulativeSpendByProvider`'s ACTUAL, tokens-derived
-  // figures -- deliberately NOT `priorSpend.totalUsd + runningTotal`, even
-  // though that reads as the more obvious sum. `runningTotal` (the variable
-  // the pre-existing global `--max-spend` admission check uses) is a
-  // PROJECTED running total (each admitted cell's pre-flight `priceByKey`
-  // estimate, summed as cells are admitted -- see the per-cell loop above),
-  // not the ACTUAL cost of what those cells turned out to spend; that
-  // projected-vs-actual basis for the global ceiling predates this issue and
-  // is out of its scope to change. Mixing `priorSpend.totalUsd` (real,
-  // tokens-derived) with `runningTotal` (projected) here would report a
-  // cumulative total on two different bases in the same field. Summing
-  // `cumulativeSpendByProvider` instead keeps this field on the ACTUAL basis
-  // throughout, matching `spendByProvider`'s own meaning.
-  summary.cumulativeSpendUsd = Object.values(cumulativeSpendByProvider).reduce((a, b) => a + b, 0);
-  // cumulativeNonProviderSpendUsd/Models: KNOWN non-provider spend (the
-  // embedder, currently) tracked SEPARATELY from cumulativeSpendUsd/
-  // spendByProvider -- real money (Voyage is free-tier only as of this
-  // table's rate `date`, per RATE_TABLE's notes -- it is not free forever),
-  // deliberately NOT counted toward any per-provider ceiling and NOT folded
-  // into cumulativeSpendUsd, so that field stays a pure "what would trip
-  // --max-spend-anthropic/-openai" figure. Visible here rather than
-  // vanishing between spendToDate's exclusion and this summary.
-  summary.cumulativeNonProviderSpendUsd = priorSpend.excludedNonProviderUsd + runningNonProviderTotal;
-  summary.cumulativeNonProviderModels = [...new Set([...priorSpend.excludedNonProviderModels])];
   log(`[run] planned=${summary.planned} completed=${summary.completed} failed=${summary.failed} skipped=${summary.skipped}`);
   return { summary, account };
 }

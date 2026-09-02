@@ -11,7 +11,7 @@
 //   AC5 integration test with mock provider covers the full path -> integration.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -828,6 +828,86 @@ test("issue #64: a run with NO ceiling active does not fail loud on an unrated m
   assert.equal(summary.completed, 1, "no ceiling active -- the unrated row in history does not block the run");
 });
 
+// ── issue #64 follow-up (PR #72 review, MEDIUM): `spendToDate` reads and
+// JSON-parses EVERY stored body -- `store.get()` (`readFileSync` +
+// `JSON.parse`, no tolerance) throws a bare `SyntaxError`/`ENOENT` on a
+// truncated or missing body, and that read now happens on EVERY ceiling-
+// gated invocation, not just for the current spec's reused cells. Two
+// things to prove: (1) it is a DIAGNOSTIC, naming the offending key, not a
+// raw parser exception; (2) it is paid ONLY when a ceiling is active -- a
+// plain generation run must not be crashable by damage to a body (e.g. a
+// Phase 0 record) it would otherwise never touch. ──
+
+test("issue #64: a truncated body in the store surfaces as a DIAGNOSTIC naming the offending key -- never a bare SyntaxError -- and only when a ceiling is active", async (t) => {
+  const dir = tempDir(t);
+  const store = new ResultsStore(dir);
+  seedSpentRow(store, {
+    key: "arm=H2|brief=corrupt|rep=0|cfg=" + CFG_HASH,
+    armId: "H2",
+    briefId: "corrupt",
+    cfg: CFG_HASH,
+    model: "claude-haiku-4-5",
+    inputTokens: 1000,
+    outputTokens: 500,
+  });
+
+  // Corrupt the body file directly on disk -- exactly the "external damage"
+  // shape the reviewer verified against a copy of the real Phase 0 store
+  // (crash-safety means this needs external damage to trigger: store.put()
+  // writes body-then-rename and appends the index line last).
+  const entry = store.list()[0];
+  writeFileSync(`${store.bodiesDir}/${entry.bodyFile}`, '{"key": "truncated, no closing brace');
+
+  const freshStore = new ResultsStore(dir); // a NEW instance -- no cache from the seeding write above
+  const provider = new MockProvider();
+
+  await assert.rejects(
+    () =>
+      runSpec(SPEC_PROVIDERS, {
+        store: freshStore,
+        armsConfig: ARMS_CONFIG_PROVIDERS,
+        provider,
+        armIds: ["H2"],
+        maxSpendByProviderUsd: { anthropic: 1000 }, // a ceiling IS active -- the store's full history must be read
+        log: silentLog,
+      }),
+    (err) => {
+      assert.match(err.message, /spendToDate: could not read the stored body/);
+      assert.match(err.message, new RegExp(entry.key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the offending KEY must be named, not just a generic failure");
+      assert.match(err.message, /Original error:/, "the underlying parse/read error is preserved, not swallowed");
+      return true;
+    },
+  );
+});
+
+test("issue #64: a truncated body in the store does NOT crash a run with NO ceiling active -- the store's history is never even read", async (t) => {
+  const dir = tempDir(t);
+  const store = new ResultsStore(dir);
+  seedSpentRow(store, {
+    key: "arm=H2|brief=corrupt|rep=0|cfg=" + CFG_HASH,
+    armId: "H2",
+    briefId: "corrupt",
+    cfg: CFG_HASH,
+    model: "claude-haiku-4-5",
+    inputTokens: 1000,
+    outputTokens: 500,
+  });
+  const entry = store.list()[0];
+  writeFileSync(`${store.bodiesDir}/${entry.bodyFile}`, "not even json");
+
+  const freshStore = new ResultsStore(dir);
+  const provider = new MockProvider();
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store: freshStore,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H3"], // a DIFFERENT arm/brief than the corrupted record -- this run never needed that body
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 1, "a plain generation run with no ceiling must not be crashable by damage to a body it never otherwise touches");
+});
+
 test("issue #64: an empty store's spend-to-date is exactly zero, both globally and per-provider", async (t) => {
   const store = new ResultsStore(tempDir(t));
   const result = spendToDate(store, undefined, { batch: true });
@@ -915,6 +995,21 @@ test("issue #64: a store containing BOTH Phase 0 (embedder) rows AND generation 
   assert.equal(Object.keys(summary.cumulativeSpendByProvider).length, 1);
   assert.ok(summary.cumulativeSpendByProvider.anthropic > 0);
   assert.equal(summary.cumulativeSpendByProvider.openai, undefined, "no openai spend at all -- neither from generation (H2 is Anthropic-only) nor misattributed embedder spend");
+
+  // Grand-total invariant (PR #72 review, LOW -- the single-row test above
+  // only pins `totalUsd === excludedNonProviderUsd` trivially, since that
+  // store holds nothing else; a mutation dropping the embedder row from
+  // `priceRows().totalUsd` survives that alone). Cross-check via a FRESH,
+  // independent `spendToDate` read of the post-run store: `totalUsd` comes
+  // from `priceRows()` (sums every row regardless of provider), while
+  // `byProvider`/`excludedNonProviderUsd` come from the SEPARATE
+  // `priceRowsByProvider()` code path -- two different reductions over the
+  // same rows that must still agree, on a store that genuinely holds BOTH
+  // provider-attributable AND non-provider rows (two Phase 0 rows plus one
+  // real generation cell), not the degenerate single-row case.
+  const postRun = spendToDate(store1, undefined, { batch: true });
+  const providerSum = Object.values(postRun.byProvider).reduce((a, b) => a + b, 0);
+  assert.equal(postRun.totalUsd, providerSum + postRun.excludedNonProviderUsd, "the grand total must equal provider spend plus embedder spend -- nothing double-counted or dropped between the two aggregation paths");
 });
 
 test("issue #64: embedder spend recorded in the store does NOT count against a per-provider ceiling -- a cell that would otherwise fit is NOT wrongly skipped", async (t) => {
@@ -946,6 +1041,69 @@ test("issue #64: embedder spend recorded in the store does NOT count against a p
 
   assert.equal(summary.completed, 1, "the Anthropic cell must be admitted -- embedder spend is not Anthropic spend, however large");
   assert.equal(summary.skipped, 0);
+});
+
+// ── issue #64 follow-up (PR #72 review, HIGH): --max-spend (the GLOBAL
+// ceiling) and summary.cumulativeSpendUsd must agree on whether
+// non-provider/embedder spend counts. Both tests below pair maxSpendUsd with
+// an embedder-only store -- direction 1 proves the admission decision
+// already counts it (unchanged, pre-existing behavior); direction 2 proves
+// the REPORTED cumulative total now matches that same decision instead of
+// silently excluding the very money that just stopped the run.
+test("issue #64: a GLOBAL --max-spend ceiling IS tripped by embedder-only spend (direction 1: gating basis includes non-provider spend, by design -- a global ceiling is a total-dollars backstop)", async (t) => {
+  const store1 = new ResultsStore(tempDir(t));
+  seedPhase0Row(store1, { key: "phase0/dat-replication", cfg: "phase0-cfg", inputTokens: 50_000_000 });
+  const embedderOnly = spendToDate(store1, undefined, { batch: true });
+  assert.ok(embedderOnly.totalUsd > 0.05, "sanity: the seeded embedder spend is not trivially small");
+  assert.deepEqual(embedderOnly.byProvider, {}, "sanity: this store has NO provider-attributable spend at all");
+
+  const provider = new MockProvider();
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store: store1,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2"],
+    // Below the embedder spend alone -- if the global ceiling did NOT count
+    // non-provider spend, this cell (whose own projected cost is tiny)
+    // would sail through. It must not.
+    maxSpendUsd: embedderOnly.totalUsd / 2,
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 0, "the global ceiling must be tripped by embedder spend alone -- it is real money and --max-spend is a total-dollars cap");
+  assert.equal(summary.skipped, 1);
+  assert.equal(provider.calls.length, 0);
+});
+
+test("issue #64: summary.cumulativeSpendUsd matches what --max-spend actually gated against, embedder spend included (direction 2: the REPORTED basis agrees with the GATING basis)", async (t) => {
+  const store1 = new ResultsStore(tempDir(t));
+  seedPhase0Row(store1, { key: "phase0/dat-replication", cfg: "phase0-cfg", inputTokens: 50_000_000 });
+  const embedderOnly = spendToDate(store1, undefined, { batch: true });
+
+  const provider = new MockProvider();
+  // A ceiling comfortably ABOVE the embedder spend so the run actually
+  // proceeds and produces a real summary to inspect (direction 1 above
+  // already covers the skip case).
+  const { summary } = await runSpec(SPEC_PROVIDERS, {
+    store: store1,
+    armsConfig: ARMS_CONFIG_PROVIDERS,
+    provider,
+    armIds: ["H2"],
+    maxSpendUsd: embedderOnly.totalUsd + 1000,
+    log: silentLog,
+  });
+
+  assert.equal(summary.completed, 1);
+  // The embedder spend seeded BEFORE this run must show up in
+  // cumulativeNonProviderSpendUsd (unchanged from spendToDate's own figure --
+  // this run added none of its own) AND in cumulativeSpendUsd's total, per
+  // the basis decision documented at runSpec's summary-assembly site and in
+  // docs/PREREGISTRATION.md §12: cumulativeSpendUsd === sum(byProvider) +
+  // cumulativeNonProviderSpendUsd, matching what --max-spend gates on.
+  assert.equal(summary.cumulativeNonProviderSpendUsd, embedderOnly.excludedNonProviderUsd);
+  const providerTotal = Object.values(summary.cumulativeSpendByProvider).reduce((a, b) => a + b, 0);
+  assert.equal(summary.cumulativeSpendUsd, providerTotal + summary.cumulativeNonProviderSpendUsd, "cumulativeSpendUsd must equal the provider breakdown PLUS the non-provider breakdown -- no money unaccounted for between the two reported bases");
+  assert.ok(summary.cumulativeSpendUsd > embedderOnly.totalUsd, "cumulativeSpendUsd must reflect at least the pre-existing embedder spend (plus this run's own H2 spend) -- not silently drop it the way the pre-fix cumulativeSpendUsd did");
 });
 
 test("issue #64: a per-provider ceiling is enforced against spend already recorded by an EARLIER invocation of the same store, not reset to zero", async (t) => {
@@ -1029,7 +1187,14 @@ test("issue #64: a GLOBAL --max-spend ceiling is also enforced cumulatively acro
     log: silentLog,
   });
   assert.equal(first.completed, 1);
-  const priorTotal = first.cumulativeSpendUsd;
+  // The first invocation ran with NO ceiling active, so its OWN
+  // `cumulativeSpendByProvider`/`cumulativeSpendUsd` are `null` by design
+  // (spendToDate is only ever called when a ceiling is active -- see
+  // runSpec's own comment on `priorSpend`/`anyCeilingActive`). Derive
+  // "what was actually spent" from `spendByProvider` instead, which is
+  // ALWAYS computed regardless of whether a ceiling was requested.
+  assert.equal(first.cumulativeSpendByProvider, null, "sanity: no ceiling was active on the first invocation");
+  const priorTotal = first.spendByProvider.anthropic;
   assert.ok(priorTotal > 0);
 
   const store2 = new ResultsStore(dir);
@@ -1117,7 +1282,7 @@ test("issue #64: cumulative admission uses strict '>' -- a cell that would land 
   assert.equal(overBoundary.skipped, 1);
 });
 
-test("issue #64: summary exposes BOTH this-invocation spend (spendByProvider, unchanged) and cumulative spend (cumulativeSpendByProvider/cumulativeSpendUsd)", async (t) => {
+test("issue #64: summary exposes BOTH this-invocation spend (spendByProvider, unchanged) and cumulative spend (cumulativeSpendByProvider/cumulativeSpendUsd) -- only when a ceiling is active; null when it is not", async (t) => {
   const dir = tempDir(t);
   const store1 = new ResultsStore(dir);
   const provider1 = new MockProvider();
@@ -1131,6 +1296,14 @@ test("issue #64: summary exposes BOTH this-invocation spend (spendByProvider, un
     briefIds: ["b1"],
     log: silentLog,
   });
+  // No ceiling on the first invocation -- cumulative fields are `null`, not
+  // `{}`/`0` (PR #72 review: `null` means "not computed", never "computed as
+  // zero", and the store's full history is deliberately never read for a
+  // run that has nothing to gate against it).
+  assert.equal(first.cumulativeSpendByProvider, null);
+  assert.equal(first.cumulativeSpendUsd, null);
+  assert.equal(first.cumulativeNonProviderSpendUsd, null);
+  assert.equal(first.cumulativeNonProviderModels, null);
 
   const store2 = new ResultsStore(dir);
   const provider2 = new MockProvider();
@@ -1140,6 +1313,9 @@ test("issue #64: summary exposes BOTH this-invocation spend (spendByProvider, un
     provider: provider2,
     armIds: ["H2"],
     briefIds: ["b2"],
+    // A ceiling generous enough to admit the cell, active only so the
+    // cumulative fields actually get computed -- the point of this test.
+    maxSpendByProviderUsd: { anthropic: 1000 },
     log: silentLog,
   });
 
@@ -1149,5 +1325,7 @@ test("issue #64: summary exposes BOTH this-invocation spend (spendByProvider, un
   // beyond what the second invocation itself spent.
   assert.equal(second.spendByProvider.anthropic, second.cumulativeSpendByProvider.anthropic - first.spendByProvider.anthropic, "cumulative = prior invocations' spend + this invocation's own spend, never conflating the two");
   assert.ok(second.cumulativeSpendByProvider.anthropic > second.spendByProvider.anthropic, "cumulative total is strictly larger than this invocation's own total once a prior invocation spent something");
-  assert.equal(second.cumulativeSpendUsd, second.cumulativeSpendByProvider.anthropic, "single-provider grid: the global cumulative total equals the one provider's cumulative total");
+  assert.equal(second.cumulativeSpendUsd, second.cumulativeSpendByProvider.anthropic, "no embedder spend in this store -- the global cumulative total equals the one provider's cumulative total");
+  assert.equal(second.cumulativeNonProviderSpendUsd, 0, "no embedder rows in this store");
+  assert.deepEqual(second.cumulativeNonProviderModels, []);
 });
