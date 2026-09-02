@@ -150,7 +150,19 @@ export function parseArgs(argv) {
 // asserted against directly. Both default to the real implementations, so a
 // genuine CLI invocation (`main()`, no args) is unchanged.
 export async function main(argv = process.argv.slice(2), deps = {}) {
-  const { runSpecFn = runSpec, store: injectedStore } = deps;
+  const {
+    runSpecFn = runSpec,
+    store: injectedStore,
+    // getEngineVersion is injectable (issue #62 CI break): the real
+    // implementation does `require.resolve("ideate-core")`, a genuine
+    // dependency lookup that only succeeds when node_modules exists. CI runs
+    // bare `node --test` with no `npm ci` (deliberately -- see the hermetic
+    // rationale on getInstalledEngineVersion above), so a test that calls
+    // main() without stubbing this seam fails in CI even though it passes
+    // locally on a machine that happens to have `npm install`ed. Defaults to
+    // the real resolver, so a genuine CLI invocation is unchanged.
+    getEngineVersion = getInstalledEngineVersion,
+  } = deps;
   const args = parseArgs(argv);
 
   // --phase is accepted (per §12's flag table) but NOT YET wired to a
@@ -202,7 +214,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // `package.json` via plain `fs` (bypassing the exports map entirely, since
   // this is a filesystem read, not a module resolution) until it finds the
   // one whose `name` is "ideate-core".
-  const engineVersion = getInstalledEngineVersion();
+  const engineVersion = getEngineVersion();
   const engineSha = process.env.IDEATE_CORE_ENGINE_SHA || `ideate-core@${engineVersion}`;
 
   // embedderId (issue #20, AC5): lib/manifest.mjs's CONFIG_FIELDS already

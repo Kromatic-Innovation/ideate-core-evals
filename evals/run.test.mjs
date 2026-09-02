@@ -19,6 +19,13 @@ import armsConfigJson from "../arms.config.json" with { type: "json" };
 // filesystem-free.
 const FAKE_STORE = {};
 
+// getInstalledEngineVersion() does a real `require.resolve("ideate-core")`
+// -- CI runs bare `node --test` with no `npm ci`, so node_modules never
+// exists there (see run.mjs's hermetic-CI comments). Stub the injectable
+// seam so these main() tests stay filesystem/dependency-free like every
+// other test in this repo. See evals/run.mjs main()'s deps destructuring.
+const STUB_ENGINE_VERSION = () => "0.0.0-test";
+
 function spyRunSpec() {
   const calls = [];
   const fn = async (spec, opts) => {
@@ -73,7 +80,7 @@ test("parseArgs supports --no-batch as a boolean flag with no value", () => {
 
 test("main() passes --max-spend-anthropic/--max-spend-openai through to runSpec as maxSpendByProviderUsd -- dropping this wiring must fail this test", async () => {
   const runSpecFn = spyRunSpec();
-  await main(["--dry-run", "--max-spend-anthropic", "5", "--max-spend-openai", "7"], { runSpecFn, store: FAKE_STORE });
+  await main(["--dry-run", "--max-spend-anthropic", "5", "--max-spend-openai", "7"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
 
   assert.equal(runSpecFn.calls.length, 1);
   assert.deepEqual(runSpecFn.calls[0].opts.maxSpendByProviderUsd, { anthropic: 5, openai: 7 });
@@ -81,7 +88,7 @@ test("main() passes --max-spend-anthropic/--max-spend-openai through to runSpec 
 
 test("main() wires a REAL, RATE_TABLE-backed priceGrid (lib/price.mjs's runnerPriceGrid), not the interim estimator or nothing at all", async () => {
   const runSpecFn = spyRunSpec();
-  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE });
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
 
   const { priceGrid } = runSpecFn.calls[0].opts;
   assert.equal(typeof priceGrid, "function", "priceGrid must be wired -- dropping it entirely must fail this test");
@@ -98,7 +105,7 @@ test("main() wires a REAL, RATE_TABLE-backed priceGrid (lib/price.mjs's runnerPr
 
 test("main() forwards --max-spend as maxSpendUsd and --arms/--briefs/--replicates through to runSpec", async () => {
   const runSpecFn = spyRunSpec();
-  await main(["--dry-run", "--max-spend", "42", "--arms", "A,B", "--briefs", "b1", "--replicates", "2"], { runSpecFn, store: FAKE_STORE });
+  await main(["--dry-run", "--max-spend", "42", "--arms", "A,B", "--briefs", "b1", "--replicates", "2"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
 
   const { opts } = runSpecFn.calls[0];
   assert.equal(opts.maxSpendUsd, 42);
