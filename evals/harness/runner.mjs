@@ -37,7 +37,7 @@
 // silently dropped from the plan.
 
 import { planRun } from "../../lib/manifest.mjs";
-import { RunAccount, costRow, TERMINAL_STATES, isTransientFailure } from "../../lib/accounting.mjs";
+import { RunAccount, costRow, TERMINAL_STATES, isTransientFailure, isPaymentFailure } from "../../lib/accounting.mjs";
 import { assertValidProviderResponse } from "./provider.mjs";
 // providerOf/priceRowByProvider (issue #51, per-provider --max-spend): pure
 // data-shape utilities, not the interim estimator this module owns -- see
@@ -1121,6 +1121,22 @@ export async function runSpec(spec, opts) {
   // #90), keyed by kind. Populated only by the todo loop's transient branch
   // -- see there for why this is not derived from summary.byKind.
   const notStoredTransientByKind = {};
+  // ── Payment abort (issue #88) ────────────────────────────────────
+  // Set (once) to `{ cellKey, detail, providers }` the first time a cell
+  // fails `payment_required`. A sticky flag consulted at the TOP of the todo
+  // loop, deliberately not a `break` and emphatically not a `throw`:
+  //
+  //   - `break` + a post-loop backfill over plan.todo would re-record cells
+  //     that already reached a terminal state, and RunAccount#assertPlanned
+  //     throws on exactly that.
+  //   - `throw` would skip reconcile() entirely, losing the summary AND the
+  //     ledger of money genuinely spent before the account ran dry.
+  //
+  // Consulted-at-the-top gives both ACs by construction: every remaining
+  // planned cell still reaches exactly one terminal state (a classified
+  // skip), and nothing already written is touched. It is the same shape the
+  // `budget_exceeded` skip below already uses, for the same reason.
+  let paymentAborted = null;
 
   const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usd]));
   // Projected per-provider cost for each todo cell, split slot-by-slot (see
@@ -1129,6 +1145,32 @@ export async function runSpec(spec, opts) {
   const providerByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.byProvider || {}]));
 
   for (const cell of plan.todo) {
+    if (paymentAborted) {
+      // The account cannot pay. Marching this cell into the identical wall
+      // would produce a failure that is not a datum about the arm, cost
+      // wall-clock, and (post-#90) leave 180 attempt records saying nothing.
+      // A skip is the honest record: we never tried.
+      //
+      // The reason string's category (everything before the first colon --
+      // see RunAccount.reconcile) is `payment_required`, so the run summary
+      // reads `skipped=180 (payment_required=180)` rather than an
+      // undifferentiated count. The detail after the colon names the cell
+      // that hit the wall so an operator can see WHERE the run stopped.
+      //
+      // NOTE on over-skipping in a mixed-provider grid: a refusal from one
+      // provider aborts cells that would only have spent under the other.
+      // That is the AC's stated behaviour ("aborts the remaining plan"), and
+      // it is safe rather than lossy -- a skip is store-absent, so the next
+      // invocation plans every one of these `todo` again. The provider list
+      // is kept in the reason so the information is not thrown away.
+      account.skip(
+        cell.key,
+        `payment_required: account cannot pay (first refusal at '${paymentAborted.cellKey}'` +
+          (paymentAborted.providers ? `, providers: ${paymentAborted.providers}` : "") +
+          ")",
+      );
+      continue;
+    }
     // `priceByKey.get(cell.key) || 0` would mask two distinct situations as
     // the same silent zero: (a) a cell that legitimately costs $0 (falsy
     // zero -- fine), and (b) a cell missing from the pricer's breakdown
@@ -1363,7 +1405,38 @@ export async function runSpec(spec, opts) {
       // consumed real tokens (see costRowsFor's caller comment), and those
       // must survive even if recordActualSpend then throws. Both #90
       // branches below preserve that ordering.
-      if (isTransientFailure(response.failureKind)) {
+      if (isPaymentFailure(response.failureKind)) {
+        // ── The account cannot pay (issue #88) ───────────────────────────
+        // PERSISTENCE takes the transient treatment, deliberately: an empty
+        // credit balance is not a fact about the arm, so nothing goes under
+        // cell.key and a later run against a funded account plans this cell
+        // `todo` again. The money this attempt did spend is durable under
+        // its own attempt-scoped key, exactly as for a 429. (README.md and
+        // docs/retrying-failed-cells.md already promise this outcome for "an
+        // empty credit balance"; before this branch the code did the
+        // opposite, because the refusal was misclassified transport_error.)
+        //
+        // CONTINUATION is where it differs from a transient fault: set the
+        // sticky abort flag so the top of this loop skips every remaining
+        // cell. Deliberately NOT counted in notStoredTransientByKind -- that
+        // notice tells the operator to "re-run the same command", which is
+        // wrong advice while the account is dry. It gets its own line below.
+        recordGenerationAttemptFailure(store, {
+          cell,
+          costRows,
+          kind: response.failureKind,
+          detail: response.detail || "",
+          resolvedModels: resolvedModelsFor(arm),
+        });
+        const cellByProvider = providerByKey.get(cell.key) || {};
+        paymentAborted = {
+          cellKey: cell.key,
+          detail: response.detail || "",
+          providers: Object.keys(cellByProvider)
+            .filter((p) => cellByProvider[p] > 0)
+            .join(", "),
+        };
+      } else if (isTransientFailure(response.failureKind)) {
         // Environmental fault. NOTHING is written under cell.key, so the
         // next invocation re-attempts it (genuinely re-spending, which is
         // correct and honest). The attempt -- its kind, its detail, and
@@ -1503,6 +1576,31 @@ export async function runSpec(spec, opts) {
   // untouched. `failed=N` alone cannot tell an operator whether the night was
   // lost to rate limits (re-run it) or to the arms genuinely refusing (that
   // IS the result) -- the exact ambiguity that cost the #8 study a dataset.
+  // Payment abort notice (issue #88). Loud and separate from the retryable
+  // notice below, because the operator action is different in kind: a
+  // rate-limited night says "re-run the same command"; a dry account says
+  // "fund the account, THEN re-run". Surfaced on the summary as well as
+  // logged, so a caller (evals/run.mjs, a report) can branch on the fact
+  // rather than scrape the log. `null` means no payment abort occurred --
+  // never "we did not check".
+  summary.paymentAbort = paymentAborted
+    ? {
+        cellKey: paymentAborted.cellKey,
+        detail: paymentAborted.detail,
+        providers: paymentAborted.providers,
+        skipped: summary.skippedByReason.payment_required || 0,
+      }
+    : null;
+  if (paymentAborted) {
+    log(
+      `[run] ABORTED: the provider refused on billing/credit at cell '${paymentAborted.cellKey}'` +
+        (paymentAborted.providers ? ` (providers: ${paymentAborted.providers})` : "") +
+        `. ${summary.paymentAbort.skipped} remaining cell(s) were skipped, not attempted -- ` +
+        `every one of them would have hit the identical wall. Nothing was stored under those ` +
+        `cell keys, so fund the account and re-run the same command to pick up where this stopped ` +
+        `(spend already incurred is preserved). Provider detail: ${paymentAborted.detail}`,
+    );
+  }
   const retryable = Object.entries(notStoredTransientByKind);
   if (retryable.length) {
     const n = retryable.reduce((a, [, count]) => a + count, 0);
