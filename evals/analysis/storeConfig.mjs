@@ -102,6 +102,15 @@ export class UnknownStoredConfigError extends Error {
  *  entry's. */
 const CELL_KEY_RE = /^arm=(.+)\|brief=(.+)\|rep=(\d+)\|cfg=(.+)$/;
 
+/** True if `key` is a study cell key carrying `cfg`. Exported because
+ *  frame.mjs's NoCellsSelectedError needs the same filter to build its
+ *  "store holds …" list — without it that message lists judge model ids
+ *  as candidate config hashes on any real store. */
+export function isStudyCellKey(key, cfg) {
+  const m = CELL_KEY_RE.exec(key || "");
+  return Boolean(m) && m[4] === cfg;
+}
+
 /**
  * Tally the distinct configHashes the store's STUDY CELLS carry.
  *
@@ -119,8 +128,7 @@ export function tallyStoredConfigs(store) {
   const byCfg = new Map();
   for (const entry of store.list()) {
     if (typeof entry.cfg !== "string" || entry.cfg === "") continue;
-    const m = CELL_KEY_RE.exec(entry.key || "");
-    if (!m || m[4] !== entry.cfg) continue;
+    if (!isStudyCellKey(entry.key, entry.cfg)) continue;
     if (!byCfg.has(entry.cfg)) byCfg.set(entry.cfg, { cfg: entry.cfg, count: 0, states: new Set() });
     const t = byCfg.get(entry.cfg);
     t.count += 1;

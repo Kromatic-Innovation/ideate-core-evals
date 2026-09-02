@@ -63,6 +63,7 @@
 
 import { priceRows } from "../../lib/price.mjs";
 import { configHash as computeConfigHash } from "../../lib/manifest.mjs";
+import { isStudyCellKey } from "./storeConfig.mjs";
 
 /**
  * Thrown by buildFrame() when an arm level has ZERO completed rows (every
@@ -303,8 +304,15 @@ export function buildFrame(store, opts = {}) {
  */
 export class NoCellsSelectedError extends Error {
   constructor(frame) {
+    // Study cells only: a real store's `stale` pile also holds judge-call and
+    // phase0 records whose `cfg` is a judge model id / an object (see
+    // storeConfig.mjs), and listing those as candidate config hashes would
+    // send the reader chasing a hash that never existed.
     const staleByCfg = new Map();
-    for (const s of frame.excluded.stale) staleByCfg.set(s.cfg, (staleByCfg.get(s.cfg) || 0) + 1);
+    for (const s of frame.excluded.stale) {
+      if (!isStudyCellKey(s.key, s.cfg)) continue;
+      staleByCfg.set(s.cfg, (staleByCfg.get(s.cfg) || 0) + 1);
+    }
     const held =
       Array.from(staleByCfg.entries())
         .sort((a, b) => (a[0] < b[0] ? -1 : 1))

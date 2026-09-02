@@ -209,6 +209,34 @@ test("assertCellsSelected: a frame that selected nothing names the exclusion, th
   );
 });
 
+test("assertCellsSelected: 'store holds' lists study cells only, never a judge model id dressed up as a config hash", () => {
+  const store = makeTempStore("storeconfig-excluded-mixed-");
+  putCell(store, { key: cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" }), armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" });
+  store.put({
+    key: "judge-call|cell=arm=A|brief=b1|rep=0|cfg=aaaaaaaaaaaa|judge=claude-haiku-4-5|attempt=0",
+    armId: "__judge-call__",
+    briefId: "arm=A|brief=b1|rep=0|cfg=aaaaaaaaaaaa",
+    replicate: 0,
+    cfg: "claude-haiku-4-5",
+    result: { scores: [] },
+    resolvedModels: { judge: "claude-haiku-4-5" },
+    accounting: { state: "completed" },
+    costRows: [],
+  });
+
+  const frame = buildFrame(store, { configHash: "560d764366bc" });
+  assert.throws(
+    () => assertCellsSelected(frame),
+    (err) => {
+      assert.match(err.message, /store holds aaaaaaaaaaaa \(1\)/);
+      assert.doesNotMatch(err.message, /claude-haiku-4-5/);
+      // The raw stale count is still honest about everything that was excluded.
+      assert.match(err.message, /2 excluded as stale/);
+      return true;
+    },
+  );
+});
+
 test("assertCellsSelected: a frame with rows passes through unchanged", () => {
   const store = makeTempStore("storeconfig-ok-");
   putCell(store, { key: cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" }), armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" });
