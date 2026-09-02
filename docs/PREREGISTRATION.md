@@ -803,3 +803,98 @@ Verified by targeted mutation (each reverted before commit): hardcoding `R=1` is
 See the §4.4 marker for the registered summary of this item.
 
 ---
+
+## Appendix D — Amendments (dated 2026-09-02)
+
+Per the amendment rule at the top of this document. This appendix registers a
+**change to `configHash`'s field set** (§11) and the invalidation it causes,
+in advance of the run that will carry it. Nothing in §6 is changed.
+
+### Item 1 — §3.1/§11: `arms.config.json` now participates in `configHash` as `armsConfigHash`; `ideasPerAgent`/`maxRounds` are retired (issue #101)
+
+**The defect.** §11 registers `configHash` as covering "everything that could
+change the measurement (engine SHA, prompt hash, judge hash, embedder, panel
+shape)". **Panel shape and model assignment were not in fact covered** —
+`arms.config.json` was hashed nowhere at all. §3.1's design intent is that
+*the only thing varying between arms is model assignment*, so the single
+variable this study manipulates was invisible to the mechanism that decides
+which cells are comparable. Editing arm C from `claude-sonnet-5` to
+`claude-opus-5` produced cells with an identical `configHash`; `planRun`
+classified them `reuse` and the frame pooled two different experiments with no
+`stale` warning — the exact outcome §11's never-silently-pool guarantee exists
+to prevent. This item makes §11's existing words true rather than changing
+what they claim.
+
+**What changed.** `lib/manifest.mjs` gains `armsConfigHash()`, a sha256-12 over
+the parsed `arms.config.json`, declared in `CONFIG_FIELDS` and stamped by
+`evals/run.mjs`. It covers every arm's model assignment and slot ORDER, each
+arm's `mode`/`personaDisabled`/`totalIdeasRequested`, and the `panel` block's
+`size`/`ideasPerAgent`/`maxRounds`.
+
+**What it excludes, and why.** Documentation-only keys — any `_`-prefixed key
+(`_comment`, `_modelIdSource`) plus `label` and `purpose` — are not hashed.
+Editing them changes what a reader is *told* about an arm, never what was
+*measured* of it, and hashing them would falsely mark every stored cell
+`stale` on a typo fix. This is the same measured-vs-described distinction
+Appendix B item 15 draws when it keeps `analysisHash` out of `configHash`.
+The exclusion is a **denylist of named prose fields, not an allowlist of
+measurement fields**: a field added to `arms.config.json` later is hashed by
+default, so the failure mode is a conservative over-invalidation rather than
+silent under-coverage.
+
+**Two `CONFIG_FIELDS` entries retired.** `ideasPerAgent` and `maxRounds` are
+removed. Neither had ever been set by any caller, and neither could honestly
+be: `spec.config` is per-spec while both values are **per-arm** (the panel
+block registers `ideasPerAgent: 6` / `maxRounds: 2`, but arm A is a single
+solo call with `maxRounds: 1`, §3.1). Stamping the panel constant into a
+per-spec slot would have made `configHash` claim coverage of a value it did
+not pin. `armsConfigHash` covers both, per-arm, as written. A
+declared-but-never-set field is worse than an absent one, because it reads as
+covered.
+
+**Two further absent fields, now populated.** `judgeHash` is set from
+`evals/judge/score.mjs`'s `computeJudgeHash()` over the registered judge
+roster — the mechanism has existed since issue #21 and simply had no caller on
+the run path. It is populated rather than removed because **Appendix B item 3
+already registers, in advance, that `judgeHash` is a `CONFIG_FIELDS` entry and
+that `judgeHash` → `configHash` → `cellKey` is "correct and intended"**;
+removing it would be a deviation from that registration, not a code cleanup.
+The registered cost is accepted explicitly: **swapping a judge model now
+invalidates GENERATION cells, which must be re-generated rather than merely
+re-scored.** That is the conservative direction, and it is what §5.3/§11
+already register — a cell's result is comparable to another's only if the
+judge that could score it is identical too.
+
+`clusterDistanceThreshold` (Appendix B item 8) is likewise now stamped into
+`spec.config` by `evals/run.mjs`, settling the ownership question on the
+**generation** side: since issue #85 wired pool metrics into `runSpec`,
+`distinct_k` is a stored generation artifact and a direct function of the
+threshold. It is set **unconditionally**, never gated on whether a live
+embedder was wired, so `--dry-run` projects the same `configHash` the real run
+stamps. `evals/analysis/` is deliberately unchanged: per issue #91 it computes
+no hash at all, reading the store's own `cfg` instead, and its
+`--cluster-distance-threshold` flag survives as a *recomputation* parameter
+for the rarefied lane, where a value disagreeing with what generation used
+already fails loudly (`buildRarefiedFrame` recomputes full-pool `distinct_k`
+and throws on a mismatch with the stored scalar).
+
+**Consequence, registered in advance.** `configHash` moves to
+**`0000daa58e5a`**, from `5ce5478956e5` (the value the #8 smoke store carries)
+via `ed73fc14eb48` (issue #99's prompt-hash fix). The full hashed input:
+
+```
+harnessVersion            0.0.1
+engineSha                 ideate-core@0.4.0
+promptHash                4a3460df3dc6
+judgeHash                 ee4836950521
+embedderId                voyage-4-lite
+corpusHash                55e05c2811a7
+armsConfigHash            61ed0026c2a0
+clusterDistanceThreshold  0.23141118234233987
+```
+
+Every pre-existing stored cell becomes `stale` rather than being reused, per
+`planRun`. **This is correct and intended**, and the timing is the argument:
+the only data in any store is the #8 smoke study, whose results are discarded
+from confirmatory analysis by construction (§8.3). Absorbing the invalidation
+now costs one smoke run; after Phase 2's grid exists it would cost the grid.
