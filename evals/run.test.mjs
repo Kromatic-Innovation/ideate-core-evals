@@ -496,6 +496,37 @@ test("formatSpendSummary returns no lines for a dry-run result (no summary at al
   assert.deepEqual(formatSpendSummary(null), []);
 });
 
+// ── issue #119 AC3: the report surface names WHEN the cumulative total is
+// not entirely fact-based ────────────────────────────────────────────────
+test("formatSpendSummary surfaces legacyPricingRowCount as a NOTE next to the cumulative total", () => {
+  const summary = {
+    spendByProvider: { anthropic: 0.5 },
+    cumulativeSpendByProvider: { anthropic: 1.5 },
+    cumulativeSpendUsd: 1.75,
+    cumulativeNonProviderSpendUsd: 0.25,
+    cumulativeNonProviderModels: [],
+    cumulativeLegacyPricingRowCount: 7,
+    cumulativeLegacyPricingFallbackRegime: "single",
+  };
+  const joined = formatSpendSummary(summary).join("\n");
+  assert.match(joined, /NOTE: 7 cost row\(s\) in this store predate the per-row pricing regime/);
+  assert.match(joined, /'single'/);
+});
+
+test("formatSpendSummary emits no legacy-pricing note when every row carried its own regime", () => {
+  const summary = {
+    spendByProvider: { anthropic: 0.5 },
+    cumulativeSpendByProvider: { anthropic: 1.5 },
+    cumulativeSpendUsd: 1.75,
+    cumulativeNonProviderSpendUsd: 0.25,
+    cumulativeNonProviderModels: [],
+    cumulativeLegacyPricingRowCount: 0,
+    cumulativeLegacyPricingFallbackRegime: "single",
+  };
+  const joined = formatSpendSummary(summary).join("\n");
+  assert.doesNotMatch(joined, /NOTE: \d+ cost row/);
+});
+
 // ── --phase 0 wiring (issue #48) ────────────────────────────────────────────
 // The actual controls logic lives in evals/metrics/phase0.mjs and is tested
 // there (phase0.test.mjs); these tests exercise main()'s WIRING of it --
