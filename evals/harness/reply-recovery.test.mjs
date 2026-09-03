@@ -69,6 +69,16 @@ const silentLogger = () => {};
 /** The observed worst-case clean output length for a 30-idea arm-A reply. */
 const OBSERVED_MAX_OUTPUT_TOKENS_30 = 1857;
 
+/** Issue #122: the observed worst-case output length for a real arm-D
+ *  (Opus) round-2 reply (6 ideas) -- the live measurement TOKENS_PER_IDEA_BY_MODEL's
+ *  "claude-opus-5" entry (558) is derived from. Independent of that constant
+ *  on purpose (like OBSERVED_MAX_OUTPUT_TOKENS_30 above): a test that reads
+ *  the constant under test to build its own expectation is not a regression
+ *  guard on the MEASUREMENT, only on the arithmetic. See prompts.mjs's
+ *  TOKENS_PER_IDEA_BY_MODEL doc comment for how this number was obtained
+ *  (driving arm D's real generate() call end-to-end, not a synthetic probe). */
+const OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6 = 3346;
+
 function armsConfigFor(...armIds) {
   const arms = {};
   for (const id of armIds) arms[id] = armsConfigJson.arms[id];
@@ -220,6 +230,23 @@ test("#93 AC1: maxTokensForIdeas gives a 30-idea Sonnet request 2x-3x headroom o
   // And explicitly NOT the "+10%" the issue body ruled out.
   assert.ok(solo > 1.1 * LEGACY_MAX_TOKENS);
   assert.equal(solo, Math.ceil(30 * TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"] * MAX_TOKENS_HEADROOM));
+});
+
+test("#122: maxTokensForIdeas gives a 6-idea Opus request 2x-3x headroom over the observed 3346-token real-run worst case", () => {
+  // The Opus counterpart of the Sonnet test above -- and independent of
+  // TOKENS_PER_IDEA_BY_MODEL["claude-opus-5"] for the same reason: a test that
+  // reads the constant under test to build its own expected value cannot catch
+  // a bad edit to that constant, only a bad edit to the arithmetic around it.
+  const panel = maxTokensForIdeas(6, "claude-opus-5");
+  assert.ok(
+    panel >= 2 * OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6,
+    `${panel} must be at least 2x ${OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6}`,
+  );
+  assert.ok(
+    panel <= 3 * OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6,
+    `${panel} must be at most 3x ${OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6}`,
+  );
+  assert.ok(panel > LEGACY_MAX_TOKENS, "the whole point of #122: Opus's real ceiling must clear the pre-#122 flat floor");
 });
 
 test("#93 AC1: a 6-idea (panel) Sonnet request still computes to EXACTLY the legacy 2048 — comparability with run #8", () => {
