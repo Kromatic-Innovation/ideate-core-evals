@@ -11,6 +11,7 @@
 //   node evals/run.mjs --no-cancel-on-abandon  # leave an abandoned batch running (issue #92/#103)
 //   node evals/run.mjs --prune                 # what WOULD be removed (issue #98)
 //   node evals/run.mjs --prune --kinds transient --cfg 5ce5478956e5 --apply
+//   node evals/run.mjs --results-dir results-pilot ...   # a SEPARATE store (issue #120)
 //
 // This file is intentionally thin: it parses argv, loads the corpus + arm
 // config + a results store rooted at `results/` (gitignored, per-deployment --
@@ -29,9 +30,9 @@
 // NOT wired into CI (per docs/PREREGISTRATION.md §9: "Not wired into CI...
 // Runs on demand via node evals/run.mjs --phase N").
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, statSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
 
 import { CORPUS, CORPUS_HASH } from "./corpus/index.mjs";
@@ -68,6 +69,76 @@ import { computeJudgeHash } from "./judge/score.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
+
+// The store this CLI reads and writes when no --results-dir is given.
+// Anchored at REPO_ROOT (not cwd) so a run launched from a subdirectory still
+// finds the study's one store -- unchanged behaviour, and the reason this
+// constant exists rather than the join() being inlined three times.
+export const DEFAULT_RESULTS_DIR = join(REPO_ROOT, "results");
+
+/**
+ * Resolve --results-dir (issue #120) to an absolute directory, refusing a
+ * path that exists but is not a results store.
+ *
+ * ── Why the flag exists at all ──────────────────────────────────────────────
+ * docs/PREREGISTRATION.md §11 permits a pilot to inform the confirmatory n
+ * ONLY if "the pilot's own data is then not reused in the confirmatory test",
+ * and #49 AC5 requires that exclusion be enforced STRUCTURALLY. The pilot must
+ * run at the grid's configHash (a variance estimate collected under a
+ * different configuration does not transfer), so every pilot cell would
+ * otherwise be classified `reuse` by planRun and pooled by buildFrame -- and
+ * correctly so, since there is no config change for the never-silently-pool
+ * guarantee to detect. Two SEPARATE stores cannot pool at any configHash,
+ * under any analysis path, whether or not anyone remembers the rule. That is
+ * what makes this a structural exclusion rather than an intended one.
+ *
+ * ── Relative paths resolve against cwd, deliberately ────────────────────────
+ * evals/analysis/analysis.mjs hands its own --results-dir value straight to
+ * `new ResultsStore(...)`, i.e. resolved against process.cwd(). The whole
+ * point of this flag is that the directory run.mjs WRITES is the directory
+ * analysis.mjs later READS, so `--results-dir results-pilot` must name the
+ * same place for both commands. It does, because both resolve it the same
+ * way. Only the DEFAULT differs (REPO_ROOT-anchored here), and a default is
+ * never typed twice by an operator.
+ *
+ * @param {string|undefined} resultsDir  the raw --results-dir value, or
+ *   undefined for the default store
+ * @returns {string} an absolute directory path, suitable for `new ResultsStore()`
+ */
+export function resolveStoreDir(resultsDir) {
+  const dir = resultsDir === undefined ? DEFAULT_RESULTS_DIR : resolve(resultsDir);
+
+  // A path that does not exist is FINE: ResultsStore's constructor mkdirs it
+  // recursively and writes an empty index.jsonl, which is exactly how the
+  // default `results/` store comes into being on a fresh checkout. Creating
+  // the pilot's store on first use is the same behaviour, not a new one.
+  if (!existsSync(dir)) return dir;
+
+  if (!statSync(dir).isDirectory()) {
+    throw new Error(
+      `run.mjs: --results-dir '${resultsDir}' resolves to ${dir}, which exists and is not a directory. ` +
+        "A results store is a directory holding index.jsonl + bodies/ (see lib/store.mjs).",
+    );
+  }
+
+  // Exists, is a directory, is NON-EMPTY, and holds no index.jsonl: this is
+  // not a store, and ResultsStore would happily initialise one on top of
+  // whatever is in there. Refuse instead. The hazard is a typo'd or
+  // shell-completed path (`--results-dir docs`, `--results-dir lib`) silently
+  // becoming the study's store -- and, on the pilot/confirmatory split this
+  // flag exists for, a mistyped pilot directory that quietly initialises
+  // somewhere else is indistinguishable from a working one until the
+  // confirmatory analysis reads a store that was never written.
+  const entries = readdirSync(dir);
+  if (entries.length > 0 && !existsSync(join(dir, "index.jsonl"))) {
+    throw new Error(
+      `run.mjs: --results-dir '${resultsDir}' resolves to ${dir}, which exists and is not empty but holds no ` +
+        `index.jsonl -- it is not a results store (found: ${entries.slice(0, 5).join(", ")}${entries.length > 5 ? ", ..." : ""}). ` +
+        "Refusing to initialise a store over it. Pass a new or empty directory, or an existing store's directory.",
+    );
+  }
+  return dir;
+}
 
 /**
  * Resolve the installed `ideate-core` package's own version from its
@@ -253,6 +324,31 @@ export function parseArgs(argv) {
       case "--no-batch":
         args.noBatch = true;
         break;
+      // ── --results-dir (issue #120) ──────────────────────────────────────
+      // Which results store this invocation reads and writes. Mirrors the
+      // flag evals/analysis/analysis.mjs has always accepted, so a pilot
+      // written here is analysable there by passing the same value.
+      //
+      // This is NOT a mode flag: it is meaningful on a real run, a
+      // --dry-run, a --prune and a --phase 0 alike, because every one of
+      // those four opens a store. It therefore appears in none of the three
+      // ignored-flag rejection lists in main() -- those exist for flags a
+      // mode would silently DROP, and no mode drops this one.
+      case "--results-dir":
+        args.resultsDir = argv[++i];
+        if (!args.resultsDir) throw new Error("run.mjs: --results-dir requires a directory argument");
+        // A missing value would otherwise swallow the NEXT flag as the
+        // directory name -- `--results-dir --prune` would create a store in a
+        // directory literally called `--prune` and then run unpruned. For a
+        // flag whose entire job is to say where the study's data lives, a
+        // silently-wrong directory is the failure worth an explicit guard.
+        if (args.resultsDir.startsWith("--")) {
+          throw new Error(
+            `run.mjs: --results-dir got '${args.resultsDir}', which looks like a flag, not a directory. ` +
+              "Pass the store directory explicitly (e.g. --results-dir results-pilot).",
+          );
+        }
+        break;
       // ── Issue #103 ──────────────────────────────────────────────
       // Both of these are OFF-switches for a default-on behaviour, and there
       // is deliberately no on-switch for either. Resume defaults on because
@@ -374,13 +470,24 @@ export function parseArgs(argv) {
  * never a fabricated $0, matching the same non-negotiable this repo applies
  * everywhere else a number could be silently wrong instead of loudly absent.
  *
+ * `storeDir` (issue #120) names the store these cumulative figures were read
+ * OUT OF. Since --results-dir made the store selectable, "study-to-date" is
+ * no longer a single unambiguous number: a pilot invocation and a
+ * confirmatory invocation each have their own, and they are SUPPOSED to be
+ * different (that separation is the §11 guarantee). A cumulative total
+ * printed without its basis is therefore a number an operator can read as
+ * the wrong study's spend -- and --max-spend gates on that same number.
+ *
  * @param {object} summary  runSpec()'s returned `summary` (absent on a
  *   `--dry-run` invocation, which returns `{ dryRun }` instead -- callers
  *   should not call this function for that case)
+ * @param {object} [o]
+ *   @param {string} [o.storeDir] the store the cumulative figures came from
  * @returns {string[]} lines, one per `console.log`/`log()` call
  */
-export function formatSpendSummary(summary) {
+export function formatSpendSummary(summary, { storeDir } = {}) {
   if (!summary) return [];
+  const inStore = storeDir ? ` in store ${storeDir}` : "";
   const lines = [];
   const fmt = (usd) => `$${Number(usd).toFixed(4)}`;
   const byProviderLine = (label, obj) => {
@@ -398,10 +505,10 @@ export function formatSpendSummary(summary) {
   // leaves it `undefined` -- both mean the same thing here ("nothing to
   // show"), and this function must not crash on either.
   if (summary.cumulativeSpendByProvider == null) {
-    lines.push("[spend] --- cumulative (study-to-date) --- NOT COMPUTED");
+    lines.push(`[spend] --- cumulative (study-to-date${inStore}) --- NOT COMPUTED`);
     lines.push("[spend] no --max-spend/--max-spend-<provider> was requested this invocation, so the store's full cost history was not read. Pass a ceiling flag to see cumulative spend, or query spendToDate(store) directly.");
   } else {
-    lines.push("[spend] --- cumulative (study-to-date, across every prior invocation and configHash) ---");
+    lines.push(`[spend] --- cumulative (study-to-date${inStore}, across every prior invocation and configHash in THAT store only) ---`);
     lines.push(byProviderLine("[spend] by provider", summary.cumulativeSpendByProvider));
     const nonProviderModels = summary.cumulativeNonProviderModels || [];
     lines.push(`[spend] excluded (non-provider, e.g. embedder): ${fmt(summary.cumulativeNonProviderSpendUsd)}` + (nonProviderModels.length ? ` (${nonProviderModels.join(", ")})` : ""));
@@ -489,6 +596,33 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   } = deps;
   const args = parseArgs(argv);
 
+  // ── Which store (issue #120) ──────────────────────────────────────────
+  // Resolved ONCE, before any mode branches, and used by all four of them
+  // (--prune, --phase 0, --dry-run, a real run). Resolving it here rather
+  // than at each `new ResultsStore(...)` site is what makes it impossible
+  // for a mode to be added later that silently keeps the default.
+  if (injectedStore && args.resultsDir !== undefined) {
+    // Precedence stated out loud instead of one silently winning. A real CLI
+    // invocation never injects, so this can only fire in a test -- where a
+    // no-op flag is exactly the thing that would make a --results-dir test
+    // pass without --results-dir doing anything.
+    throw new Error(
+      "run.mjs: --results-dir and an injected store are mutually exclusive -- the injected store already fixes " +
+        "the directory, so honouring the flag would silently do nothing.",
+    );
+  }
+  const storeDir = injectedStore ? null : resolveStoreDir(args.resultsDir);
+  const openStore = () => injectedStore || new ResultsStore(storeDir);
+  // What every mode's report says it read. `spendToDate()` is cumulative
+  // over the store IN USE, so an operator running the pilot must never read
+  // a total that silently includes the main store (or vice versa) -- and
+  // --max-spend gates on precisely that number.
+  const storeLabel = injectedStore
+    ? (typeof injectedStore.dir === "string" ? injectedStore.dir : "(injected store)")
+    : storeDir;
+  const storeOrigin = injectedStore ? "injected" : args.resultsDir === undefined ? "default" : "--results-dir";
+  log(`[store] results store: ${storeLabel} (${storeOrigin})`);
+
   // ── --prune (issue #98) ───────────────────────────────────────────────
   // Handled FIRST, and returning before anything else: a prune reads and
   // rewrites a store, and that is all it does. It must not resolve
@@ -518,7 +652,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (args.dryRun && args.apply) {
       throw new Error("run.mjs: --dry-run and --apply contradict each other. --prune is dry-run by default; pass --apply only when you mean to modify the store.");
     }
-    const store = injectedStore || new ResultsStore(join(REPO_ROOT, "results"));
+    const store = openStore();
     const pruneOpts = {
       configHash: args.cfg,
       armIds: args.arms,
@@ -621,7 +755,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
           "  VOYAGE_API_KEY=... node evals/run.mjs --phase 0",
       );
     }
-    const store = injectedStore || new ResultsStore(join(REPO_ROOT, "results"));
+    const store = openStore();
     const summary = await runPhase0Fn({ apiKey, store });
     const { lines, allPassed } = formatPhase0Report(summary);
     for (const line of lines) console.log(line);
@@ -781,7 +915,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     },
   };
 
-  const store = injectedStore || new ResultsStore(join(REPO_ROOT, "results"));
+  const store = openStore();
 
   // Provider wiring: --dry-run calls nothing (provider: undefined, unchanged
   // from before #19 -- runSpec() only requires a provider when !dryRun -- see
@@ -929,7 +1063,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // instead, and --dry-run already prints its own projection via `log` --
   // see runner.mjs's dry-run branch), so formatSpendSummary's own
   // `if (!summary) return []` guard makes this a no-op there.
-  for (const line of formatSpendSummary(result && result.summary)) log(line);
+  for (const line of formatSpendSummary(result && result.summary, { storeDir: storeLabel })) log(line);
   // Judge payment abort notice (issue #106). Without this the abort is
   // INVISIBLE: runner.mjs logs #88's `[run] ABORTED:` line for a
   // GENERATION-side refusal, but a judge-side one only moves a count inside
