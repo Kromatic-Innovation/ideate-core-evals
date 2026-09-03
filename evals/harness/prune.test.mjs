@@ -983,6 +983,61 @@ test("#115: fold -> evict -> fold -- a salvage written after a fold never reuses
   );
 });
 
+test("#115: a salvage already folded into a compacted record is still recognised as reused -- the compacted branch of the idempotency check", (t) => {
+  const store = tempStore(t);
+  const cellK = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+
+  // Two independent real failures of the same cell, each cleanly evicted (so
+  // salvaged) on its own -- attempt=0 carries S1, attempt=1 carries S2.
+  const S1 = "2026-09-01T00:00:00.000Z";
+  const S2 = "2026-09-02T00:00:00.000Z";
+  putCell(store, { briefId: "b1", state: "failed", kind: "rate_limited", storedAt: S1 });
+  pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null });
+  putCell(store, { briefId: "b1", state: "failed", kind: "rate_limited", storedAt: S2 });
+  pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null });
+  assert.deepEqual(
+    store.keys().sort(),
+    [`pruned-cell|cell=${cellK}|attempt=0`, `pruned-cell|cell=${cellK}|attempt=1`].sort(),
+    "precondition: two raw salvage records",
+  );
+
+  // FOLD: keepAttempts=1 folds the OLDEST (attempt=0, identity S1) into a
+  // compacted record and leaves attempt=1 raw. S1's identity now lives ONLY
+  // in `prunedFromStoredAts` on the compacted record -- nowhere raw.
+  pruneStore(store, { keepAttempts: 1 });
+  assert.ok(store.has(`pruned-cell-compacted|cell=${cellK}|through=0`), "attempt=0 folded into a compacted record");
+  assert.ok(store.has(`pruned-cell|cell=${cellK}|attempt=1`), "attempt=1 (S2) stays raw");
+
+  // RESUME: the cell reappears with the SAME identity (S1) the now-folded
+  // salvage already accounts for -- exactly what an interrupted prune
+  // resuming looks like once a fold has run between the salvage write and
+  // the cell removal that never happened.
+  const unit = spendToDate(store).totalUsd / 2; // two salvaged evictions' worth, priced identically
+  const key = putCell(store, { briefId: "b1", state: "failed", kind: "rate_limited", storedAt: S1 });
+  const before = spendToDate(store); // the resumed cell's row duplicates money the compacted record already holds
+  assert.ok(
+    Math.abs(before.totalUsd - 3 * unit) <= 1e-9,
+    `precondition: the resumed cell's row is a real (if temporary) double-count -- $${3 * unit} expected, got $${before.totalUsd}`,
+  );
+  const keysBefore = store.keys().length;
+
+  pruneStore(store, { kinds: ["rate_limited"], keepAttempts: 1 });
+
+  assert.equal(store.has(key), false, "the resumed cell is still removed");
+  assert.equal(
+    store.has(`pruned-cell|cell=${cellK}|attempt=2`),
+    false,
+    "the compacted branch must recognise S1 as already covered -- no new salvage slot is allocated",
+  );
+  assert.equal(store.keys().length, keysBefore - 1, "only the cell itself goes -- no salvage record is added");
+  const after = spendToDate(store);
+  assert.ok(
+    Math.abs(after.totalUsd - 2 * unit) <= 1e-9,
+    `recognising S1 as already covered must drop the resumed cell's row as a duplicate, converging back to the two real salvages: ` +
+      `$${2 * unit} expected, got $${after.totalUsd}`,
+  );
+});
+
 test("#115: a pruned-cell fold whose rows straddle a dated rate change is abandoned, not mispriced (#98/#108 precedent)", (t) => {
   const store = tempStore(t);
   const cellK = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
