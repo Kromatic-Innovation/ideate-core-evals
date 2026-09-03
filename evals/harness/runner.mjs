@@ -2447,12 +2447,21 @@ export async function runSpec(spec, opts) {
     (summary.judge && summary.judge.skippedByReason && summary.judge.skippedByReason.payment_required) || 0;
   summary.judgePaymentAbort = judgeRefused || judgeUnattempted ? { refused: judgeRefused, skipped: judgeUnattempted } : null;
   if (summary.judgePaymentAbort) {
+    // #106 first put a notice for this condition in evals/run.mjs, before
+    // this summary knew the refused/skipped split -- it could only say the
+    // abort was "entirely billing", not how it divided. #116 deleted that
+    // duplicate (it fired on the same condition as this one, so a real
+    // judge-side billing refusal printed `[run] JUDGING ABORTED:` twice) and
+    // folded its two operator-actionable clauses that this notice lacked --
+    // the docs/retrying-failed-cells.md pointer and the spend-preserved
+    // sentence -- into the text below, so nothing #106 added is lost.
     log(
       `[run] JUDGING ABORTED: a judge account refused on billing/credit. ${judgeRefused} judge leg(s) were ` +
         `actually attempted and refused; a further ${judgeUnattempted} leg(s) were NOT attempted, because every ` +
         `later leg on that same account would have hit the identical wall. Nothing was called or spent for the ` +
         `unattempted ones. GENERATION was NOT stopped: those pools are stored, and the next invocation of the ` +
-        `same command judges them once the account is funded. Judge legs on any OTHER provider are unaffected.`,
+        `same command judges them once the account is funded. Judge legs on any OTHER provider are unaffected. ` +
+        `Spend already incurred is preserved; see docs/retrying-failed-cells.md.`,
     );
   }
   // spendByProvider: the ACTUAL per-provider total THIS INVOCATION spent,

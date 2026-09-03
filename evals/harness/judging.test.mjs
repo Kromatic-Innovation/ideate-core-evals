@@ -318,6 +318,78 @@ test("issue #112: an ORDINARY judge failure produces no payment abort and no ski
   );
 });
 
+// ── issue #116: the notice is actually PRINTED, exactly once, and carries
+// every clause from both of its former sources ──
+//
+// #106 first printed a `[run] JUDGING ABORTED:` notice from evals/run.mjs,
+// but its coverage (evals/run.test.mjs) drove a MOCKED runSpecFn returning a
+// synthetic summary -- runSpec()/runner.mjs never executed, so nothing ever
+// asserted the notice this file's code actually computes is ever emitted.
+// #112 added a second, better notice here in runner.mjs (the real
+// refused/skipped split), and this file's tests above assert the SHAPE of
+// summary.judgePaymentAbort -- but, same gap, nothing asserts the printed
+// string either. Net effect before #116: two notices fired on the same run
+// (a real duplication bug) and zero tests caught it, because every test that
+// exercised the real emitter ignored its log output (`silentLog`) and every
+// test that inspected log output ran against a mock that never reached the
+// emitter. These two tests run the real emitter (no mocked runSpecFn, no
+// silentLog) and read what it actually printed.
+
+test("issue #116: a judge-side billing refusal prints [run] JUDGING ABORTED: exactly once, carrying the split, the docs pointer, and the spend-preserved line", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+  const openaiJudge = new MockJudgeProvider({ failFor: new Map(JUDGE_MODELS.openai.map((m) => [m, { failureKind: "payment_required" }])) });
+  const lines = [];
+
+  const { summary } = await runSpec(SPEC, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge, openai: openaiJudge },
+    corpus: CORPUS,
+    log: (msg) => lines.push(msg),
+  });
+
+  // Same 4-pool grid as the mid-run test above: one openai leg actually
+  // refused (on the first pool), three short-circuited (the later pools).
+  assert.deepEqual(summary.judgePaymentAbort, { refused: 1, skipped: 3 }, "sanity: this scenario does trip the abort");
+
+  const abortLines = lines.filter((l) => l.includes("[run] JUDGING ABORTED:"));
+  assert.equal(abortLines.length, 1, "the notice must print EXACTLY ONCE per run -- two emitters firing on this same condition was the #116 bug");
+  const [notice] = abortLines;
+  assert.match(notice, /1 judge leg\(s\) were actually attempted and refused/, "the real refused count is in the PRINTED text, not only in the returned summary");
+  assert.match(notice, /a further 3 leg\(s\) were NOT attempted/, "the real skipped count is in the PRINTED text");
+  assert.doesNotMatch(notice, /cannot say how the total splits/, "the split IS known and printed in this same notice -- it must not also disclaim it (evals/run.mjs's deleted #106 wording)");
+  assert.match(notice, /docs\/retrying-failed-cells\.md/, "evals/run.mjs's doc pointer must survive the #116 fold-in");
+  assert.match(notice, /Spend already incurred is preserved/, "evals/run.mjs's spend-preserved sentence must survive the #116 fold-in");
+});
+
+test("issue #116: a run with no judge-side billing refusal prints no JUDGING ABORTED notice at all", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const provider = new MockProvider();
+  const anthropicJudge = new MockJudgeProvider();
+  const openaiJudge = new MockJudgeProvider();
+  const lines = [];
+
+  const { summary } = await runSpec(SPEC, {
+    store,
+    armsConfig: ARMS_CONFIG,
+    provider,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge, openai: openaiJudge },
+    corpus: CORPUS,
+    log: (msg) => lines.push(msg),
+  });
+
+  assert.equal(summary.judgePaymentAbort, null, "sanity: no billing refusal occurred in this scenario");
+  assert.ok(
+    !lines.some((l) => l.includes("[run] JUDGING ABORTED:")),
+    "no notice may print when nothing was refused -- the guarantee evals/run.test.mjs held (via a mocked runSpecFn) before #116 deleted that coverage along with the notice it mocked",
+  );
+});
+
 test("runSpec does NOT invoke judging when judgeModels is omitted -- generation-only callers/tests are unaffected", async (t) => {
   const store = new ResultsStore(tempDir(t));
   const provider = new MockProvider();
