@@ -141,14 +141,14 @@ test("a prune interrupted between the salvage write and the cell removal converg
   assert.throws(() => pruneStore(store, { kinds: ["rate_limited"] }), /SIMULATED CRASH/);
   store.remove = realRemove;
   assert.ok(store.has(key), "the cell is still there");
-  assert.ok(store.has(`pruned-cell|cell=${key}|pruned=0`), "and so is its salvage");
+  assert.ok(store.has(`pruned-cell|cell=${key}|attempt=0`), "and so is its salvage");
   assert.ok(Math.abs(spendToDate(store).totalUsd - 2 * oneSpend) <= 1e-9, "the window over-counts, which is the recoverable direction");
 
   // Re-running converges: the salvage is recognised as this cell record's
   // own, reused rather than duplicated, and the cell finally goes.
   pruneStore(store, { kinds: ["rate_limited"] });
   assert.equal(store.has(key), false);
-  assert.deepEqual(store.keys(), [`pruned-cell|cell=${key}|pruned=0`]);
+  assert.deepEqual(store.keys(), [`pruned-cell|cell=${key}|attempt=0`]);
   assert.ok(Math.abs(spendToDate(store).totalUsd - oneSpend) <= 1e-9, "back to exactly one spend");
 });
 
@@ -164,8 +164,8 @@ test("a cell that re-ran and failed identically gets its OWN salvage -- that is 
   // attempts were paid for.
   putCell(store, { state: "failed", kind: "rate_limited", storedAt: "2026-09-02T10:00:00.000Z" });
   pruneStore(store, { kinds: ["rate_limited"] });
-  assert.ok(store.has(`pruned-cell|cell=${key}|pruned=0`));
-  assert.ok(store.has(`pruned-cell|cell=${key}|pruned=1`));
+  assert.ok(store.has(`pruned-cell|cell=${key}|attempt=0`));
+  assert.ok(store.has(`pruned-cell|cell=${key}|attempt=1`));
   assert.ok(Math.abs(spendToDate(store).totalUsd - 2 * oneSpend) <= 1e-9, "both nights are counted");
 });
 
@@ -536,7 +536,7 @@ test("parseCellKey accepts a real cell key and rejects every side-ledger shape",
   const cell = cellKey({ armId: "A", briefId: "b1", replicate: 2, cfg: CFG });
   assert.deepEqual(parseCellKey(cell), { armId: "A", briefId: "b1", replicate: 2, cfg: CFG });
   assert.equal(parseCellKey(`generation-attempt|cell=${cell}|attempt=0`), null);
-  assert.equal(parseCellKey(`pruned-cell|cell=${cell}|pruned=0`), null);
+  assert.equal(parseCellKey(`pruned-cell|cell=${cell}|attempt=0`), null);
   assert.equal(parseCellKey("phase0|dat|2026-09-01"), null);
 });
 
@@ -877,4 +877,143 @@ test("supersede is blind to a retired record's cell status -- a decision, not an
   assert.equal(remaining.length, 1, "still just the highest-attempt record -- retired or not, keepBatchReplays alone decides");
   assert.ok(remaining[0].endsWith("|attempt=3"));
   assert.equal(readBatchResumeRecord(store, cell).retired, true, "and it is the retired tombstone, correctly reported as such");
+});
+
+// ── #115: pruned-cell joins ATTEMPT_FAMILIES -- allocator + idempotency ────
+//
+// `salvageEvictedCellSpend` used to allocate its `pruned-cell|cell=…|pruned=N`
+// slot by scanning from n=0 for the first FREE slot -- safe only while
+// nothing ever freed one. Once `pruned-cell` joined the compacted families
+// (below), a fold routinely frees the low slots, and the naive fix (copy
+// #98/#108's max+1 allocator) collides with the idempotency check's own
+// identity field (`prunedFromStoredAt`), which a fold does not preserve.
+// Both halves moved together -- see salvageEvictedCellSpend's own header in
+// runner.mjs. These tests drive REAL evictions and folds through pruneStore,
+// never a synthetic fixture, for the same reason putAttempt/meterJudge/
+// putReplay do above: the whole defect was a disagreement between what a
+// writer numbers and what the pruner assumes, and a fixture that reimplements
+// the key shape cannot catch that disagreement.
+
+test("#115: pruned-cell is a first-class ATTEMPT_FAMILIES member -- compacted through the SAME grammar, not a fourth scheme", () => {
+  assert.ok(ATTEMPT_FAMILIES.includes("pruned-cell"), "alongside generation-attempt / metrics-attempt / judge-call");
+});
+
+test("#115: a compacted pruned-cell record carries the FULL set of physical identities it folded, not just the newest", (t) => {
+  const store = tempStore(t);
+  const cellK = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  const stamps = [];
+  for (let n = 0; n < 3; n++) {
+    const storedAt = `2026-09-0${n + 1}T00:00:00.000Z`;
+    stamps.push(storedAt);
+    putCell(store, { briefId: "b1", state: "failed", kind: "rate_limited", storedAt });
+    pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null }); // one eviction at a time, no compaction yet
+  }
+
+  pruneStore(store, { keepAttempts: 1 }); // folds the two oldest (0, 1); attempt=2 stays raw (newest, kept)
+
+  const compactedKey = `pruned-cell-compacted|cell=${cellK}|through=1`;
+  assert.ok(store.has(compactedKey), "precondition: the fold produced the expected compacted key");
+  const body = store.get(compactedKey);
+  assert.deepEqual(
+    (body.result.prunedFromStoredAts || []).slice().sort(),
+    stamps.slice(0, 2).sort(),
+    "the fold's identity set is exactly the two records it actually folded -- not the one it kept raw, and not lost entirely",
+  );
+});
+
+test("#115: fold -> evict -> fold -- a salvage written after a fold never reuses a slot the fold just freed, and no spend is lost", (t) => {
+  const store = tempStore(t);
+  const cellK = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  let unit = null;
+
+  // Three independent real failures of the SAME cell, each cleanly evicted
+  // (and so salvaged) on its own -- exactly the "gets its OWN salvage" test
+  // above, three times over, to build up a pile worth folding.
+  for (let n = 0; n < 3; n++) {
+    putCell(store, { briefId: "b1", state: "failed", kind: "rate_limited", storedAt: `2026-09-0${n + 1}T00:00:00.000Z` });
+    if (unit === null) unit = spendToDate(store).totalUsd; // one real failure's worth, captured once
+    pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null });
+  }
+  assert.deepEqual(
+    store.keys().sort(),
+    [0, 1, 2].map((n) => `pruned-cell|cell=${cellK}|attempt=${n}`).sort(),
+    "precondition: three raw salvage records, numbered by the writer itself",
+  );
+
+  // ── FOLD: bound the pile. keepAttempts=1 folds the two OLDEST (0, 1) into
+  // one compacted record and leaves the newest (2) raw -- freeing slots 0
+  // and 1, exactly the shape the issue's reproduction needs: a fold frees
+  // LOW slots while a higher one stays occupied.
+  const keysBefore = store.keys().length;
+  const before = spendToDate(store);
+  pruneStore(store, { keepAttempts: 1 });
+  assert.ok(store.has(`pruned-cell-compacted|cell=${cellK}|through=1`), "0 and 1 folded together");
+  assert.ok(store.has(`pruned-cell|cell=${cellK}|attempt=2`), "2 is under the retention bound and stays raw");
+  assert.equal(store.keys().filter((k) => k.startsWith("pruned-cell")).length, 2, "slots 0 and 1 are gone -- freed");
+
+  // ── EVICT: a fourth, genuinely new failure of the same cell. Under the
+  // bug this issue names, a scan-from-zero allocator would find slot 0 free
+  // (the fold just freed it) and reuse it -- writing NEW real money under a
+  // `through=0` that the NEXT compaction would sort BELOW the already-
+  // compacted `through=1` record, excluding it from `contributors` while
+  // still removing it. The fix must allocate max+1 instead.
+  putCell(store, { briefId: "b1", state: "failed", kind: "rate_limited", storedAt: "2026-09-04T00:00:00.000Z" });
+  pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null });
+  assert.ok(
+    store.has(`pruned-cell|cell=${cellK}|attempt=3`),
+    "the new salvage is numbered ONE PAST THE MAX (through=1 compacted, attempt=2 raw) -- never a freed low slot",
+  );
+  assert.equal(store.has(`pruned-cell|cell=${cellK}|attempt=0`), false, "slot 0 must stay dead -- reusing it is exactly the bug");
+
+  // ── FOLD again: the money from ALL FOUR failures must still be exactly
+  // accounted for, and the record count -- across the WHOLE fold -> evict ->
+  // fold sequence, not any single step -- must have gone down, not up.
+  // Either assertion alone passes trivially (spend survives if nothing is
+  // ever removed; the count falls if money is silently dropped); only the
+  // conjunction is this operation's actual contract.
+  pruneStore(store, { keepAttempts: 1 });
+  const keysAfter = store.keys().length;
+  const after = spendToDate(store);
+
+  assert.ok(keysAfter < keysBefore, `the sequence must shrink the store (${keysBefore} -> ${keysAfter})`);
+  assert.ok(
+    Math.abs(after.totalUsd - (before.totalUsd + unit)) <= 1e-9,
+    `spend must equal the three original failures plus the one new one, with nothing dropped by either fold: ` +
+      `$${before.totalUsd} + $${unit} expected, got $${after.totalUsd}`,
+  );
+});
+
+test("#115: a pruned-cell fold whose rows straddle a dated rate change is abandoned, not mispriced (#98/#108 precedent)", (t) => {
+  const store = tempStore(t);
+  const cellK = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  assert.ok(RATE_TABLE["claude-sonnet-5"].introUntil, "precondition: the straddle fixture needs a model with a dated rate change");
+  const STRADDLE_MODEL = "claude-sonnet-5";
+  const beforeIntroEnd = "2026-08-30T00:00:00Z";
+  const afterIntroEnd = "2026-09-01T00:00:00Z";
+
+  // Four real failures, alternating sides of the dated rate change, each
+  // cleanly evicted on its own so the pile is four RAW pruned-cell records
+  // before the fold under test runs.
+  for (let n = 0; n < 4; n++) {
+    putCell(store, {
+      briefId: "b1",
+      state: "failed",
+      kind: "rate_limited",
+      storedAt: `2026-09-0${n + 1}T00:00:00.000Z`,
+      rows: [row(cellK, { model: STRADDLE_MODEL, timestamp: n % 2 === 0 ? beforeIntroEnd : afterIntroEnd })],
+    });
+    pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null });
+  }
+
+  const before = spendToDate(store);
+  const keysBefore = store.keys().length;
+  const result = pruneStore(store, { keepAttempts: 1 });
+
+  const c = result.plan.compactions.find((x) => x.family === "pruned-cell");
+  assert.ok(c, "a pruned-cell compaction was planned");
+  assert.equal(c.rowsFolded, false, "the fold was abandoned");
+  assert.match(c.foldSkippedReason, /reprice/);
+  assert.equal(c.rows.length, c.rowsBefore, "every original row survives verbatim, unfolded");
+  assert.ok(store.keys().length < keysBefore, "but the record count still comes down -- the bound is the point");
+  assertSpendPreserved(spendToDate(store), before, "an abandoned fold must still preserve the ledger exactly");
 });

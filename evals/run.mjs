@@ -269,7 +269,7 @@ export function formatPrunePlan(plan, { applied = false } = {}) {
     lines.push(
       `[prune] EVICT ${verb} cell ${e.key}  state=${e.state}${e.kind ? ` kind=${e.kind}` : ""}  ` +
         (e.costRows.length
-          ? `(${e.costRows.length} cost row(s) re-homed under pruned-cell|cell=${e.key}|pruned=N — the money stays)`
+          ? `(${e.costRows.length} cost row(s) re-homed under pruned-cell|cell=${e.key}|attempt=N — the money stays)`
           : "(no cost rows to preserve)"),
     );
   }
