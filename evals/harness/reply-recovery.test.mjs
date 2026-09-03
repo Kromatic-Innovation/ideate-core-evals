@@ -51,9 +51,10 @@ import {
   withCellMaxTokens,
 } from "./provider.mjs";
 import {
+  DEFAULT_TOKENS_PER_IDEA,
   LEGACY_MAX_TOKENS,
   MAX_TOKENS_HEADROOM,
-  TOKENS_PER_IDEA,
+  TOKENS_PER_IDEA_BY_MODEL,
   maxTokensForIdeas,
   promptTemplateHash,
   salvageCandidateArray,
@@ -67,6 +68,16 @@ const silentLogger = () => {};
 
 /** The observed worst-case clean output length for a 30-idea arm-A reply. */
 const OBSERVED_MAX_OUTPUT_TOKENS_30 = 1857;
+
+/** Issue #122: the observed worst-case output length for a real arm-D
+ *  (Opus) round-2 reply (6 ideas) -- the live measurement TOKENS_PER_IDEA_BY_MODEL's
+ *  "claude-opus-5" entry (558) is derived from. Independent of that constant
+ *  on purpose (like OBSERVED_MAX_OUTPUT_TOKENS_30 above): a test that reads
+ *  the constant under test to build its own expectation is not a regression
+ *  guard on the MEASUREMENT, only on the arithmetic. See prompts.mjs's
+ *  TOKENS_PER_IDEA_BY_MODEL doc comment for how this number was obtained
+ *  (driving arm D's real generate() call end-to-end, not a synthetic probe). */
+const OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6 = 3346;
 
 function armsConfigFor(...armIds) {
   const arms = {};
@@ -212,21 +223,38 @@ function runArm(armId, fetchImpl) {
 // AC 1 — max_tokens scales with what the arm asks for
 // ════════════════════════════════════════════════════════════════════════════
 
-test("#93 AC1: maxTokensForIdeas gives a 30-idea request 2x-3x headroom over the observed 1857-token worst case", () => {
-  const solo = maxTokensForIdeas(30);
+test("#93 AC1: maxTokensForIdeas gives a 30-idea Sonnet request 2x-3x headroom over the observed 1857-token worst case", () => {
+  const solo = maxTokensForIdeas(30, "claude-sonnet-5");
   assert.ok(solo >= 2 * OBSERVED_MAX_OUTPUT_TOKENS_30, `${solo} must be at least 2x ${OBSERVED_MAX_OUTPUT_TOKENS_30}`);
   assert.ok(solo <= 3 * OBSERVED_MAX_OUTPUT_TOKENS_30, `${solo} must be at most 3x ${OBSERVED_MAX_OUTPUT_TOKENS_30}`);
   // And explicitly NOT the "+10%" the issue body ruled out.
   assert.ok(solo > 1.1 * LEGACY_MAX_TOKENS);
-  assert.equal(solo, Math.ceil(30 * TOKENS_PER_IDEA * MAX_TOKENS_HEADROOM));
+  assert.equal(solo, Math.ceil(30 * TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"] * MAX_TOKENS_HEADROOM));
 });
 
-test("#93 AC1: a 6-idea (panel) request still computes to EXACTLY the legacy 2048 — comparability with run #8", () => {
+test("#122: maxTokensForIdeas gives a 6-idea Opus request 2x-3x headroom over the observed 3346-token real-run worst case", () => {
+  // The Opus counterpart of the Sonnet test above -- and independent of
+  // TOKENS_PER_IDEA_BY_MODEL["claude-opus-5"] for the same reason: a test that
+  // reads the constant under test to build its own expected value cannot catch
+  // a bad edit to that constant, only a bad edit to the arithmetic around it.
+  const panel = maxTokensForIdeas(6, "claude-opus-5");
+  assert.ok(
+    panel >= 2 * OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6,
+    `${panel} must be at least 2x ${OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6}`,
+  );
+  assert.ok(
+    panel <= 3 * OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6,
+    `${panel} must be at most 3x ${OBSERVED_OPUS_ROUND2_OUTPUT_TOKENS_6}`,
+  );
+  assert.ok(panel > LEGACY_MAX_TOKENS, "the whole point of #122: Opus's real ceiling must clear the pre-#122 flat floor");
+});
+
+test("#93 AC1: a 6-idea (panel) Sonnet request still computes to EXACTLY the legacy 2048 — comparability with run #8", () => {
   // The floor is the whole comparability argument: arms B–H and A' must send
   // byte-identical requests to the ones run #8 sent, so only arm A's cells
   // become non-comparable. If this ever fails, every arm's #8 data is affected.
-  assert.equal(maxTokensForIdeas(armsConfigJson.panel.ideasPerAgent), LEGACY_MAX_TOKENS);
-  assert.equal(maxTokensForIdeas(6), 2048);
+  assert.equal(maxTokensForIdeas(armsConfigJson.panel.ideasPerAgent, "claude-sonnet-5"), LEGACY_MAX_TOKENS);
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5"), 2048);
 });
 
 test("#93 AC1: maxTokensForCell degrades safely on an empty/garbage agent list (never -Infinity or NaN)", () => {
@@ -236,28 +264,51 @@ test("#93 AC1: maxTokensForCell degrades safely on an empty/garbage agent list (
     const v = maxTokensForCell(input);
     assert.ok(Number.isFinite(v) && v >= LEGACY_MAX_TOKENS, `maxTokensForCell(${JSON.stringify(input)}) = ${v}`);
   }
-  assert.equal(maxTokensForCell([{ ideasPerAgent: 6 }, { ideasPerAgent: 30 }]), maxTokensForIdeas(30));
+  assert.equal(
+    maxTokensForCell([{ ideasPerAgent: 6, model: "claude-sonnet-5" }, { ideasPerAgent: 30, model: "claude-sonnet-5" }]),
+    maxTokensForIdeas(30, "claude-sonnet-5"),
+  );
 });
 
-test("#93 AC1: arm A's live batch request carries the scaled max_tokens; arm B's still carries exactly 2048", async () => {
+test("#93 AC1: arm A's live batch request carries the scaled max_tokens; arm B's carries its own (Haiku-fallback) ceiling", async () => {
   const capA = {};
   await runArm("A", anthropicBatchFetch({ reply: cleanReply(30), capture: capA }));
   assert.equal(capA.requests.length, 1);
-  assert.equal(capA.requests[0].params.max_tokens, maxTokensForIdeas(30));
+  assert.equal(capA.requests[0].params.max_tokens, maxTokensForIdeas(30, "claude-sonnet-5"));
   assert.ok(capA.requests[0].params.max_tokens >= 3700);
 
+  // Arm B (homogeneous Haiku) has no measured Haiku rate (issue #122 -- not
+  // remeasured, see prompts.mjs's header comment), so it falls back to
+  // DEFAULT_TOKENS_PER_IDEA, the same generous ceiling Opus gets. That is
+  // NOT "arm B now behaves like arm D" -- Haiku still writes whatever it
+  // writes; only the unused CEILING moved, which costs nothing (see
+  // prompts.mjs: "max_tokens is a CEILING, not a target").
   const capB = {};
   await runArm("B", anthropicBatchFetch({ reply: cleanReply(6), capture: capB }));
   assert.equal(capB.requests.length, 5);
-  for (const r of capB.requests) assert.equal(r.params.max_tokens, 2048);
+  for (const r of capB.requests) assert.equal(r.params.max_tokens, maxTokensForIdeas(6, "claude-haiku-4-5"));
 });
 
-test("#93 AC1: every panel arm in arms.config.json still sends exactly 2048; only arm A changes", () => {
+test("#93/#122 AC1: every panel arm in arms.config.json sends its OWN model's computed ceiling; only models above the floor change", () => {
   for (const [id, arm] of Object.entries(armsConfigJson.arms)) {
     const { agents } = resolveIdeateAgents(arm, armsConfigJson);
     const got = maxTokensForCell(agents);
-    if (arm.mode === "solo") assert.equal(got, maxTokensForIdeas(arm.totalIdeasRequested), `arm ${id}`);
-    else assert.equal(got, LEGACY_MAX_TOKENS, `arm ${id} must be unchanged from run #8`);
+    if (arm.mode === "solo") {
+      assert.equal(got, maxTokensForIdeas(arm.totalIdeasRequested, agents[0].model), `arm ${id}`);
+    } else {
+      // Per-model max across the panel's slots. Only claude-sonnet-5 has its
+      // own measured rate that computes BELOW the floor at ideasPerAgent 6
+      // (930 < 2048) -- every other model (Opus: measured above the floor;
+      // Haiku/GPT tiers: no measurement, so DEFAULT_TOKENS_PER_IDEA, which
+      // also computes above the floor) raises the cell's ceiling. So arm C
+      // (pure Sonnet) is the ONLY panel arm unchanged from run #8; every arm
+      // with even one non-Sonnet slot (B, D, E, F, G, H, A') is raised.
+      const expected = Math.max(...agents.map((a) => maxTokensForIdeas(a.ideasPerAgent, a.model)));
+      assert.equal(got, expected, `arm ${id}`);
+      const allSonnet = agents.every((a) => a.model === "claude-sonnet-5");
+      if (allSonnet) assert.equal(got, LEGACY_MAX_TOKENS, `arm ${id} is pure Sonnet and must be unchanged from run #8`);
+      else assert.ok(got > LEGACY_MAX_TOKENS, `arm ${id} has a non-Sonnet slot and must be raised above the floor`);
+    }
   }
 });
 
@@ -550,7 +601,7 @@ function openaiProvider(armId, fetchImpl) {
   });
 }
 
-test("#93 OpenAI: a panel arm still requests exactly 2048 max_completion_tokens", async () => {
+test("#93/#122 OpenAI: a panel arm requests its model's computed ceiling (gpt-5.6-terra is unmeasured -> the generous fallback)", async () => {
   const capture = {};
   const resp = await openaiProvider("H", openaiSingleFetch({ reply: cleanReply(6), capture })).generate(
     cellFor("H"),
@@ -558,7 +609,7 @@ test("#93 OpenAI: a panel arm still requests exactly 2048 max_completion_tokens"
     { mode: "single" },
   );
   assert.equal(resp.terminalState, "completed");
-  assert.equal(capture.body.max_completion_tokens, 2048);
+  assert.equal(capture.body.max_completion_tokens, maxTokensForIdeas(6, "gpt-5.6-terra"));
 });
 
 test("#93 OpenAI: a solo-shaped arm gets the scaled ceiling, and salvage + truncation detection both work", async () => {
@@ -571,7 +622,7 @@ test("#93 OpenAI: a solo-shaped arm gets the scaled ceiling, and salvage + trunc
     armsConfigJson.arms.A,
     { mode: "single" },
   );
-  assert.equal(capture.body.max_completion_tokens, maxTokensForIdeas(30));
+  assert.equal(capture.body.max_completion_tokens, maxTokensForIdeas(30, "claude-sonnet-5"));
   assert.equal(resp.terminalState, "completed");
   assert.equal(resp.result.candidates.length, 28);
   assert.equal(resp.diagnostics[0].truncated, true);
@@ -621,7 +672,8 @@ test("#93 comparability: promptTemplateHash covers prompt TEXT, the sizing const
     round2: prompts.buildRound2Prompt(probe),
     round1Defaults: prompts.buildRound1Prompt(),
     round2Defaults: prompts.buildRound2Prompt(),
-    tokensPerIdea: prompts.TOKENS_PER_IDEA,
+    tokensPerIdeaByModel: prompts.TOKENS_PER_IDEA_BY_MODEL,
+    defaultTokensPerIdea: prompts.DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: prompts.MAX_TOKENS_HEADROOM,
     legacyMaxTokens: prompts.LEGACY_MAX_TOKENS,
     salvageVersion: prompts.SALVAGE_VERSION,

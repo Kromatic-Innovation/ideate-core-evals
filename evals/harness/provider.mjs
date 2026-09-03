@@ -639,14 +639,16 @@ export function realizedAgents(ideateResult) {
 /**
  * The per-cell max_tokens ceiling: the largest any of this cell's agents could
  * need. Cells are homogeneous in ideasPerAgent today (solo: totalIdeasRequested;
- * panel: panel.ideasPerAgent for every slot), so this is just "what this arm
- * asks for" -- taking the max keeps it correct if that ever stops holding.
- * Guards the empty-agents case explicitly: `Math.max(...[])` is -Infinity.
+ * panel: panel.ideasPerAgent for every slot), but NOT homogeneous in model
+ * (arms E/F/G/H mix models per slot) -- so this takes the max across each
+ * agent's OWN model-aware sizing (issue #122), not one ideas count applied to
+ * a single flat rate. Guards the empty-agents case explicitly: `Math.max(...[])`
+ * is -Infinity.
  */
 export function maxTokensForCell(agents) {
   const list = Array.isArray(agents) ? agents.filter(Boolean) : [];
   if (list.length === 0) return maxTokensForIdeas(undefined);
-  return Math.max(...list.map((a) => maxTokensForIdeas(a.ideasPerAgent)));
+  return Math.max(...list.map((a) => maxTokensForIdeas(a.ideasPerAgent, a.model)));
 }
 
 // ══ BATCH RESUME (issue #103) ══════════════════════════════════════
