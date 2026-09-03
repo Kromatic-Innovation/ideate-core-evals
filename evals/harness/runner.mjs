@@ -216,15 +216,29 @@ function resolvedModelsFor(arm) {
  * Build cost rows for a completed cell's tokens, in whatever shape the
  * provider returned (single-model `model` + token fields, or multi-model
  * `tokens_by_model` for the mixed arms) -- costRow() accepts either.
+ *
+ * `pricingRegime` (issue #119) stamps the FACT of which rate this call must
+ * price at -- "batch" or "single" -- onto the row at write time, covering
+ * BOTH shapes (a `tokens_by_model` row is one generation call spanning
+ * several models, all made under the SAME provider mode, so one regime value
+ * for the whole row is correct, exactly like `billing_mode` already applies
+ * uniformly across a `tokens_by_model` row).
+ *
+ * Passing the CURRENT invocation's `pricingLever` is correct even for a
+ * REPLAYED response: `loadBatchResumeState` above refuses to hand back
+ * replay state whose recorded `pricingLever` disagrees with this
+ * invocation's (see that function's header) -- so by the time `response`
+ * reaches here, whatever regime the tokens were actually billed under is
+ * GUARANTEED to equal `pricingLever`, replayed or freshly submitted alike.
  */
-function costRowsFor(cellKey, tokens, timestamp) {
+function costRowsFor(cellKey, tokens, timestamp, pricingRegime) {
   if (!tokens) return [];
   const billing_mode = "api"; // this study is real metered spend (§7)
   if (tokens.tokens_by_model) {
-    return [costRow({ cellKey, timestamp, billing_mode, tokens_by_model: tokens.tokens_by_model })];
+    return [costRow({ cellKey, timestamp, billing_mode, pricing_regime: pricingRegime, tokens_by_model: tokens.tokens_by_model })];
   }
   if (tokens.model) {
-    return [costRow({ cellKey, timestamp, billing_mode, ...tokens })];
+    return [costRow({ cellKey, timestamp, billing_mode, pricing_regime: pricingRegime, ...tokens })];
   }
   return [];
 }
@@ -313,6 +327,30 @@ function pricingLeverFor(batch) {
  * reconciliation would catch, but priced at the wrong RATE, which looks
  * entirely plausible in a total. Money accounted correctly beats money saved,
  * so the mismatch declines to replay and says so out loud.
+ *
+ * ── #119 revisit: still necessary, NOT relaxed ────────────────────────────
+ * Issue #119 asked whether this guard is now over-strict, now that a cost
+ * row carries its own `pricing_regime` instead of relying on a store-wide
+ * flag. It is not, and the reason is a granularity mismatch this function's
+ * own signature exposes: `pricingLever` here is ONE value for the whole
+ * invocation, and `costRowsFor` stamps that ONE value onto a whole
+ * response's cost row(s) (see its own header -- correct today only BECAUSE
+ * this guard makes "replayed" and "this invocation's mode" the same value
+ * whenever a reply is actually replayed). A resumed cell's `response` can in
+ * principle mix REPLAYED batch-produced replies with NEWLY-submitted
+ * current-mode replies within the SAME response (some outstanding batch
+ * handles resolve, others are re-issued) -- nothing between the provider and
+ * `costRowsFor` currently tracks which reply came from which regime at that
+ * finer grain. Relaxing this guard would let exactly that mixed response
+ * through, and `costRowsFor` would still stamp its ONE row with the CURRENT
+ * invocation's `pricingLever` -- silently mis-pricing whichever replies were
+ * actually replayed from the other regime, reintroducing the ~2x hazard
+ * this guard exists to prevent, just moved one level down. Relaxing it
+ * safely would require the provider layer to report, per reply, which
+ * regime it actually came from -- a real change, out of this issue's stated
+ * scope ("one field on costRow(), plus reading it in priceRows"). No test
+ * added here proves relaxation safe, so per this issue's own instruction the
+ * guard is LEFT AS IS.
  */
 function loadBatchResumeState(store, cell, pricingLever, log) {
   const record = readBatchResumeRecord(store, cell.key);
@@ -539,11 +577,26 @@ function sumTokensInto(target, tokens) {
  * attempts, WITHOUT changing what the ledger prices.
  *
  * Rows are grouped by the tuple that pricing is a linear function of —
- * `(cellKey, billing_mode, model)` for a single-model row, and
- * `(cellKey, billing_mode, <the exact model key-set>)` for a `tokens_by_model`
- * row. A `tokens_by_model` row is never reshaped into N single-model rows:
- * that would be an untested assumption about how `priceRow` treats the two
- * shapes, and this function's whole job is to not assume.
+ * `(cellKey, billing_mode, pricing_regime, model)` for a single-model row,
+ * and `(cellKey, billing_mode, pricing_regime, <the exact model key-set>)`
+ * for a `tokens_by_model` row. A `tokens_by_model` row is never reshaped into
+ * N single-model rows: that would be an untested assumption about how
+ * `priceRow` treats the two shapes, and this function's whole job is to not
+ * assume.
+ *
+ * `pricing_regime` joined the group key in #119: two rows that would
+ * otherwise fold together (same cell, billing mode, model) but were billed
+ * under DIFFERENT regimes must never be summed into one row — that row could
+ * only carry ONE `pricing_regime`, so folding across a mismatch would either
+ * silently overwrite one row's regime with the other's (mis-pricing the
+ * overwritten one by ~2x on the next read) or fabricate a regime for
+ * whichever row lacked one. A row with NO `pricing_regime` at all (a legacy
+ * row) forms its own group too, for the identical reason: it must never be
+ * folded together with a fact-bearing row, which would launder a recorded
+ * fact and a stated assumption into one indistinguishable number. Because
+ * `pricing_regime` (present or absent) is read straight off `row` before any
+ * folding happens, this falls out of adding it to the key -- no separate
+ * "same regime" check is needed.
  *
  * The folded set is then PRICED and compared against the original. If the
  * two disagree by more than floating-point noise — the `introUntil` boundary
@@ -558,20 +611,25 @@ export function foldCostRows(rows, rateTable = DEFAULT_RATE_TABLE, { batch = tru
   const groups = new Map(); // groupKey -> { row, timestamp }
   const passthrough = [];
   for (const row of rows) {
-    const { cellKey, timestamp, billing_mode, model, tokens_by_model, ...tokens } = row;
+    // `pricing_regime` is pulled out EXPLICITLY, never left to fall into
+    // `...tokens` -- `sumTokensInto` below only ever copies
+    // FOLDABLE_TOKEN_FIELDS, so a regime left inside `tokens` would be
+    // silently dropped off every folded row, quietly turning a fact-bearing
+    // row back into a legacy-shaped one (issue #119).
+    const { cellKey, timestamp, billing_mode, pricing_regime, model, tokens_by_model, ...tokens } = row;
     if (model && !tokens_by_model && foldableTokens(tokens)) {
-      const gk = JSON.stringify(["model", cellKey, billing_mode, model]);
+      const gk = JSON.stringify(["model", cellKey, billing_mode, pricing_regime, model]);
       let g = groups.get(gk);
-      if (!g) groups.set(gk, (g = { cellKey, billing_mode, model, timestamp, tokens: {} }));
+      if (!g) groups.set(gk, (g = { cellKey, billing_mode, pricing_regime, model, timestamp, tokens: {} }));
       if (timestamp > g.timestamp) g.timestamp = timestamp;
       sumTokensInto(g.tokens, tokens);
       continue;
     }
     if (tokens_by_model && !model && Object.values(tokens_by_model).every((t) => t && typeof t === "object" && foldableTokens(t))) {
       const models = Object.keys(tokens_by_model).sort();
-      const gk = JSON.stringify(["by_model", cellKey, billing_mode, models]);
+      const gk = JSON.stringify(["by_model", cellKey, billing_mode, pricing_regime, models]);
       let g = groups.get(gk);
-      if (!g) groups.set(gk, (g = { cellKey, billing_mode, tokens_by_model: {}, timestamp }));
+      if (!g) groups.set(gk, (g = { cellKey, billing_mode, pricing_regime, tokens_by_model: {}, timestamp }));
       if (timestamp > g.timestamp) g.timestamp = timestamp;
       for (const [m, t] of Object.entries(tokens_by_model)) {
         g.tokens_by_model[m] = g.tokens_by_model[m] || {};
@@ -587,15 +645,28 @@ export function foldCostRows(rows, rateTable = DEFAULT_RATE_TABLE, { batch = tru
 
   const foldedRows = [...passthrough];
   for (const g of groups.values()) {
+    // `pricing_regime` is only spread onto the rebuilt row when the GROUP
+    // actually carried one -- `costRow()` treats `undefined` as "omit the
+    // field entirely" (see its own header), so a group folded from legacy
+    // rows (no regime) produces another legacy row, not a fabricated one.
+    const regime = g.pricing_regime !== undefined ? { pricing_regime: g.pricing_regime } : {};
     foldedRows.push(
       g.tokens_by_model
-        ? costRow({ cellKey: g.cellKey, timestamp: g.timestamp, billing_mode: g.billing_mode, tokens_by_model: g.tokens_by_model })
-        : costRow({ cellKey: g.cellKey, timestamp: g.timestamp, billing_mode: g.billing_mode, model: g.model, ...g.tokens }),
+        ? costRow({ cellKey: g.cellKey, timestamp: g.timestamp, billing_mode: g.billing_mode, ...regime, tokens_by_model: g.tokens_by_model })
+        : costRow({ cellKey: g.cellKey, timestamp: g.timestamp, billing_mode: g.billing_mode, ...regime, model: g.model, ...g.tokens }),
     );
   }
   if (foldedRows.length >= rows.length) return { rows, folded: false, reason: "fold would not reduce the row count" };
 
   // ── Verify, then commit ───────────────────────────────────────────────────
+  // `{ batch }` is now (issue #119) a FALLBACK ONLY -- lib/price.mjs's
+  // priceRow/priceRows read `pricing_regime` straight off each row when
+  // present, and consult this option solely for rows that lack it. Since
+  // every row in one GROUP now shares an identical `pricing_regime` (it is
+  // part of the fold's own group key, just above), this option only ever
+  // matters for a group folded entirely from legacy (regime-less) rows --
+  // and it is applied IDENTICALLY to `before` and `after`, so it cannot be
+  // the source of a price mismatch between them either way.
   const before = priceRows(rows, rateTable, { batch });
   const after = priceRows(foldedRows, rateTable, { batch });
   const beforeByProvider = priceRowsByProvider(rows, rateTable, { batch });
@@ -1172,14 +1243,58 @@ function subsetSpec(spec, { arms, briefs, replicates } = {}) {
  * cell's judge spend is unprojected but IS metered and counted here once it
  * runs -- a pre-flight under-estimate, never a ledger under-count.
  *
+ * ── `{ batch }` is now a FALLBACK, not the primary source (issue #119) ────
+ * Before #119, this was the ONE flag `priceRows`/`priceRowsByProvider`
+ * applied to EVERY row in the store -- correct only while a whole store held
+ * one regime, which #103's resume path (and the documented `--no-batch`
+ * fallback) made false in practice. Cost rows now carry their own
+ * `pricing_regime` (lib/accounting.mjs's `costRow()`), and `priceRows` reads
+ * it per row; `{ batch }` here is consulted ONLY for rows that predate that
+ * field.
+ *
+ * ── The reconciliation, and the one place it stops short ─────────────────
+ * `priceRow`'s own default (`false`/"single") IS `lib/price.mjs`'s
+ * `LEGACY_PRICING_REGIME_FALLBACK` -- that is the reconciled, canonical
+ * value: a legacy row should be priced at the pricier, non-discounted rate,
+ * so the fallback can only OVER-state spend, never under-state it (the same
+ * "fail loud/over-project" direction `runnerPriceGrid`'s own header commits
+ * to). This function's default deliberately STAYS `true` rather than also
+ * adopting it, for a concrete, narrow reason: `pruneStore` (this module's
+ * prune/compaction region, out of THIS issue's scope -- see its own header)
+ * calls `spendToDate(store)` bare at two points and separately computes
+ * `priceRows(knownDuplicateRows, DEFAULT_RATE_TABLE, { batch: true })` to
+ * verify money survived a prune, comparing all three. Flipping only this
+ * function's default to `false` would price the bare `spendToDate()` calls
+ * under a DIFFERENT fallback than the hardcoded `{ batch: true }` `duplicates`
+ * term they are subtracted against -- for a store of legacy (regime-less)
+ * rows, exactly what `pruneStore`'s own fixture stores are, that desyncs the
+ * invariant it exists to enforce and throws `spend-to-date changed across
+ * the prune`, a false positive with no actual money defect (confirmed: this
+ * was the FIRST thing tried, and it reproduces that exact throw in
+ * evals/harness/prune.test.mjs). Reconciling that call site is a one-line
+ * fix, but it sits inside the region a sibling lane (#115) owns -- so this
+ * default stays `true`, documented as a KNOWN, NAMED exception rather than
+ * silently left to disagree with `priceRow`'s for no stated reason. Flagged
+ * to the #115 lane in this issue's own closing report.
+ *
+ * `legacyPricingRowCount`/`legacyPricingFallbackRegime` (AC3) surface HOW
+ * MANY of the summed rows had no recorded regime and were therefore priced
+ * on this stated assumption rather than a fact -- see `formatSpendSummary`
+ * in evals/run.mjs, the report surface this is threaded to. This is the
+ * actual acceptance criterion, and it holds regardless of which literal
+ * value the fallback resolves to.
+ *
  * @param {object} store       a lib/store.mjs ResultsStore
  * @param {object} [rateTable=DEFAULT_RATE_TABLE]  pinned, dated rate table
- * @param {{batch?: boolean}} [opts]  batch discount to apply when re-pricing
- *   (matches the `batch` flag `runSpec()`/`runnerPriceGrid` price the plan
- *   under -- this study is batch-first by default, see the module header)
+ * @param {{batch?: boolean}} [opts]  legacy-row fallback (see above) --
+ *   NOT the store-wide lever it used to be; a row carrying its own
+ *   `pricing_regime` ignores this entirely. Default `true`/"batch" -- see
+ *   "the one place it stops short" above for why this diverges from
+ *   `priceRow`'s own `LEGACY_PRICING_REGIME_FALLBACK` default.
  * @returns {{ totalUsd: number, byProvider: Object<string, number>,
  *   hasMissingRate: boolean, missingRateModels: string[],
- *   excludedNonProviderUsd: number, excludedNonProviderModels: string[] }}
+ *   excludedNonProviderUsd: number, excludedNonProviderModels: string[],
+ *   legacyPricingRowCount: number, legacyPricingFallbackRegime: string }}
  *   `totalUsd` includes excluded non-provider spend (e.g. the embedder);
  *   `byProvider` never does -- see the excludedNonProviderUsd/Models fields
  *   for that money, tracked separately rather than silently dropped.
@@ -1233,6 +1348,13 @@ export function spendToDate(store, rateTable = DEFAULT_RATE_TABLE, { batch = tru
     // see embedder spend is tracked, just outside the provider ceilings.
     excludedNonProviderUsd: byProviderTotals.excludedNonProviderUsd,
     excludedNonProviderModels: byProviderTotals.excludedNonProviderModels,
+    // issue #119 AC3: how many rows had no recorded pricing_regime and were
+    // priced on `legacyPricingFallbackRegime` (a stated assumption) instead
+    // of a fact. `totals` (priceRows) already computed this scanning the
+    // exact same `allCostRows` priceRowsByProvider also scanned, so it is
+    // not recomputed here.
+    legacyPricingRowCount: totals.legacyPricingRowCount,
+    legacyPricingFallbackRegime: totals.legacyPricingFallbackRegime,
   };
 }
 
@@ -1723,7 +1845,16 @@ export async function runSpec(spec, opts) {
       const afterTokens = (embedder.usage && embedder.usage.total_tokens) || 0;
       const delta = afterTokens - beforeTokens;
       if (delta > 0) {
-        costRows.push(costRow({ cellKey: cell.key, timestamp, billing_mode: "api", model: embedder.modelId, input_tokens: delta }));
+        // pricing_regime is always "single" here (issue #119), NEVER the
+        // generation-side `pricingLever` in scope in this module -- the
+        // Voyage embedder in this codebase (lib/embedder.mjs's real
+        // implementation and the one wired here) has no async
+        // submit-then-poll Batch API code path; `.embed()` is one
+        // synchronous HTTP call every time, regardless of whether the
+        // STUDY's generation calls ran `--batch` or `--no-batch` this
+        // invocation. Stamping the generation-side lever here would record
+        // a fact about a DIFFERENT call.
+        costRows.push(costRow({ cellKey: cell.key, timestamp, billing_mode: "api", pricing_regime: "single", model: embedder.modelId, input_tokens: delta }));
       }
     }
   }
@@ -2128,7 +2259,7 @@ export async function runSpec(spec, opts) {
     }
 
     if (response.terminalState === "completed") {
-      const genCostRows = costRowsFor(cell.key, response.tokens, timestamp);
+      const genCostRows = costRowsFor(cell.key, response.tokens, timestamp, pricingLever);
 
       // ── UNDERSIZED-POOL BACKSTOP (issue #102) ────────────────────────────
       // A cell whose pool was assembled from fewer agents than its arm
@@ -2321,7 +2452,7 @@ export async function runSpec(spec, opts) {
       // so nothing already paid for is lost. This branch is the generation
       // counterpart the metrics defence was missing.
       account.fail(cell.key, response.failureKind, response.detail || "");
-      const costRows = costRowsFor(cell.key, response.tokens, timestamp);
+      const costRows = costRowsFor(cell.key, response.tokens, timestamp, pricingLever);
       for (const row of costRows) account.addCost(row);
       // issue #74 -- same store.put()-before-recordActualSpend reordering
       // as the completed branch above: a FAILED cell can still have
@@ -2510,11 +2641,23 @@ export async function runSpec(spec, opts) {
     summary.cumulativeNonProviderSpendUsd = cumulativeNonProviderSpendUsd;
     summary.cumulativeNonProviderModels = [...new Set(priorSpend.excludedNonProviderModels)];
     summary.cumulativeSpendUsd = Object.values(cumulativeSpendByProvider).reduce((a, b) => a + b, 0) + cumulativeNonProviderSpendUsd;
+    // issue #119 AC3: how many of the store's cost rows predate
+    // `pricing_regime` and were therefore priced under
+    // `priorSpend.legacyPricingFallbackRegime` (a stated assumption) rather
+    // than a fact recorded on the row -- surfaced alongside the cumulative
+    // total it partly rests on, per `spendToDate`'s own header. This
+    // invocation's OWN newly-written rows always carry the field (see
+    // `costRowsFor`), so this count only ever reflects rows from BEFORE this
+    // issue shipped, or a caller that deliberately omitted it.
+    summary.cumulativeLegacyPricingRowCount = priorSpend.legacyPricingRowCount;
+    summary.cumulativeLegacyPricingFallbackRegime = priorSpend.legacyPricingFallbackRegime;
   } else {
     summary.cumulativeSpendByProvider = null;
     summary.cumulativeNonProviderSpendUsd = null;
     summary.cumulativeNonProviderModels = null;
     summary.cumulativeSpendUsd = null;
+    summary.cumulativeLegacyPricingRowCount = null;
+    summary.cumulativeLegacyPricingFallbackRegime = null;
   }
   // Skip-reason breakdown (PR #86 review): summary.skippedByReason (from
   // RunAccount.reconcile(), see lib/accounting.mjs) already distinguishes

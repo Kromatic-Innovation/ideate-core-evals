@@ -9,7 +9,7 @@
 //   AC3 killing + restarting re-runs only incomplete cells -> "resume: a killed run ..."
 //   AC4 a forced provider failure surfaces as classified failed -> "a forced provider failure ..."
 //   AC5 integration test with mock provider covers the full path -> integration.test.mjs
-import { test } from "node:test";
+import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,8 +18,8 @@ import { tmpdir } from "node:os";
 import { ResultsStore } from "../../lib/store.mjs";
 import { configHash, cellKey, planRun } from "../../lib/manifest.mjs";
 import { costRow } from "../../lib/accounting.mjs";
-import { priceRowByProvider, priceRowsByProvider } from "../../lib/price.mjs";
-import { runSpec, planAndPrice, interimPriceGrid, spendToDate } from "./runner.mjs";
+import { priceRowByProvider, priceRowsByProvider, priceRows } from "../../lib/price.mjs";
+import { runSpec, planAndPrice, interimPriceGrid, spendToDate, foldCostRows } from "./runner.mjs";
 import { MockProvider } from "./provider.mjs";
 
 function tempDir(t) {
@@ -661,6 +661,60 @@ test("batch: false is an explicit opt-out to single mode -- and prices at full (
 
   await runSpec(SPEC, { store, armsConfig: ARMS_CONFIG, provider, batch: false, log: silentLog });
   assert.ok(provider.calls.every((c) => c.mode === "single"));
+});
+
+// ── issue #119: a generation cell's cost row records the invocation's own
+// pricing regime, at write time -- covering the mixed-store hazard AC1/AC2 ──
+test("issue #119: cost rows stamp pricing_regime matching the invocation's actual batch/single mode", async (t) => {
+  const batchStore = new ResultsStore(tempDir(t));
+  await runSpec(SPEC, { store: batchStore, armsConfig: ARMS_CONFIG, provider: new MockProvider(), log: silentLog });
+  const batchKey = cellKey({ armId: SPEC.arms[0].id, briefId: SPEC.briefs[0].id, replicate: 0, cfg: configHash(SPEC.config) });
+  const batchRow = batchStore.get(batchKey).costRows[0];
+  assert.equal(batchRow.pricing_regime, "batch", "batch is the harness default -- the row records the fact, not an assumption");
+
+  const singleStore = new ResultsStore(tempDir(t));
+  await runSpec(SPEC, { store: singleStore, armsConfig: ARMS_CONFIG, provider: new MockProvider(), batch: false, log: silentLog });
+  const singleRow = singleStore.get(batchKey).costRows[0];
+  assert.equal(singleRow.pricing_regime, "single");
+});
+
+// ── issue #119 AC: a store holding cells from BOTH regimes (one run
+// --batch, a second run --no-batch on top of it) is priced correctly for
+// EACH cell, and spendToDate's total sits strictly between what pricing the
+// whole store wholly as batch or wholly as single would give -- exactly the
+// signature the issue's own measured $3.25-vs-$6.50 finding described. ────
+test("issue #119 AC: spendToDate on a mixed batch+single store differs from pricing the whole store as either regime", async (t) => {
+  const dir = tempDir(t);
+  const store1 = new ResultsStore(dir);
+  const twoCellSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }], replicates: 1, config: CFG };
+  await runSpec(twoCellSpec, { store: store1, armsConfig: ARMS_CONFIG, provider: new MockProvider(), armIds: ["A"], briefIds: ["b1"], log: silentLog });
+
+  const store2 = new ResultsStore(dir);
+  await runSpec(twoCellSpec, { store: store2, armsConfig: ARMS_CONFIG, provider: new MockProvider(), armIds: ["A"], briefIds: ["b2"], batch: false, log: silentLog });
+
+  const mixed = spendToDate(store2);
+  assert.equal(mixed.legacyPricingRowCount, 0, "every row here was written through costRowsFor and carries its own regime");
+
+  // Sanity: both cells actually recorded, one of each regime.
+  const b1Key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG_HASH });
+  const b2Key = cellKey({ armId: "A", briefId: "b2", replicate: 0, cfg: CFG_HASH });
+  assert.equal(store2.get(b1Key).costRows[0].pricing_regime, "batch");
+  assert.equal(store2.get(b2Key).costRows[0].pricing_regime, "single");
+
+  // Pricing the SAME rows wholly under one regime (the pre-#119 behaviour --
+  // simulated by stripping each row's own recorded fact, since a row's own
+  // `pricing_regime` otherwise always wins over the opts fallback) gives a
+  // DIFFERENT total than the correct per-row mixed pricing above -- the
+  // direct proof that a mixed store cannot be priced correctly by a single
+  // store-wide flag, and that this store IS mixed enough to show it.
+  const allRows = [store2.get(b1Key), store2.get(b2Key)]
+    .flatMap((r) => r.costRows)
+    .map(({ pricing_regime, ...rest }) => rest);
+  const whollyBatch = priceRows(allRows, undefined, { batch: true }).totalUsd;
+  const whollySingle = priceRows(allRows, undefined, { batch: false }).totalUsd;
+  assert.notEqual(mixed.totalUsd, whollyBatch);
+  assert.notEqual(mixed.totalUsd, whollySingle);
+  assert.ok(mixed.totalUsd > whollyBatch && mixed.totalUsd < whollySingle);
 });
 
 // ── --arms / --briefs / --replicates subsetting ──────────────────────────────
@@ -1472,6 +1526,7 @@ test("issue #85: the embedder call is metered as a non-provider costRow (voyage-
   const embedderRow = record.costRows.find((r) => r.model === "voyage-4-lite");
   assert.ok(embedderRow, "a voyage-4-lite costRow is stored alongside the generation costRow");
   assert.equal(embedderRow.input_tokens, 14, "2 candidates x 7 tokens each -- the DELTA of this one embed() call, not a cumulative total");
+  assert.equal(embedderRow.pricing_regime, "single", "issue #119: this embedder has no batch code path, regardless of the study's own --batch/--no-batch flag");
 
   const spend = spendToDate(store);
   assert.ok(spend.excludedNonProviderUsd > 0, "embedder spend is priced and surfaced via excludedNonProviderUsd");
@@ -2138,4 +2193,88 @@ test("issue #88: the abort is announced separately from the 're-run the same com
   // The transient notice ("re-run the same command") must NOT claim this
   // failure -- it is wrong advice while the balance is zero.
   assert.equal(lines.some((l) => l.includes("were NOT stored under their cell keys")), false);
+});
+
+// ── issue #119: foldCostRows must never fold across a pricing_regime
+// mismatch, and must never drop the regime off a row it DOES fold ─────────
+describe("foldCostRows -- pricing_regime is part of the fold group key (issue #119)", () => {
+  test("rows that would otherwise fold together, but carry DIFFERENT pricing_regime, are kept as separate rows", () => {
+    const batchRow = costRow({
+      cellKey: "arm=A|brief=b1|rep=0|cfg=abc", timestamp: "2026-07-15T00:00:00Z",
+      billing_mode: "api", pricing_regime: "batch", model: "claude-haiku-4-5",
+      input_tokens: 1000, output_tokens: 500,
+    });
+    const singleRow = costRow({
+      cellKey: "arm=A|brief=b1|rep=0|cfg=abc", timestamp: "2026-07-15T01:00:00Z",
+      billing_mode: "api", pricing_regime: "single", model: "claude-haiku-4-5",
+      input_tokens: 2000, output_tokens: 900,
+    });
+
+    const { rows, folded } = foldCostRows([batchRow, singleRow, { ...singleRow, timestamp: "2026-07-15T02:00:00Z" }]);
+    // 3 rows in: 1 batch (alone -- no partner to fold with) + 2 single
+    // (foldable together). The batch row must never be swept into the
+    // single group merely because cellKey/billing_mode/model all match.
+    assert.equal(folded, true, "the two single rows alone are still enough rows to fold");
+    assert.equal(rows.length, 2, "1 lone batch row (passthrough) + 1 folded single row");
+    const regimes = rows.map((r) => r.pricing_regime).sort();
+    assert.deepEqual(regimes, ["batch", "single"], "both regimes survive, distinct, never merged into one");
+    const foldedSingle = rows.find((r) => r.pricing_regime === "single");
+    assert.equal(foldedSingle.input_tokens, 4000, "the two single rows' tokens WERE summed together");
+  });
+
+  test("a legacy row (no pricing_regime) never folds together with a fact-bearing row of the same shape", () => {
+    const legacyRow = costRow({
+      cellKey: "arm=A|brief=b1|rep=0|cfg=abc", timestamp: "2026-07-15T00:00:00Z",
+      billing_mode: "api", model: "claude-haiku-4-5", input_tokens: 1000, output_tokens: 500,
+    });
+    const factRow = costRow({
+      cellKey: "arm=A|brief=b1|rep=0|cfg=abc", timestamp: "2026-07-15T01:00:00Z",
+      billing_mode: "api", pricing_regime: "batch", model: "claude-haiku-4-5", input_tokens: 1000, output_tokens: 500,
+    });
+    const legacyRow2 = costRow({
+      cellKey: "arm=A|brief=b1|rep=0|cfg=abc", timestamp: "2026-07-15T02:00:00Z",
+      billing_mode: "api", model: "claude-haiku-4-5", input_tokens: 3000, output_tokens: 1500,
+    });
+
+    const { rows, folded } = foldCostRows([legacyRow, factRow, legacyRow2]);
+    assert.equal(folded, true, "the two legacy rows alone are still enough to fold together");
+    assert.equal(rows.length, 2, "1 folded legacy row + 1 untouched fact-bearing row");
+    const stillFactBearing = rows.find((r) => r.pricing_regime === "batch");
+    assert.ok(stillFactBearing, "the batch-regime row was never touched");
+    const foldedLegacy = rows.find((r) => !("pricing_regime" in r));
+    assert.ok(foldedLegacy, "the folded legacy row is STILL a legacy row -- no regime was fabricated for it");
+    assert.equal(foldedLegacy.input_tokens, 4000, "the two legacy rows' tokens were summed");
+  });
+
+  test("no folded row ever loses a pricing_regime it should carry -- fold+price agrees with pricing the originals per-row", () => {
+    const rows = [
+      costRow({ cellKey: "c1", timestamp: "2026-07-15T00:00:00Z", billing_mode: "api", pricing_regime: "batch", model: "claude-haiku-4-5", input_tokens: 1000, output_tokens: 500 }),
+      costRow({ cellKey: "c1", timestamp: "2026-07-15T00:30:00Z", billing_mode: "api", pricing_regime: "batch", model: "claude-haiku-4-5", input_tokens: 1000, output_tokens: 500 }),
+      costRow({ cellKey: "c1", timestamp: "2026-07-15T01:00:00Z", billing_mode: "api", pricing_regime: "single", model: "claude-haiku-4-5", input_tokens: 1000, output_tokens: 500 }),
+      costRow({ cellKey: "c1", timestamp: "2026-07-15T01:30:00Z", billing_mode: "api", pricing_regime: "single", model: "claude-haiku-4-5", input_tokens: 1000, output_tokens: 500 }),
+    ];
+    const before = priceRows(rows).totalUsd; // each row priced under its OWN recorded regime
+    const { rows: folded, folded: didFold } = foldCostRows(rows);
+    assert.equal(didFold, true);
+    assert.equal(folded.length, 2, "one folded row per regime");
+    for (const r of folded) assert.ok(r.pricing_regime === "batch" || r.pricing_regime === "single", "every folded row still carries a real regime");
+    const after = priceRows(folded).totalUsd;
+    assert.ok(Math.abs(before - after) <= 1e-9 * Math.max(1, Math.abs(before)), "folding must not change what the ledger prices, per-regime");
+  });
+
+  test("a tokens_by_model row's single pricing_regime folds and is preserved the same way a flat row's is", () => {
+    const rowA = costRow({
+      cellKey: "c1", timestamp: "2026-07-15T00:00:00Z", billing_mode: "api", pricing_regime: "batch",
+      tokens_by_model: { "claude-haiku-4-5": { input_tokens: 1000, output_tokens: 500 } },
+    });
+    const rowB = costRow({
+      cellKey: "c1", timestamp: "2026-07-15T00:30:00Z", billing_mode: "api", pricing_regime: "batch",
+      tokens_by_model: { "claude-haiku-4-5": { input_tokens: 2000, output_tokens: 1000 } },
+    });
+    const { rows, folded } = foldCostRows([rowA, rowB]);
+    assert.equal(folded, true);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].pricing_regime, "batch");
+    assert.equal(rows[0].tokens_by_model["claude-haiku-4-5"].input_tokens, 3000);
+  });
 });
