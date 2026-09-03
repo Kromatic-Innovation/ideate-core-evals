@@ -259,8 +259,9 @@ Mixed-effects (random intercept for brief; random arm-slope-by-brief to allow ar
 The harness emits a ledger row per run matching **cwc#1639 / cron-fleet#35 / #75** requirements (read at `code-workspace-config` cwc#1639 and `cron-fleet/lib/cron-health/fleet-cost.mjs`):
 
 1. **Price at READ TIME from `model` + token counts + billing regime.** The ledger stores the _fact_ (tokens × model × timestamp), never a derived dollar figure as authoritative — the exact defect cron-fleet#75 exists to fix.
-2. **Row carries** `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `billing_mode`, timestamp. **No `cost_usd` column.**
+2. **Row carries** `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `billing_mode`, `pricing_regime`, timestamp. **No `cost_usd` column.**
 3. **`billing_mode: "api"`** for this study (real metered spend). A subscription-mode row would carry `notional_usd`, never `cost_usd` — and the report must name the regime for any dollar figure it shows.
+3a. **`pricing_regime: "batch"|"single"`** (added issue #119) is a SECOND, independent fact recorded on the row — which read-time rate (batch API vs. realtime) this call's tokens must price at. It is orthogonal to `billing_mode` (see #2: `billing_mode` is "api"/"subscription"; batch-vs-single is a lever WITHIN "api" spend) and, like every other field in this ledger, it is still a FACT about the call, never a derived dollar figure — `lib/price.mjs` still applies it at read time. A row written before this field existed omits it and is priced under a named, recorded fallback (`lib/price.mjs`'s `LEGACY_PRICING_REGIME_FALLBACK`), never a silent guess.
 4. Multi-model runs use **`tokens_by_model`** (the schema-v2 field for a run spanning models) — mandatory for the mixed arms E/F/G.
 
 A separate `price.mjs` applies a **pinned, dated rate table** at read time. Re-pricing the whole study after a rate change is then a one-line re-run, not a re-collection.
