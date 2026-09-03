@@ -250,6 +250,12 @@ export async function runPhase0(deps) {
         cellKey: datKey,
         timestamp,
         billing_mode: "api",
+        // Always "single" (issue #119): this embedder has no async batch
+        // submit-then-poll code path in this codebase -- `.embed()` is one
+        // synchronous call, regardless of the STUDY's own --batch/--no-batch
+        // flag. See evals/harness/runner.mjs's identical embedder costRow
+        // comment for the full reasoning.
+        pricing_regime: "single",
         model: embedder.modelId,
         input_tokens: datTokens,
       }),
@@ -301,6 +307,8 @@ export async function runPhase0(deps) {
         cellKey: controlsKey,
         timestamp,
         billing_mode: "api",
+        // Always "single" -- see the DAT replication costRow above (issue #119).
+        pricing_regime: "single",
         model: embedder.modelId,
         input_tokens: controlsTokens,
       }),
