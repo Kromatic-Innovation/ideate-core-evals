@@ -136,7 +136,7 @@ mixing batch and non-batch spend is priced at one lever for all of it.** That
 is a pre-existing property of `--no-batch`, not something resume introduced,
 but it is named here rather than left to be discovered.
 
-## Growth, and what the prune does not yet do
+## Growth, and what the prune does
 
 A replay record is written only for a cell that will be **re-planned**. A cell
 stored `completed` writes none: `planRun` classifies it `reuse` forever after,
@@ -145,12 +145,41 @@ therefore bounded by that cell's **failure** count, exactly like `#90`'s
 `generation-attempt` records, and the highest-numbered record shadows every
 older one.
 
-Superseded replay records are **not** yet reachable by `--prune` at all —
-compaction excludes the family deliberately (it would destroy the handle) and
-eviction selects through `parseCellKey`, which returns `null` for these keys.
-They carry no money, so removal needs no salvage and is a small, safe change;
-it is left out of `#103` rather than bundled in. Tracked at **#117**. Until
-then they are dead weight, not a correctness problem.
+Superseded replay records **are** reachable by `--prune` now, via a third
+operation alongside evict and compact — **supersede** (`#117`). Compaction
+still excludes the family deliberately (folding a batch handle plus recovered
+replies into a summed cost row would destroy exactly the handle resume exists
+to re-poll), and eviction still cannot select these keys at all (`parseCellKey`
+requires a leading `arm=`). Supersede is neither: for each cell it keeps the
+highest-attempt `batch-replay` record — the one `readBatchResumeRecord` would
+actually read — and removes every older one outright. No fold, no salvage:
+the family always carries `costRows: []`, so there is no money to re-home.
+
+```bash
+node evals/run.mjs --prune --keep-batch-replays 2 --apply
+```
+
+`--keep-batch-replays` is its **own** knob, not `--keep-attempts`
+(`DEFAULT_BATCH_REPLAY_RETENTION`, default **1**). The two families share a
+key grammar but not a size profile: an attempt record is cheap to keep several
+of because compaction sums it down to one cost row, while a batch-replay
+record is never folded and carries full recovered reply text, so every kept
+copy costs its full size. And unlike an attempt record — where a few recent
+ones have diagnostic value ("read the last few bad nights by hand") — an
+older batch-replay record carries no information a newer one doesn't already
+shadow, since only the highest-attempt one is ever read. Keeping exactly 1,
+the record resume would actually use, is therefore the natural default rather
+than a smaller copy of 5.
+
+**Left deliberately out of scope: a `retired`-but-superseded record is not
+chased further.** A cell that has completed can never replay again, so its
+last `batch-replay` record — `retired: true`, or simply the cell's own stored
+state being `completed` — is dead weight even at `keepBatchReplays`. Supersede
+does not cross-reference the cell's own record to catch this: doing so would
+make this operation's correctness depend on two record families staying in
+sync, which is exactly the coupling that produced `#115`'s
+`salvageEvictedCellSpend` bug. Retaining one dead record per such cell is a
+bounded, honest cost, not a correctness gap.
 
 ## Operator recipes
 

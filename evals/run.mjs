@@ -11,6 +11,7 @@
 //   node evals/run.mjs --no-cancel-on-abandon  # leave an abandoned batch running (issue #92/#103)
 //   node evals/run.mjs --prune                 # what WOULD be removed (issue #98)
 //   node evals/run.mjs --prune --kinds transient --cfg 5ce5478956e5 --apply
+//   node evals/run.mjs --prune --keep-batch-replays 2 --apply   # superseded batch-replay records (issue #117)
 //   node evals/run.mjs --results-dir results-pilot ...   # a SEPARATE store (issue #120)
 //
 // This file is intentionally thin: it parses argv, loads the corpus + arm
@@ -37,7 +38,7 @@ import { createRequire } from "node:module";
 
 import { CORPUS, CORPUS_HASH } from "./corpus/index.mjs";
 import { ResultsStore } from "../lib/store.mjs";
-import { runSpec, planPrune, pruneStore, DEFAULT_ATTEMPT_RETENTION } from "./harness/runner.mjs";
+import { runSpec, planPrune, pruneStore, DEFAULT_ATTEMPT_RETENTION, DEFAULT_BATCH_REPLAY_RETENTION } from "./harness/runner.mjs";
 import {
   FAILURE_KINDS,
   TRANSIENT_FAILURE_KINDS,
@@ -251,6 +252,10 @@ export function expandKindSelectors(raw) {
  */
 export function formatPrunePlan(plan, { applied = false } = {}) {
   const verb = applied ? "removed" : "would remove";
+  // Optional so a caller (including this file's own tests) that built a plan
+  // object before the supersede operation existed does not need to grow a
+  // field it isn't testing.
+  const supersedes = plan.supersedes || [];
   const lines = [];
   lines.push(`[prune] store holds ${plan.keysBefore} record(s)`);
 
@@ -283,6 +288,16 @@ export function formatPrunePlan(plan, { applied = false } = {}) {
     if (!c.rowsFolded && c.rowsBefore > 1) {
       lines.push(`[prune]   note: rows kept UNFOLDED — ${c.foldSkippedReason}`);
     }
+  }
+
+  if (supersedes.length === 0) {
+    lines.push("[prune] no cell has a superseded batch-replay record — nothing to supersede");
+  }
+  for (const s of supersedes) {
+    lines.push(
+      `[prune] SUPERSEDE ${verb} ${s.removeKeys.length} batch-replay record(s) for cell ${s.cellKey} ` +
+        `(keeping ${s.keptKeys.length} newest — no cost rows, nothing to preserve)`,
+    );
   }
 
   lines.push(`[prune] ${applied ? "store now holds" : "store would hold"} ${plan.keysAfter} record(s)`);
@@ -435,6 +450,17 @@ export function parseArgs(argv) {
         args.keepAttempts = parseRequiredNumber(argv, ++i, "--keep-attempts");
         if (!Number.isInteger(args.keepAttempts) || args.keepAttempts < 1) {
           throw new Error(`run.mjs: --keep-attempts must be a positive integer, got ${args.keepAttempts}`);
+        }
+        break;
+      // Its own knob, deliberately not --keep-attempts (issue #117): a
+      // batch-replay record is not compacted, it is superseded outright, and
+      // it is far heavier per record (full recovered reply text, not a
+      // handful of cost rows) -- see DEFAULT_BATCH_REPLAY_RETENTION's own
+      // header for why the right number here is not 5.
+      case "--keep-batch-replays":
+        args.keepBatchReplays = parseRequiredNumber(argv, ++i, "--keep-batch-replays");
+        if (!Number.isInteger(args.keepBatchReplays) || args.keepBatchReplays < 1) {
+          throw new Error(`run.mjs: --keep-batch-replays must be a positive integer, got ${args.keepBatchReplays}`);
         }
         break;
       default:
@@ -682,6 +708,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       states: args.states,
       allowCompleted: args.allowCompleted === true,
       keepAttempts: args.keepAttempts === undefined ? DEFAULT_ATTEMPT_RETENTION : args.keepAttempts,
+      keepBatchReplays: args.keepBatchReplays === undefined ? DEFAULT_BATCH_REPLAY_RETENTION : args.keepBatchReplays,
     };
     if (!args.apply) {
       for (const line of formatPrunePlan(planPrune(store, pruneOpts), { applied: false })) log(line);
@@ -711,6 +738,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (args.states !== undefined) pruneOnlyFlags.push("--states");
   if (args.allowCompleted) pruneOnlyFlags.push("--allow-completed");
   if (args.keepAttempts !== undefined) pruneOnlyFlags.push("--keep-attempts");
+  if (args.keepBatchReplays !== undefined) pruneOnlyFlags.push("--keep-batch-replays");
   if (pruneOnlyFlags.length) {
     throw new Error(
       `run.mjs: ${pruneOnlyFlags.join(", ")} ${pruneOnlyFlags.length === 1 ? "is" : "are"} only meaningful with --prune, ` +
