@@ -450,36 +450,19 @@ test("main() prints an end-of-run spend summary via the injected log -- the ONLY
   assert.match(joined, /TOTAL.*\$1\.7500/, "the cumulative grand total is printed");
 });
 
-// issue #106: a judge-side payment refusal aborts JUDGING. runner.mjs logs
-// #88's `[run] ABORTED:` line for a GENERATION-side refusal, but a judge-side
-// one only moves a count inside summary.judge.byKind -- which nothing printed
-// before this, so the operator had no way to learn the judge account went dry.
-
-test("issue #106: main() surfaces a judge-side payment abort to the operator, and says generation was NOT stopped", async () => {
-  const runSpecFn = spyRunSpecWithSummary({
-    completed: 4,
-    judge: { planned: 8, completed: 4, failed: 4, byKind: { payment_required: 4 } },
-  });
-  const lines = [];
-  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION, log: (msg) => lines.push(msg) });
-
-  const joined = lines.join("\n");
-  assert.match(joined, /JUDGING ABORTED/, "the abort is announced -- otherwise it is invisible outside summary.judge");
-  assert.match(joined, /4 judge leg\(s\) are payment_required/, "the count comes from summary.judge.byKind, not a re-derivation");
-  assert.match(
-    joined,
-    /cannot say how the total splits/,
-    "byKind cannot distinguish a refused leg from a short-circuited one, so the notice must not claim a split it has no basis for",
-  );
-  assert.match(joined, /GENERATION was NOT stopped/, "the asymmetry with #88 is stated, because it is the whole operator-facing decision");
-});
-
-test("issue #106: a run whose judge legs never hit a payment refusal prints no judging-abort notice", async () => {
-  const runSpecFn = spyRunSpecWithSummary({ judge: { planned: 8, completed: 7, failed: 1, byKind: { parse_failure: 1 } } });
-  const lines = [];
-  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION, log: (msg) => lines.push(msg) });
-  assert.doesNotMatch(lines.join("\n"), /JUDGING ABORTED/, "an ordinary judge failure is not a payment abort");
-});
+// issue #106's judge-side payment-abort notice used to be printed from here
+// (evals/run.mjs), and these two tests pinned it -- driving a MOCKED
+// runSpecFn returning a synthetic summary, so runner.mjs itself never ran.
+// #112 added its own, strictly better notice in evals/harness/runner.mjs
+// (the real refused/skipped split this file's notice could never compute),
+// so a real judge-side billing refusal printed `[run] JUDGING ABORTED:`
+// TWICE, and this file's copy carried a claim #112 made false ("cannot say
+// how the total splits"). #116 deleted evals/run.mjs's notice entirely (see
+// its comment there) and, with it, deleted these two tests -- there is no
+// longer any code path here for them to cover. The printed-notice coverage,
+// including the "no refusal -> no notice" guarantee the second test held,
+// now lives in evals/harness/judging.test.mjs (search `issue #116`), against
+// the real emitter instead of a mock.
 
 test("main() prints an explicit 'NOT COMPUTED' line for cumulative spend, never a fabricated $0, when no ceiling was requested this invocation", async () => {
   const runSpecFn = spyRunSpec(); // returns { summary: {} } -- no ceiling, so cumulative fields are absent, matching the real null case

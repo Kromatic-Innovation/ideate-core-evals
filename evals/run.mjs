@@ -1085,31 +1085,17 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // see runner.mjs's dry-run branch), so formatSpendSummary's own
   // `if (!summary) return []` guard makes this a no-op there.
   for (const line of formatSpendSummary(result && result.summary, { storeDir: storeLabel })) log(line);
-  // Judge payment abort notice (issue #106). Without this the abort is
-  // INVISIBLE: runner.mjs logs #88's `[run] ABORTED:` line for a
-  // GENERATION-side refusal, but a judge-side one only moves a count inside
-  // `summary.judge.byKind`, which nothing prints. The operator action is the
-  // same as #88's -- fund the account, re-run -- and it cannot be taken if
-  // the run never says the judge account went dry.
-  //
-  // Deliberately says what is and is not affected, because the answer is
-  // asymmetric and surprising by design: GENERATION completed normally, and
-  // the pools it produced are judged on the next invocation once the account
-  // is funded (runSpec() judges an already-generated-but-unjudged pool on
-  // resume -- issue #68 AC4). Nothing here needs re-generating.
-  const judgeSummary = result && result.summary && result.summary.judge;
-  const judgePaymentFailures = (judgeSummary && judgeSummary.byKind && judgeSummary.byKind.payment_required) || 0;
-  if (judgePaymentFailures) {
-    log(
-      `[run] JUDGING ABORTED: at least one judge account refused on billing/credit. ${judgePaymentFailures} judge ` +
-        `leg(s) are payment_required -- the leg(s) that were actually refused, plus every later leg on that same ` +
-        `account, which were NOT attempted (each would have hit the identical wall). This count cannot say how the ` +
-        `total splits between the two, only that it is entirely billing. GENERATION was NOT stopped and is ` +
-        `unaffected: those pools are already stored, and the ` +
-        `next invocation of this same command judges them once the account is funded. Judge legs on the OTHER ` +
-        `provider were unaffected. Spend already incurred is preserved; see docs/retrying-failed-cells.md.`,
-    );
-  }
+  // Judge payment abort notice (issue #106) used to live here, printed from
+  // `result.summary.judge.byKind` because that was the only place the abort
+  // was visible. #112 (PR #113) added `summary.judgePaymentAbort` and its own,
+  // strictly better notice -- it has the real refused/skipped split this
+  // count never could -- inside runSpec()/runner.mjs itself, so both fired on
+  // the same run and printed `[run] JUDGING ABORTED:` twice. #116 folded this
+  // notice's two operator-actionable clauses that runner.mjs's copy lacked
+  // (the docs/retrying-failed-cells.md pointer and the spend-preserved
+  // sentence) into runner.mjs's notice and deleted this one. See
+  // evals/harness/runner.mjs's `judgePaymentAbort` comment for the surviving
+  // notice.
   return result;
 }
 
