@@ -9,7 +9,7 @@
 // every cell through unthrottled instead of erroring).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, main, formatSpendSummary, formatPhase0Report, formatPrunePlan } from "./run.mjs";
+import { parseArgs, main, formatSpendSummary, formatPhase0Report, formatPrunePlan, resolveStoreDir, DEFAULT_RESULTS_DIR } from "./run.mjs";
 // The real judge-call writer (issue #108) -- the CLI prune tests below use it
 // rather than hand-built keys, so the fixture cannot drift from the writer.
 import { meterJudgeCall } from "./judge/gate.mjs";
@@ -29,9 +29,9 @@ import armsConfigJson from "../arms.config.json" with { type: "json" };
 // --prune (issue #98) is the one CLI mode that touches a REAL store rather
 // than being handed to a spy runSpec, so these tests build a genuine temp
 // ResultsStore. Still hermetic: temp dirs, no provider, no network.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { ResultsStore } from "../lib/store.mjs";
 import { cellKey } from "../lib/manifest.mjs";
 import { TRANSIENT_FAILURE_KINDS, INTRINSIC_FAILURE_KINDS, PAYMENT_FAILURE_KINDS } from "../lib/accounting.mjs";
@@ -601,7 +601,21 @@ test("main() --phase 0 prints NO spend summary via the injected log -- it never 
     });
 
     assert.equal(runSpecFn.calls.length, 0, "--phase 0 must never call runSpec -- it has no arms/briefs grid");
-    assert.deepEqual(lines, [], "formatSpendSummary's [spend] lines must never appear for --phase 0 -- it has no runSpec summary to render, only formatPhase0Report's own (console.log-only) report");
+    // Filtered to `[spend]` rather than asserting an empty array: since #120
+    // every mode announces which store it opened (a `[store]` line), and
+    // --phase 0 persists to one like any other mode. The invariant this test
+    // exists for is unchanged -- NO spend summary, because there is no
+    // runSpec summary to render.
+    assert.deepEqual(
+      lines.filter((l) => l.startsWith("[spend]")),
+      [],
+      "formatSpendSummary's [spend] lines must never appear for --phase 0 -- it has no runSpec summary to render, only formatPhase0Report's own (console.log-only) report",
+    );
+    assert.deepEqual(
+      lines.filter((l) => !l.startsWith("[store]")),
+      [],
+      "and nothing OTHER than the store announcement reaches the injected log either",
+    );
   } finally {
     if (prior === undefined) delete process.env.VOYAGE_API_KEY;
     else process.env.VOYAGE_API_KEY = prior;
@@ -1067,4 +1081,231 @@ test("issue #101: --arms scoping does NOT move armsConfigHash -- the hash is ove
     configHash(unscoped.calls[0].spec.config),
     "and so the whole configHash is unmoved -- a scoped run's cells remain comparable to a full run's",
   );
+});
+
+// ── --results-dir (issue #120): store separation as the §11 mechanism ───────
+// docs/PREREGISTRATION.md §11 permits a pilot to inform the confirmatory n
+// only if "the pilot's own data is then not reused in the confirmatory test",
+// and #49 AC5 requires that exclusion be STRUCTURAL. The pilot must run at
+// the grid's configHash for its variance estimate to transfer, so nothing in
+// the config machinery can separate them -- two stores can.
+
+/** An empty temp directory, cleaned up on exit like the prune fixtures. */
+function tempStoreDir(prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  pruneTempDirs.push(dir);
+  return dir;
+}
+
+test("parseArgs accepts --results-dir, and refuses a missing or flag-shaped value", () => {
+  assert.equal(parseArgs(["--results-dir", "results-pilot"]).resultsDir, "results-pilot");
+  assert.equal(parseArgs([]).resultsDir, undefined, "absent means the default store, not an empty string");
+  assert.throws(() => parseArgs(["--results-dir"]), /--results-dir requires a directory argument/);
+  assert.throws(
+    () => parseArgs(["--results-dir", "--prune"]),
+    /looks like a flag, not a directory/,
+    "a swallowed next-flag would create a store in a directory called '--prune' and then run unpruned",
+  );
+});
+
+test("resolveStoreDir defaults to REPO_ROOT/results, resolves a relative flag value against cwd (matching analysis.mjs), and creates nothing", () => {
+  assert.equal(resolveStoreDir(undefined), DEFAULT_RESULTS_DIR);
+  const missing = join(tempStoreDir("ideate-run-store-"), "not-yet");
+  assert.equal(resolveStoreDir(missing), missing, "a non-existent directory is accepted -- ResultsStore mkdirs it, exactly as it does for results/");
+  assert.equal(existsSync(missing), false, "resolveStoreDir itself never creates anything");
+  // The cwd-relative resolution is the compatibility contract with
+  // evals/analysis/analysis.mjs, which hands its own --results-dir value
+  // straight to `new ResultsStore(...)`. If these two diverged, an operator
+  // passing the same relative path to both commands would write a pilot in
+  // one directory and analyse an empty store in another.
+  assert.equal(resolveStoreDir("results-pilot"), resolve(process.cwd(), "results-pilot"));
+});
+
+test("issue #120 AC3: --results-dir refuses a path that exists but is not a store, rather than initialising over it", async () => {
+  const notAStore = tempStoreDir("ideate-run-notastore-");
+  writeFileSync(join(notAStore, "PREREGISTRATION.md"), "# not a results store\n");
+  assert.throws(() => resolveStoreDir(notAStore), /is not a results store/);
+  assert.throws(() => resolveStoreDir(notAStore), /Refusing to initialise a store over it/);
+
+  const aFile = join(tempStoreDir("ideate-run-file-"), "store.txt");
+  writeFileSync(aFile, "x");
+  assert.throws(() => resolveStoreDir(aFile), /exists and is not a directory/);
+
+  // The message names WHICH store, and never reports a flag the operator did
+  // not pass. The guard applies to the default store too -- a results/ that
+  // has lost its index.jsonl would otherwise be silently re-initialised, and
+  // every paid-for cell re-planned as `todo`.
+  assert.throws(() => resolveStoreDir(notAStore), new RegExp(`--results-dir '${notAStore}'`));
+  assert.doesNotMatch(
+    (() => {
+      try {
+        resolveStoreDir(notAStore);
+      } catch (e) {
+        return e.message;
+      }
+    })(),
+    /the default results store/,
+  );
+
+  // An EXISTING store is accepted -- the guard is about junk, not about
+  // refusing to append to the store this flag exists to build up. An EMPTY
+  // directory is accepted too (tempStoreDir's own dirs, used throughout).
+  const real = tempStoreDir("ideate-run-real-");
+  new ResultsStore(real);
+  assert.equal(resolveStoreDir(real), real);
+
+  // And it fires through the CLI, not only through the helper.
+  await assert.rejects(
+    () => main(["--dry-run", "--results-dir", notAStore], { runSpecFn: spyRunSpec(), log: () => {}, getEngineVersion: STUB_ENGINE_VERSION }),
+    /is not a results store/,
+  );
+});
+
+test("issue #120 AC2: --results-dir composes with a real run, --dry-run, --prune and --phase 0 -- it is in none of the ignored-flag rejection lists", async () => {
+  // --dry-run / a real run: the store runSpec receives is rooted at the flag.
+  const runSpecFn = spyRunSpec();
+  const dryDir = tempStoreDir("ideate-run-dry-");
+  await main(["--dry-run", "--results-dir", dryDir], { runSpecFn, log: () => {}, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(runSpecFn.calls[0].opts.store.dir, dryDir, "--dry-run must not silently plan against results/");
+
+  // --prune: the mode whose live code path DELETES. A --results-dir it
+  // ignored would prune the wrong store.
+  const pruneDir = tempStoreDir("ideate-run-prunedir-");
+  const seeded = new ResultsStore(pruneDir);
+  const key = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: PRUNE_CFG });
+  seeded.put({
+    key,
+    armId: "A",
+    briefId: "b1",
+    replicate: 0,
+    cfg: PRUNE_CFG,
+    result: { candidates: [] },
+    resolvedModels: { proposer: "claude-haiku-4-5" },
+    accounting: { state: "failed", kind: "rate_limited", detail: "429" },
+    costRows: [],
+  });
+  const pruneLines = [];
+  await main(["--prune", "--kinds", "transient", "--apply", "--results-dir", pruneDir], {
+    log: (m) => pruneLines.push(m),
+    getEngineVersion: STUB_ENGINE_VERSION,
+    runSpecFn: spyRunSpec(),
+  });
+  assert.equal(new ResultsStore(pruneDir).has(key), false, "--prune operated on the flagged store");
+  assert.ok(pruneLines.some((l) => l.includes(pruneDir)), "and said which store it read");
+
+  // --phase 0: persists its controls to a store like every other mode.
+  const prior = process.env.VOYAGE_API_KEY;
+  process.env.VOYAGE_API_KEY = "test-key-123";
+  const priorExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    const phase0Dir = tempStoreDir("ideate-run-phase0-");
+    const runPhase0Fn = spyRunPhase0(PASSING_PHASE0_SUMMARY);
+    await main(["--phase", "0", "--results-dir", phase0Dir], { runPhase0Fn, log: () => {}, getEngineVersion: STUB_ENGINE_VERSION });
+    assert.equal(runPhase0Fn.calls[0].store.dir, phase0Dir, "--phase 0 must not silently persist to results/");
+  } finally {
+    if (prior === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = prior;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("issue #120 AC4: every mode says which store it opened, and the cumulative spend figure carries its store as its basis", async () => {
+  const dir = tempStoreDir("ideate-run-label-");
+  const summary = {
+    spendByProvider: { anthropic: 0.5 },
+    cumulativeSpendByProvider: { anthropic: 1.5 },
+    cumulativeSpendUsd: 1.75,
+    cumulativeNonProviderSpendUsd: 0.25,
+    cumulativeNonProviderModels: ["voyage-4-lite"],
+  };
+  const lines = [];
+  await main(["--dry-run", "--max-spend-anthropic", "300", "--results-dir", dir], {
+    runSpecFn: spyRunSpecWithSummary(summary),
+    getEngineVersion: STUB_ENGINE_VERSION,
+    log: (m) => lines.push(m),
+  });
+  const joined = lines.join("\n");
+  assert.ok(lines.includes(`[store] results store: ${dir} (--results-dir)`), joined);
+  // The cumulative total is what --max-spend gates on and what an operator
+  // reads as "study spend". spendToDate() is cumulative over the store IN
+  // USE, so the number without its store is a number that can be read as the
+  // wrong study's.
+  assert.ok(joined.includes(`cumulative (study-to-date in store ${dir}`), joined);
+  assert.match(joined, /in THAT store only/);
+
+  // ... and the NOT-COMPUTED branch carries it too, so the basis is never
+  // separated from the (absent) number either.
+  assert.match(
+    formatSpendSummary({}, { storeDir: "/tmp/x" }).join("\n"),
+    /cumulative \(study-to-date in store \/tmp\/x\) --- NOT COMPUTED/,
+  );
+});
+
+test("issue #120: --results-dir and an injected store are mutually exclusive rather than one silently winning", async () => {
+  await assert.rejects(
+    () => main(["--dry-run", "--results-dir", tempStoreDir("ideate-run-both-")], { store: FAKE_STORE, runSpecFn: spyRunSpec(), log: () => {}, getEngineVersion: STUB_ENGINE_VERSION }),
+    /mutually exclusive/,
+  );
+});
+
+// ── THE §11 assertion ────────────────────────────────────────────────
+// Two invocations, two --results-dir values, IDENTICAL configHash. The second
+// must report 0 reuse. This runs the REAL runSpec (dry-run: it calls nothing)
+// so that planRun -- the thing that would classify a pilot cell `reuse` -- is
+// the code under test, not a spy.
+
+test("issue #120 AC5 / PREREGISTRATION §11: a second invocation against a DIFFERENT --results-dir reuses none of the first store's cells, at the same configHash", async () => {
+  const pilotDir = tempStoreDir("ideate-run-pilot-");
+  const gridDir = tempStoreDir("ideate-run-grid-");
+  const scope = ["--dry-run", "--arms", "A", "--briefs", "biz-01", "--replicates", "2"];
+
+  // 1. Plan against the (empty) pilot store to learn the real cells and the
+  //    real configHash this CLI builds -- never a hand-invented one.
+  const first = await main([...scope, "--results-dir", pilotDir], { log: () => {}, getEngineVersion: STUB_ENGINE_VERSION });
+  const planned = first.dryRun.plan.todo;
+  assert.ok(planned.length > 0, "the scoped plan must have cells, or the 0-reuse assertion below is vacuous");
+
+  // 2. Fill the PILOT store with completed cells -- i.e. the pilot ran.
+  const pilotStore = new ResultsStore(pilotDir);
+  for (const cell of planned) {
+    pilotStore.put({
+      key: cell.key,
+      armId: cell.armId,
+      briefId: cell.briefId,
+      replicate: cell.replicate,
+      cfg: cell.cfg,
+      result: { candidates: [] },
+      resolvedModels: { proposer: "claude-haiku-4-5" },
+      accounting: { state: "completed" },
+      costRows: [],
+    });
+  }
+
+  // 3. THE CONTROL. Re-planning against the pilot store reuses every one of
+  //    them -- which is exactly the contamination §11 forbids, and proves the
+  //    0 below is caused by store separation rather than by an empty plan or
+  //    a drifted config.
+  const rerun = await main([...scope, "--results-dir", pilotDir], { log: () => {}, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(rerun.dryRun.plan.reuse.length, planned.length, "same store, same config: every pilot cell is reused");
+  assert.equal(rerun.dryRun.plan.todo.length, 0);
+
+  // 4. THE GUARANTEE. Same flags, same configHash, a DIFFERENT store.
+  const confirmatory = await main([...scope, "--results-dir", gridDir], { log: () => {}, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(
+    confirmatory.dryRun.plan.reuse.length,
+    0,
+    "PREREGISTRATION §11: the pilot's own data must not be reused in the confirmatory test",
+  );
+  assert.equal(confirmatory.dryRun.plan.todo.length, planned.length, "and every cell is planned afresh -- the 0 above is separation, not an empty plan");
+  assert.equal(confirmatory.dryRun.plan.stale.length, 0, "nor is it a config change: the pilot cells are not even visible as stale from the other store");
+
+  // 5. And the configHash really is identical across the two, so the pilot's
+  //    variance estimate transfers (which is the whole reason the config
+  //    machinery CANNOT be the separation mechanism -- issue #120).
+  const cfgOf = (r) => [...new Set([...r.dryRun.plan.todo, ...r.dryRun.plan.reuse].map((c) => c.cfg))];
+  assert.deepEqual(cfgOf(rerun), cfgOf(confirmatory), "same configHash in both stores -- the separation is structural, not a config divergence");
+
+  // 6. The pilot store is untouched by the confirmatory invocation.
+  assert.equal(new ResultsStore(pilotDir).keys().length, planned.length);
 });

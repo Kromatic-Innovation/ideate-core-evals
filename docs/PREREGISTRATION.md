@@ -409,6 +409,20 @@ This is a real tension with the additive design, and it is resolved by _separati
 
 Both the "pilot for the pilot" (§8.3 Phase 2a) and the additive store are compatible with this, because neither is used to _test_ a confirmatory hypothesis.
 
+### How the pilot's non-reuse is enforced: store separation
+
+The "not reused" condition in the variance-estimation row above is enforced **structurally, by running the pilot into its own results store** — `node evals/run.mjs --results-dir results-pilot ...` — while the confirmatory grid runs into the default `results/`. `evals/analysis/analysis.mjs --results-dir` reads whichever of the two is named.
+
+This is the only mechanism that works, and the reason is worth stating because the alternatives all look plausible:
+
+- **Not a different `configHash`.** A variance estimate transfers to the grid only if the pilot ran at the grid's configuration, so identical configuration is a _requirement_ of the pilot, not an oversight. `planRun` therefore classifies every pilot cell as `reuse` for the grid, and correctly: the never-silently-pool guarantee fires on config _change_, and here there is no change to detect.
+- **Not pruning the pilot's cells before the grid.** That is enforcement by intention — one forgotten command away from a contaminated confirmatory fit, and the contamination is invisible afterwards, because pooled cells look like ordinary cells.
+- **Not a `phase` label on the cell.** That puts the guarantee inside the analysis path, where every future reader of the frame has to remember to honour it.
+
+Two stores cannot pool at any `configHash`, under any analysis path, whether or not anyone remembers the rule. That is what "structural" means here, and it is the mechanism §8.3 Phase 2a's "explicitly excluded if not" now names.
+
+One consequence follows for §7/§8 accounting and is registered with it: `spendToDate()` is cumulative **over the store in use**, so a pilot invocation and a confirmatory invocation report separate study-to-date totals, and `--max-spend` gates each against its own. `evals/run.mjs` therefore names the store it opened in its own report. The study's total spend is the **sum across the stores**, never either figure alone.
+
 ---
 
 ## 12. Configurability
@@ -831,8 +845,10 @@ See the §4.4 marker for the registered summary of this item.
 
 Per the amendment rule at the top of this document. This appendix registers a
 **change to `configHash`'s field set** (§11) and the invalidation it causes,
-in advance of the run that will carry it (item 1), and a **narrowing of one of
-§1's named residual threats** (item 2). Nothing in §6 is changed.
+in advance of the run that will carry it (item 1), a **narrowing of one of
+§1's named residual threats** (item 2), and the **mechanism by which §11's
+pilot/confirmatory non-reuse condition is enforced** (item 3). Nothing in §6
+is changed.
 
 ### Item 1 — §3.1/§11: `arms.config.json` now participates in `configHash` as `armsConfigHash`; `ideasPerAgent`/`maxRounds` are retired (issue #101)
 
@@ -1022,3 +1038,48 @@ registration finds the gap named rather than discovering it.
 touches §7's accounting mechanics and §1's residual-threat list only. It is
 recorded because Appendix B item 4 put the exception on the record, and an
 exception that has changed shape must say so in the same place.
+
+### Item 3 — §11/§8.3: the pilot's non-reuse is enforced by store separation, and `evals/run.mjs` gains `--results-dir` (issue #120)
+
+**What was missing.** §11's optional-stopping table permits variance
+estimation from a pilot on the condition that "the pilot's own data is then
+**not reused** in the confirmatory test", and #49 AC5 restates that as
+"enforce the exclusion structurally, not by intention". **No mechanism
+existed.** `evals/run.mjs` hardcoded its results store to `results/` at all
+three of its store-construction sites, so a pilot could only be run into the
+same store the confirmatory grid reads. Phase 2 (§8.3) was therefore not
+runnable without either violating §11 or hand-waving the exclusion.
+
+**Why no configuration-level separation was available.** The pilot's variance
+estimate transfers to the grid only if the pilot ran at the grid's
+configuration. Identical configuration is thus a requirement of the pilot,
+which means `planRun` classifies every pilot cell `reuse` for the grid and
+`buildFrame` pools them — and §11's never-silently-pool guarantee does not
+help, because it fires on config _change_ and there is correctly no change to
+detect. This is the case the accumulation machinery cannot see.
+
+**What changed in the code.** `evals/run.mjs` accepts `--results-dir`,
+defaulting to `results/` and honoured by every mode it has (a real run,
+`--dry-run`, `--prune`, `--phase 0`) — mirroring the flag
+`evals/analysis/analysis.mjs` has always accepted, and resolved the same way
+(relative to the working directory), so a pilot written by one is analysed by
+the other under the same path. A path that does not exist is created, matching
+`ResultsStore`'s behaviour for `results/`; a path that exists and is not a
+store is refused rather than initialised over. The guarantee is asserted
+directly in `evals/run.test.mjs`: two invocations at the same `configHash`
+against two different `--results-dir` values, where the second reports **0
+reuse** and the first (same store) reuses every cell as the control.
+
+**What this changes about accounting, registered with it.** `spendToDate()` is
+cumulative over the store in use, so the pilot and the confirmatory grid now
+have separate study-to-date totals and `--max-spend` gates each against its
+own. `evals/run.mjs` names the store it opened in every mode's report, and the
+cumulative figure carries its store as its basis, so neither total can be read
+as the other's. §8's budget is the sum across the two stores.
+
+**Registered impact.** Nil on any hypothesis, metric, or threshold. This item
+adds an enforcement mechanism for a condition §11 already registered; it does
+not change the condition. It supersedes §8.3 Phase 2a's "explicitly excluded
+if not" as folk knowledge — that clause's exclusion is now the store boundary.
+Not in scope, and explicitly still unwired: `--phase 2` as a real alias, which
+`evals/run.mjs` continues to refuse rather than silently map.
