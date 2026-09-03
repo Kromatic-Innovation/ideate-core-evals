@@ -107,6 +107,13 @@ export const DEFAULT_RESULTS_DIR = join(REPO_ROOT, "results");
  */
 export function resolveStoreDir(resultsDir) {
   const dir = resultsDir === undefined ? DEFAULT_RESULTS_DIR : resolve(resultsDir);
+  // The not-a-store guard below applies to the DEFAULT store too, not only to
+  // a flag value -- a `results/` that has lost its index.jsonl is a store this
+  // CLI would otherwise silently re-initialise, re-planning every paid-for
+  // cell as `todo`. `named` keeps the message honest about which of the two
+  // the operator is looking at, so the default case never reports a flag that
+  // was never passed.
+  const named = resultsDir === undefined ? "the default results store" : `--results-dir '${resultsDir}'`;
 
   // A path that does not exist is FINE: ResultsStore's constructor mkdirs it
   // recursively and writes an empty index.jsonl, which is exactly how the
@@ -116,7 +123,7 @@ export function resolveStoreDir(resultsDir) {
 
   if (!statSync(dir).isDirectory()) {
     throw new Error(
-      `run.mjs: --results-dir '${resultsDir}' resolves to ${dir}, which exists and is not a directory. ` +
+      `run.mjs: ${named} resolves to ${dir}, which exists and is not a directory. ` +
         "A results store is a directory holding index.jsonl + bodies/ (see lib/store.mjs).",
     );
   }
@@ -132,7 +139,7 @@ export function resolveStoreDir(resultsDir) {
   const entries = readdirSync(dir);
   if (entries.length > 0 && !existsSync(join(dir, "index.jsonl"))) {
     throw new Error(
-      `run.mjs: --results-dir '${resultsDir}' resolves to ${dir}, which exists and is not empty but holds no ` +
+      `run.mjs: ${named} resolves to ${dir}, which exists and is not empty but holds no ` +
         `index.jsonl -- it is not a results store (found: ${entries.slice(0, 5).join(", ")}${entries.length > 5 ? ", ..." : ""}). ` +
         "Refusing to initialise a store over it. Pass a new or empty directory, or an existing store's directory.",
     );

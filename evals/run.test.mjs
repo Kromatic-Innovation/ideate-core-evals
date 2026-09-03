@@ -1131,6 +1131,22 @@ test("issue #120 AC3: --results-dir refuses a path that exists but is not a stor
   writeFileSync(aFile, "x");
   assert.throws(() => resolveStoreDir(aFile), /exists and is not a directory/);
 
+  // The message names WHICH store, and never reports a flag the operator did
+  // not pass. The guard applies to the default store too -- a results/ that
+  // has lost its index.jsonl would otherwise be silently re-initialised, and
+  // every paid-for cell re-planned as `todo`.
+  assert.throws(() => resolveStoreDir(notAStore), new RegExp(`--results-dir '${notAStore}'`));
+  assert.doesNotMatch(
+    (() => {
+      try {
+        resolveStoreDir(notAStore);
+      } catch (e) {
+        return e.message;
+      }
+    })(),
+    /the default results store/,
+  );
+
   // An EXISTING store is accepted -- the guard is about junk, not about
   // refusing to append to the store this flag exists to build up. An EMPTY
   // directory is accepted too (tempStoreDir's own dirs, used throughout).
