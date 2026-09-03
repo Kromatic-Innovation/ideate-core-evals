@@ -274,7 +274,10 @@ test("issue #99: editing a generation prompt template moves the configHash of th
     round2: prompts.buildRound2Prompt(probe),
     round1Defaults: prompts.buildRound1Prompt(),
     round2Defaults: prompts.buildRound2Prompt(),
-    tokensPerIdea: prompts.TOKENS_PER_IDEA,
+    // issue #122: promptTemplateHash()'s payload folds in the per-model
+    // rate map (and its fallback), not the single pre-#122 constant.
+    tokensPerIdeaByModel: prompts.TOKENS_PER_IDEA_BY_MODEL,
+    defaultTokensPerIdea: prompts.DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: prompts.MAX_TOKENS_HEADROOM,
     legacyMaxTokens: prompts.LEGACY_MAX_TOKENS,
     salvageVersion: prompts.SALVAGE_VERSION,

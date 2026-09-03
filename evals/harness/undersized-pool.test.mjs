@@ -312,6 +312,29 @@ test("issue #102: a TRUNCATED reply that #93's salvage rescued does NOT fail the
   assert.equal(resp.result.candidates.length, 10); // salvage kept the 2 complete objects
 });
 
+test("issue #122: arm D's raised (per-model Opus) ceiling does NOT relax the #102 guard -- a reply that still truncates fails the cell", async () => {
+  // Issue #122 AC5: raising max_tokens for Opus must not be achieved by (or
+  // read as) weakening the undersized-pool guard. This proves the guard is
+  // still live UNDER the new, larger Opus ceiling: one of arm D's five agents
+  // comes back cut off by max_tokens with NOTHING recoverable (the string
+  // never closes, so salvage's char-walk drops the one open object it finds),
+  // so that agent contributes zero candidates -- an undersized pool, same as
+  // any other partial round, just against arm D's real (raised) request
+  // rather than the pre-#122 flat 2048.
+  const unsalvageable = '[{"text":"a heated shelter incomplete because it was cut off mid-sen';
+  const provider = anthropicProvider(
+    anthropicBatchFetchByIndex((i) => (i === 0 ? { ok: unsalvageable, stopReason: "max_tokens" } : { ok: OK_IDEAS })),
+    { armId: "D" },
+  );
+  const resp = await provider.generate(cellFor("D"), armsConfigJson.arms.D, { mode: "batch", timestamp: new Date().toISOString() });
+
+  assert.equal(resp.terminalState, "failed");
+  assert.equal(resp.failureKind, "parse_failure");
+  assert.match(resp.detail, /UNDERSIZED/);
+  assert.match(resp.detail, /cause=partial_truncated/);
+  assert.match(resp.detail, /non_contributing_replies=1/);
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. The OpenAI path gets the same rule (arm H, and arm G's OpenAI slots)
 // ─────────────────────────────────────────────────────────────────────────────
