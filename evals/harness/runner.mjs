@@ -43,6 +43,7 @@ import { planRun } from "../../lib/manifest.mjs";
 // that block's own comment in lib/store.mjs.
 import {
   ATTEMPT_FAMILIES,
+  BATCH_RESUME_FAMILY,
   parseAttemptKey,
   nextAttemptNumber,
   readBatchResumeRecord,
@@ -482,6 +483,13 @@ function recordGenerationAttemptFailure(store, { cell, costRows, kind, detail, r
 //   COMPACT — several attempt records for one cell are folded into ONE
 //             record whose cost rows are the per-(cell, billing mode, model)
 //             SUM of theirs. Count falls; money is identical.
+//   SUPERSEDE — every `batch-replay` record for a cell but the highest-
+//             attempt one is removed outright, no fold and no salvage
+//             (issue #117). Safe because the family always carries
+//             `costRows: []` (enforced by `writeBatchResumeRecord`), and
+//             correct because a batch-replay record is read only by
+//             highest-attempt-wins (`readBatchResumeRecord`) -- an older one
+//             is pure dead weight the moment a newer one exists.
 //
 // ── Why compaction, and not a count cap ─────────────────────────────────────
 // The obvious bounded policy — "keep the newest 5 attempts, drop the rest" —
@@ -528,6 +536,26 @@ const PRUNED_CELL_FAMILY = "pruned-cell";
  *  nights out of the store by hand" — the diagnostic value of an individual
  *  attempt record decays fast, while its money does not decay at all. */
 export const DEFAULT_ATTEMPT_RETENTION = 5;
+
+/** Default retention window for the SUPERSEDE operation (issue #117): how
+ *  many `batch-replay` records per cell survive un-removed. Deliberately its
+ *  OWN knob, not `keepAttempts` -- and deliberately a much smaller default
+ *  (1, not 5).
+ *
+ *  The two record shapes look alike (same key grammar, same max+1
+ *  numbering) but differ in exactly the ways that make one number wrong for
+ *  both: an attempt record is COMPACTED (folded into a cheap summed cost
+ *  row, so keeping several costs almost nothing), while a batch-replay
+ *  record is SUPERSEDED outright (no fold exists for a batch handle plus
+ *  full recovered reply text, so every kept record costs its full size).
+ *  And unlike an attempt record, an older batch-replay record carries no
+ *  information a newer one doesn't already shadow -- `readBatchResumeRecord`
+ *  only ever reads the highest-attempt one (see its own header), so a
+ *  retained older record is not "the last few bad nights read by hand", it
+ *  is dead weight from the moment a newer one exists. 1 -- keep only the
+ *  record resume would actually read -- is therefore the natural default,
+ *  not merely a smaller version of 5. */
+export const DEFAULT_BATCH_REPLAY_RETENTION = 1;
 
 /** The exact `cellKey()` grammar from lib/manifest.mjs. Selection MUST go
  *  through this and never through `entry.cfg`: a real store's `cfg` is not
@@ -743,8 +771,14 @@ function sortRowsCanonically(rows) {
  *   @param {number|null} [opts.keepAttempts=DEFAULT_ATTEMPT_RETENTION] how
  *     many attempt records per (cell, family) survive un-folded. `null`
  *     disables compaction entirely.
+ *   @param {number|null} [opts.keepBatchReplays=DEFAULT_BATCH_REPLAY_RETENTION]
+ *     how many `batch-replay` records per cell survive the supersede
+ *     operation (issue #117). Its own knob, deliberately not shared with
+ *     `keepAttempts` -- see DEFAULT_BATCH_REPLAY_RETENTION's own header.
+ *     `null` disables the supersede operation entirely.
  * @returns {{evictions: Array, refused: Array, compactions: Array,
- *   keysBefore: number, keysAfter: number, selectorsGiven: boolean}}
+ *   supersedes: Array, keysBefore: number, keysAfter: number,
+ *   selectorsGiven: boolean}}
  */
 export function planPrune(store, opts = {}) {
   const {
@@ -755,6 +789,7 @@ export function planPrune(store, opts = {}) {
     states,
     allowCompleted = false,
     keepAttempts = DEFAULT_ATTEMPT_RETENTION,
+    keepBatchReplays = DEFAULT_BATCH_REPLAY_RETENTION,
   } = opts;
 
   const selectorsGiven = Boolean(configHash || armIds || briefIds || kinds || states);
@@ -912,13 +947,57 @@ export function planPrune(store, opts = {}) {
     }
   }
 
+  // ── Supersede: drop batch-replay records shadowed by a newer one (#117) ──
+  // No fold here (contrast compaction above): a batch-replay record's
+  // payload is a durable batch handle plus recovered replies, not cost
+  // rows, so there is nothing to sum. The operation is pure removal of
+  // every record but the highest-attempt one per cell -- safe outright
+  // because BATCH_RESUME_FAMILY records always carry costRows: [] (enforced
+  // by writeBatchResumeRecord), so nothing here can ever drop money.
+  //
+  // Deliberately blind to whether the cell that owns each group has
+  // COMPLETED (a `retired` batch-replay record, or one whose cell is stored
+  // `completed`, can never replay again and so is dead weight even at
+  // `keepBatchReplays`). That is a real decision, not an oversight: reading
+  // cross-family cell state here would make this operation's correctness
+  // depend on two record families staying in sync, which is exactly the
+  // coupling that produced #115's `salvageEvictedCellSpend` bug. Retaining
+  // one dead record per still-`keepBatchReplays`-eligible cell is a bounded,
+  // honest cost; this prune does not chase it further. See
+  // docs/resuming-batches.md for the same call stated for an operator.
+  const supersedes = [];
+  if (keepBatchReplays !== null && keepBatchReplays !== undefined) {
+    if (!Number.isInteger(keepBatchReplays) || keepBatchReplays < 1) {
+      throw new Error(`planPrune: keepBatchReplays must be a positive integer (or null to disable), got ${keepBatchReplays}`);
+    }
+    const byCell = new Map();
+    for (const entry of entries) {
+      const parsed = parseAttemptKey(entry.key);
+      if (!parsed || parsed.family !== BATCH_RESUME_FAMILY) continue;
+      if (!byCell.has(parsed.cellKey)) byCell.set(parsed.cellKey, []);
+      byCell.get(parsed.cellKey).push({ ...parsed, key: entry.key });
+    }
+    for (const [cellKeyStr, records] of byCell) {
+      if (records.length <= keepBatchReplays) continue;
+      // Numeric ordering, never lexical: `through` is already a Number (see
+      // parseAttemptKey), so attempt=10 correctly outranks attempt=9 -- a
+      // string comparator would get this backwards.
+      records.sort((a, b) => a.through - b.through);
+      const removeKeys = records.slice(0, records.length - keepBatchReplays).map((r) => r.key);
+      const keptKeys = records.slice(records.length - keepBatchReplays).map((r) => r.key);
+      supersedes.push({ cellKey: cellKeyStr, removeKeys, keptKeys });
+    }
+  }
+
   const netRemoved =
     evictions.length +
-    compactions.reduce((n, c) => n + c.removeKeys.length - (store.has(c.newKey) ? 0 : 1), 0);
+    compactions.reduce((n, c) => n + c.removeKeys.length - (store.has(c.newKey) ? 0 : 1), 0) +
+    supersedes.reduce((n, s) => n + s.removeKeys.length, 0);
   return {
     evictions,
     refused,
     compactions,
+    supersedes,
     keysBefore: entries.length,
     // Eviction adds one salvage record per evicted cell that carried money.
     keysAfter: entries.length - netRemoved + evictions.filter((e) => e.costRows.length > 0).length,
@@ -1033,7 +1112,17 @@ export function pruneStore(store, opts = {}) {
     log(`[prune] compacted ${c.removeKeys.length} ${c.family} record(s) for '${c.cellKey}' into ${c.newKey} (${c.rowsBefore} -> ${c.rows.length} cost row(s))`);
   }
 
-  // ── 3. Prove the money survived ─────────────────────────────────────────
+  // ── 3. Remove superseded batch-replay records (issue #117) ──────────────
+  // No salvage step, unlike eviction above: BATCH_RESUME_FAMILY records
+  // always carry costRows: [] (enforced by writeBatchResumeRecord), so
+  // there is no money to re-home before removing them.
+  for (const s of plan.supersedes) {
+    store.remove(s.removeKeys);
+    removed.push(...s.removeKeys);
+    log(`[prune] superseded ${s.removeKeys.length} batch-replay record(s) for cell '${s.cellKey}' (kept ${s.keptKeys.length} newest)`);
+  }
+
+  // ── 4. Prove the money survived ─────────────────────────────────────────
   // The last line of defence, and the only one that runs in production: a
   // fold bug or a lost salvage shows up here, on the operator's terminal,
   // rather than three weeks later in a cost figure nobody can reconcile.

@@ -32,7 +32,7 @@ import armsConfigJson from "../arms.config.json" with { type: "json" };
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { ResultsStore } from "../lib/store.mjs";
+import { ResultsStore, BATCH_RESUME_FAMILY, writeBatchResumeRecord } from "../lib/store.mjs";
 import { cellKey } from "../lib/manifest.mjs";
 import { TRANSIENT_FAILURE_KINDS, INTRINSIC_FAILURE_KINDS, PAYMENT_FAILURE_KINDS } from "../lib/accounting.mjs";
 
@@ -796,6 +796,18 @@ test("--keep-attempts refuses zero, a fraction and a non-number", () => {
   assert.throws(() => parseArgs(["--prune", "--keep-attempts", "lots"]), /numeric argument/);
 });
 
+test("parseArgs accepts --keep-batch-replays, its own knob from --keep-attempts (#117)", () => {
+  const args = parseArgs(["--prune", "--keep-attempts", "3", "--keep-batch-replays", "2", "--apply"]);
+  assert.equal(args.keepAttempts, 3);
+  assert.equal(args.keepBatchReplays, 2);
+});
+
+test("--keep-batch-replays refuses zero, a fraction and a non-number", () => {
+  assert.throws(() => parseArgs(["--prune", "--keep-batch-replays", "0"]), /positive integer/);
+  assert.throws(() => parseArgs(["--prune", "--keep-batch-replays", "1.5"]), /positive integer/);
+  assert.throws(() => parseArgs(["--prune", "--keep-batch-replays", "lots"]), /numeric argument/);
+});
+
 test("--prune is dry-run by default: main() reports a plan and writes nothing", async () => {
   const store = pruneFixtureStore();
   const before = store.keys();
@@ -817,6 +829,54 @@ test("--prune --apply removes the cell, and reports the spend it verified", asyn
   assert.ok(lines.some((l) => l.includes("EVICT removed")), lines.join("\n"));
   assert.ok(lines.some((l) => /spend-to-date after/.test(l)), lines.join("\n"));
   assert.equal(lines.some((l) => l.includes("DRY RUN")), false);
+});
+
+// ── #117: --prune reaches superseded batch-replay records too ──────────────
+
+/** pruneFixtureStore() plus five real batch-replay records for one cell,
+ *  written through lib/store.mjs's own writer. */
+function replayFixtureStore() {
+  const store = pruneFixtureStore();
+  const replayed = cellKey({ armId: "A", briefId: "b5", replicate: 0, cfg: PRUNE_CFG });
+  for (let n = 0; n < 5; n++) {
+    writeBatchResumeRecord(store, {
+      cellKey: replayed,
+      cfg: PRUNE_CFG,
+      replies: { [`r${n}`]: { model: "claude-haiku-4-5", text: `reply ${n}` } },
+      pricingLever: "batch",
+    });
+  }
+  return { store, replayed };
+}
+
+test("--prune dry-run reports what a supersede WOULD remove, and modifies nothing", async () => {
+  const { store } = replayFixtureStore();
+  const before = store.keys();
+  const lines = [];
+  await main(["--prune"], { store, log: (m) => lines.push(m), getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+
+  assert.deepEqual(store.keys(), before, "a dry run modifies nothing");
+  assert.ok(lines.some((l) => l.includes("SUPERSEDE would remove") && l.includes("batch-replay")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("DRY RUN")), lines.join("\n"));
+});
+
+test("--prune --apply removes superseded batch-replay records and keeps the newest, no selector needed", async () => {
+  const { store, replayed } = replayFixtureStore();
+  const lines = [];
+  await main(["--prune", "--apply"], { store, log: (m) => lines.push(m), getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+
+  const remaining = store.keys().filter((k) => k.startsWith(BATCH_RESUME_FAMILY));
+  assert.deepEqual(remaining, [`${BATCH_RESUME_FAMILY}|cell=${replayed}|attempt=4`], "only the highest-attempt record survives");
+  assert.ok(lines.some((l) => l.includes("SUPERSEDE removed") && l.includes("batch-replay")), lines.join("\n"));
+  assert.ok(lines.some((l) => /spend-to-date after/.test(l)), lines.join("\n"));
+});
+
+test("--keep-batch-replays raises the retention window, independent of --keep-attempts", async () => {
+  const { store, replayed } = replayFixtureStore();
+  await main(["--prune", "--keep-batch-replays", "2", "--apply"], { store, log: () => {}, getEngineVersion: STUB_ENGINE_VERSION, runSpecFn: spyRunSpec() });
+
+  const remaining = store.keys().filter((k) => k.startsWith(`${BATCH_RESUME_FAMILY}|cell=${replayed}|`));
+  assert.equal(remaining.length, 2);
 });
 
 // ── #108 AC5: judge-call records, same command ────────────────────────────
@@ -925,6 +985,7 @@ test("prune-only flags on a REAL run are rejected, not silently ignored", async 
   await assert.rejects(() => main(["--apply"], base), /only meaningful with --prune/);
   await assert.rejects(() => main(["--allow-completed"], base), /only meaningful with --prune/);
   await assert.rejects(() => main(["--keep-attempts", "3"], base), /only meaningful with --prune/);
+  await assert.rejects(() => main(["--keep-batch-replays", "2"], base), /only meaningful with --prune/);
   await assert.rejects(() => main(["--states", "failed"], base), /only meaningful with --prune/);
 });
 

@@ -21,7 +21,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { ResultsStore } from "../../lib/store.mjs";
+import { ResultsStore, BATCH_RESUME_FAMILY, writeBatchResumeRecord, readBatchResumeRecord } from "../../lib/store.mjs";
 import { cellKey, configHash, planRun } from "../../lib/manifest.mjs";
 import { RATE_TABLE } from "../../lib/price.mjs";
 import { INTRINSIC_FAILURE_KINDS } from "../../lib/accounting.mjs";
@@ -35,6 +35,7 @@ import {
   spendToDate,
   ATTEMPT_FAMILIES,
   DEFAULT_ATTEMPT_RETENTION,
+  DEFAULT_BATCH_REPLAY_RETENTION,
 } from "./runner.mjs";
 // The real judge-call writer (issue #108). Imported so these tests exercise
 // the actual numbering, not a fixture's guess at the key shape.
@@ -743,4 +744,137 @@ test("#108 AC5: judge-call records are covered by the SAME prune invocation as e
   assert.deepEqual(families, ["generation-attempt", "judge-call"], "both families in one plan");
   assertSpendPreserved(spendToDate(store), before, "one prune, two families, same ledger");
   assert.ok(ATTEMPT_FAMILIES.includes("judge-call"), "and it is a first-class member of the family list, not a special case");
+});
+
+// ── #117: supersede — a prune path for superseded batch-replay records ─────
+
+/** Write one real batch-replay record through lib/store.mjs's own writer, so
+ *  these tests exercise the actual numbering rather than a fixture's guess
+ *  at the key shape (same rationale as putAttempt using the real key
+ *  grammar, and meterJudge using the real gate.mjs writer). */
+function putReplay(store, cell, n) {
+  return writeBatchResumeRecord(store, {
+    cellKey: cell,
+    cfg: CFG,
+    replies: { [`r${n}`]: { model: "claude-haiku-4-5", text: `reply ${n}` } },
+    pricingLever: "batch",
+  });
+}
+
+test("supersede removes every batch-replay record but the highest, and spend + record count both move", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 6; n++) putReplay(store, cell, n);
+  assert.equal(store.keys().filter((k) => k.startsWith(BATCH_RESUME_FAMILY)).length, 6, "precondition");
+
+  const before = spendToDate(store);
+  const keysBefore = store.keys().length;
+
+  pruneStore(store, { keepBatchReplays: 1 });
+
+  // Both halves together, matching this file's own convention for the
+  // compaction tests above: "spend unchanged" alone is satisfied by doing
+  // nothing, and "fewer records" alone is satisfied by dropping money. Only
+  // the conjunction is the property this operation must have.
+  const keysAfter = store.keys().length;
+  assert.ok(keysAfter < keysBefore, `supersede must actually shrink the store (${keysBefore} -> ${keysAfter})`);
+  assertSpendPreserved(spendToDate(store), before, "batch-replay records carry no money -- spend must be exactly unchanged");
+
+  const remaining = store.keys().filter((k) => k.startsWith(BATCH_RESUME_FAMILY));
+  assert.deepEqual(remaining, [`${BATCH_RESUME_FAMILY}|cell=${cell}|attempt=5`], "only the highest-attempt record survives");
+});
+
+test("supersede selection is numeric, not lexical -- attempt=11 outranks attempt=9", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n <= 11; n++) putReplay(store, cell, n);
+
+  pruneStore(store, { keepBatchReplays: 1 });
+
+  const remaining = store.keys().filter((k) => k.startsWith(BATCH_RESUME_FAMILY));
+  assert.deepEqual(remaining, [`${BATCH_RESUME_FAMILY}|cell=${cell}|attempt=11`], "a string comparator would have kept attempt=9, not 11");
+});
+
+// ── AC 2: the highest-attempt record is never removed while re-plannable ───
+
+test("the highest-attempt batch-replay record is never removed -- readBatchResumeRecord still resolves it after a prune", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 4; n++) putReplay(store, cell, n);
+  const before = readBatchResumeRecord(store, cell);
+  assert.equal(before.attempt, 3, "precondition");
+
+  pruneStore(store, { keepBatchReplays: 1 });
+
+  const after = readBatchResumeRecord(store, cell);
+  assert.ok(after, "the cell is still re-plannable -- resume must find a record");
+  assert.equal(after.attempt, 3, "the SAME record that was live before the prune, not merely 'a' record");
+  assert.deepEqual(after.replies, before.replies);
+});
+
+// ── AC 4: the #103 compaction exclusion, re-asserted by test ───────────────
+
+test("compaction still never touches the batch-replay family (#103 exclusion, re-asserted for #117)", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  const bodies = [];
+  for (let n = 0; n < 8; n++) {
+    const { key } = putReplay(store, cell, n);
+    bodies.push([key, JSON.stringify(store.get(key))]);
+  }
+  // Aggressive compaction retention, supersede disabled -- so ONLY
+  // compaction runs, on the real prune path, not a re-check of the constant.
+  const result = pruneStore(store, { keepAttempts: 1, keepBatchReplays: null });
+  assert.equal(result.plan.compactions.length, 0, "batch-replay records must never form a compaction group");
+  for (const [key, body] of bodies) {
+    assert.ok(store.has(key), `${key} must survive a compaction-only prune untouched`);
+    assert.equal(
+      JSON.stringify(store.get(key)),
+      body,
+      `${key}'s body must be byte-identical -- compaction would have rewritten it as summed cost rows`,
+    );
+  }
+});
+
+// ── The two open decisions, pinned by test ──────────────────────────────────
+
+test("--keep-batch-replays is its own knob, independent of --keep-attempts", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 6; n++) putReplay(store, cell, n);
+
+  // A generous keepAttempts -- which does not even apply to this family --
+  // must not leak into how many batch-replay records survive.
+  pruneStore(store, { keepAttempts: 5, keepBatchReplays: 3 });
+  assert.equal(store.keys().filter((k) => k.startsWith(BATCH_RESUME_FAMILY)).length, 3);
+});
+
+test("DEFAULT_BATCH_REPLAY_RETENTION is 1, and is what an unscoped --prune actually uses", (t) => {
+  assert.equal(DEFAULT_BATCH_REPLAY_RETENTION, 1);
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 3; n++) putReplay(store, cell, n);
+
+  pruneStore(store, {});
+
+  assert.equal(store.keys().filter((k) => k.startsWith(BATCH_RESUME_FAMILY)).length, 1);
+});
+
+test("supersede is blind to a retired record's cell status -- a decision, not an oversight (#117)", (t) => {
+  const store = tempStore(t);
+  const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
+  for (let n = 0; n < 3; n++) putReplay(store, cell, n);
+  // A 4th record, written retired -- as writeBatchResumeRecord's caller does
+  // when the cell finally completes. "The cell completed" is real, but it is
+  // not visible from this record alone, and supersede does not go looking:
+  // cross-referencing the cell's own stored record would couple two record
+  // families' correctness together (the exact shape of #115's bug).
+  writeBatchResumeRecord(store, { cellKey: cell, cfg: CFG, replies: {}, pricingLever: "batch", retired: true });
+
+  pruneStore(store, { keepBatchReplays: 1 });
+
+  const remaining = store.keys().filter((k) => k.startsWith(BATCH_RESUME_FAMILY));
+  assert.equal(remaining.length, 1, "still just the highest-attempt record -- retired or not, keepBatchReplays alone decides");
+  assert.ok(remaining[0].endsWith("|attempt=3"));
+  assert.equal(readBatchResumeRecord(store, cell).retired, true, "and it is the retired tombstone, correctly reported as such");
 });
