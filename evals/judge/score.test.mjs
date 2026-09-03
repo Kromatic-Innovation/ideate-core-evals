@@ -771,6 +771,30 @@ test("runJudgeMatrix executes BOTH legs of every pool when both providers are wi
   assert.ok(anthropic.calls.length === 2 && openai.calls.length === 2);
 });
 
+// ── issue #119: runJudgeMatrix's `mode` reaches meterJudgeCall, so every
+// judge-call cost row (a FLAT, non-tokens_by_model shape) carries its own
+// pricing_regime rather than staying on meterJudgeCall's default forever. ──
+test("issue #119: runJudgeMatrix threads `mode` onto every judge-call costRow's pricing_regime", async () => {
+  const store = makeTempStore("judge-matrix-mode-");
+  const anthropic = new MockJudgeProvider();
+  const openai = new MockJudgeProvider();
+  const pools = [poolEntry("arm=B|brief=biz-01|rep=0|cfg=x", "B", "b idea 1", "b idea 2")];
+  const { costRows } = await runJudgeMatrix({
+    pools,
+    judgeModels: JUDGE_MODELS,
+    providers: { anthropic, openai },
+    store,
+    seed: 1,
+    mode: "single",
+    timestamp: "2026-08-02T00:00:00Z",
+  });
+  assert.ok(costRows.length > 0);
+  for (const row of costRows) {
+    assert.equal(row.pricing_regime, "single", "the composition's own mode, not meterJudgeCall's default");
+    assert.ok(!("tokens_by_model" in row), "a judge-call row is the FLAT shape, not tokens_by_model");
+  }
+});
+
 test("runJudgeMatrix does NOT silently drop the OpenAI leg when its provider is absent — it records it deferred", async () => {
   const store = makeTempStore("judge-defer-");
   const anthropic = new MockJudgeProvider();

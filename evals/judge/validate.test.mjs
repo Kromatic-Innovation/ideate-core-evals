@@ -157,6 +157,23 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   assert.deepEqual(out.costRows[0], costRecord.costRows[0]);
   assert.equal(out.hasMissingRate, false);
   assert.ok(out.spendByProvider.anthropic > 0);
+
+  // issue #119: this composition's judge call is the SAME flat-shape
+  // costRow a generation judge leg is, and it must carry the composition's
+  // own `mode` as `pricing_regime` -- the default here is "batch" (mode's
+  // own default), matching meterJudgeCall's default so nothing changes for
+  // a caller (like this one) that never passes `mode`.
+  assert.equal(out.costRows[0].pricing_regime, "batch");
+});
+
+test("runJudgeValidation — mode: 'single' reaches the stored costRow's pricing_regime (issue #119)", async () => {
+  const root = tmpRoot("mode-single");
+  writeValidationFixture(root);
+  const store = makeTempStore("judge-validate-mode-single-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+
+  const out = await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP, mode: "single" });
+  assert.equal(out.costRows[0].pricing_regime, "single");
 });
 
 test("runJudgeValidation — a failed judge run still meters whatever tokens the judge consumed before failing", async () => {
