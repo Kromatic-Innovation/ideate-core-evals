@@ -153,7 +153,7 @@ $ node evals/run.mjs --prune --kinds transient --cfg 5ce5478956e5
 [prune] store holds 56 record(s)
 [prune] EVICT would remove cell arm=A|brief=biz-01|rep=0|cfg=5ce5478956e5
         state=failed kind=rate_limited  (1 cost row(s) re-homed under
-        pruned-cell|cell=arm=A|brief=biz-01|rep=0|cfg=5ce5478956e5|pruned=N
+        pruned-cell|cell=arm=A|brief=biz-01|rep=0|cfg=5ce5478956e5|attempt=N
         — the money stays)
 [prune] store would hold 56 record(s)
 [prune] DRY RUN — nothing was modified. Re-run with --apply to commit.
@@ -233,12 +233,20 @@ These records are invisible to `planRun` (its key regex requires a leading
 `arm=`), so they never masquerade as cells.
 
 **A prune never destroys spend either.** Evicting a cell first re-homes its
-cost rows under `pruned-cell|cell=<the cell key>|pruned=<n>` — the same shape
+cost rows under `pruned-cell|cell=<the cell key>|attempt=<n>` — the same shape
 issue #90 writes for a live transient failure, applied retroactively — and
 only then removes the cell. After an `--apply`, the command recomputes
 `spendToDate()` and **throws if the figure moved**, so a bug in this path
 surfaces on your terminal rather than in a cost total nobody can reconcile
 three weeks later.
+
+`pruned-cell` records are themselves one of the bounded, compacted families
+(issue #115) — numbered `|attempt=N` and folded by the exact same
+`--keep-attempts` policy described below, not a separate scheme. That is why
+the key uses `attempt=`, not a family-private `pruned=` counter: a fold
+routinely frees low slot numbers, and only a shared max+1 allocator (the same
+one every other compacted family already uses) stays correct once a slot can
+be freed.
 
 ### Attempt records are bounded, not unbounded
 
@@ -269,11 +277,13 @@ is left unfolded rather than repriced. The bound is best-effort; the ledger is
 not.
 
 `judge-call` records (`evals/judge/gate.mjs`) fold the same way as of #108,
-under the same `--prune --keep-attempts` and with no judge-specific flag —
+under the same `--prune --keep-attempts` and with no judge-specific flag --
 they group per (cell, judge model), so two judges scoring one pool are two
-independent sequences. Still not compacted: `pruned-cell` records, which need
-a second numbering fix in `salvageEvictedCellSpend` before they can be (it
-re-uses the lowest free `pruned=N` slot, and a fold frees the low ones).
+independent sequences. `pruned-cell` records fold the same way too, as of
+#115: they needed a numbering fix in `salvageEvictedCellSpend` first (it used
+to re-use the lowest free `pruned=N` slot, which a fold routinely frees) --
+see that function's own header in `evals/harness/runner.mjs` for the
+allocator and idempotency-identity change that had to move together.
 
 ## The store's append-only contract, precisely
 

@@ -476,10 +476,14 @@ function recordGenerationAttemptFailure(store, { cell, costRows, kind, detail, r
 //
 //   EVICT   — a cell record leaves the store so `planRun` plans it `todo`
 //             again. Its cost rows are first RE-HOMED under a
-//             `pruned-cell|cell=…|pruned=N` record, which is exactly what
+//             `pruned-cell|cell=…|attempt=N` record, which is exactly what
 //             #90 does for a live transient failure, applied retroactively.
 //             A legacy store is thereby not merely repaired, it is brought
 //             to the shape #90 would have written in the first place.
+//             `pruned-cell` is itself one of ATTEMPT_FAMILIES (issue #115),
+//             so its own records are bounded by the SAME compaction below —
+//             see `salvageEvictedCellSpend` for the allocator/idempotency
+//             pair that had to move together to make that safe.
 //   COMPACT — several attempt records for one cell are folded into ONE
 //             record whose cost rows are the per-(cell, billing mode, model)
 //             SUM of theirs. Count falls; money is identical.
@@ -718,20 +722,6 @@ export function foldCostRows(rows, rateTable = DEFAULT_RATE_TABLE, { batch = tru
   return { rows: foldedRows, folded: true };
 }
 
-/** Sorted-key JSON, matching how lib/store.mjs canonicalizes a body before
- *  writing it — so a record built here compares equal to its own stored
- *  form regardless of property insertion order. */
-function canonicalJson(value) {
-  return JSON.stringify(value, (_k, v) => {
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      const out = {};
-      for (const k of Object.keys(v).sort()) out[k] = v[k];
-      return out;
-    }
-    return v;
-  });
-}
-
 /** Sort cost rows into a canonical order so a compacted record's body is a
  *  pure function of what it accounts for. Without this, re-running a prune
  *  over an already-compacted record could produce the same rows in a
@@ -914,6 +904,16 @@ export function planPrune(store, opts = {}) {
 
       const rawRows = [];
       const models = new Set();
+      // Only populated for PRUNED_CELL_FAMILY -- see this loop's push() below
+      // and salvageEvictedCellSpend's own header. A raw pruned-cell record
+      // carries a single `prunedFromStoredAt` (the physical cell record it
+      // salvaged); the topmost compacted record it may be folding already
+      // carries the WHOLE set from its own prior fold. Either way, gathering
+      // over `contributors` (never the wider `foldSet`) is correct for the
+      // identical reason it is correct for `rawRows` above: anything folded
+      // out of `foldSet` but not a contributor is already subsumed by
+      // `topCompacted`'s own recorded set.
+      const prunedFromStoredAts = family === PRUNED_CELL_FAMILY ? new Set() : null;
       let cfg;
       for (const r of contributors) {
         const body = store.get(r.key);
@@ -921,6 +921,14 @@ export function planPrune(store, opts = {}) {
         for (const m of Object.values(body.resolvedModels || {})) {
           if (typeof m === "string") models.add(m);
           else if (Array.isArray(m)) for (const x of m) models.add(x);
+        }
+        if (prunedFromStoredAts) {
+          const result = body.result || {};
+          if (r.compacted) {
+            for (const s of result.prunedFromStoredAts || []) prunedFromStoredAts.add(s);
+          } else if (result.prunedFromStoredAt) {
+            prunedFromStoredAts.add(result.prunedFromStoredAt);
+          }
         }
       }
       for (const entry of entries) {
@@ -943,6 +951,7 @@ export function planPrune(store, opts = {}) {
         rowsFolded: fold.folded,
         foldSkippedReason: fold.folded ? null : fold.reason,
         models: [...models].sort(),
+        ...(prunedFromStoredAts ? { prunedFromStoredAts: [...prunedFromStoredAts].sort() } : {}),
       });
     }
   }
@@ -1023,6 +1032,22 @@ export function planPrune(store, opts = {}) {
  * and the operator finds out from the prune rather than from a study that
  * quietly claims to have cost less than it did.
  *
+ * ── Known limitation, carried forward rather than fixed here (issue #115) ──
+ * The guard throw above fires AFTER every eviction/compaction/supersede in
+ * the plan has already been applied to `store` — `ResultsStore` has no
+ * transaction, so there is no atomic "apply the whole plan or none of it"
+ * available to reach for. #115 considered and deliberately did not attempt
+ * this: it is a `lib/store.mjs`-level capability (e.g. a snapshot-and-revert
+ * around `remove()`/`put()`), not a fix expressible in this module's policy
+ * layer, and the money-first ordering above already makes the one thing that
+ * matters true regardless — a crash or a guard throw here over-reports
+ * (the same money briefly counted twice) and never under-reports, and a
+ * re-run converges (see planPrune's `covered` rule and
+ * `salvageEvictedCellSpend`'s idempotency check). The thrown error message
+ * says so explicitly ("the store has already been modified") for the same
+ * reason this comment does: the limitation is meant to be found here, not
+ * rediscovered from a half-mutated store three weeks from now.
+ *
  * @param {object} store  a lib/store.mjs ResultsStore
  * @param {object} [opts] planPrune()'s options, plus:
  *   @param {(msg: string) => void} [opts.log]
@@ -1069,7 +1094,19 @@ export function pruneStore(store, opts = {}) {
       briefId: c.cellKey,
       replicate: 0,
       cfg: c.cfg,
-      result: { kind: `${c.family}-compacted`, cellKey: c.cellKey, through: c.through },
+      result: {
+        kind: `${c.family}-compacted`,
+        cellKey: c.cellKey,
+        through: c.through,
+        // Only present for PRUNED_CELL_FAMILY (issue #115): the set of
+        // physical cell-record identities (`prunedFromStoredAt`) this fold
+        // accounts for. This is what lets salvageEvictedCellSpend's
+        // idempotency check keep working once a raw record's OWN identity
+        // field has been folded away -- see planPrune's compaction loop,
+        // which builds this set, and lib/store.mjs's ATTEMPT_FAMILIES
+        // comment for the fuller why.
+        ...(c.prunedFromStoredAts ? { prunedFromStoredAts: c.prunedFromStoredAts } : {}),
+      },
       resolvedModels: { models: c.models },
       // The compacted record reports the state of what it folds, rather than
       // one hardcoded state for every family. A generation/metrics attempt
@@ -1147,7 +1184,7 @@ export function pruneStore(store, opts = {}) {
 }
 
 /**
- * Re-home an evicted cell's cost rows under a `pruned-cell|cell=…|pruned=N`
+ * Re-home an evicted cell's cost rows under a `pruned-cell|cell=…|attempt=N`
  * record, so the money the cell paid for survives the cell.
  *
  * This is #90's own mechanism applied retroactively: a transient generation
@@ -1155,16 +1192,37 @@ export function pruneStore(store, opts = {}) {
  * `reuse`; after this it lives under an attempt-scoped key exactly as #90
  * would have written it, and the cell plans `todo` again.
  *
- * The `pruned=N` suffix is chosen so the operation is IDEMPOTENT rather than
- * merely unique: N is the lowest index at which either nothing is stored, or
- * what is stored is a salvage of THIS PHYSICAL cell record. So a prune
- * interrupted between the salvage write and the cell removal, then re-run,
- * reuses the record it already wrote instead of writing a second copy of the
- * same money.
+ * ── Slot allocation: max+1, not scan-from-zero (issue #115) ────────────────
+ * `pruned-cell` is one of `ATTEMPT_FAMILIES` (lib/store.mjs), so its records
+ * are bounded by the same compaction as every other family here — and that
+ * makes a scan-from-zero-for-the-first-FREE-slot allocator actively wrong:
+ * a fold frees the low slots it just compacted away, and the very next
+ * salvage would reuse one of them, writing NEW real money under a slot
+ * number the next compaction's `through` sort places BELOW the already-
+ * compacted record — excluding it from `contributors` while `removeKeys`
+ * still removes it. That is a silent, permanent spend loss (see this
+ * function's own regression test in evals/harness/prune.test.mjs for the
+ * exact fold → evict → fold sequence). `nextAttemptNumber` is immune: it
+ * derives from the MAXIMUM attempt/through any stored record (raw or
+ * compacted) accounts for, so a freed low slot never gets reused.
  *
- * "This physical record" is the load-bearing phrase, and identity here is the
- * index entry's `storedAt`, never the body's content. Content cannot tell the
- * two cases apart, and they need opposite answers:
+ * ── Idempotency: identity that SURVIVES a fold (issue #115) ────────────────
+ * The salvage still has to be idempotent across a prune interrupted between
+ * the salvage write and the cell removal — same requirement #98 always had.
+ * What changed is what "already salvaged" can be checked against: a RAW
+ * pruned-cell record's identity is its own `prunedFromStoredAt` field (the
+ * index entry's `storedAt` for the physical cell record it salvages — see
+ * below for why `storedAt`, never content). A COMPACTED one can no longer
+ * carry a single `prunedFromStoredAt`, because it folds several such
+ * identities into one record; it carries the whole set instead, under
+ * `prunedFromStoredAts` (plural — populated by planPrune's compaction loop,
+ * see there). Checking both raw and compacted shapes, rather than moving the
+ * fold-preserving burden onto the generic compaction path, keeps every OTHER
+ * attempt family's compacted body exactly as it always was.
+ *
+ * "Physical record" is the load-bearing phrase, and identity is the index
+ * entry's `storedAt`, never the body's content. Content cannot tell two
+ * cases apart, and they need opposite answers:
  *
  *   - CRASH: salvage written, process died before the cell was removed. The
  *     cell and the salvage hold the SAME money. A re-run must reuse.
@@ -1205,28 +1263,37 @@ function salvageEvictedCellSpend(store, evicted) {
     },
     costRows: evicted.costRows,
   };
-  for (let n = 0; n < 1000; n++) {
-    const key = `${PRUNED_CELL_FAMILY}|cell=${evicted.key}|pruned=${n}`;
-    if (store.has(key)) {
-      const prior = store.get(key);
-      // Sorted-key comparison, not a bare JSON.stringify: what comes BACK
-      // from the store was canonicalized on write (lib/store.mjs sorts
-      // object keys), so a literal stringify of the record we are about to
-      // write compares unequal to its own stored form purely on property
-      // order. `result` carries `prunedFromStoredAt`, so this compares
-      // RECORD IDENTITY and not merely equal content.
-      if (canonicalJson(prior.result) === canonicalJson(body.result) && canonicalJson(prior.costRows) === canonicalJson(body.costRows)) {
-        // Already salvaged by an interrupted earlier prune. The caller needs
-        // to know, because removing the cell now takes away a DUPLICATE of
-        // money that is already recorded, not money.
-        return { key, reused: true };
-      }
-      continue;
+
+  // ── Idempotency check FIRST, over every stored pruned-cell record ────────
+  // Deliberately not folded into the allocation loop below: allocation only
+  // needs to know the NEXT number, but idempotency needs to check EVERY
+  // existing record (raw or compacted) for this cell, because the match
+  // this physical eviction is looking for could be sitting under any slot,
+  // including one a fold already renumbered away.
+  for (const key of store.keys()) {
+    const parsed = parseAttemptKey(key);
+    if (!parsed || parsed.family !== PRUNED_CELL_FAMILY || parsed.cellKey !== evicted.key) continue;
+    const stored = store.get(key);
+    const result = stored.result || {};
+    const alreadyCovered = parsed.compacted
+      ? (result.prunedFromStoredAts || []).includes(evicted.storedAt)
+      : result.prunedFromStoredAt === evicted.storedAt;
+    if (alreadyCovered) {
+      // Already salvaged (raw) or already folded into a compacted record
+      // that accounts for it (compacted) by an interrupted earlier prune.
+      // The caller needs to know, because removing the cell now takes away
+      // a DUPLICATE of money that is already recorded, not money.
+      return { key, reused: true };
     }
-    store.put({ key, ...body });
-    return { key, reused: false };
   }
-  throw new Error(`salvageEvictedCellSpend: 1000 salvage records already exist for cell '${evicted.key}' -- refusing to write another`);
+
+  // ── Allocate: max+1 across raw AND compacted shapes ──────────────────────
+  // See this function's own header for why scan-from-zero is unsafe once
+  // this family compacts.
+  const attempt = nextAttemptNumber(store, PRUNED_CELL_FAMILY, evicted.key);
+  const key = `${PRUNED_CELL_FAMILY}|cell=${evicted.key}|attempt=${attempt}`;
+  store.put({ key, ...body });
+  return { key, reused: false };
 }
 
 /**
