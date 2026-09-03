@@ -1032,7 +1032,7 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
       // SCORES exist, so a crash here is recoverable by re-scoring (cheap,
       // recomputable) -- the alternative ordering risked losing the ALREADY-
       // SPENT judge-call row instead (not recomputable; real money gone).
-      const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
+      const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp, mode });
       costRows.push(metered.row);
       recordJudgeScores(store, { poolKey: row.poolKey, judgeModel: row.judge_model, judgeProvider: row.judge_provider, scores: resp.scores });
       results.push({ poolKey: row.poolKey, judge_provider: row.judge_provider, judge_model: row.judge_model, state: "completed", scores: resp.scores });
@@ -1042,7 +1042,7 @@ export async function runJudgeMatrix({ pools, judgeModels, providers, store, see
       // and still contributes a costRow — the ledger must not undercount spend
       // just because the call didn't complete.
       if (resp.tokens && (resp.tokens.input_tokens || resp.tokens.output_tokens)) {
-        const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp });
+        const metered = meterJudgeCall({ store, cellKey: row.poolKey, judgeModel: row.judge_model, tokens: resp.tokens, timestamp, mode });
         costRows.push(metered.row);
       }
       // Sticky (issue #106): record the refusal against the provider INSTANCE

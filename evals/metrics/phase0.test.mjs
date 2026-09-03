@@ -103,6 +103,9 @@ test("runPhase0 stores both controls under run-discriminated keys, with token-ba
   assert.equal(datRecord.costRows[0].billing_mode, "api");
   assert.equal(datRecord.costRows[0].input_tokens, 2);
   assert.equal("cost_usd" in datRecord.costRows[0], false);
+  // issue #119: this embedder call has no batch code path in this codebase,
+  // so its regime is always "single", regardless of any study-wide batch flag.
+  assert.equal(datRecord.costRows[0].pricing_regime, "single");
 
   // cfg is INDEX-visible metadata (lib/store.mjs put()) -- a reader must be
   // able to see pass/fail by scanning list() alone, without opening a body.
@@ -115,6 +118,7 @@ test("runPhase0 stores both controls under run-discriminated keys, with token-ba
   assert.equal(controlsRecord.result.random.verdict.failed, false);
   assert.equal(controlsRecord.costRows[0].input_tokens, 3);
   assert.equal(controlsRecord.costRows[0].billing_mode, "api");
+  assert.equal(controlsRecord.costRows[0].pricing_regime, "single"); // issue #119
   assert.equal(controlsRecord.result.threshold, VOYAGE_CLUSTER_DISTANCE_THRESHOLD);
   assert.equal(controlsRecord.result.thresholdProvenance.pairSetHash, VOYAGE_CALIBRATION_RECORD.pairSetHash);
   assert.equal(controlsRecord.result.provenance.gitSha, "stub-sha");

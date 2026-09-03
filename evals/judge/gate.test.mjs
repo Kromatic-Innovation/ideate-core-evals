@@ -287,6 +287,45 @@ test("AC10 — a judge call produces a costRow (tokens x model, no cost_usd) tha
   assert.ok(!("notional_usd" in row));
 });
 
+// ── issue #119: judge-call rows are the OTHER cost-row shape -- flat, no
+// tokens_by_model -- and must carry pricing_regime exactly like a
+// generation row does, or every judge leg (the dominant cost driver) stays
+// on the store-wide default while looking like the issue is closed. ───────
+test("issue #119 — meterJudgeCall stamps pricing_regime from `mode`, defaulting to batch", () => {
+  const store = makeTempStore("judge-gate-test-");
+  const defaulted = meterJudgeCall({
+    store,
+    cellKey: "arm=B|brief=b1|rep=0|cfg=deadbeef1234",
+    judgeModel: "claude-sonnet-5",
+    tokens: { input_tokens: 100, output_tokens: 50 },
+    timestamp: "2026-07-31T00:00:00Z",
+  });
+  assert.equal(store.get(defaulted.key).costRows[0].pricing_regime, "batch", "no mode passed -- defaults to batch, the pre-#119 effective behaviour");
+
+  const single = meterJudgeCall({
+    store,
+    cellKey: "arm=B|brief=b1|rep=0|cfg=deadbeef1234",
+    judgeModel: "claude-sonnet-5",
+    tokens: { input_tokens: 100, output_tokens: 50 },
+    timestamp: "2026-07-31T00:00:01Z",
+    mode: "single",
+  });
+  assert.equal(store.get(single.key).costRows[0].pricing_regime, "single");
+
+  assert.throws(
+    () =>
+      meterJudgeCall({
+        store,
+        cellKey: "arm=B|brief=b1|rep=0|cfg=deadbeef1234",
+        judgeModel: "claude-sonnet-5",
+        tokens: { input_tokens: 1, output_tokens: 1 },
+        timestamp: "2026-07-31T00:00:02Z",
+        mode: "bogus",
+      }),
+    /mode must be "batch" or "single"/,
+  );
+});
+
 // ── #108: max+1, not a count ────────────────────────────────────────
 // These assert the numbering directly against a store the prune has already
 // folded, WITHOUT running the prune -- the record shapes are the contract

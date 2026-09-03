@@ -518,6 +518,19 @@ export function attachIdeaLevelScores({ store, judgeHash, pools, ideaLevelScores
  *   @param {string} o.judgeModel  judge model id
  *   @param {object} o.tokens      token usage: { input_tokens, output_tokens, ... }
  *   @param {string} o.timestamp   ISO 8601, caller-supplied (see lib/accounting.mjs costRow)
+ *   @param {"batch"|"single"} [o.mode="batch"]  which endpoint THIS judge call
+ *     went through -- stamped onto the row as `pricing_regime` (issue #119).
+ *     A judge call is a flat-shape costRow (`model` + token fields, never
+ *     `tokens_by_model`), and it needs this exactly as much as a generation
+ *     row does: score.mjs's providers run batch-first by default (`mode =
+ *     "batch"` on both `AnthropicJudgeProvider#score` and
+ *     `OpenAIJudgeProvider#score`), so a judge-heavy store is exactly as
+ *     mixed-regime as a generation-heavy one once `--no-batch` or a partial
+ *     judge retry is in the picture. Defaults to `"batch"` -- the pre-#119
+ *     effective behaviour for every existing caller that does not pass this
+ *     (evals/harness/prune.test.mjs, evals/judge/gate.test.mjs,
+ *     evals/run.test.mjs) -- so nothing already calling this function
+ *     without `mode` changes what it records.
  *
  * `row` (issue #63) is the SAME costRow() object stored in `costRows` below,
  * handed back to the caller so it can be surfaced upward (e.g.
@@ -550,14 +563,18 @@ export function attachIdeaLevelScores({ store, judgeHash, pools, ideaLevelScores
  * under-counts real spend).
  * @returns {{key: string, written: boolean, row: object}}
  */
-export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp }) {
+export function meterJudgeCall({ store, cellKey, judgeModel, tokens, timestamp, mode = "batch" }) {
   if (!store) throw new Error("meterJudgeCall: store is required");
   if (!cellKey) throw new Error("meterJudgeCall: cellKey is required");
   if (!judgeModel) throw new Error("meterJudgeCall: judgeModel is required");
+  if (mode !== "batch" && mode !== "single") {
+    throw new Error(`meterJudgeCall: mode must be "batch" or "single", got ${JSON.stringify(mode)}`);
+  }
   const row = costRow({
     cellKey,
     timestamp,
     billing_mode: "api",
+    pricing_regime: mode,
     model: judgeModel,
     ...tokens,
   });

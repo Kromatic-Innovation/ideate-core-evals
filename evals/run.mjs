@@ -520,6 +520,20 @@ export function formatSpendSummary(summary, { storeDir } = {}) {
     const nonProviderModels = summary.cumulativeNonProviderModels || [];
     lines.push(`[spend] excluded (non-provider, e.g. embedder): ${fmt(summary.cumulativeNonProviderSpendUsd)}` + (nonProviderModels.length ? ` (${nonProviderModels.join(", ")})` : ""));
     lines.push(`[spend] TOTAL (matches --max-spend's own basis: provider + non-provider): ${fmt(summary.cumulativeSpendUsd)}`);
+    // issue #119 AC3: the cumulative total above is not ENTIRELY fact-based
+    // when this is > 0 -- some of the rows it sums predate `pricing_regime`
+    // (lib/accounting.mjs's costRow()) and were priced under a stated,
+    // recorded assumption (`legacyPricingFallbackRegime`) rather than a
+    // recorded fact. Surfaced here, next to the number it qualifies, rather
+    // than left implicit -- an operator reading only the TOTAL line must not
+    // come away thinking every dollar of it rests on data.
+    if (summary.cumulativeLegacyPricingRowCount > 0) {
+      lines.push(
+        `[spend] NOTE: ${summary.cumulativeLegacyPricingRowCount} cost row(s) in this store predate the per-row pricing regime ` +
+          `(issue #119) and were priced under the stated assumption '${summary.cumulativeLegacyPricingFallbackRegime}' rather than a ` +
+          "recorded fact -- the TOTAL above is not entirely fact-based.",
+      );
+    }
   }
   return lines;
 }

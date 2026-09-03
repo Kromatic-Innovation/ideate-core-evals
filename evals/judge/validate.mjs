@@ -214,6 +214,7 @@ export async function runJudgeValidation({
         judgeModel,
         tokens: resp.tokens,
         timestamp,
+        mode, // issue #119: stamp this composition's actual batch/single lever onto the row
       });
       costRows.push(metered.row);
     }
