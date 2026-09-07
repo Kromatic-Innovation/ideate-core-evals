@@ -297,6 +297,42 @@ test("issue #99: editing a generation prompt template moves the configHash of th
   assert.notEqual(configHash({ ...spec.config, promptHash: "unpinned" }), configHash(spec.config));
 });
 
+// ── issue #128: the harnessVersion bump is a REMEDY, so it is tested ────────
+//
+// #128 changed what a cell RUNS (`resolveIdeateAgents` forwards slot-level
+// stance/temperature/strategy, and `personaDisabled` finally has a consumer)
+// without touching arms.config.json -- so `armsConfigHash` could not see it,
+// and pre-#128 cells would have pooled with post-#128 cells while the hash
+// said nothing had changed. Bumping `harnessVersion` is the remedy the issue
+// asked for; an untested remedy is a remedy that can be reverted silently.
+// Same seam and same shape as the #99 pair above: read spec.config off a real
+// main() invocation, because the defect being guarded lives in run.mjs.
+
+test("issue #128: main() stamps the BUMPED harnessVersion, not the pre-#128 0.0.1", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+
+  const { spec } = runSpecFn.calls[0];
+  assert.notEqual(spec.config.harnessVersion, "0.0.1", "reverting the bump would silently re-pool pre-#128 cells with post-#128 ones");
+  assert.equal(spec.config.harnessVersion, "0.1.0");
+});
+
+test("issue #128: the harnessVersion bump MOVES configHash -- the actual staleness guard", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  const { spec } = runSpecFn.calls[0];
+
+  // A cell stamped under the pre-#128 harness must NOT share a configHash with
+  // one stamped under this harness. Everything else about the two configs is
+  // identical, so this isolates the bump itself.
+  assert.notEqual(
+    configHash({ ...spec.config, harnessVersion: "0.0.1" }),
+    configHash(spec.config),
+    "pre-#128 cells must go `stale` rather than being reused -- A' ran a different panel before this change",
+  );
+  assert.ok(CONFIG_FIELDS.includes("harnessVersion"), "and the field has to be IN the hash for the bump to mean anything");
+});
+
 test("--phase 0 REFUSES --max-poll-minutes rather than silently dropping it (issue #92)", async () => {
   await assert.rejects(() => main(["--phase", "0", "--max-poll-minutes", "90"], { store: FAKE_STORE }), /--phase 0 does not accept .*--max-poll-minutes/);
 });
