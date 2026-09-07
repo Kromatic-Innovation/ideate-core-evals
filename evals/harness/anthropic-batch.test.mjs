@@ -24,8 +24,10 @@ import {
   AnthropicBatchProvider,
   resolveIdeateAgents,
   buildAnthropicMessageParams,
+  UNIFORM_PERSONA,
   DEFAULT_MAX_POLL_MS,
 } from "./provider.mjs";
+import { buildRound1Prompt } from "./prompts.mjs";
 import { runSpec } from "./runner.mjs";
 import { ResultsStore } from "../../lib/store.mjs";
 import { cellKey, configHash, planRun } from "../../lib/manifest.mjs";
@@ -118,6 +120,180 @@ test("resolveIdeateAgents: a panel arm maps one agent per slot, panel.ideasPerAg
   // DIFFERENT arms is not the case here, but WITHIN one arm ids must still be
   // distinguishable per spec (`${slot.persona}#${i}`).
   assert.equal(new Set(agents.map((a) => a.id)).size, 5);
+});
+
+// ── issue #128: personaDisabled has a consumer, and slot levers are forwarded ─
+
+test("#128: A' resolves to ONE identical explicit persona across all five slots -- the ablation is no longer arm B", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms["A'"], armsConfigJson);
+  assert.equal(agents.length, 5);
+
+  // Every persona-shaped field is IDENTICAL across the panel...
+  for (const field of ["persona", "stance", "temperature", "strategy"]) {
+    assert.equal(
+      new Set(agents.map((a) => a[field])).size,
+      1,
+      `personaDisabled must give every slot the same ${field}`,
+    );
+  }
+
+  // ...and every one is EXPLICITLY SET. This is the load-bearing half: an
+  // unset field falls through to ideate-core's `DEFAULT_PERSONAS[i % 5]`
+  // by-index fill (`spec.stance || base.stance`), which is exactly how the
+  // five "identical" slots used to receive five DIFFERENT personas.
+  for (const a of agents) {
+    assert.equal(typeof a.stance, "string");
+    assert.ok(a.stance.length > 0, "stance must be a non-empty string, or ideate-core fills it by index");
+    assert.equal(typeof a.strategy, "string");
+    assert.ok(a.strategy.length > 0);
+    assert.ok(Number.isFinite(a.temperature), "temperature must be finite, or ideate-core fills it by index");
+  }
+
+  assert.equal(agents[0].stance, UNIFORM_PERSONA.stance);
+});
+
+test("#128: A' and B are no longer the same panel -- A' is uniform where B is differentiated", () => {
+  const aPrime = resolveIdeateAgents(armsConfigJson.arms["A'"], armsConfigJson).agents;
+  const b = resolveIdeateAgents(armsConfigJson.arms.B, armsConfigJson).agents;
+
+  // Same models and same panel shape -- the ONLY difference is the persona lever.
+  assert.deepEqual(aPrime.map((a) => a.model), b.map((a) => a.model));
+
+  // A' carries one explicit stance; B carries none, so ideate-core fills B's
+  // five slots from DEFAULT_PERSONAS BY INDEX -- five different personas. That
+  // asymmetry is what makes the ablation an ablation.
+  assert.ok(aPrime.every((a) => a.stance === UNIFORM_PERSONA.stance));
+  assert.ok(b.every((a) => a.stance === undefined), "a non-personaDisabled arm forwards no stance of its own");
+});
+
+test("#128: personaDisabled does NOT disturb model assignment (the study's independent variable)", () => {
+  const arm = {
+    mode: "panel",
+    personaDisabled: true,
+    slots: [
+      { persona: "proposer_uniform", model: "claude-haiku-4-5" },
+      { persona: "proposer_uniform", model: "claude-opus-5" },
+    ],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.deepEqual(agents.map((a) => a.model), ["claude-haiku-4-5", "claude-opus-5"]);
+});
+
+test("#128: a personaDisabled panel still gets UNIQUE agent ids (ideate-core#87 / IC-01)", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms["A'"], armsConfigJson);
+  assert.equal(new Set(agents.map((a) => a.id)).size, agents.length);
+});
+
+test("#128: arm.uniformPersona overrides the harness default -- the config seam for the registration amendment (#129)", () => {
+  const arm = {
+    mode: "panel",
+    personaDisabled: true,
+    uniformPersona: { persona: "flat", stance: "STANCE FROM CONFIG", temperature: 0.1, strategy: "direct" },
+    slots: [
+      { persona: "proposer_uniform", model: "claude-haiku-4-5" },
+      { persona: "proposer_uniform", model: "claude-haiku-4-5" },
+    ],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.ok(agents.every((a) => a.stance === "STANCE FROM CONFIG"));
+  assert.ok(agents.every((a) => a.persona === "flat"));
+  assert.ok(agents.every((a) => a.temperature === 0.1));
+  assert.ok(agents.every((a) => a.strategy === "direct"));
+  assert.deepEqual(agents.map((a) => a.id), ["flat#0", "flat#1"]);
+});
+
+test("#128: a personaDisabled arm with no uniformPersona still gets an explicit persona, never an unset one", () => {
+  // Defense against the defect recurring in a FUTURE ablation arm: the switch
+  // alone is enough; forgetting to write a uniformPersona block cannot silently
+  // reopen the by-index fallback.
+  const arm = {
+    mode: "panel",
+    personaDisabled: true,
+    slots: [{ persona: "x", model: "m" }, { persona: "y", model: "m" }],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(new Set(agents.map((a) => a.stance)).size, 1);
+  assert.equal(agents[0].stance, UNIFORM_PERSONA.stance);
+});
+
+test("#128: slot-level stance/temperature/strategy are forwarded verbatim on the panel path", () => {
+  const arm = {
+    mode: "panel",
+    personaDisabled: false,
+    slots: [
+      { persona: "p1", model: "claude-haiku-4-5", stance: "S1", temperature: 0.15, strategy: "direct" },
+      { persona: "p2", model: "claude-haiku-4-5" },
+    ],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.deepEqual(
+    { stance: agents[0].stance, temperature: agents[0].temperature, strategy: agents[0].strategy },
+    { stance: "S1", temperature: 0.15, strategy: "direct" },
+  );
+  // A slot that specifies nothing stays UNSET, so ideate-core's documented
+  // fill-from-DEFAULT_PERSONAS behaviour is preserved for arms B-H exactly as
+  // it was before #128. This change is additive, not a behaviour change for
+  // the arms that never named a lever.
+  assert.equal(agents[1].stance, undefined);
+  assert.equal(agents[1].temperature, undefined);
+  assert.equal(agents[1].strategy, undefined);
+});
+
+test("#128: slot-level stance/temperature/strategy are forwarded on the SOLO path too (arm A)", () => {
+  const arm = {
+    mode: "solo",
+    totalIdeasRequested: 30,
+    slots: [{ persona: "solo", model: "claude-sonnet-5", stance: "SOLO STANCE", temperature: 0.33, strategy: "cot" }],
+  };
+  const { agents, maxRounds } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(maxRounds, 1);
+  assert.equal(agents[0].stance, "SOLO STANCE");
+  assert.equal(agents[0].temperature, 0.33);
+  assert.equal(agents[0].strategy, "cot");
+  assert.equal(agents[0].ideasPerAgent, 30);
+});
+
+test("#128: arms.config.json's registered arms A-H are unchanged by the forwarding -- they name no lever", () => {
+  for (const [id, arm] of Object.entries(armsConfigJson.arms)) {
+    if (arm.personaDisabled) continue;
+    const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+    for (const a of agents) {
+      assert.equal(a.stance, undefined, `arm ${id} must forward no stance of its own`);
+      assert.equal(a.temperature, undefined, `arm ${id} must forward no temperature of its own`);
+      assert.equal(a.strategy, undefined, `arm ${id} must forward no strategy of its own`);
+    }
+  }
+});
+
+// ── The forwarded fields' real reach, pinned (issue #128) ────────────────────
+// Forwarding a field that nothing consumes is the very defect #128 reports, so
+// each field's actual reach is asserted rather than assumed.
+
+test("#128: a forwarded stance REACHES the submitted prompt", () => {
+  const withStance = buildRound1Prompt({ context: "ctx", persona: "p", stance: "UNIQUE-STANCE-MARKER", ideasPerAgent: 6 });
+  assert.ok(withStance.includes("UNIQUE-STANCE-MARKER"), "stance must be rendered into the round-1 prompt");
+  const withoutStance = buildRound1Prompt({ context: "ctx", persona: "p", ideasPerAgent: 6 });
+  assert.ok(!withoutStance.includes("UNIQUE-STANCE-MARKER"));
+  assert.notEqual(withStance, withoutStance);
+});
+
+test("#128: a forwarded temperature is RECORDED but never submitted -- PREREGISTRATION §3.3 strips it universally", () => {
+  const params = buildAnthropicMessageParams({ model: "claude-haiku-4-5", prompt: "p", maxTokens: 100, temperature: 0.9, top_p: 0.5, top_k: 40 });
+  assert.equal(params.temperature, undefined);
+  assert.equal(params.top_p, undefined);
+  assert.equal(params.top_k, undefined);
+  assert.deepEqual(Object.keys(params).sort(), ["max_tokens", "messages", "model"]);
+});
+
+test("#128: a forwarded strategy does NOT yet change the prompt -- the lever is registered to #129, not shipped here", () => {
+  // This harness injects its OWN buildRound1Prompt/buildRound2Prompt into
+  // ideate-core, and they do not branch on strategy, so direct-vs-CoT is not
+  // yet a variable lever at the wire. Asserted, not assumed: if a future change
+  // makes the prompt strategy-sensitive, this test fails and the residual noted
+  // in resolveIdeateAgents' header must be updated with it.
+  const cot = buildRound1Prompt({ context: "ctx", persona: "p", stance: "s", ideasPerAgent: 6, strategy: "cot" });
+  const direct = buildRound1Prompt({ context: "ctx", persona: "p", stance: "s", ideasPerAgent: 6, strategy: "direct" });
+  assert.equal(cot, direct);
 });
 
 test("generate() covers the solo path (Arm A) end-to-end via a fake ideateImpl and completes", async () => {
