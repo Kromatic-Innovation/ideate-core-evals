@@ -239,6 +239,35 @@ test("#128: slot-level stance/temperature/strategy are forwarded verbatim on the
   assert.equal(agents[1].strategy, undefined);
 });
 
+test("#128: personaDisabled applies on the SOLO path too -- the flag cannot be a no-op in one mode", () => {
+  // No registered arm is solo AND persona-disabled today (arm A sets
+  // `personaDisabled: false`), which is exactly why this is pinned now: a flag
+  // that silently applies in one branch only is the same no-consumer defect
+  // #128 reports, merely relocated to whichever ablation gets registered next.
+  const arm = {
+    mode: "solo",
+    personaDisabled: true,
+    totalIdeasRequested: 30,
+    slots: [{ persona: "solo", model: "claude-sonnet-5" }],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].stance, UNIFORM_PERSONA.stance);
+  assert.equal(agents[0].persona, UNIFORM_PERSONA.persona);
+  assert.equal(agents[0].strategy, UNIFORM_PERSONA.strategy);
+  assert.ok(Number.isFinite(agents[0].temperature));
+  // ...and the model still comes from the slot, not the persona.
+  assert.equal(agents[0].model, "claude-sonnet-5");
+});
+
+test("#128: arm A (personaDisabled: false) is untouched by the solo-path uniform logic", () => {
+  const { agents, maxRounds } = resolveIdeateAgents(armsConfigJson.arms.A, armsConfigJson);
+  assert.equal(maxRounds, 1);
+  assert.equal(agents[0].persona, "solo");
+  assert.equal(agents[0].model, "claude-sonnet-5");
+  assert.equal(agents[0].ideasPerAgent, 30);
+  assert.equal(agents[0].stance, undefined, "arm A names no stance, so ideate-core still fills it -- unchanged by #128");
+});
+
 test("#128: slot-level stance/temperature/strategy are forwarded on the SOLO path too (arm A)", () => {
   const arm = {
     mode: "solo",

@@ -1752,8 +1752,20 @@ export const UNIFORM_PERSONA = Object.freeze({
 
 export function resolveIdeateAgents(arm, armsConfig) {
   if (!arm) throw new Error("resolveIdeateAgents: arm is required");
+  // Resolved ABOVE the mode branch on purpose. `personaDisabled` means the same
+  // thing on a solo arm as on a panel one, and a flag that quietly applies in
+  // one branch only is the exact shape of the defect #128 reports -- just
+  // relocated. No solo arm sets it today (arm A is `personaDisabled: false`),
+  // which is precisely why it needs pinning now rather than after some future
+  // solo ablation is registered and silently runs the wrong persona.
+  //
+  // `model` is read from the RAW slot on both paths below, never from the
+  // uniform persona: disabling the persona lever must not disturb the model
+  // assignment, which is the study's actual independent variable (§3.1).
+  const uniform = arm.personaDisabled ? { ...UNIFORM_PERSONA, ...(arm.uniformPersona || {}) } : null;
   if (arm.mode === "solo") {
-    const slot = (arm.slots && arm.slots[0]) || {};
+    const rawSlot = (arm.slots && arm.slots[0]) || {};
+    const slot = uniform ? { ...rawSlot, ...uniform } : rawSlot;
     return {
       agents: [
         {
@@ -1762,7 +1774,7 @@ export function resolveIdeateAgents(arm, armsConfig) {
           stance: slot.stance,
           temperature: slot.temperature,
           strategy: slot.strategy,
-          model: slot.model,
+          model: rawSlot.model,
           ideasPerAgent: arm.totalIdeasRequested,
         },
       ],
@@ -1773,10 +1785,7 @@ export function resolveIdeateAgents(arm, armsConfig) {
   const slots = arm.slots || [];
   // The persona-disabled ablation resolves ONE persona for the whole panel and
   // applies it to every slot, so the slots cannot drift apart the way five
-  // hand-copied stances could. `model` is read from the SLOT below, never from
-  // the uniform persona: disabling the persona lever must not disturb the model
-  // assignment, which is the study's actual independent variable (§3.1).
-  const uniform = arm.personaDisabled ? { ...UNIFORM_PERSONA, ...(arm.uniformPersona || {}) } : null;
+  // hand-copied stances could.
   return {
     agents: slots.map((slot, i) => {
       const spec = uniform ? { ...slot, ...uniform } : slot;
