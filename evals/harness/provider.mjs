@@ -1782,11 +1782,27 @@ export const UNIFORM_PERSONA = Object.freeze({
  * `roundConfig` applies ITS default (round 1 blind, build-on rounds 2+ pool
  * -- node_modules/ideate-core/lib/ideate-core.mjs `roundConfig`). An arm that
  * DOES set `sharing` gets it applied to every BUILD-ON round only (round 2..
- * maxRounds) via `buildIdeateRounds` below -- `roundConfig` is never
- * consulted for round 1, so a round-1 entry would be silently inert; forcing
- * "pool" onto round 1 would be a real method change (ideate-core's "round 1
- * is blind" is documented as a deliberate design decision, not a default to
- * override), which this amendment is geometry, not that.
+ * maxRounds), via `buildIdeateRounds` below leaving `rounds[0]` EMPTY.
+ *
+ * CORRECTION (fix round, Quine finding #3): an earlier version of this
+ * comment and of `buildIdeateRounds` claimed `roundConfig` is "only ever
+ * called for round >= 2" and that a round-1 override was "structurally
+ * impossible" -- both false. `resolveMaxRounds`'s `meta.sharing` builder
+ * (node_modules/ideate-core/lib/ideate-core.mjs ~line 504) calls
+ * `roundConfig(i + 1, deps)` for EVERY `i` from 0, i.e. it DOES read
+ * `deps.rounds[0]` -- just for provenance metadata, not for round-1
+ * BEHAVIOUR (the round-1 generation loop above never calls `roundConfig` at
+ * all, so round 1 always runs blind regardless of `deps.rounds[0]`). Filling
+ * index 0 with `{ sharing }` therefore left round 1 correctly running blind
+ * while `meta.sharing` LIED about it (`meta.sharing[0]` would read the
+ * override value, e.g. "pool", even though round 1 ran blind) -- a
+ * provenance corruption a later audit of the study's own result record would
+ * have no way to catch. `buildIdeateRounds` leaves `rounds[0] = {}` so
+ * `roundConfig(1, deps)` falls through to its own `isFirst` default and
+ * `meta.sharing[0]` reports "blind" truthfully. Forcing "pool" onto round 1
+ * would additionally be a real method change (ideate-core documents "round 1
+ * is blind" as deliberate, not a default to override), which this amendment
+ * is geometry, not that -- a second, independent reason index 0 must stay empty.
  *
  * `size` is *validated when an ARM explicitly overrides it*, not merely
  * recorded: nothing else in this harness derives panel width from a scalar
@@ -1819,15 +1835,25 @@ export function resolvePanelGeometry(arm, armsConfig) {
  * (issue #129 amendment B), or `undefined` when nothing set one (see
  * `resolvePanelGeometry` above for the inherited-default rationale).
  *
- * Index 0 (round 1) is dead by construction -- ideate-core's `roundConfig`
- * is only ever called for round >= 2 -- so filling it uniformly with every
- * other round is simpler than special-casing it and changes nothing
- * observable.
+ * `rounds[0]` (round 1) is left as `{}`, NEVER `{ sharing }` -- see the
+ * CORRECTION in `resolvePanelGeometry`'s header above. Round-1 GENERATION
+ * behaviour is unaffected either way (ideate-core's round-1 loop never calls
+ * `roundConfig`), but `meta.sharing` DOES read `roundConfig(1, deps).sharing`
+ * for its provenance record, so an `{ sharing }` at index 0 would make the
+ * stored cell's own metadata claim round 1 ran under the override when it
+ * actually ran blind -- a silent provenance corruption, not a behavior bug.
  */
 export function buildIdeateRounds(maxRounds, sharing) {
   if (sharing === undefined) return undefined;
   const n = Number.isFinite(maxRounds) && maxRounds > 0 ? Math.floor(maxRounds) : 0;
-  return Array.from({ length: n }, () => ({ sharing }));
+  // An empty array is NOT the same as `undefined` to ideate-core's own
+  // `resolveMaxRounds` (`Array.isArray(deps.rounds) && deps.rounds.length`
+  // gates on a NON-EMPTY array), so a bogus `maxRounds` here would return `[]`
+  // -- which reads as absent to that check anyway, but returning `undefined`
+  // explicitly is more honest about what this function actually resolved
+  // (nothing) than handing back an array that merely happens to be empty.
+  if (n === 0) return undefined;
+  return Array.from({ length: n }, (_, i) => (i === 0 ? {} : { sharing }));
 }
 
 export function resolveIdeateAgents(arm, armsConfig) {
@@ -1846,6 +1872,17 @@ export function resolveIdeateAgents(arm, armsConfig) {
   // persona content.
   const uniform = arm.personaDisabled ? { ...UNIFORM_PERSONA, ...(arm.uniformPersona || {}) } : null;
   if (arm.mode === "solo") {
+    // A solo arm has no panel to have geometry -- `ideasPerAgent` comes from
+    // `totalIdeasRequested` and `maxRounds` is hardcoded 1 below, so
+    // `arm.panel` (size/ideasPerAgent/maxRounds/sharing) has literally
+    // nothing to attach to on this branch. Fail loud rather than silently
+    // ignoring it (COULD #7, fix round): the same "declared field reads as
+    // covered but isn't" shape the `size` invariant above guards against.
+    if (arm.panel) {
+      throw new Error(
+        `resolveIdeateAgents: arm '${arm.label || "(unlabeled)"}' is mode "solo" but sets a panel geometry override -- solo arms have no panel; remove arm.panel or set mode to "panel"`,
+      );
+    }
     const rawSlot = (arm.slots && arm.slots[0]) || {};
     const slot = uniform ? { ...rawSlot, ...uniform } : rawSlot;
     return {
@@ -1961,10 +1998,24 @@ export function withCellMaxTokens(req, cellMaxTokens) {
 // thinking (Haiku 4.5 among them) take `thinking: {type:"enabled",
 // budget_tokens:N}` instead and are expected to reject `output_config.effort`.
 // No arm sets `effort` on a Haiku slot today, so this throws only if a future
-// registration amendment tries to -- fail loud before spend, matching
-// lib/price.mjs's `runnerPriceGrid` missing-rate-table precedent, rather than
-// silently sending a request the API would 400 on anyway.
-const ANTHROPIC_EFFORT_SUPPORTED_MODELS = new Set([
+// registration amendment tries to.
+//
+// CORRECTION (fix round, Quine finding #4): this throw is NOT "fail loud
+// before spend" on its own -- ideate-core calls this builder (indirectly, via
+// `complete()`) from inside its own `safeComplete`, which SWALLOWS a thrown
+// error (`catch (err) { onAgentError(err, ctx); return null; }`) so that one
+// bad agent never sinks a whole panel. On a mixed-model panel (arm G's shape:
+// 3 Anthropic + 2 OpenAI models in one cell) with `effort` set on a Haiku
+// slot, the OTHER four agents in that cell still enqueue, submit, and bill
+// before the cell fails as undersized -- this throw catches the malformed
+// REQUEST, but not before the panel's other slots have already spent. The
+// real fail-loud-before-spend guard is the config-level invariant test in
+// anthropic-batch.test.mjs (sweeping arms.config.json, mirroring the
+// existing force-strip sweep) -- that fails at `npm test`, well before any
+// run against a real API. This throw stays as defense-in-depth for a slot
+// resolved outside arms.config.json (a hand-built arm, a future config
+// source), but is not itself the before-spend guarantee.
+export const ANTHROPIC_EFFORT_SUPPORTED_MODELS = new Set([
   "claude-fable-5-1",
   "claude-mythos-5-1",
   "claude-fable-5",

@@ -123,12 +123,12 @@
     },
     "AS": {
       "label": "Solo baseline, stance-neutral control",
-      "purpose": "issue #129 amendment F. Arm A's slot persona 'solo' is not a DEFAULT_PERSONAS name, so ideate-core falls through to DEFAULT_PERSONAS[0] -- PRAGMATIST, stance-assigned, strategy 'direct' -- which means arm A varies from the panel arms in stance AND strategy AND rounds AND model, all at once. AS isolates the STANCE lever only: personaDisabled (+ uniformPersona) forces the SAME explicit, perspective-free stance arm A' uses for its panel ablation, but uniformPersona here overrides temperature/strategy back to PRAGMATIST's own values (0.4/direct) instead of taking UNIFORM_PERSONA's cot-leaning defaults, so AS differs from arm A in stance ONLY -- not also in strategy. Same model (claude-sonnet-5), same totalIdeasRequested (30), same maxRounds (1) as arm A.",
+      "purpose": "issue #129 amendment F. Arm A's slot persona 'solo' is not a DEFAULT_PERSONAS name, so ideate-core falls through to DEFAULT_PERSONAS[0] -- PRAGMATIST, stance-assigned, strategy 'direct' -- which means arm A varies from the panel arms in stance AND strategy AND rounds AND model, all at once. AS aims to isolate the STANCE lever only: personaDisabled (+ uniformPersona) forces the SAME explicit, perspective-free stance arm A' uses for its panel ablation, and uniformPersona overrides temperature/strategy back to PRAGMATIST's assumed values (0.4/direct, verified against ideate-core@0.5.0's DEFAULT_PERSONAS[0] -- not independently re-verified against a live ideate-core call from this harness) instead of taking UNIFORM_PERSONA's cot-leaning defaults, so AS is BUILT to differ from arm A in stance only. Same model (claude-sonnet-5), same totalIdeasRequested (30), same maxRounds (1) as arm A. `uniformPersona.persona` is deliberately inert (no reference to 'stance' or 'neutral' in the string sent to the model, unlike an earlier draft's 'solo_stance_neutral') -- the persona name reaches the model verbatim in the round-1 prompt (evals/harness/prompts.mjs), and naming the experimental construct in the prompt text would be a demand characteristic.",
       "mode": "solo",
       "personaDisabled": true,
       "totalIdeasRequested": 30,
       "uniformPersona": {
-        "persona": "solo_stance_neutral",
+        "persona": "solo_b",
         "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
         "temperature": 0.4,
         "strategy": "direct"
