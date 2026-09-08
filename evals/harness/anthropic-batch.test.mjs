@@ -326,15 +326,16 @@ test("#128: a forwarded temperature is RECORDED but never submitted -- PREREGIST
   assert.deepEqual(Object.keys(params).sort(), ["max_tokens", "messages", "model"]);
 });
 
-test("#128: a forwarded strategy does NOT yet change the prompt -- the lever is registered to #129, not shipped here", () => {
-  // This harness injects its OWN buildRound1Prompt/buildRound2Prompt into
-  // ideate-core, and they do not branch on strategy, so direct-vs-CoT is not
-  // yet a variable lever at the wire. Asserted, not assumed: if a future change
-  // makes the prompt strategy-sensitive, this test fails and the residual noted
-  // in resolveIdeateAgents' header must be updated with it.
+test("#130: a forwarded strategy of 'cot' now changes the prompt -- the lever shipped in #130", () => {
+  // This harness's buildRound1Prompt/buildRound2Prompt now branch on
+  // strategy, so direct-vs-CoT IS a variable lever at the wire. Asserted,
+  // not assumed: if a future change removes the branch, this test fails and
+  // the residual noted in resolveIdeateAgents' header must be updated with it.
   const cot = buildRound1Prompt({ context: "ctx", persona: "p", stance: "s", ideasPerAgent: 6, strategy: "cot" });
   const direct = buildRound1Prompt({ context: "ctx", persona: "p", stance: "s", ideasPerAgent: 6, strategy: "direct" });
-  assert.equal(cot, direct);
+  assert.notEqual(cot, direct);
+  assert.ok(cot.includes("Work through the brief before you commit to any idea"));
+  assert.ok(!direct.includes("Work through the brief before you commit to any idea"));
 });
 
 // ── issue #129 amendment A: `effort` forwarding ──────────────────────────────

@@ -53,16 +53,23 @@ import { createHash } from "node:crypto";
  * @returns {string} the full prompt text to send as the user message.
  */
 export function buildRound1Prompt(args = {}) {
-  const { context, stance, persona, ideasPerAgent } = args;
+  const { context, stance, persona, ideasPerAgent, strategy } = args;
   const brief = (context && context.brief) || "";
   const n = Number.isFinite(ideasPerAgent) && ideasPerAgent > 0 ? ideasPerAgent : 6;
   const stanceLine = stance ? `Adopt this stance while you brainstorm:\n${stance}\n\n` : "";
+  const cotLine =
+    strategy === "cot"
+      ? `Work through the brief before you commit to any idea: first name the distinct dimensions along which ` +
+        `responses to this brief could differ; then consider what a response at each end of each dimension would ` +
+        `look like; only then decide which ideas to submit. Do not include this reasoning in your reply.\n\n`
+      : "";
 
   return (
     `You are one independent idea-generation agent (persona: ${persona || "generalist"}) contributing to ` +
     `a brainstorm. You do NOT see any other agent's output -- generate your own ideas independently.\n\n` +
     `BRIEF:\n${brief}\n\n` +
     stanceLine +
+    cotLine +
     `Generate exactly ${n} distinct candidate ideas responding to the brief above. Favor genuine variety over ` +
     `restating the same idea in different words.\n\n` +
     `Reply with ONLY a JSON array of ${n} objects, each shaped exactly {"text": "<the idea, 1-3 sentences>"}. ` +
@@ -83,7 +90,7 @@ export function buildRound1Prompt(args = {}) {
  * @returns {string}
  */
 export function buildRound2Prompt(args = {}) {
-  const { context, stance, persona, seeds, buildOnDirective, ideasPerAgent } = args;
+  const { context, stance, persona, seeds, buildOnDirective, ideasPerAgent, strategy } = args;
   const brief = (context && context.brief) || "";
   const n = Number.isFinite(ideasPerAgent) && ideasPerAgent > 0 ? ideasPerAgent : 6;
   const stanceLine = stance ? `Your stance:\n${stance}\n\n` : "";
@@ -94,6 +101,12 @@ export function buildRound2Prompt(args = {}) {
     buildOnDirective ||
     "Build on the shared pool below: COMBINE, EXTEND, or SUBVERT these into genuinely NEW directions. " +
       "Do NOT restate or lightly reword an existing idea.";
+  const cotLine =
+    strategy === "cot"
+      ? `Work through the shared pool before you commit to any idea: first name what the existing ideas have in ` +
+        `common; then consider which dimensions they leave unexplored; only then decide which new ideas to submit. ` +
+        `Do not include this reasoning in your reply.\n\n`
+      : "";
 
   return (
     `You are one agent (persona: ${persona || "generalist"}) in a build-on brainstorming round.\n\n` +
@@ -101,6 +114,7 @@ export function buildRound2Prompt(args = {}) {
     stanceLine +
     `SHARED POOL SO FAR:\n${seedList}\n\n` +
     `${directive}\n\n` +
+    cotLine +
     `Generate exactly ${n} NEW candidate ideas.\n\n` +
     `Reply with ONLY a JSON array of ${n} objects, each shaped exactly {"text": "<the idea, 1-3 sentences>"}. ` +
     `No other fields, no surrounding prose, no markdown fence -- just the JSON array.`
@@ -478,8 +492,17 @@ const HASH_PROBE_ARGS = Object.freeze({
  */
 export function promptTemplateHash() {
   const payload = JSON.stringify({
+    // issue #130: strategy is now a rendered lever, not just a recorded one --
+    // rendered TWICE per builder (once per branch) so a wording change to
+    // EITHER branch (direct or cot) moves the hash. A single render (as
+    // before #130) would leave the cot wording unhashed and silently
+    // mutable -- exactly the defect promptTemplateHash exists to prevent.
     round1: buildRound1Prompt(HASH_PROBE_ARGS),
     round2: buildRound2Prompt(HASH_PROBE_ARGS),
+    round1Direct: buildRound1Prompt({ ...HASH_PROBE_ARGS, strategy: "direct" }),
+    round1Cot: buildRound1Prompt({ ...HASH_PROBE_ARGS, strategy: "cot" }),
+    round2Direct: buildRound2Prompt({ ...HASH_PROBE_ARGS, strategy: "direct" }),
+    round2Cot: buildRound2Prompt({ ...HASH_PROBE_ARGS, strategy: "cot" }),
     // Rendered again with no args at all, so a change to either builder's
     // default/fallback branch also moves the hash.
     round1Defaults: buildRound1Prompt(),
