@@ -66,8 +66,19 @@ const CORPUS = [{ id: "brief-1", text: "Design a better bus stop." }];
 const noopSleep = async () => {};
 const silentLogger = () => {};
 
-/** The observed worst-case clean output length for a 30-idea arm-A reply. */
-const OBSERVED_MAX_OUTPUT_TOKENS_30 = 1857;
+/** Issue #130: the old #93 measurement (1857 output tokens / 30 ideas,
+ *  giving a per-idea rate of 61.9) was taken with NO `effort` reachable from
+ *  this harness -- per Anthropic's docs that is exactly `effort: "high"`
+ *  behavior for claude-sonnet-5 (its API default), so `maxTokensForIdeas`'s
+ *  default (undefined effort) now resolves to the `high` bucket, not that
+ *  stale 61.9 figure. The `high` bucket's own rate (175) is the ceil of the
+ *  TOP per-idea figure across ALL N/strategy combinations measured under
+ *  `high` effort on 2026-09-08 (174.2, from the N=60/cot condition -- see
+ *  prompts.mjs's header comment for the full table). Scaling that per-idea
+ *  rate by THIS test's ideas count (30) reproduces the same "2x-3x of what
+ *  was actually observed" check #93 used, because TOKENS_PER_IDEA is a
+ *  PER-IDEA rate, not tied to one specific N. */
+const OBSERVED_HIGH_TOKENS_PER_IDEA = 174.2;
 
 /** Issue #122: the observed worst-case output length for a real arm-D
  *  (Opus) round-2 reply (6 ideas) -- the live measurement TOKENS_PER_IDEA_BY_MODEL's
@@ -223,13 +234,14 @@ function runArm(armId, fetchImpl) {
 // AC 1 — max_tokens scales with what the arm asks for
 // ════════════════════════════════════════════════════════════════════════════
 
-test("#93 AC1: maxTokensForIdeas gives a 30-idea Sonnet request 2x-3x headroom over the observed 1857-token worst case", () => {
+test("#130 AC1: maxTokensForIdeas gives a 30-idea Sonnet request (default/high effort) 2x-3x headroom over the observed worst per-idea rate", () => {
   const solo = maxTokensForIdeas(30, "claude-sonnet-5");
-  assert.ok(solo >= 2 * OBSERVED_MAX_OUTPUT_TOKENS_30, `${solo} must be at least 2x ${OBSERVED_MAX_OUTPUT_TOKENS_30}`);
-  assert.ok(solo <= 3 * OBSERVED_MAX_OUTPUT_TOKENS_30, `${solo} must be at most 3x ${OBSERVED_MAX_OUTPUT_TOKENS_30}`);
+  const observedWorst30 = 30 * OBSERVED_HIGH_TOKENS_PER_IDEA;
+  assert.ok(solo >= 2 * observedWorst30, `${solo} must be at least 2x ${observedWorst30}`);
+  assert.ok(solo <= 3 * observedWorst30, `${solo} must be at most 3x ${observedWorst30}`);
   // And explicitly NOT the "+10%" the issue body ruled out.
   assert.ok(solo > 1.1 * LEGACY_MAX_TOKENS);
-  assert.equal(solo, Math.ceil(30 * TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"] * MAX_TOKENS_HEADROOM));
+  assert.equal(solo, Math.ceil(30 * TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"].high * MAX_TOKENS_HEADROOM));
 });
 
 test("#122: maxTokensForIdeas gives a 6-idea Opus request 2x-3x headroom over the observed 3346-token real-run worst case", () => {
@@ -249,12 +261,29 @@ test("#122: maxTokensForIdeas gives a 6-idea Opus request 2x-3x headroom over th
   assert.ok(panel > LEGACY_MAX_TOKENS, "the whole point of #122: Opus's real ceiling must clear the pre-#122 flat floor");
 });
 
-test("#93 AC1: a 6-idea (panel) Sonnet request still computes to EXACTLY the legacy 2048 — comparability with run #8", () => {
-  // The floor is the whole comparability argument: arms B–H and A' must send
-  // byte-identical requests to the ones run #8 sent, so only arm A's cells
-  // become non-comparable. If this ever fails, every arm's #8 data is affected.
-  assert.equal(maxTokensForIdeas(armsConfigJson.panel.ideasPerAgent, "claude-sonnet-5"), LEGACY_MAX_TOKENS);
-  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5"), 2048);
+test("#130: a 6-idea Sonnet request explicitly at effort:\"low\" still floors to the legacy 2048", () => {
+  // The `low` bucket (81/idea) is the only Sonnet path left that still
+  // computes below the floor (6 * 81 * 2.5 = 1215 < 2048) -- this is the one
+  // remaining sliver of #93's original "byte-identical with run #8"
+  // comparability guarantee. No arm in arms.config.json actually sets
+  // effort:"low" today, so this documents the invariant rather than
+  // asserting anything about a live arm.
+  assert.equal(maxTokensForIdeas(armsConfigJson.panel.ideasPerAgent, "claude-sonnet-5", "low"), LEGACY_MAX_TOKENS);
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "low"), 2048);
+});
+
+test("#130: a 6-idea Sonnet request with no effort set resolves to EXACTLY the explicit high-effort figure, and both exceed the legacy floor", () => {
+  // This is issue #130's core behavior change: undefined effort is no longer
+  // a free pass to the un-labeled 62 rate -- it resolves to the documented
+  // effort-omitted-equals-high equivalence, which now computes ABOVE the
+  // floor at ideasPerAgent 6. Arm C (the only panel arm that was still at the
+  // floor under #122) is therefore raised by this change -- see the
+  // arms.config.json sweep test below.
+  const noEffort = maxTokensForIdeas(6, "claude-sonnet-5");
+  const explicitHigh = maxTokensForIdeas(6, "claude-sonnet-5", "high");
+  assert.equal(noEffort, explicitHigh, "undefined effort must resolve to the high bucket");
+  assert.ok(noEffort > LEGACY_MAX_TOKENS, "issue #130's whole point: the last floor-pinned Sonnet cell is now raised");
+  assert.equal(noEffort, Math.ceil(6 * TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"].high * MAX_TOKENS_HEADROOM));
 });
 
 test("#93 AC1: maxTokensForCell degrades safely on an empty/garbage agent list (never -Infinity or NaN)", () => {
@@ -289,27 +318,69 @@ test("#93 AC1: arm A's live batch request carries the scaled max_tokens; arm B's
   for (const r of capB.requests) assert.equal(r.params.max_tokens, maxTokensForIdeas(6, "claude-haiku-4-5"));
 });
 
-test("#93/#122 AC1: every panel arm in arms.config.json sends its OWN model's computed ceiling; only models above the floor change", () => {
+test("#93/#122/#130 AC1: every panel arm in arms.config.json sends its OWN model's (and effort's) computed ceiling; #130 raises the last floor-pinned arm", () => {
   for (const [id, arm] of Object.entries(armsConfigJson.arms)) {
     const { agents } = resolveIdeateAgents(arm, armsConfigJson);
     const got = maxTokensForCell(agents);
     if (arm.mode === "solo") {
-      assert.equal(got, maxTokensForIdeas(arm.totalIdeasRequested, agents[0].model), `arm ${id}`);
+      assert.equal(got, maxTokensForIdeas(arm.totalIdeasRequested, agents[0].model, agents[0].effort), `arm ${id}`);
     } else {
-      // Per-model max across the panel's slots. Only claude-sonnet-5 has its
-      // own measured rate that computes BELOW the floor at ideasPerAgent 6
-      // (930 < 2048) -- every other model (Opus: measured above the floor;
-      // Haiku/GPT tiers: no measurement, so DEFAULT_TOKENS_PER_IDEA, which
-      // also computes above the floor) raises the cell's ceiling. So arm C
-      // (pure Sonnet) is the ONLY panel arm unchanged from run #8; every arm
-      // with even one non-Sonnet slot (B, D, E, F, G, H, A') is raised.
-      const expected = Math.max(...agents.map((a) => maxTokensForIdeas(a.ideasPerAgent, a.model)));
+      // Per-model, per-effort max across the panel's slots. No slot in
+      // arms.config.json sets `effort` today, so every model's UNDEFINED
+      // effort resolution decides this: Sonnet now resolves to the `high`
+      // bucket (175/idea, computes ABOVE the floor at ideasPerAgent 6 --
+      // issue #130), Opus resolves to its EFFORT_FREE rate (558, already
+      // above the floor since #122), and Haiku/GPT tiers fall back to
+      // DEFAULT_TOKENS_PER_IDEA (776, also above the floor). Arm C (pure
+      // Sonnet) was the ONLY panel arm still at the run #8 floor under #122
+      // -- #130 raises it too, so EVERY registered panel arm is now above
+      // the floor.
+      const expected = Math.max(...agents.map((a) => maxTokensForIdeas(a.ideasPerAgent, a.model, a.effort)));
       assert.equal(got, expected, `arm ${id}`);
-      const allSonnet = agents.every((a) => a.model === "claude-sonnet-5");
-      if (allSonnet) assert.equal(got, LEGACY_MAX_TOKENS, `arm ${id} is pure Sonnet and must be unchanged from run #8`);
-      else assert.ok(got > LEGACY_MAX_TOKENS, `arm ${id} has a non-Sonnet slot and must be raised above the floor`);
+      assert.ok(got > LEGACY_MAX_TOKENS, `arm ${id} must be raised above the floor under #130`);
     }
   }
+});
+
+test("#130 wiring: a solo cell whose slot sets effort:\"max\" gets its wire max_tokens sized from the max bucket (776), not high (175) or the pre-#130 flat rate (62) -- proves effort reaches the real request, not just the lookup table", async () => {
+  // This drives the REAL generate() -> resolveIdeateAgents -> maxTokensForCell
+  // -> withCellMaxTokens seam end to end, the same way the arm-A test above
+  // does -- the point is to prove the wiring, not just the table lookup
+  // (prompts.test.mjs / the maxTokensForIdeas unit tests above already cover
+  // that). ideateImplLikeIdeateCore's fake `complete()` call never mentions
+  // `effort` -- if this test passes, the cap reached the wire via
+  // resolveIdeateAgents's `agents[].effort` -> maxTokensForCell ->
+  // withCellMaxTokens, NOT via anything the fake ideateImpl does.
+  const armId = "EFFORT_MAX_PROBE";
+  const arm = {
+    mode: "solo",
+    totalIdeasRequested: 30,
+    slots: [{ persona: "solo", model: "claude-sonnet-5", effort: "max" }],
+  };
+  const armsConfig = { panel: armsConfigJson.panel, arms: { [armId]: arm } };
+  const capture = {};
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig,
+    fetchImpl: anthropicBatchFetch({ reply: cleanReply(30), capture }),
+    ideateImpl: ideateImplLikeIdeateCore,
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+  const resp = await provider.generate(cellFor(armId), arm, { mode: "batch" });
+  assert.equal(resp.terminalState, "completed");
+  assert.equal(capture.requests.length, 1);
+
+  const gotMaxTokens = capture.requests[0].params.max_tokens;
+  const expectedMax = maxTokensForIdeas(30, "claude-sonnet-5", "max");
+  const expectedHigh = maxTokensForIdeas(30, "claude-sonnet-5", "high");
+  const expectedOldFlat = Math.max(LEGACY_MAX_TOKENS, Math.ceil(30 * 62 * MAX_TOKENS_HEADROOM));
+
+  assert.equal(gotMaxTokens, expectedMax, "the wire request must carry the MAX-bucket cap");
+  assert.notEqual(gotMaxTokens, expectedHigh, "must not silently fall back to the high bucket");
+  assert.notEqual(gotMaxTokens, expectedOldFlat, "must not silently fall back to the pre-#130 flat (unlabeled) rate");
+  assert.equal(gotMaxTokens, Math.ceil(30 * 776 * MAX_TOKENS_HEADROOM));
 });
 
 test("#93: withCellMaxTokens never shrinks a request the engine deliberately sized larger", () => {
