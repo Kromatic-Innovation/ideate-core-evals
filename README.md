@@ -28,6 +28,8 @@ See [`docs/PREREGISTRATION.md` §11](docs/PREREGISTRATION.md) for why accumulati
 
 Both providers offer 50% Batch API discounts and evals are latency-insensitive, so the study is batch-first. Projected **~$79** for the full grid; **~$160** with contingency. A `--max-spend` pre-flight prices the planned grid and refuses to start if it would exceed the ceiling.
 
+**Batch-first buys throughput only if a batch holds more than one request** (issue #148). Cells run one at a time by default, so a **solo** arm submits a Message Batch of exactly one request and then waits out its full queue latency before the next cell is submitted — measured at 2h34m for zero cells on Study 1 Stage 1a. The discount is unaffected (batch pricing is per request, not per batch), but "latency-insensitive" only holds when the queue wait is amortised across many requests. For a grid of solo arms, pass `--cell-concurrency N --batch-window-ms 2000` so several cells' requests land in one batch; the run warns when every planned arm is solo and concurrency is 1.
+
 Cost rows conform to the CFO contract (cwc#1639 / cron-fleet#75): they record **tokens × model × timestamp × billing regime** and never a derived dollar figure. Pricing is applied at read time from a pinned, dated rate table, so a rate change is a re-price, not a re-collection.
 
 ## Phase 0 — negative controls + DAT replication (issue #48)
