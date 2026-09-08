@@ -638,6 +638,96 @@ test("#129 fix round 2: arm AS's `purpose` field carries no run-time weight -- a
   assert.equal(armsConfigHash(armsConfigJson), armsConfigHash(withoutPurpose));
 });
 
+// ── #130: Study 1 Stage 1a screening arms (Appendix F item 2) ──────────────
+// Eight registered arms (S1-C0/N10/N60/ELOW/EMAX/SPRAG/SCONTRA/DIRECT). The
+// design is a one-factor-at-a-time sweep off a centre point (S1-C0), so its
+// load-bearing invariants are exactly the ones a silent copy/transcription
+// drift would break without any test noticing: (1) two of the eight carry a
+// stance string transcribed VERBATIM from ideate-core's own DEFAULT_PERSONAS
+// (not this repo's UNIFORM_PERSONA), (2) the other six share the SAME inert
+// neutral stance arm AS already uses, and (3) all eight use the same inert
+// persona name arm AS uses ('solo_b') -- a descriptive name here would leak
+// the manipulation into the prompt, since buildRound1Prompt interpolates the
+// persona name verbatim (evals/harness/prompts.mjs:62).
+//
+// Same hermetic-CI constraint as the PRAGMATIST_* constants above applies
+// here: this file must stay loadable with an EMPTY node_modules, so the
+// DEFAULT_PERSONAS stance strings below are PINNED LITERALS, sourced
+// explicitly, not a live import of "ideate-core".
+const S1_NEUTRAL_ARMS = ["S1-C0", "S1-N10", "S1-N60", "S1-ELOW", "S1-EMAX", "S1-DIRECT"];
+const S1_ALL_ARMS = [...S1_NEUTRAL_ARMS, "S1-SPRAG", "S1-SCONTRA"];
+const DEFAULT_PERSONAS_0_STANCE = // node_modules/ideate-core/lib/ideate-core.mjs DEFAULT_PERSONAS[0].stance ("pragmatist"), verified 2026-09-08 against ideate-core@0.5.0
+  "PRAGMATIST: practical, resource-aware, shippable. Favor ideas that a small team could start on Monday. Prefer clarity and feasibility over cleverness.";
+const DEFAULT_PERSONAS_1_STANCE = // node_modules/ideate-core/lib/ideate-core.mjs DEFAULT_PERSONAS[1].stance ("contrarian"), verified 2026-09-08 against ideate-core@0.5.0
+  "CONTRARIAN: challenge the obvious. Invert the default assumption, argue the opposite of the expected move, and surface what everyone is ignoring.";
+
+test("#130: all eight S1 arms are registered in arms.config.json", () => {
+  for (const armId of S1_ALL_ARMS) {
+    assert.ok(armsConfigJson.arms[armId], `arm ${armId} must be registered`);
+  }
+});
+
+test("#130: S1-SPRAG's stance is byte-identical to ideate-core@0.5.0's DEFAULT_PERSONAS[0].stance", () => {
+  assert.equal(armsConfigJson.arms["S1-SPRAG"].uniformPersona.stance, DEFAULT_PERSONAS_0_STANCE);
+});
+
+test("#130: S1-SCONTRA's stance is byte-identical to ideate-core@0.5.0's DEFAULT_PERSONAS[1].stance", () => {
+  assert.equal(armsConfigJson.arms["S1-SCONTRA"].uniformPersona.stance, DEFAULT_PERSONAS_1_STANCE);
+});
+
+test("#130: the six centre/off-centre S1 arms (not SPRAG/SCONTRA) carry arm AS's exact stance string", () => {
+  for (const armId of S1_NEUTRAL_ARMS) {
+    assert.equal(
+      armsConfigJson.arms[armId].uniformPersona.stance,
+      armsConfigJson.arms.AS.uniformPersona.stance,
+      `arm ${armId}'s stance must equal arm AS's uniformPersona.stance verbatim`,
+    );
+  }
+});
+
+test("#130: every S1 arm uses the same inert persona name arm AS uses ('solo_b')", () => {
+  for (const armId of S1_ALL_ARMS) {
+    assert.equal(
+      armsConfigJson.arms[armId].uniformPersona.persona,
+      armsConfigJson.arms.AS.uniformPersona.persona,
+      `arm ${armId}'s uniformPersona.persona must match arm AS's ('solo_b') -- a descriptive name would leak the manipulation into the prompt`,
+    );
+  }
+});
+
+test("#130: resolveIdeateAgents resolves each S1 arm with the intended stance/strategy/model/effort/ideasPerAgent, maxRounds 1 (solo)", () => {
+  const expected = {
+    "S1-C0": { effort: "high", strategy: "cot", totalIdeasRequested: 30 },
+    "S1-N10": { effort: "high", strategy: "cot", totalIdeasRequested: 10 },
+    "S1-N60": { effort: "high", strategy: "cot", totalIdeasRequested: 60 },
+    "S1-ELOW": { effort: "low", strategy: "cot", totalIdeasRequested: 30 },
+    "S1-EMAX": { effort: "max", strategy: "cot", totalIdeasRequested: 30 },
+    "S1-SPRAG": { effort: "high", strategy: "cot", totalIdeasRequested: 30, stance: DEFAULT_PERSONAS_0_STANCE },
+    "S1-SCONTRA": { effort: "high", strategy: "cot", totalIdeasRequested: 30, stance: DEFAULT_PERSONAS_1_STANCE },
+    "S1-DIRECT": { effort: "high", strategy: "direct", totalIdeasRequested: 30 },
+  };
+  for (const [armId, want] of Object.entries(expected)) {
+    const arm = armsConfigJson.arms[armId];
+    const { agents, maxRounds } = resolveIdeateAgents(arm, armsConfigJson);
+    assert.equal(agents.length, 1, `${armId} is solo -- exactly one agent`);
+    const agent = agents[0];
+    assert.equal(agent.model, "claude-sonnet-5", `${armId} model`);
+    assert.equal(agent.effort, want.effort, `${armId} effort (read from the raw slot)`);
+    assert.equal(agent.strategy, want.strategy, `${armId} strategy (from uniformPersona overlay)`);
+    assert.equal(agent.stance, want.stance || armsConfigJson.arms.AS.uniformPersona.stance, `${armId} stance (from uniformPersona overlay)`);
+    assert.equal(agent.persona, "solo_b", `${armId} persona name stays inert`);
+    assert.equal(agent.ideasPerAgent, want.totalIdeasRequested, `${armId} ideasPerAgent comes from totalIdeasRequested`);
+    assert.equal(maxRounds, 1, `${armId} maxRounds must be 1 (solo)`);
+  }
+});
+
+test("#130: S1 arms' resolved persona strings do not name the experimental construct -- covered by the existing vocabulary sweep, checked directly here too", () => {
+  for (const armId of S1_ALL_ARMS) {
+    const { agents } = resolveIdeateAgents(armsConfigJson.arms[armId], armsConfigJson);
+    assert.ok(!EXPERIMENTAL_VOCABULARY.test(agents[0].persona), `${armId}'s resolved persona must not trip the demand-characteristic vocabulary sweep`);
+  }
+});
+
 test("generate() covers the solo path (Arm A) end-to-end via a fake ideateImpl and completes", async () => {
   const fetchImpl = async (url, opts) => {
     const body = JSON.parse(opts.body);
@@ -793,6 +883,46 @@ test("buildAnthropicMessageParams never carries temperature/top_p/top_k, for eve
     assert.ok(!("top_p" in params), `model ${model} must not carry top_p`);
     assert.ok(!("top_k" in params), `model ${model} must not carry top_k`);
   }
+});
+
+// #130: the sweep above proves the CONFIG is legal (every effort-setting arm
+// names a supported model) and force-strips every MODEL id, but neither
+// exercises the actual REQUEST SHAPE a registered slot with `effort` set
+// produces -- it never passes `effort` into `buildAnthropicMessageParams`.
+// The eight S1-* arms are the first registered arms to set `effort` at all
+// (the pre-#130 config's effort sweep loop body was dormant), so this closes
+// the gap between "the config is legal" and "the request built from it is
+// correct" for the actual registered slots, not just a synthetic one.
+test("#130: buildAnthropicMessageParams builds the correct output_config.effort (or omits it) for every real arm/slot in arms.config.json, force-strip included", () => {
+  let sawEffortSet = false;
+  let sawEffortUnset = false;
+  for (const [armId, arm] of Object.entries(armsConfigJson.arms)) {
+    for (const slot of arm.slots || []) {
+      if (!slot.model || !slot.model.startsWith("claude-")) continue;
+      if (slot.effort !== undefined && !ANTHROPIC_EFFORT_SUPPORTED_MODELS.has(slot.model)) continue; // covered/forbidden by the sweep above
+      const params = buildAnthropicMessageParams({
+        model: slot.model,
+        prompt: "hi",
+        temperature: 0.9,
+        top_p: 0.8,
+        top_k: 40,
+        maxTokens: 111,
+        effort: slot.effort,
+      });
+      assert.ok(!("temperature" in params), `${armId}/${slot.model}: must not carry temperature`);
+      assert.ok(!("top_p" in params), `${armId}/${slot.model}: must not carry top_p`);
+      assert.ok(!("top_k" in params), `${armId}/${slot.model}: must not carry top_k`);
+      if (slot.effort !== undefined) {
+        sawEffortSet = true;
+        assert.deepEqual(params.output_config, { effort: slot.effort }, `${armId}/${slot.model}: output_config.effort must equal the slot's own effort value`);
+      } else {
+        sawEffortUnset = true;
+        assert.ok(!("output_config" in params), `${armId}/${slot.model}: a slot with no effort must not carry output_config`);
+      }
+    }
+  }
+  assert.ok(sawEffortSet, "sanity: at least one registered slot must set effort (the S1-* arms), or this test's effort-set branch never ran");
+  assert.ok(sawEffortUnset, "sanity: at least one registered slot must leave effort unset, or this test's effort-unset branch never ran");
 });
 
 // ── #129 fix round (Quine finding #4): the Haiku-effort throw inside
