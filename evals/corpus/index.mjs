@@ -1,4 +1,4 @@
-// index.mjs — the frozen, content-hashed 24-brief stratified corpus (issues #2, #43).
+// index.mjs — the frozen, content-hashed 48-brief stratified corpus (issues #2, #43, #129).
 //
 // ── What "frozen" means here ─────────────────────────────────────────────────
 // Per docs/PREREGISTRATION.md §3.2 and §11: "Briefs are frozen and hashed into
@@ -31,7 +31,24 @@ import { createHash } from "node:crypto";
 import { BRIEFS } from "./briefs.mjs";
 
 const STRATA = ["business", "product", "scientific", "aut"];
-const EXPECTED_STRATUM_COUNTS = { business: 6, product: 6, scientific: 6, aut: 6 };
+// Deliberately equal (12 each) — §3.2/§6.2 treat briefs as an exchangeable
+// random effect, so an unequal split would let one stratum dominate the
+// brief-level variance and quietly narrow the cross-domain generalization
+// claim to whichever stratum has the most briefs. See briefs.mjs header for
+// the corrected rationale (coordinator review, 2026-09-08).
+const EXPECTED_STRATUM_COUNTS = { business: 12, product: 12, scientific: 12, aut: 12 };
+
+// The 24 brief ids frozen BEFORE the #129 amendment (issue #43 corpus, hash
+// `55e05c2811a7`, disclosed in docs/PREREGISTRATION.md Appendix B item 13).
+// Used to reconstruct and re-hash the pre-amendment corpus from the current
+// (additive) one, so the earlier registration stays independently checkable
+// forever — not just "we say we didn't touch them."
+export const PRE_AMENDMENT_BRIEF_IDS = [
+  "biz-01", "biz-02", "biz-03", "biz-04", "biz-05", "biz-06",
+  "prod-01", "prod-02", "prod-03", "prod-04", "prod-05", "prod-06",
+  "sci-01", "sci-02", "sci-03", "sci-04", "sci-05", "sci-06",
+  "aut-01", "aut-02", "aut-03", "aut-04", "aut-05", "aut-06",
+];
 
 /** sha256(text), hex, truncated to 12 chars — same convention as configHash. */
 export function briefContentHash(brief) {
@@ -70,8 +87,8 @@ export function corpusHash(corpus) {
  * @param {Array} corpus
  */
 export function validateCorpus(corpus) {
-  if (!Array.isArray(corpus) || corpus.length !== 24) {
-    throw new Error(`validateCorpus: expected exactly 24 briefs, got ${corpus?.length ?? "non-array"}`);
+  if (!Array.isArray(corpus) || corpus.length !== 48) {
+    throw new Error(`validateCorpus: expected exactly 48 briefs, got ${corpus?.length ?? "non-array"}`);
   }
 
   const ids = new Set();
@@ -91,7 +108,7 @@ export function validateCorpus(corpus) {
     }
     counts[brief.stratum] += 1;
 
-    if (brief.provenance !== "authored" && brief.provenance !== "sampled") {
+    if (!["authored", "sampled", "verbatim"].includes(brief.provenance)) {
       throw new Error(`validateCorpus: brief '${brief.id}' has invalid provenance '${brief.provenance}'`);
     }
     if (brief.provenance === "sampled") {
@@ -100,6 +117,17 @@ export function validateCorpus(corpus) {
       }
       if (!brief.selection.algorithm || brief.selection.seed === undefined) {
         throw new Error(`validateCorpus: sampled brief '${brief.id}' is missing algorithm/seed metadata`);
+      }
+    }
+    if (brief.provenance === "verbatim") {
+      if (!brief.source || typeof brief.source.citation !== "string") {
+        throw new Error(`validateCorpus: verbatim brief '${brief.id}' is missing source.citation`);
+      }
+      if (typeof brief.source.location !== "string") {
+        throw new Error(`validateCorpus: verbatim brief '${brief.id}' is missing source.location (page/appendix)`);
+      }
+      if (typeof brief.source.comparabilityCaveat !== "string") {
+        throw new Error(`validateCorpus: verbatim brief '${brief.id}' is missing source.comparabilityCaveat`);
       }
     }
 
@@ -127,3 +155,25 @@ validateCorpus(BRIEFS);
 export { BRIEFS };
 export const CORPUS = BRIEFS;
 export const CORPUS_HASH = corpusHash(BRIEFS);
+
+/**
+ * Reconstructs and hashes the pre-#129-amendment corpus (the 24 briefs
+ * frozen at issue #43, hash `55e05c2811a7`) from within the CURRENT
+ * (additive) corpus, by filtering to `PRE_AMENDMENT_BRIEF_IDS`. Because the
+ * amendment is required to be additive-only — existing briefs unchanged,
+ * only appended to — this must always equal the previously-registered
+ * `55e05c2811a7`, and corpus.test.mjs checks that directly rather than
+ * trusting the constant.
+ *
+ * @param {Array} corpus
+ * @returns {string} 12-hex-char sha256, same convention as corpusHash
+ */
+export function preAmendmentCorpusHash(corpus) {
+  const subset = corpus.filter((b) => PRE_AMENDMENT_BRIEF_IDS.includes(b.id));
+  if (subset.length !== PRE_AMENDMENT_BRIEF_IDS.length) {
+    throw new Error(
+      `preAmendmentCorpusHash: expected ${PRE_AMENDMENT_BRIEF_IDS.length} pre-amendment briefs, found ${subset.length}`,
+    );
+  }
+  return corpusHash(subset);
+}
