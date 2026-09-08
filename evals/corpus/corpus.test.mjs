@@ -10,6 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import {
   BRIEFS,
@@ -38,10 +39,30 @@ test("the corpus has exactly 48 briefs", () => {
   assert.equal(CORPUS, BRIEFS, "CORPUS is the same frozen array BRIEFS exports");
 });
 
-test("stratum counts are exactly 6 business / 6 product / 23 scientific / 12 aut / 1 anchor", () => {
-  const counts = { business: 0, product: 0, scientific: 0, aut: 0, anchor: 0 };
+test("stratum counts are exactly 12 business / 12 product / 12 scientific / 12 aut", () => {
+  const counts = { business: 0, product: 0, scientific: 0, aut: 0 };
   for (const b of BRIEFS) counts[b.stratum] = (counts[b.stratum] || 0) + 1;
-  assert.deepEqual(counts, { business: 6, product: 6, scientific: 23, aut: 12, anchor: 1 });
+  assert.deepEqual(counts, { business: 12, product: 12, scientific: 12, aut: 12 });
+});
+
+test("all four strata carry EQUAL brief counts (parity guard, #129 coordinator correction)", () => {
+  // Dedicated invariant, independent of the specific numbers above: §3.2's
+  // "stratified so results generalize across task type" and §6.2's
+  // `(1 | brief)` / `(1 | brief:arm)` random-effects model both assume
+  // briefs are roughly exchangeable across strata. A corpus where one
+  // stratum holds a different share of briefs than the others breaks that
+  // silently — the brief-level variance (and the headline effect estimate)
+  // gets dominated by whichever stratum has the most briefs. This is
+  // exactly the invariant a first draft of this amendment violated
+  // (6/6/23/12/1) without any test catching it.
+  const counts = {};
+  for (const b of BRIEFS) counts[b.stratum] = (counts[b.stratum] || 0) + 1;
+  const values = Object.values(counts);
+  assert.ok(values.length >= 2, "sanity: corpus has more than one stratum");
+  const [first, ...rest] = values;
+  for (const v of rest) {
+    assert.equal(v, first, `stratum counts must be equal; got ${JSON.stringify(counts)}`);
+  }
 });
 
 test("every brief id is unique and stable (string)", () => {
@@ -75,17 +96,20 @@ test("every brief carries provenance, and sampled/verbatim briefs carry a source
   }
 });
 
-test("authored strata (business, product, aut) are all provenance: authored", () => {
+test("business and aut strata are entirely provenance: authored; product is authored except its one verbatim anchor (prod-07)", () => {
   for (const b of BRIEFS) {
-    if (b.stratum === "business" || b.stratum === "product" || b.stratum === "aut") {
+    if (b.stratum === "business" || b.stratum === "aut") {
       assert.equal(b.provenance, "authored", `${b.id} (${b.stratum}) should be authored`);
+    }
+    if (b.stratum === "product" && b.id !== "prod-07") {
+      assert.equal(b.provenance, "authored", `${b.id} (product) should be authored`);
     }
   }
 });
 
 test("the scientific stratum is provenance: sampled, sourced from LiveIdeaBench", () => {
   const sci = BRIEFS.filter((b) => b.stratum === "scientific");
-  assert.equal(sci.length, 23);
+  assert.equal(sci.length, 12);
   for (const b of sci) {
     assert.equal(b.provenance, "sampled");
     assert.equal(b.selection.source.repo, "x66ccff/liveideabench");
@@ -95,13 +119,17 @@ test("the scientific stratum is provenance: sampled, sourced from LiveIdeaBench"
   }
 });
 
-test("the anchor stratum is exactly 1 brief, provenance: verbatim, sourced from Meincke/Girotra", () => {
-  const anchor = BRIEFS.filter((b) => b.stratum === "anchor");
-  assert.equal(anchor.length, 1);
-  const [a] = anchor;
-  assert.equal(a.id, "anchor-01");
-  assert.equal(a.provenance, "verbatim");
+test("the product stratum contains exactly 1 verbatim brief (the anchor), sourced from Meincke/Girotra", () => {
+  const product = BRIEFS.filter((b) => b.stratum === "product");
+  assert.equal(product.length, 12);
+  const verbatim = product.filter((b) => b.provenance === "verbatim");
+  assert.equal(verbatim.length, 1, "exactly one verbatim (externally-anchored) brief in product");
+  const [a] = verbatim;
+  assert.equal(a.id, "prod-07");
   assert.equal(a.source, ANCHOR_SOURCE, "the shipped brief references the shared ANCHOR_SOURCE record");
+  for (const b of product) {
+    if (b.id !== "prod-07") assert.equal(b.provenance, "authored", `${b.id} should be authored`);
+  }
 });
 
 test("validateCorpus accepts the frozen corpus and rejects malformed ones", () => {
@@ -340,7 +368,7 @@ test("the classic divergent-thinking stratum uses AUT ('uses for X') phrasing", 
   }
 });
 
-test("extending the scientific sample count (6 -> 23, #129) preserves the prior draw prefix", () => {
+test("extending the scientific sample count (6 -> 12, #129) preserves the prior draw prefix", () => {
   const before = sampleKeywords(LIVEIDEABENCH_KEYWORDS, 6, SCIENTIFIC_SAMPLE_SEED);
   const after = sampleKeywords(LIVEIDEABENCH_KEYWORDS, SCIENTIFIC_SAMPLE_COUNT, SCIENTIFIC_SAMPLE_SEED);
   assert.deepEqual(after.slice(0, 6), before, "sci-01..sci-06's keywords are unchanged by the #129 expansion");
@@ -348,8 +376,10 @@ test("extending the scientific sample count (6 -> 23, #129) preserves the prior 
 
 // ── #129 part D: the anchor brief is transcribed verbatim, not paraphrased ──
 
-test("the anchor brief text matches the transcribed Meincke et al. Base Prompt exactly", () => {
-  const anchor = BRIEFS.find((b) => b.stratum === "anchor");
+test("the anchor brief (prod-07) text matches the transcribed Meincke et al. Base Prompt exactly", () => {
+  const anchor = BRIEFS.find((b) => b.id === "prod-07");
+  assert.equal(anchor.stratum, "product");
+  assert.equal(anchor.provenance, "verbatim");
   const expected =
     "Generate new product ideas with the following requirements: The product will " +
     "target college students in the United States. It should be a physical good, " +
@@ -393,4 +423,21 @@ test("the anchor source records the Mack Institute URL, its retrieval date, and 
 test("the anchor source records the human-prompt caveat verbatim from Girotra et al.", () => {
   assert.match(ANCHOR_SOURCE.humanPromptCaveat, /essentially the same prompt we gave the/);
   assert.match(ANCHOR_SOURCE.humanPromptCaveat, /not a transcript/);
+});
+
+test("business is disclosed as the one stratum with no external anchor (all 12 authored, none verbatim/sampled)", () => {
+  const business = BRIEFS.filter((b) => b.stratum === "business");
+  assert.equal(business.length, 12);
+  for (const b of business) {
+    assert.equal(b.provenance, "authored", `${b.id} should be authored — business has no external instrument`);
+  }
+  // The disclosure itself lives as a prominent code comment in briefs.mjs
+  // (searched, not re-typed here, so this test breaks if the comment is
+  // ever deleted rather than silently passing against a stale copy).
+  const briefsSrc = readFileSync(new URL("./briefs.mjs", import.meta.url), "utf8");
+  assert.match(
+    briefsSrc,
+    /business is the one stratum in this corpus with NO external\s*\n\s*\/\/ anchor/,
+    "briefs.mjs must plainly disclose business has no external anchor",
+  );
 });

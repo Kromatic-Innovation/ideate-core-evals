@@ -30,8 +30,13 @@
 import { createHash } from "node:crypto";
 import { BRIEFS } from "./briefs.mjs";
 
-const STRATA = ["business", "product", "scientific", "aut", "anchor"];
-const EXPECTED_STRATUM_COUNTS = { business: 6, product: 6, scientific: 23, aut: 12, anchor: 1 };
+const STRATA = ["business", "product", "scientific", "aut"];
+// Deliberately equal (12 each) — §3.2/§6.2 treat briefs as an exchangeable
+// random effect, so an unequal split would let one stratum dominate the
+// brief-level variance and quietly narrow the cross-domain generalization
+// claim to whichever stratum has the most briefs. See briefs.mjs header for
+// the corrected rationale (coordinator review, 2026-09-08).
+const EXPECTED_STRATUM_COUNTS = { business: 12, product: 12, scientific: 12, aut: 12 };
 
 // The 24 brief ids frozen BEFORE the #129 amendment (issue #43 corpus, hash
 // `55e05c2811a7`, disclosed in docs/PREREGISTRATION.md Appendix B item 13).
@@ -87,7 +92,7 @@ export function validateCorpus(corpus) {
   }
 
   const ids = new Set();
-  const counts = { business: 0, product: 0, scientific: 0, aut: 0, anchor: 0 };
+  const counts = { business: 0, product: 0, scientific: 0, aut: 0 };
 
   for (const brief of corpus) {
     if (!brief.id || typeof brief.id !== "string") {

@@ -11,17 +11,39 @@
 // Two ADDITIVE changes, bundled into one amendment per §3.2/§11 (adding a
 // brief invalidates the pre-registration, so batching avoids invalidating it
 // twice):
-//   D. A new `anchor` stratum (1 brief, provenance "verbatim") registers
-//      Meincke et al.'s "Base Prompt" as an externally-published
-//      comparability anchor — see ANCHOR_SOURCE below.
-//   E. 23 more briefs (24 -> 47 pre-anchor, 48 with the anchor), weighted
-//      toward externally-traceable sources: scientific 6 -> 23 (+17, all
-//      sampled from LiveIdeaBench — see sample.mjs) and aut 6 -> 12 (+6,
-//      more canonical Alternate-Uses-Task objects). business and product
-//      are UNCHANGED (6 each, still authored, now explicitly secondary
-//      per #129 part D) — no external source covers either stratum, so no
-//      new briefs were authored for them rather than inventing more
-//      unverifiable content.
+//   D. Meincke et al.'s "Base Prompt" is registered as an externally-
+//      published comparability anchor — `prod-07`, provenance "verbatim" —
+//      see ANCHOR_SOURCE below. It lives IN the `product` stratum, not a
+//      separate fifth stratum: folding it in is what gives `product` an
+//      external anchor at all (a first draft of this amendment used a
+//      standalone `anchor` stratum; corrected 2026-09-08 per coordinator
+//      review, see below).
+//   E. 24 more briefs (24 -> 48), keeping strict 12/12/12/12 parity across
+//      business/product/scientific/aut rather than weighting the corpus
+//      toward one stratum. scientific 6 -> 12 (+6, sampled from
+//      LiveIdeaBench — see sample.mjs), aut 6 -> 12 (+6, more canonical
+//      Alternate-Uses-Task objects), product 6 -> 12 (+6, including the
+//      anchor brief above), business 6 -> 12 (+6, authored — no external
+//      instrument exists for this stratum; disclosed, not hidden, in the
+//      comment above biz-07..12 below).
+//
+//   ── Why parity, not weighting toward scientific (corrected 2026-09-08) ──
+//   A first draft of this amendment weighted scientific to 23 briefs (48%
+//   of the corpus) on the theory that "weight toward externally-traceable
+//   sources" meant maximizing external-brief COUNT. That was wrong: §3.2
+//   states the corpus is "stratified so results generalize across task
+//   type, not just one domain," and §6.2's model
+//   (`distinct_k ~ arm + (1 | brief) + (1 | brief:arm)`) treats briefs as
+//   exchangeable random effects — so an unequal split doesn't just look
+//   lopsided, it lets the brief-level variance (and the headline effect
+//   estimate) be dominated by whichever stratum has the most briefs, quietly
+//   turning a cross-domain generalization claim into a within-scientific
+//   one. "Weight toward externally-traceable sources" is satisfied instead
+//   by which strata GAIN an anchor (scientific, aut-paradigm, and now
+//   product via the Meincke brief — 3 of 4, up from 1 of 4), not by breaking
+//   parity. business remains the one stratum with no external anchor, and
+//   that absence is disclosed rather than papered over.
+//
 // The original 24 briefs (biz-01..06, prod-01..06, sci-01..06, aut-01..06)
 // are retained byte-identical — same id, same text, same content hash — so
 // the pre-amendment corpus (hash `55e05c2811a7`) remains reconstructible by
@@ -96,10 +118,10 @@ function scientificSelectionMeta(keyword, index) {
 }
 
 // ── The canonical comparability anchor (issue #129 part D) ──────────────────
-// Full source record for anchor-01 below. Kept as a named constant (rather
-// than inlined in the brief) so the citation/caveats are one grep away and
-// so corpus.test.mjs can assert against it directly instead of re-deriving
-// strings.
+// Full source record for prod-07 below (the product-stratum verbatim brief).
+// Kept as a named constant (rather than inlined in the brief) so the
+// citation/caveats are one grep away and so corpus.test.mjs can assert
+// against it directly instead of re-deriving strings.
 //
 // Citations — #129's own citation text is WRONG (drops Meincke as an author
 // of the 2023 paper) and must not be copied from the issue body:
@@ -168,7 +190,7 @@ export const ANCHOR_SOURCE = {
 /**
  * @typedef {object} Brief
  * @property {string} id
- * @property {"business"|"product"|"scientific"|"aut"|"anchor"} stratum
+ * @property {"business"|"product"|"scientific"|"aut"} stratum
  * @property {string} text
  * @property {"authored"|"sampled"|"verbatim"} provenance
  * @property {object} [selection]  required when provenance === "sampled":
@@ -233,6 +255,66 @@ export const BRIEFS = [
       "genuinely different ways to respond as you can.",
   },
 
+  // ── Business expansion (6 more, authored, #129 amendment) ─────────────────
+  // DISCLOSURE: business is the one stratum in this corpus with NO external
+  // anchor. Unlike scientific (LiveIdeaBench), aut (the Guilford/Torrance
+  // Alternate-Uses-Task paradigm), and product (the Meincke/Girotra Base
+  // Prompt, prod-07 below), no published instrument covers generic
+  // business/go-to-market ideation in a form usable here. Rather than
+  // inventing a citation for one, this is stated plainly: biz-01..12 are
+  // ALL authored, all secondary evidence, and this stratum's results cannot
+  // be checked against any prior published number. Honest disclosure beats
+  // a fabricated anchor.
+  {
+    id: "biz-07",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company wants to raise its prices but is worried about losing customers. " +
+      "Generate as many genuinely different ways to do this as you can.",
+  },
+  {
+    id: "biz-08",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company has one product and is deciding whether to build a second one. " +
+      "Generate as many genuinely different ways to decide as you can.",
+  },
+  {
+    id: "biz-09",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company's sales team and product team disagree about what customers actually " +
+      "need. Generate as many genuinely different ways to resolve this as you can.",
+  },
+  {
+    id: "biz-10",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company relies on a single large customer for most of its revenue. Generate " +
+      "as many genuinely different ways to reduce this risk as you can.",
+  },
+  {
+    id: "biz-11",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company must decide whether to build a new capability itself or buy it from " +
+      "someone else. Generate as many genuinely different ways to decide as you can.",
+  },
+  {
+    id: "biz-12",
+    stratum: "business",
+    provenance: "authored",
+    text:
+      "A company's team has doubled in size in the last year and its old ways of " +
+      "working no longer fit. Generate as many genuinely different ways to adapt as " +
+      "you can.",
+  },
+
   // ── Product / feature ideation (6, authored) ──────────────────────────────
   {
     id: "prod-01",
@@ -283,6 +365,70 @@ export const BRIEFS = [
     text:
       "A product works well on one device type but poorly on another. Generate as " +
       "many genuinely different ways to fix this as you can.",
+  },
+
+  // ── Product expansion (6 more, #129 amendment part D/E) ────────────────────
+  // prod-07 is the canonical comparability anchor: Meincke, Mollick &
+  // Terwiesch (2024) "Base Prompt", transcribed VERBATIM — do not reword.
+  // See ANCHOR_SOURCE above for the full citation, location, and
+  // comparability caveats; this is the point of the brief, not boilerplate.
+  // It is placed in `product` (not a standalone stratum) because that is
+  // what gives the product stratum an externally-traceable anchor, per
+  // coordinator correction 2026-09-08 — see the file header.
+  {
+    id: "prod-07",
+    stratum: "product",
+    provenance: "verbatim",
+    text:
+      "Generate new product ideas with the following requirements: The product will " +
+      "target college students in the United States. It should be a physical good, " +
+      "not a service or software. I'd like a product that could be sold at a retail " +
+      "price of less than about USD 50. The ideas are just ideas. The product need " +
+      "not yet exist, nor may it necessarily be clearly feasible. Number all ideas " +
+      "and give them a name. The name and idea are separated by a colon. Please " +
+      "generate 100 ideas as 100 separate paragraphs. The idea should be expressed " +
+      "as a paragraph of 40-80 words.",
+    source: ANCHOR_SOURCE,
+  },
+  {
+    id: "prod-08",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A product team is deciding what to remove, not add, before its next release. " +
+      "Generate as many genuinely different ways to decide what to cut as you can.",
+  },
+  {
+    id: "prod-09",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A product's setup process takes users longer than the team would like. Generate " +
+      "as many genuinely different ways to shorten it as you can.",
+  },
+  {
+    id: "prod-10",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A product needs to support a second language for the first time. Generate as " +
+      "many genuinely different ways to approach this as you can.",
+  },
+  {
+    id: "prod-11",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A product's power users want more control while new users want less complexity. " +
+      "Generate as many genuinely different ways to serve both as you can.",
+  },
+  {
+    id: "prod-12",
+    stratum: "product",
+    provenance: "authored",
+    text:
+      "A product has one feature that breaks more often than any other. Generate as " +
+      "many genuinely different ways to address this as you can.",
   },
 
   // ── Scientific (6, sampled from LiveIdeaBench) ────────────────────────────
@@ -384,30 +530,5 @@ export const BRIEFS = [
     stratum: "aut",
     provenance: "authored",
     text: "Generate as many genuinely different uses for a blanket as you can.",
-  },
-
-  // ── Canonical comparability anchor (1, verbatim, #129 amendment part D) ────
-  // Meincke, Mollick & Terwiesch (2024) "Base Prompt" — the same task Girotra,
-  // Meincke, Terwiesch & Ulrich (2023) used to compare ChatGPT-4 ideation
-  // against Wharton students, later re-used by Meincke et al. (2024) as the
-  // baseline strategy in their prompting-diversity study. Transcribed
-  // VERBATIM — do not reword. See ANCHOR_SOURCE below for the full citation,
-  // location, and comparability caveats; this is the point of the brief, not
-  // boilerplate. Kept as its own stratum (not folded into "product") because
-  // it is a single fixed external instrument, not a sampled or authored set.
-  {
-    id: "anchor-01",
-    stratum: "anchor",
-    provenance: "verbatim",
-    text:
-      "Generate new product ideas with the following requirements: The product will " +
-      "target college students in the United States. It should be a physical good, " +
-      "not a service or software. I'd like a product that could be sold at a retail " +
-      "price of less than about USD 50. The ideas are just ideas. The product need " +
-      "not yet exist, nor may it necessarily be clearly feasible. Number all ideas " +
-      "and give them a name. The name and idea are separated by a colon. Please " +
-      "generate 100 ideas as 100 separate paragraphs. The idea should be expressed " +
-      "as a paragraph of 40-80 words.",
-    source: ANCHOR_SOURCE,
   },
 ];
