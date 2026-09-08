@@ -145,12 +145,22 @@ export const ANCHOR_SOURCE = {
   // Verified against the retrieved PDF text at transcription time (2026-09-08):
   // the "Base Prompt" is reproduced inline on p.12 (the "Exhaustion" section,
   // introducing the exhaustion-comparison prompts) AND again in Appendix D
-  // ("Table of Prompts", pp. 20-33; the Base Prompt row itself falls on p.24),
-  // Meincke, Mollick & Terwiesch (2024) working paper. Both reproductions are
-  // byte-identical.
+  // ("Table of Prompts", pp. 20-36 — Appendix E: Idea Examples first appears
+  // on p.36, and prompt-table rows still run through pp.34-35; the row
+  // labelled "Base Prompt" begins on p.24 and continues onto p.25),
+  // Meincke, Mollick & Terwiesch (2024) working paper. Both occurrences of
+  // the row LABELLED "Base Prompt" are byte-identical (independently
+  // verified 2026-09-08: both hash to md5 4f7d9191488a5e9f0eb6162dca94582f,
+  // confirming the straight apostrophe in "I'd" and the hyphen in "40-80"
+  // are genuine, not extraction artifacts). The same 561-character string
+  // also recurs, unlabelled, as the tail of 4 other Appendix D rows that are
+  // built by prefixing extra text onto it (5 occurrences total in the
+  // paper) — only the 2 rows actually labelled "Base Prompt" are counted
+  // above, which is what this record means.
   location:
     "Reproduced inline on p.12 (\"Exhaustion\" section) and in Appendix D (\"Table of " +
-    "Prompts\", pp. 20-33, Base Prompt row on p.24) of Meincke, Mollick & Terwiesch (2024).",
+    "Prompts\", pp. 20-36, Base Prompt row begins on p.24 and continues onto p.25) of " +
+    "Meincke, Mollick & Terwiesch (2024).",
   // `retrievedFrom` names the document the TEXT ABOVE was actually
   // transcribed from — Meincke et al. (2024), the `secondaryCitation`. It
   // must NOT point at Girotra et al. (2023): that PDF is 14 pages and has

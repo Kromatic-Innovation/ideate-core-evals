@@ -442,6 +442,24 @@ test("retrievedFrom and location are internally consistent — both name Meincke
   assert.match(ANCHOR_SOURCE.retrievedFrom, /2402\.01727/, "retrievedFrom's identifier must match the transcription-source citation (arXiv:2402.01727v1)");
 });
 
+test("location records the corrected Appendix D page range and the Base Prompt row's page wrap", () => {
+  // Two precision corrections (coordinator review, 2026-09-08), independently
+  // re-verified against the retrieved PDF text:
+  //  - Appendix D actually runs pp.20-36, not pp.20-33: Appendix E ("Idea
+  //    Examples") first appears on p.36, and prompt-table rows still run
+  //    through pp.34-35.
+  //  - The Base Prompt row does not sit wholly on p.24: it begins there and
+  //    wraps onto p.25 (confirmed: p.24 ends mid-sentence at "Number all",
+  //    p.25 opens with "ideas and give them a name...").
+  assert.match(ANCHOR_SOURCE.location, /pp\. 20-36/, "Appendix D page range must be pp. 20-36, not pp. 20-33");
+  assert.doesNotMatch(ANCHOR_SOURCE.location, /20-33/, "the old (wrong) Appendix D page range must not remain");
+  assert.match(
+    ANCHOR_SOURCE.location,
+    /begins on p\.24 and continues onto p\.25/,
+    "must not imply the Base Prompt row sits wholly on p.24 — it wraps onto p.25",
+  );
+});
+
 test("versionRisk describes the registered text's own (stable arXiv) provenance, not Girotra's SSRN risk", () => {
   assert.match(ANCHOR_SOURCE.versionRisk, /arXiv:2402\.01727v1/);
   assert.match(ANCHOR_SOURCE.versionRisk, /stable/i);
