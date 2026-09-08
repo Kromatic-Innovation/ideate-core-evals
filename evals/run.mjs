@@ -78,6 +78,18 @@ const REPO_ROOT = join(__dirname, "..");
 export const DEFAULT_RESULTS_DIR = join(REPO_ROOT, "results");
 
 /**
+ * The coalescing window applied when `--cell-concurrency` is raised and
+ * `--batch-window-ms` is not given (issue #148).
+ *
+ * Lives here rather than in provider.mjs because it is a CLI-ergonomics
+ * decision, not a provider default: the provider's own default stays 0 (the
+ * historical per-round debounce) so a programmatic caller gets exactly the old
+ * behaviour unless it asks otherwise. See the wiring site for why the pairing
+ * is defaulted rather than left to the operator to remember.
+ */
+export const DEFAULT_CONCURRENT_BATCH_WINDOW_MS = 2000;
+
+/**
  * Resolve --results-dir (issue #120) to an absolute directory, refusing a
  * path that exists but is not a results store.
  *
@@ -370,6 +382,10 @@ export function parseArgs(argv) {
       // wait for their requests to arrive -- and an operator tuning one should
       // not be forced to guess the other. 0 is legal (the historical per-round
       // debounce); a negative value is not.
+      // Explicitly settable to 0 ("give me the historical debounce even at
+      // concurrency > 1"), which is why the pairing default at the provider
+      // construction is applied by ABSENCE of the flag, never by the value
+      // being falsy.
       case "--batch-window-ms":
         args.batchWindowMs = parseRequiredNumber(argv, ++i, "--batch-window-ms");
         if (!(args.batchWindowMs >= 0)) {
@@ -1052,10 +1068,31 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       corpus: CORPUS,
       armsConfig,
       ...(args.maxPollMinutes !== undefined ? { maxPollMs: args.maxPollMinutes * 60 * 1000 } : {}),
-      // batchWindowMs (issue #148): same "pass only what the operator set"
-      // discipline -- unset leaves the provider's own 0 default, which is the
-      // historical per-round debounce.
-      ...(args.batchWindowMs !== undefined ? { batchWindowMs: args.batchWindowMs } : {}),
+      // batchWindowMs (issue #148). This is the ONE place the "pass only what
+      // the operator set" discipline does not apply, and the exception is the
+      // point of the fix.
+      //
+      // Concurrency and the window are not two independent knobs: raising
+      // concurrency while the window stays 0 buys nothing. A zero window closes
+      // on the next macrotask, so it coalesces only cells that arrive together
+      // -- true of a run's first burst and false in steady state, where a worker
+      // picks up its next cell when its previous batch returns, minutes after
+      // its peers. So `--cell-concurrency 24` alone would give an operator 24
+      // concurrent cells, one batch each, and no warning (the all-solo guard
+      // below is silenced by concurrency > 1). The documented recommendation
+      // would be a thing to remember, and forgetting it would look like the fix
+      // not working.
+      //
+      // So concurrency > 1 defaults the window to something useful, and
+      // --batch-window-ms still overrides. 2000ms is chosen against the thing it
+      // trades off: a batch queue wait measured in minutes to hours, against
+      // which two seconds of coalescing is free. Concurrency 1 keeps 0 -- the
+      // historical per-round debounce, unchanged.
+      ...(args.batchWindowMs !== undefined
+        ? { batchWindowMs: args.batchWindowMs }
+        : (args.cellConcurrency ?? 1) > 1
+          ? { batchWindowMs: DEFAULT_CONCURRENT_BATCH_WINDOW_MS }
+          : {}),
       // Same "pass only what the operator actually set" discipline as
       // maxPollMs above: an unset off-switch leaves the provider's own
       // default-on in place rather than re-specifying it here, where it could
