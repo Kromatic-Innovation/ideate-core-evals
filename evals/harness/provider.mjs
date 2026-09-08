@@ -151,6 +151,33 @@ function assertPollCeiling(maxPollMs, providerName) {
 }
 
 /**
+ * Guard `batchWindowMs` (issue #148), for the same reason assertPollCeiling
+ * guards `maxPollMs`: a NaN window would be handed straight to `setTimeout`,
+ * which coerces it to 0 -- silently restoring the per-round debounce and
+ * quietly re-introducing the one-request-batch behaviour this setting exists to
+ * fix. A misconfiguration must fail loud, not degrade to the broken default.
+ */
+function assertBatchWindow(batchWindowMs, providerName) {
+  if (!Number.isFinite(batchWindowMs) || batchWindowMs < 0) {
+    throw new Error(
+      `${providerName}: batchWindowMs must be a finite, non-negative number of milliseconds, got ${JSON.stringify(batchWindowMs)} -- ` +
+        "setTimeout silently coerces a non-finite delay to 0, which would restore the per-round debounce without saying so",
+    );
+  }
+  return batchWindowMs;
+}
+
+/** Guard `maxBatchRequests` (issue #148): a non-positive or non-finite bound
+ *  would either flush on every single push (restoring one-request batches) or
+ *  never bound the buffer at all. */
+function assertMaxBatchRequests(maxBatchRequests, providerName) {
+  if (!Number.isInteger(maxBatchRequests) || maxBatchRequests < 1) {
+    throw new Error(`${providerName}: maxBatchRequests must be a positive integer, got ${JSON.stringify(maxBatchRequests)}`);
+  }
+  return maxBatchRequests;
+}
+
+/**
  * The ledger discriminator issue #92 asks for: "we gave up waiting" must be
  * distinguishable from "the API failed". `failureKind` is `timeout` in both the
  * ceiling case and a hypothetical provider-reported one, so the DETAIL string
@@ -717,6 +744,17 @@ function canonicalRequestJson(value) {
 }
 
 /**
+ * How many buffered requests force an early flush, whatever the window says.
+ *
+ * Not a guess at a limit: Anthropic documents 100,000 requests (or 256 MB) per
+ * Message Batch and OpenAI 50,000, so this is well inside both. It exists as a
+ * bound on the ONE thing a coalescing window cannot bound by itself -- a run
+ * whose concurrency is set high enough that the buffer would otherwise grow
+ * without limit before the timer fires (issue #148).
+ */
+export const DEFAULT_MAX_BATCH_REQUESTS = 10000;
+
+/**
  * A CONTENT-DERIVED, stable `custom_id` for one batched request (#103 AC1).
  *
  * Before this, ids were `req-<i>-<Math.random()>` -- unique within a batch and
@@ -866,11 +904,44 @@ function defaultCompletion(cell, arm, latencyMs) {
 // no signal marking "this is the last one". We turn that into ONE Message
 // Batch per round by buffering: every `complete(req)` call pushes
 // `{req, resolve, reject}` onto `this.#pending` and, on the FIRST push of a
-// fresh batch, schedules `this.#flush()` via `setTimeout(fn, 0)` -- a
-// subsequent-MACROTASK debounce, which fires only after every synchronously
+// fresh batch, schedules `this.#flush()` via `setTimeout(fn, batchWindowMs)` --
+// a subsequent-MACROTASK debounce, which fires only after every synchronously
 // queued microtask (i.e. every agent's `complete()` call for this round) has
 // already pushed onto the buffer. `flush()` then submits everything
 // accumulated as a single batch and resolves each caller by `custom_id`.
+//
+// -- The window is what lets a batch span CELLS, not just agents (issue #148) --
+// `batchWindowMs` defaults to 0: the historical subsequent-macrotask debounce
+// exactly, coalescing one round's agents and nothing else. That is all a
+// STRICTLY SEQUENTIAL runner can ever produce -- and under it a SOLO arm submits
+// a batch of exactly ONE request and then pays the full queue wait for zero
+// parallelism, once per cell. Measured on Study 1 Stage 1a: a one-request batch
+// sat `in_progress` for 2h34m with zero cells collected.
+//
+// Nothing in THIS class assumed one cell per flush. The result-distribution
+// path already keys replies by the id they were SUBMITTED under and resolves
+// `byCustomId.get(id)`'s own entry; `#abandon` already walks
+// `new Set(batch.map((e) => e.ctx))` and files one handle per distinct cell;
+// and `#flush`'s `submitId`/`customId` split exists precisely for "ONE flush
+// spans TWO cells whose requests serialize identically." The batcher was built
+// cross-cell-capable and said so; what prevented cross-cell batches was the
+// runner's sequential loop plus a zero-length window, not this class.
+//
+// So the fix is two settings, not a rewrite: the runner runs `cellConcurrency`
+// cells at once (see runner.mjs), and a non-zero `batchWindowMs` holds the
+// buffer open long enough for those cells' round-1 requests to land in the SAME
+// batch. The window is fixed from the first push rather than reset by each
+// arrival, so a steady trickle can never defer a flush indefinitely;
+// `maxBatchRequests` flushes early if the buffer fills first. Both bounds are
+// cheap relative to a batch queue wait measured in minutes to hours.
+//
+// Why the window is needed on top of concurrency, stated precisely: a zero
+// window closes the barrier on the NEXT MACROTASK, so it captures exactly those
+// cells whose engines reached `complete()` without yielding to one. Whether
+// ideate-core does that is not a property this class controls -- one `await`
+// anywhere on the way in and the zero window collapses straight back to one
+// batch per cell. The window makes the coalescing a property of the harness
+// rather than of the engine's internal scheduling.
 export class AnthropicBatchProvider {
   /**
    * @param {object} [opts]
@@ -894,6 +965,15 @@ export class AnthropicBatchProvider {
    *   @param {number} [opts.pollIntervalMs]   batch-poll interval (live default 2000ms).
    *   @param {number} [opts.maxPollMs]        poll ceiling before classifying `timeout`
    *     (live default DEFAULT_MAX_POLL_MS -- see that constant for why 60 min).
+   *   @param {number} [opts.batchWindowMs] issue #148: how long the barrier holds the
+   *     buffer open before submitting. 0 (default) is the historical
+   *     subsequent-macrotask debounce -- one batch per ROUND of one cell. A
+   *     positive value lets requests from CONCURRENT cells (runner.mjs's
+   *     `cellConcurrency`) coalesce into one batch. Fixed from the first push,
+   *     never reset by later arrivals.
+   *   @param {number} [opts.maxBatchRequests] issue #148: flush early once this many
+   *     requests are buffered, whatever the window says (default
+   *     DEFAULT_MAX_BATCH_REQUESTS).
    *   @param {boolean} [opts.cancelOnAbandon] issue #92: cancel an in-flight batch when the
    *     poll ceiling is reached, so it does not bill unattended for work #90 is about to
    *     re-submit. Default true; set false to leave the handle live for a manual re-poll.
@@ -914,6 +994,8 @@ export class AnthropicBatchProvider {
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     pollIntervalMs = 2000,
     maxPollMs = DEFAULT_MAX_POLL_MS,
+    batchWindowMs = 0,
+    maxBatchRequests = DEFAULT_MAX_BATCH_REQUESTS,
     cancelOnAbandon = true,
     resume = true,
     maxRetries = 3,
@@ -927,6 +1009,8 @@ export class AnthropicBatchProvider {
     this.sleep = sleep;
     this.pollIntervalMs = pollIntervalMs;
     this.maxPollMs = assertPollCeiling(maxPollMs, "AnthropicBatchProvider");
+    this.batchWindowMs = assertBatchWindow(batchWindowMs, "AnthropicBatchProvider");
+    this.maxBatchRequests = assertMaxBatchRequests(maxBatchRequests, "AnthropicBatchProvider");
     this.cancelOnAbandon = cancelOnAbandon;
     this.resume = resume;
     this.maxRetries = maxRetries;
@@ -938,10 +1022,42 @@ export class AnthropicBatchProvider {
     // per batch.
     this.#pending = [];
     this.#flushScheduled = false;
+    this.#flushTimer = undefined;
   }
 
   #pending;
   #flushScheduled;
+  #flushTimer;
+
+  /**
+   * Open (or close) the barrier window for the buffer's newest entry (#148).
+   *
+   * On the FIRST push of a fresh batch, arm a `setTimeout` for `batchWindowMs`.
+   * Later pushes inside that window do NOT re-arm it -- the window is fixed
+   * from the first arrival, so a steady trickle of requests can never defer the
+   * flush indefinitely (an idle-reset debounce could, and a batch that never
+   * submits is strictly worse than one submitted a little early).
+   *
+   * At `batchWindowMs` 0 this is byte-for-byte the historical behaviour: a
+   * subsequent-macrotask debounce that fires only once every synchronously
+   * queued microtask -- i.e. every agent's `complete()` call for this round --
+   * has already pushed onto the buffer.
+   *
+   * The size bound flushes early and CLEARS the timer, so the buffer is never
+   * submitted twice for one window.
+   */
+  #scheduleFlush() {
+    if (this.#pending.length >= this.maxBatchRequests) {
+      if (this.#flushTimer !== undefined) clearTimeout(this.#flushTimer);
+      this.#flushTimer = undefined;
+      this.#flushScheduled = false;
+      void this.#flush();
+      return;
+    }
+    if (this.#flushScheduled) return;
+    this.#flushScheduled = true;
+    this.#flushTimer = setTimeout(() => this.#flush(), this.batchWindowMs);
+  }
 
   /**
    * The interface method (see the file header). Never throws for a transport
@@ -1257,15 +1373,7 @@ export class AnthropicBatchProvider {
     }
     return new Promise((resolve, reject) => {
       this.#pending.push({ req, params, customId, resolve, reject, ctx });
-      if (!this.#flushScheduled) {
-        this.#flushScheduled = true;
-        // Subsequent-macrotask debounce: every agent's complete() call for
-        // this round is already queued (they were all fired synchronously by
-        // ideate-core's Promise.all) by the time a setTimeout(fn, 0) callback
-        // runs, because a macrotask never runs before the current + already
-        // queued microtasks drain.
-        setTimeout(() => this.#flush(), 0);
-      }
+      this.#scheduleFlush();
     });
   }
 
@@ -1501,6 +1609,8 @@ export class AnthropicBatchProvider {
     const batch = this.#pending;
     this.#pending = [];
     this.#flushScheduled = false;
+    if (this.#flushTimer !== undefined) clearTimeout(this.#flushTimer);
+    this.#flushTimer = undefined;
     if (!batch.length) return;
 
     // custom_ids are CONTENT-DERIVED as of #103 and computed in
@@ -2322,6 +2432,10 @@ export class OpenAIBatchProvider {
    *   @param {Function} [opts.sleep]       (ms)=>Promise; injectable for instant tests.
    *   @param {number}   [opts.pollIntervalMs]  (live default 2000ms)
    *   @param {number}   [opts.maxPollMs]       (live default DEFAULT_MAX_POLL_MS -- issue #92)
+   *   @param {number}   [opts.batchWindowMs]   issue #148: coalescing window; 0 (default) is the
+   *     historical per-round debounce. See AnthropicBatchProvider for the full note.
+   *   @param {number}   [opts.maxBatchRequests] issue #148: early-flush bound (default
+   *     DEFAULT_MAX_BATCH_REQUESTS)
    *   @param {boolean}  [opts.cancelOnAbandon] cancel an in-flight batch at the ceiling (default true)
    *   @param {boolean}  [opts.resume]          issue #103: replay already-paid-for replies and
    *     re-poll an abandoned handle instead of re-submitting (default true, batch mode only)
@@ -2337,6 +2451,8 @@ export class OpenAIBatchProvider {
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     pollIntervalMs = 2000,
     maxPollMs = DEFAULT_MAX_POLL_MS,
+    batchWindowMs = 0,
+    maxBatchRequests = DEFAULT_MAX_BATCH_REQUESTS,
     cancelOnAbandon = true,
     resume = true,
     maxRetries = 3,
@@ -2350,16 +2466,50 @@ export class OpenAIBatchProvider {
     this.sleep = sleep;
     this.pollIntervalMs = pollIntervalMs;
     this.maxPollMs = assertPollCeiling(maxPollMs, "OpenAIBatchProvider");
+    this.batchWindowMs = assertBatchWindow(batchWindowMs, "OpenAIBatchProvider");
+    this.maxBatchRequests = assertMaxBatchRequests(maxBatchRequests, "OpenAIBatchProvider");
     this.cancelOnAbandon = cancelOnAbandon;
     this.resume = resume;
     this.maxRetries = maxRetries;
     this.logger = logger;
     this.#pending = [];
     this.#flushScheduled = false;
+    this.#flushTimer = undefined;
   }
 
   #pending;
   #flushScheduled;
+  #flushTimer;
+
+  /**
+   * Open (or close) the barrier window for the buffer's newest entry (#148).
+   *
+   * On the FIRST push of a fresh batch, arm a `setTimeout` for `batchWindowMs`.
+   * Later pushes inside that window do NOT re-arm it -- the window is fixed
+   * from the first arrival, so a steady trickle of requests can never defer the
+   * flush indefinitely (an idle-reset debounce could, and a batch that never
+   * submits is strictly worse than one submitted a little early).
+   *
+   * At `batchWindowMs` 0 this is byte-for-byte the historical behaviour: a
+   * subsequent-macrotask debounce that fires only once every synchronously
+   * queued microtask -- i.e. every agent's `complete()` call for this round --
+   * has already pushed onto the buffer.
+   *
+   * The size bound flushes early and CLEARS the timer, so the buffer is never
+   * submitted twice for one window.
+   */
+  #scheduleFlush() {
+    if (this.#pending.length >= this.maxBatchRequests) {
+      if (this.#flushTimer !== undefined) clearTimeout(this.#flushTimer);
+      this.#flushTimer = undefined;
+      this.#flushScheduled = false;
+      void this.#flush();
+      return;
+    }
+    if (this.#flushScheduled) return;
+    this.#flushScheduled = true;
+    this.#flushTimer = setTimeout(() => this.#flush(), this.batchWindowMs);
+  }
 
   /** Same wrapper shape as AnthropicBatchProvider#generate -- see there. */
   async generate(cell, arm, opts = {}) {
@@ -2580,10 +2730,7 @@ export class OpenAIBatchProvider {
     }
     return new Promise((resolve, reject) => {
       this.#pending.push({ req, params, customId, resolve, reject, ctx });
-      if (!this.#flushScheduled) {
-        this.#flushScheduled = true;
-        setTimeout(() => this.#flush(), 0);
-      }
+      this.#scheduleFlush();
     });
   }
 
@@ -2729,6 +2876,8 @@ export class OpenAIBatchProvider {
     const batch = this.#pending;
     this.#pending = [];
     this.#flushScheduled = false;
+    if (this.#flushTimer !== undefined) clearTimeout(this.#flushTimer);
+    this.#flushTimer = undefined;
     if (!batch.length) return;
 
     // Content-derived ids with the same submitId/customId split the Anthropic

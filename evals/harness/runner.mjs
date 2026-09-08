@@ -1526,6 +1526,61 @@ export function spendToDate(store, rateTable = DEFAULT_RATE_TABLE, { batch = tru
 }
 
 /**
+ * Run `cells` through `runOne` with at most `concurrency` in flight (issue #148).
+ *
+ * Deliberately a worker pool over a shared cursor rather than a chunked
+ * `Promise.all`: a chunked version would idle every finished worker until the
+ * slowest cell in its chunk completed, which for a batch-mode run means idling
+ * behind a queue wait measured in minutes.
+ *
+ * Three properties the cell loop depends on:
+ *
+ *   1. **`concurrency` 1 is the historical sequential loop, exactly.** One
+ *      worker, one cell at a time, each awaited to completion before the next is
+ *      started. Nothing about ordering or interleaving changes at the default.
+ *   2. **`onSettled` runs for every cell, on every path.** It is in a `finally`,
+ *      so a cell that throws still releases whatever it reserved. Without this,
+ *      one throw silently ratchets every remaining admission decision.
+ *   3. **A throw still aborts the run, and does so promptly.** `runSpec`'s
+ *      fail-loud guards (a missing RATE_TABLE entry, an unknown arm) must not be
+ *      swallowed into an unhandled rejection. The first rejection is recorded
+ *      and rethrown after the in-flight workers settle -- workers stop pulling
+ *      new cells the moment one fails, so an aborting run does not first march
+ *      the rest of the plan into the same wall. Cells already in flight are
+ *      allowed to finish rather than being abandoned mid-write: they have spent
+ *      real money and their store writes must land.
+ *
+ * @param {Array<object>} cells
+ * @param {number} concurrency
+ * @param {(cell: object) => Promise<void>} runOne
+ * @param {(cellKey: string) => void} onSettled
+ */
+export async function runCellsWithConcurrency(cells, concurrency, runOne, onSettled = () => {}) {
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error(`runCellsWithConcurrency: concurrency must be a positive integer, got ${JSON.stringify(concurrency)}`);
+  }
+  let cursor = 0;
+  let firstError = null;
+  const worker = async () => {
+    while (cursor < cells.length && firstError === null) {
+      const cell = cells[cursor];
+      cursor += 1;
+      try {
+        await runOne(cell);
+      } catch (err) {
+        if (firstError === null) firstError = err;
+      } finally {
+        onSettled(cell.key);
+      }
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < Math.min(concurrency, cells.length); i += 1) workers.push(worker());
+  await Promise.all(workers);
+  if (firstError !== null) throw firstError;
+}
+
+/**
  * Plan a spec against the store (the shared first half of dry-run and a real
  * run) and price the `todo` set. Pulled out of runSpec() so --dry-run and the
  * real run price identically -- no drift between "what dry-run predicted" and
@@ -1567,6 +1622,16 @@ export function planAndPrice(spec, { store, armsConfig, priceGrid = interimPrice
  *     partial progress under a cap). A resumed run's ceiling therefore gates
  *     the STUDY's total spend, not just this invocation's -- re-invoking the
  *     runner N times no longer permits N x the stated cap.
+ *   @param {number} [opts.cellConcurrency] how many `plan.todo` cells run at once
+ *     (issue #148). Default 1 -- the historical strictly-sequential loop, byte for
+ *     byte. Raising it is what lets a batch-mode run coalesce requests from
+ *     SEVERAL cells into one Message Batch (see provider.mjs's `batchWindowMs`);
+ *     with a solo arm, concurrency 1 means every batch holds exactly one request
+ *     and the run serializes one full queue wait per cell. Admission control stays
+ *     exact under concurrency by RESERVING each in-flight cell's projected share
+ *     (see `reserveInFlight` in the cell loop) -- so a ceiling still cannot be
+ *     crossed, and the only behavioural difference is that a cell which would
+ *     have been admitted sequentially may be skipped while peers are in flight.
  *   @param {Object<string,number>} [opts.maxSpendByProviderUsd] per-provider
  *     ceilings (issue #51), e.g. `{ anthropic: 300, openai: 150 }` -- keyed by
  *     `lib/price.mjs`'s `providerOf()` output. Same fail-closed, per-cell,
@@ -1640,6 +1705,7 @@ export async function runSpec(spec, opts) {
     // behaviour anyone wants, so it should not need a flag to avoid.
     resume = true,
     dryRun = false,
+    cellConcurrency = 1,
     maxSpendUsd,
     maxSpendByProviderUsd,
     rateTable = DEFAULT_RATE_TABLE,
@@ -2265,7 +2331,55 @@ export async function runSpec(spec, opts) {
   // whether admitting it would cross a provider's ceiling.
   const providerByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.byProvider || {}]));
 
-  for (const cell of plan.todo) {
+  // ── In-flight reservations (issue #148) ────────────────────────────────────
+  // The admission check below is "everything ACTUALLY spent so far, plus this
+  // one cell's PROJECTION." Under the historical sequential loop that was
+  // complete: no other cell could be mid-flight, so there was nothing else to
+  // count. With `cellConcurrency > 1` there is -- up to K-1 cells that have
+  // been admitted, have spent real money, and have not yet reported a single
+  // token. Without these reservations every one of those cells would be
+  // invisible to the next admission decision and a ceiling could be crossed by
+  // up to K cells' worth of spend, silently.
+  //
+  // A reservation is the admitted cell's own PROJECTED share, held from the
+  // moment it is admitted until its cell task settles, and released in the
+  // driver's `finally` -- not at the end of the cell body. Any throw between
+  // admission and completion (recordActualSpend's fail-loud missing-rate guard,
+  // a store write) would otherwise leak the reservation and ratchet the
+  // effective ceiling down for every remaining cell of the run.
+  //
+  // By the time a reservation is released, that cell's ACTUAL spend has already
+  // gone through recordActualSpend, so there is no window in which a cell's
+  // money is counted by neither the reservation nor the running total. The
+  // projection is an estimate, so the guard is conservative in the safe
+  // direction where they differ: an over-projecting cell holds back slightly
+  // more headroom than it turns out to need.
+  const inFlightReservations = new Map();
+  let inFlightTotal = 0;
+  const inFlightByProvider = {};
+
+  function reserveInFlight(cellKey, usd, byProvider) {
+    inFlightReservations.set(cellKey, { usd, byProvider });
+    inFlightTotal += usd;
+    for (const [provider, amount] of Object.entries(byProvider)) {
+      inFlightByProvider[provider] = (inFlightByProvider[provider] || 0) + amount;
+    }
+  }
+
+  // Idempotent by construction: a cell that returned before ever being admitted
+  // (a payment abort, a budget skip) has no entry, so the driver can call this
+  // unconditionally in its `finally` without knowing which path the cell took.
+  function releaseInFlight(cellKey) {
+    const held = inFlightReservations.get(cellKey);
+    if (!held) return;
+    inFlightReservations.delete(cellKey);
+    inFlightTotal -= held.usd;
+    for (const [provider, amount] of Object.entries(held.byProvider)) {
+      inFlightByProvider[provider] = (inFlightByProvider[provider] || 0) - amount;
+    }
+  }
+
+  const runOneCell = async (cell) => {
     if (paymentAborted) {
       // The account cannot pay. Marching this cell into the identical wall
       // would produce a failure that is not a datum about the arm, cost
@@ -2290,7 +2404,7 @@ export async function runSpec(spec, opts) {
           (paymentAborted.providers ? `, providers: ${paymentAborted.providers}` : "") +
           ")",
       );
-      continue;
+      return;
     }
     // `priceByKey.get(cell.key) || 0` would mask two distinct situations as
     // the same silent zero: (a) a cell that legitimately costs $0 (falsy
@@ -2328,7 +2442,9 @@ export async function runSpec(spec, opts) {
         // BEFORE this invocation started, PLUS this invocation's real spend
         // so far -- never just the latter, which is what let a resumed run
         // restart its budget at zero.
-        const already = (priorSpend.byProvider[provider] || 0) + (runningTotalByProvider[provider] || 0);
+        // `inFlightByProvider` (issue #148): the projected share of every cell
+        // admitted but not yet settled. Zero under the default concurrency of 1.
+        const already = (priorSpend.byProvider[provider] || 0) + (runningTotalByProvider[provider] || 0) + (inFlightByProvider[provider] || 0);
         if (already + projected > ceiling) {
           trippedProvider = provider;
           break;
@@ -2336,7 +2452,7 @@ export async function runSpec(spec, opts) {
       }
     }
 
-    if (trippedProvider || (maxSpendUsd !== undefined && priorSpend.totalUsd + runningTotal + cellCost > maxSpendUsd)) {
+    if (trippedProvider || (maxSpendUsd !== undefined && priorSpend.totalUsd + runningTotal + inFlightTotal + cellCost > maxSpendUsd)) {
       // Budget-skipped: recorded via RunAccount as a classified skip, never
       // dropped from the plan (see reconcile()'s tally below and the AC's
       // own wording: "recorded skipped: budget_exceeded, never dropped").
@@ -2354,8 +2470,13 @@ export async function runSpec(spec, opts) {
       // including none) sees it as `todo` again, which is the only sane
       // resume behavior for "we chose not to spend on this yet."
       account.skip(cell.key, trippedProvider ? `budget_exceeded:${trippedProvider}` : "budget_exceeded");
-      continue;
+      return;
     }
+
+    // Admitted. Hold this cell's projected share against every ceiling until it
+    // settles (issue #148) -- see reserveInFlight's header. Released by the
+    // driver's `finally`, never here, so a throw below cannot leak it.
+    reserveInFlight(cell.key, cellCost, providerByKey.get(cell.key) || {});
     // `runningTotal` is no longer bumped by this cell's PROJECTED `cellCost`
     // here (PR #76 fix round, Sentry HIGH finding) -- it is now maintained
     // exclusively as ACTUAL spend-so-far, updated inside recordActualSpend()
@@ -2402,7 +2523,7 @@ export async function runSpec(spec, opts) {
       // defect forward as a permanent property of the arm. No cost rows
       // exist to persist -- the provider threw before reporting any tokens.
       account.fail(cell.key, "harness_error", `provider threw: ${err && err.message}`);
-      continue;
+      return;
     }
 
     // The rule: persist the replay state for any cell that will be RE-PLANNED,
@@ -2489,7 +2610,7 @@ export async function runSpec(spec, opts) {
         // survive or the next invocation buys them again.
         if (resumeEnabled) persistBatchResumeState(store, cell, response.resume, pricingLever, log);
         recordActualSpend(genCostRows);
-        continue; // no metrics, no store.put, no judging -- this pool is discarded
+        return; // no metrics, no store.put, no judging -- this pool is discarded
       }
 
       // ── Pool metrics (issue #85), computed BEFORE the single store.put()
@@ -2550,7 +2671,7 @@ export async function runSpec(spec, opts) {
         // NOTHING under cell.key, so the store-level retryability described
         // above holds regardless of what this invocation's summary reports.
         account.skip(cell.key, `metrics_failed: ${metrics.detail}`);
-        continue; // no candidates survive to judge -- nothing was ever stored
+        return; // no candidates survive to judge -- nothing was ever stored
       }
 
       // agentCountFields (issue #102 AC2): the realized agent count is retained
@@ -2706,7 +2827,15 @@ export async function runSpec(spec, opts) {
       recordActualSpend(costRows);
       // No candidates on a failed generation cell -- nothing to judge.
     }
-  }
+  };
+
+  // Drive the cells. At `cellConcurrency` 1 this is the historical sequential
+  // loop exactly -- one cell entered, awaited to its terminal state, then the
+  // next -- and every admission decision still sees only real, settled spend
+  // (`inFlightTotal` is 0 whenever a cell is being admitted, because no other
+  // cell is in flight). Above 1, cells overlap so their generation requests can
+  // land in one Message Batch (issue #148).
+  await runCellsWithConcurrency(plan.todo, cellConcurrency, runOneCell, releaseInFlight);
 
   // The gate: reconcile() throws unless every planned cell reached exactly
   // one terminal state. Called before any statistic is computed -- there is
