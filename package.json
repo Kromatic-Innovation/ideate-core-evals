@@ -19,6 +19,6 @@
     "@huggingface/transformers": "^4.2.0"
   },
   "dependencies": {
-    "ideate-core": "0.4.0"
+    "ideate-core": "0.5.0"
   }
 }
