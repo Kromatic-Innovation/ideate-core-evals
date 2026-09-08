@@ -207,6 +207,17 @@ function resolvedModelsFor(arm) {
     // Multiple slots can share a persona name under personaDisabled arms
     // (A'): keep them distinguishable by index so no model silently
     // overwrites another in the record.
+    //
+    // NOTE (issue #128): this record is keyed off the RAW `slot.persona` in
+    // arms.config.json, deliberately -- a stored cell must record what the
+    // config said, independent of how the harness resolved it. That is a
+    // DIFFERENT string from the agent id `resolveIdeateAgents` produces once
+    // an arm sets `uniformPersona` (the config seam left for issue #129):
+    // there the agent id follows the uniform persona's name while this key
+    // keeps the slot's. Today both resolve to "proposer_uniform" for A', so
+    // they agree; if #129 gives the override a distinct name they will not,
+    // and any join between candidate attribution (agent id) and this
+    // `resolvedModels` map has to go through the slot INDEX, not the name.
     const key = out[slot.persona] === undefined ? slot.persona : `${slot.persona}#${Object.keys(out).length}`;
     out[key] = slot.model;
   }

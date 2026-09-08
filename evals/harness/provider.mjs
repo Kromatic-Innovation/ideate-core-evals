@@ -1680,24 +1680,128 @@ export class AnthropicBatchProvider {
 // on panel shape). Panel: one agent per slot, `armsConfig.panel.ideasPerAgent`
 // / `armsConfig.panel.maxRounds` held constant across every panel arm (per
 // arms.config.json's own top-level comment).
+//
+// ── What each forwarded field actually reaches (issue #128) ──────────────────
+// This mapping forwards a slot's `stance` / `temperature` / `strategy`
+// alongside its `persona` / `model`. ideate-core's `resolveAgents` fills any
+// field a slot LEAVES UNSET from `DEFAULT_PERSONAS` -- by NAME when the slot
+// names a known persona, else BY PANEL INDEX (`spec.stance || base.stance`,
+// `Number.isFinite(spec.temperature) ? ... : base.temperature`, and so on).
+// That index fallback is the whole of issue #128: no arm in arms.config.json
+// names a DEFAULT_PERSONAS persona, so before this change every panel arm --
+// including the persona-DISABLED ablation A' -- silently received the five
+// different default personas by array index, and A' was byte-for-byte arm B.
+//
+// The three fields are NOT equally load-bearing, and saying so here is the
+// point: a field that is forwarded but has no consumer is exactly the defect
+// #128 reports.
+//
+//   stance      REACHES THE WIRE. evals/harness/prompts.mjs's
+//               buildRound1Prompt / buildRound2Prompt render a stance line
+//               from it, and those builders are the ones this harness injects
+//               into ideate-core (see the `buildRound1Prompt` deps below), so
+//               a slot-level stance changes the prompt actually submitted.
+//   temperature RECORDED, NOT SENT. docs/PREREGISTRATION.md §3.3 strips
+//               sampling params universally, and both request builders here
+//               (buildAnthropicMessageParams / buildOpenAIChatParams) are
+//               allowlists that never read `temperature` for any model. It
+//               still rides the agent record and ideate-core's normalizeExtra
+//               ctx, which is why forwarding it matters: stored cells used to
+//               record five index-derived temperatures 0.4-1.0 that were
+//               never actually submitted.
+//   strategy    RECORDED, NOT RENDERED -- yet. ideate-core passes it into the
+//               prompt-builder ctx, but THIS harness's own buildRound1Prompt /
+//               buildRound2Prompt override ideate-core's and do not branch on
+//               it, so direct-vs-CoT is still not a variable lever at the
+//               prompt. Making it one means writing a CoT prompt template,
+//               which is a registered prompt change (issue #129, the
+//               "make prompt levers settable" amendment), not a harness fix.
+//               Pinned by a test so this boundary cannot rot back into a
+//               silent no-consumer field.
+
+/**
+ * The single persona every slot of a `personaDisabled` arm runs under.
+ *
+ * `personaDisabled: true` has to mean "give every slot ONE identical, EXPLICIT
+ * persona", never "leave the fields unset". Leaving them unset is precisely
+ * what produced issue #128: an unset stance falls through to
+ * `DEFAULT_PERSONAS[i % 5]` inside ideate-core, so the five slots of the
+ * persona-disabled ablation received five DIFFERENT personas and the ablation
+ * measured nothing. An explicit value defeats that fallback by construction.
+ *
+ * Overridable per-arm via `arm.uniformPersona` in arms.config.json, so the
+ * registration amendment (issue #129) can set the ablation's persona as
+ * DATA without a code change -- and, because arms.config.json is covered by
+ * `armsConfigHash` (lib/manifest.mjs), such an override moves `configHash`
+ * and marks prior cells `stale` on its own.
+ *
+ * The values: `strategy` matches the modal DEFAULT_PERSONAS strategy ("cot",
+ * 4 of 5) so the A-vs-A' contrast isolates the PERSONA lever rather than also
+ * flipping prompt strategy; `temperature` sits near the default panel's mean
+ * (0.4/0.9/0.6/1.0/1.0 -> 0.78) and is inert at the wire under §3.3 either
+ * way; the stance is deliberately perspective-free -- "disabled" means no
+ * assigned viewpoint, not a sixth viewpoint.
+ */
+export const UNIFORM_PERSONA = Object.freeze({
+  persona: "proposer_uniform",
+  stance:
+    "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+  temperature: 0.8,
+  strategy: "cot",
+});
+
 export function resolveIdeateAgents(arm, armsConfig) {
   if (!arm) throw new Error("resolveIdeateAgents: arm is required");
+  // Resolved ABOVE the mode branch on purpose. `personaDisabled` means the same
+  // thing on a solo arm as on a panel one, and a flag that quietly applies in
+  // one branch only is the exact shape of the defect #128 reports -- just
+  // relocated. No solo arm sets it today (arm A is `personaDisabled: false`),
+  // which is precisely why it needs pinning now rather than after some future
+  // solo ablation is registered and silently runs the wrong persona.
+  //
+  // `model` is read from the RAW slot on both paths below, never from the
+  // uniform persona: disabling the persona lever must not disturb the model
+  // assignment, which is the study's actual independent variable (§3.1).
+  const uniform = arm.personaDisabled ? { ...UNIFORM_PERSONA, ...(arm.uniformPersona || {}) } : null;
   if (arm.mode === "solo") {
-    const slot = (arm.slots && arm.slots[0]) || {};
+    const rawSlot = (arm.slots && arm.slots[0]) || {};
+    const slot = uniform ? { ...rawSlot, ...uniform } : rawSlot;
     return {
-      agents: [{ id: slot.persona || "solo", persona: slot.persona, model: slot.model, ideasPerAgent: arm.totalIdeasRequested }],
+      agents: [
+        {
+          id: slot.persona || "solo",
+          persona: slot.persona,
+          stance: slot.stance,
+          temperature: slot.temperature,
+          strategy: slot.strategy,
+          model: rawSlot.model,
+          ideasPerAgent: arm.totalIdeasRequested,
+        },
+      ],
       maxRounds: 1,
     };
   }
   const panel = (armsConfig && armsConfig.panel) || {};
   const slots = arm.slots || [];
+  // The persona-disabled ablation resolves ONE persona for the whole panel and
+  // applies it to every slot, so the slots cannot drift apart the way five
+  // hand-copied stances could.
   return {
-    agents: slots.map((slot, i) => ({
-      id: `${slot.persona}#${i}`,
-      persona: slot.persona,
-      model: slot.model,
-      ideasPerAgent: panel.ideasPerAgent,
-    })),
+    agents: slots.map((slot, i) => {
+      const spec = uniform ? { ...slot, ...uniform } : slot;
+      return {
+        // Ids stay per-INDEX unique even though a persona-disabled panel shares
+        // one persona name across all five slots -- ideate-core#87 (IC-01)
+        // silently deletes candidates when two agents collide on an id.
+        id: `${spec.persona}#${i}`,
+        persona: spec.persona,
+        stance: spec.stance,
+        temperature: spec.temperature,
+        strategy: spec.strategy,
+        model: slot.model,
+        ideasPerAgent: panel.ideasPerAgent,
+      };
+    }),
     maxRounds: panel.maxRounds,
   };
 }

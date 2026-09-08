@@ -883,7 +883,24 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     briefs: CORPUS.map((b) => ({ id: b.id })),
     replicates: args.replicates ?? 1,
     config: {
-      harnessVersion: "0.0.1",
+      // harnessVersion (issue #128): bumped 0.0.1 -> 0.1.0, deliberately.
+      //
+      // #128 changed what a cell RUNS without touching arms.config.json:
+      // `resolveIdeateAgents` now forwards slot-level stance/temperature/
+      // strategy and gives every slot of a `personaDisabled` arm one identical
+      // explicit persona, so arm A' stops silently resolving to arm B's five
+      // index-matched default personas. `armsConfigHash` covers the CONFIG and
+      // could not see that -- behaviour would have changed while the hash said
+      // nothing changed, which is the exact failure `configHash` exists to
+      // prevent. `harnessVersion` is the CONFIG_FIELDS entry that exists for
+      // "the harness itself changed"; bumping it here marks every pre-#128
+      // cell `stale` rather than letting it pool with post-#128 cells.
+      //
+      // The cost is registered in advance by the issue: this invalidates the
+      // cells collected so far, which is why the arm/harness change lands
+      // BEFORE a phase begins (lib/manifest.test.mjs: "introduce arms BEFORE a
+      // phase begins"), not after the confirmatory grid.
+      harnessVersion: "0.1.0",
       engineSha,
       // promptHash (issue #99): the REAL generation-prompt hash, not the
       // literal "unpinned" this used to carry. A constant is a CONFIG_FIELDS
