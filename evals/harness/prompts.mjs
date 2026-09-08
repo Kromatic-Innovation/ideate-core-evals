@@ -231,43 +231,83 @@ export function buildRound2Prompt(args = {}) {
 // the comparability question the PR body addresses via promptTemplateHash().
 
 /**
- * Per-model TOKENS_PER_IDEA: the TOP of each model's observed output-tokens-
- * per-idea rate at the shape that model is actually called with in this
- * harness (panel calls: ideasPerAgent 6, round 1 AND round 2; arm A's solo
- * call: ideasPerAgent 30, round 1 only). Keyed by the exact model id string
- * arms.config.json uses (matches lib/price.mjs's RATE_TABLE convention).
+ * Per-(model, effort) TOKENS_PER_IDEA: the TOP of each (model, effort)
+ * bucket's observed output-tokens-per-idea rate at the shape that
+ * model/effort is actually called with in this harness (panel calls:
+ * ideasPerAgent 6, round 1 AND round 2; arm A's solo call: ideasPerAgent 30,
+ * round 1 only). Keyed by the exact model id string arms.config.json uses
+ * (matches lib/price.mjs's RATE_TABLE convention); each model's value is
+ * itself keyed by effort bucket, OR by the sentinel key `EFFORT_FREE` for a
+ * rate measured with no `effort` reachable at all.
  *
- *   claude-sonnet-5: 62   -- 1857 output tokens / 30 ideas, measured live
- *                            2026-09-02, SOLO round-1 30-idea call (issue #93).
- *   claude-opus-5:   558  -- 3346 output tokens / 6 ideas, measured live
- *                            2026-09-03 by driving arm D's REAL generate()
- *                            call end to end (real ideate-core engine, real
- *                            5-agent panel, real round-1 pool feeding round 2)
- *                            (issue #122). A synthetic-seed probe of the same
- *                            shape (11 samples, both a 6- and a ~30-seed pool)
- *                            topped out at 291-298/idea and UNDER-measured the
- *                            real rate by ~2x -- see the "issue #122" header
- *                            comment above for why (a real round-1 pool has
- *                            genuine cross-persona variety a synthetic pool
- *                            does not, which elicits more elaboration in
- *                            round 2's combine/extend/subvert reply).
+ *   claude-sonnet-5: { low: 81, high: 175, max: 776 } -- issue #130. The
+ *     original single-rate entry here (62, from 1857 output tokens / 30
+ *     ideas, measured 2026-09-02 -- issue #93) was measured with NO `effort`
+ *     set, at a time `effort` was not yet reachable from this harness. That
+ *     is not "no effort" -- Anthropic's docs (platform.claude.com/docs/en/
+ *     build-with-claude/effort, verified first-party 2026-09-08) state
+ *     omitting `effort` is EXACTLY the `"high"` behavior for claude-sonnet-5
+ *     (its API default), so the old 62 was actually an unlabeled `high`
+ *     measurement -- and an undercount of it: 20 live claude-sonnet-5 calls
+ *     against the real buildRound1Prompt Stage-1a shape on 2026-09-08 (all
+ *     `max_tokens: 32000`, all `end_turn`, so nothing truncated) found:
+ *       - low,  cot,    N=30: 44.7-80.8 tokens/idea  (2 samples)
+ *       - high, cot,    N=30: 73.5-119.9 tokens/idea (2 samples)
+ *       - high, direct, N=30: 82.6-99.7 tokens/idea  (2 samples)
+ *       - high, cot,    N=10: 94.9-131.8 tokens/idea (2 samples)
+ *       - high, cot,    N=60: 53.0-174.2 tokens/idea (6 samples)
+ *       - max,  cot,    N=30: 197.5-775.6 tokens/idea (6 samples)
+ *     Each bucket below is the TOP of ITS bucket's observed range across all
+ *     N and strategy combinations measured for that effort: low -> 81 (ceil
+ *     80.8), high -> 175 (ceil 174.2, from the N=60 condition -- the highest
+ *     high-effort figure observed, not the N=30 one), max -> 776 (ceil
+ *     775.6). The N=30/max condition alone exceeded its THEN-current cap
+ *     (4650, sized from the stale 62) by 5.0x -- exactly the "riding the
+ *     limit" shape #93 named as dangerous, concentrated in the
+ *     highest-effort condition, which would read as a dose-response effect
+ *     of effort on distinct_k when it is an artifact of the cap.
+ *   claude-opus-5: { [EFFORT_FREE]: 558 } -- 3346 output tokens / 6 ideas,
+ *     measured live 2026-09-03 by driving arm D's REAL generate() call end
+ *     to end (real ideate-core engine, real 5-agent panel, real round-1 pool
+ *     feeding round 2) (issue #122), with no `effort` set (unreachable from
+ *     this harness at the time). A synthetic-seed probe of the same shape
+ *     (11 samples, both a 6- and a ~30-seed pool) topped out at 291-298/idea
+ *     and UNDER-measured the real rate by ~2x -- see the "issue #122" header
+ *     comment above for why (a real round-1 pool has genuine cross-persona
+ *     variety a synthetic pool does not, which elicits more elaboration in
+ *     round 2's combine/extend/subvert reply). Kept under the `EFFORT_FREE`
+ *     sentinel rather than re-bucketed under "high" (Sonnet's convention):
+ *     unlike Sonnet's old 62, this measurement has never been re-taken with
+ *     `effort` reachable, so re-labeling it "high" would overclaim precision
+ *     this issue did not re-verify for Opus. `maxTokensForIdeas` resolves
+ *     EFFORT_FREE for a model regardless of what `effort` argument it is
+ *     called with (see resolution order below), which is exactly what keeps
+ *     Opus's behavior byte-identical to before this change.
  *
  * Haiku (claude-haiku-4-5) is deliberately NOT in this table -- see the
  * "issue #122" header comment above for why it falls back to
  * DEFAULT_TOKENS_PER_IDEA instead of being measured.
  */
-export const TOKENS_PER_IDEA_BY_MODEL = {
-  "claude-sonnet-5": 62,
-  "claude-opus-5": 558,
-};
+export const EFFORT_FREE = "__effort_free__";
 
+export const TOKENS_PER_IDEA_BY_MODEL = {
+  "claude-sonnet-5": { low: 81, high: 175, max: 776 },
+  "claude-opus-5": { [EFFORT_FREE]: 558 },
+};
 
 /** Generous fallback for a model with no entry in TOKENS_PER_IDEA_BY_MODEL
  *  (today: claude-haiku-4-5, gpt-5.6-terra, gpt-5.6-sol, and any future
- *  model) -- the highest rate measured for ANY model so far. See the
- *  "issue #122" header comment above for why this is the documented,
- *  generous fallback AC2 requires rather than a guess. */
-export const DEFAULT_TOKENS_PER_IDEA = Math.max(...Object.values(TOKENS_PER_IDEA_BY_MODEL));
+ *  model) -- the highest rate measured for ANY model at ANY effort so far
+ *  (issue #130: 776, Sonnet's `max` bucket -- up from #122's 558, since
+ *  `max` effort was not measured until #130). See the "issue #122" header
+ *  comment above for why this is the documented, generous fallback AC2
+ *  requires rather than a guess: `max_tokens` is a CEILING billed as
+ *  generated, so over-sizing an unmeasured (model, effort) pair costs
+ *  nothing, while under-sizing it reproduces this exact defect on the next
+ *  model or effort level. */
+export const DEFAULT_TOKENS_PER_IDEA = Math.max(
+  ...Object.values(TOKENS_PER_IDEA_BY_MODEL).flatMap((byEffort) => Object.values(byEffort)),
+);
 
 /** Multiplier applied over TOKENS_PER_IDEA, per issue #93's revised AC. */
 export const MAX_TOKENS_HEADROOM = 2.5;
@@ -283,17 +323,60 @@ export const LEGACY_MAX_TOKENS = 2048;
 export const DEFAULT_IDEAS_PER_AGENT = 6;
 
 /**
+ * Resolve a per-idea output-token rate for `(model, effort)`, per issue
+ * #130's resolution order (every fallback is upward -- see the header
+ * comment above for why over-sizing is free and under-sizing reproduces the
+ * defect):
+ *
+ *   1. an EXACT (model, effort) bucket -- with `effort === undefined`
+ *      resolved to the `"high"` bucket FIRST, because Anthropic's docs
+ *      (platform.claude.com/docs/en/build-with-claude/effort, verified
+ *      first-party 2026-09-08) state omitting `effort` entirely produces
+ *      "exactly the same behavior" as `effort: "high"` -- this is that
+ *      documented equivalence, not an assumption;
+ *   2. else the model's EFFORT_FREE rate, if it measured one (Opus's 558 --
+ *      this is what keeps Opus's behavior unchanged regardless of what
+ *      `effort` argument it is called with, since Opus has no per-effort
+ *      buckets to try in step 1);
+ *   3. else the HIGHEST rate measured for that model across any of its
+ *      effort buckets (covers an unmeasured effort level on an otherwise-
+ *      measured model, e.g. `medium` on Sonnet);
+ *   4. else DEFAULT_TOKENS_PER_IDEA -- the highest rate measured for ANY
+ *      model at ANY effort (covers an entirely unmeasured model, e.g.
+ *      Haiku or a future GPT tier).
+ *
+ * @param {string} [model]
+ * @param {string} [effort]
+ * @returns {number}
+ */
+function tokensPerIdeaFor(model, effort) {
+  const byEffort = model && TOKENS_PER_IDEA_BY_MODEL[model];
+  if (byEffort) {
+    const effortKey = effort === undefined ? "high" : effort;
+    if (Object.prototype.hasOwnProperty.call(byEffort, effortKey)) return byEffort[effortKey];
+    if (Object.prototype.hasOwnProperty.call(byEffort, EFFORT_FREE)) return byEffort[EFFORT_FREE];
+    const rates = Object.values(byEffort);
+    if (rates.length) return Math.max(...rates);
+  }
+  return DEFAULT_TOKENS_PER_IDEA;
+}
+
+/**
  * How many output tokens to allow a reply that was asked for `ideas` ideas
- * from `model`.
+ * from `model` at effort level `effort`.
  *
  * @param {number} ideas  ideasPerAgent for this call (arm A: 30; panels: 6).
  * @param {string} [model]  the model id (arms.config.json's slot.model
  *   string). Unmeasured or omitted -> DEFAULT_TOKENS_PER_IDEA (issue #122).
+ * @param {string} [effort]  the resolved slot's `effort` (arms.config.json's
+ *   slot.effort string, e.g. "low"/"high"/"max"), or `undefined` when the
+ *   slot sets none -- see `tokensPerIdeaFor` above for how `undefined` is
+ *   resolved (issue #130).
  * @returns {number} a max_tokens value, never below LEGACY_MAX_TOKENS.
  */
-export function maxTokensForIdeas(ideas, model) {
+export function maxTokensForIdeas(ideas, model, effort) {
   const n = Number.isFinite(ideas) && ideas > 0 ? ideas : DEFAULT_IDEAS_PER_AGENT;
-  const rate = (model && TOKENS_PER_IDEA_BY_MODEL[model]) || DEFAULT_TOKENS_PER_IDEA;
+  const rate = tokensPerIdeaFor(model, effort);
   return Math.max(LEGACY_MAX_TOKENS, Math.ceil(n * rate * MAX_TOKENS_HEADROOM));
 }
 

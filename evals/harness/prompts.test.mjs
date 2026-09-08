@@ -18,6 +18,8 @@ import {
   MAX_TOKENS_HEADROOM,
   LEGACY_MAX_TOKENS,
   SALVAGE_VERSION,
+  EFFORT_FREE,
+  maxTokensForIdeas,
 } from "./prompts.mjs";
 
 const ROUND1_COT_MARKER = "Work through the brief before you commit to any idea";
@@ -176,7 +178,65 @@ test("#130 mutation-proof: promptTemplateHash's payload contains BOTH the direct
 // change (a wording edit to either builder, either strategy branch, the
 // sizing constants, or SALVAGE_VERSION). This value moved from the pre-#130
 // value 0fb497a4a61d specifically because #130 made `strategy` a rendered
-// lever -- see the PR body for that history.
-test("#130: promptTemplateHash() is pinned to the post-#130 value", () => {
-  assert.equal(promptTemplateHash(), "b529182bea28");
+// lever -- see the PR body for that history. It moved AGAIN, to c6c2a60a4fe8,
+// when this same issue #130 re-keyed TOKENS_PER_IDEA_BY_MODEL by (model,
+// effort) instead of a flat per-model number -- a different max_tokens cap is
+// a different request, so the sizing-constants payload changing is exactly
+// the intended effect (see the PR body for the develop value this moved from:
+// b529182bea28).
+test("#130: promptTemplateHash() is pinned to the post-#130 (effort-aware sizing) value", () => {
+  assert.equal(promptTemplateHash(), "c6c2a60a4fe8");
+});
+
+// ── issue #130: maxTokensForIdeas's (model, effort) resolution order ────────
+
+test("#130 resolution order (1): an exact (model, effort) bucket wins", () => {
+  // 6 * 81 * 2.5 = 1215, below LEGACY_MAX_TOKENS -- Math.max(floor, computed)
+  // applies here too, so this also confirms the floor still binds correctly
+  // after the (model, effort) re-key.
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "low"), LEGACY_MAX_TOKENS);
+  // A larger idea count clears the floor, proving the "low" bucket really is
+  // being read (not silently falling through to "high").
+  assert.equal(maxTokensForIdeas(30, "claude-sonnet-5", "low"), Math.ceil(30 * 81 * MAX_TOKENS_HEADROOM));
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "high"), Math.ceil(6 * 175 * MAX_TOKENS_HEADROOM));
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "max"), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
+});
+
+test("#130 resolution order: undefined effort resolves to the SAME rate as explicit \"high\" -- the documented omit-equals-high equivalence, not an assumption", () => {
+  assert.equal(maxTokensForIdeas(30, "claude-sonnet-5"), maxTokensForIdeas(30, "claude-sonnet-5", "high"));
+  assert.notEqual(maxTokensForIdeas(30, "claude-sonnet-5"), maxTokensForIdeas(30, "claude-sonnet-5", "low"));
+  assert.notEqual(maxTokensForIdeas(30, "claude-sonnet-5"), maxTokensForIdeas(30, "claude-sonnet-5", "max"));
+});
+
+test("#130 resolution order (2): a model's EFFORT_FREE rate wins over falling through to the model's highest bucket or the global default, for ANY effort argument", () => {
+  const opusEffortFree = TOKENS_PER_IDEA_BY_MODEL["claude-opus-5"][EFFORT_FREE];
+  for (const effort of [undefined, "low", "high", "max", "medium", "xhigh"]) {
+    assert.equal(
+      maxTokensForIdeas(6, "claude-opus-5", effort),
+      Math.ceil(6 * opusEffortFree * MAX_TOKENS_HEADROOM),
+      `effort=${effort}`,
+    );
+  }
+});
+
+test("#130 resolution order (3): an unmeasured effort bucket on an otherwise-measured model falls back to that model's OWN highest measured rate", () => {
+  // "medium" is not a bucket sonnet has. Sonnet's own highest bucket (776,
+  // its "max" entry) happens to equal DEFAULT_TOKENS_PER_IDEA today, so this
+  // test alone cannot distinguish step (3) from step (4) falling through --
+  // there is no registered model today whose own highest measured rate is
+  // BELOW 776 to make that distinction with real data. What it does pin: an
+  // unmeasured effort on Sonnet does not silently resolve to something
+  // smaller than Sonnet's own worst-measured case (e.g. it must not fall all
+  // the way to "low"'s 81, which would under-size exactly like this issue's
+  // defect).
+  const medium = maxTokensForIdeas(6, "claude-sonnet-5", "medium");
+  assert.equal(medium, Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
+  assert.ok(medium > maxTokensForIdeas(6, "claude-sonnet-5", "low"));
+});
+
+test("#130 resolution order (4): a wholly unmeasured model falls back to DEFAULT_TOKENS_PER_IDEA, the highest rate measured for ANY model at ANY effort (776)", () => {
+  assert.equal(DEFAULT_TOKENS_PER_IDEA, 776);
+  assert.equal(maxTokensForIdeas(6, "claude-haiku-4-5"), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
+  assert.equal(maxTokensForIdeas(6, "gpt-5.6-terra", "max"), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
+  assert.equal(maxTokensForIdeas(6), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM), "omitted model, too");
 });

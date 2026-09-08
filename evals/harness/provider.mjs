@@ -641,14 +641,19 @@ export function realizedAgents(ideateResult) {
  * need. Cells are homogeneous in ideasPerAgent today (solo: totalIdeasRequested;
  * panel: panel.ideasPerAgent for every slot), but NOT homogeneous in model
  * (arms E/F/G/H mix models per slot) -- so this takes the max across each
- * agent's OWN model-aware sizing (issue #122), not one ideas count applied to
- * a single flat rate. Guards the empty-agents case explicitly: `Math.max(...[])`
- * is -Infinity.
+ * agent's OWN model-aware AND effort-aware sizing (issue #122, extended to
+ * effort by issue #130), not one ideas count applied to a single flat rate.
+ * `a.effort` is each agent's resolved slot effort (see resolveIdeateAgents
+ * below -- every agent object it returns carries `effort` read from the RAW
+ * slot, same as `model`), forwarded here so a slot's effort actually reaches
+ * `maxTokensForIdeas`'s sizing -- without this the (model, effort) table in
+ * prompts.mjs is unreachable from any real request. Guards the empty-agents
+ * case explicitly: `Math.max(...[])` is -Infinity.
  */
 export function maxTokensForCell(agents) {
   const list = Array.isArray(agents) ? agents.filter(Boolean) : [];
   if (list.length === 0) return maxTokensForIdeas(undefined);
-  return Math.max(...list.map((a) => maxTokensForIdeas(a.ideasPerAgent, a.model)));
+  return Math.max(...list.map((a) => maxTokensForIdeas(a.ideasPerAgent, a.model, a.effort)));
 }
 
 // ══ BATCH RESUME (issue #103) ══════════════════════════════════════

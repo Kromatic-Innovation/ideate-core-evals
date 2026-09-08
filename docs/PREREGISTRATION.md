@@ -93,6 +93,8 @@ Panel size fixed at **5 agents**, `ideasPerAgent: 6`, `maxRounds: 2` (blind → 
 
 > _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), item 6). A tenth arm is registered: **AS** — solo baseline, stance-neutral control. Arm A above is **unmodified**; it remains the registered baseline. AS exists because arm A is not neutral (§3.3/#128): its slot persona `solo` is not a `DEFAULT_PERSONAS` name, so ideate-core falls through to `DEFAULT_PERSONAS[0]` (PRAGMATIST, strategy `direct`). See the appendix for the full construction, including why the arm is deliberately named `solo_b` rather than something descriptive._
 
+> _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 2). Eight Study 1 screening arms are registered for Stage 1a: `S1-C0`, `S1-N10`, `S1-N60`, `S1-ELOW`, `S1-EMAX`, `S1-SPRAG`, `S1-SCONTRA`, `S1-DIRECT`. Arms A–H, A′ and AS above are **unmodified**. See the appendix for the design, the centre point, and the held-constant factors._
+
 ### 3.2 Items (briefs) — n = 12, stratified
 
 Held constant across arms. Stratified so results generalize across task type, not just one domain:
@@ -129,6 +131,10 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 
 > _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), items 1 and 3). `effort` is registered as a settable sampling lever, forwarded per slot alongside the `stance`/`strategy`/`personaDisabled` levers #128 already forwarded. Both request builders now emit it — Anthropic as a nested `output_config.effort`, OpenAI as top-level `reasoning_effort` — verified first-party, and the resolved per-cell setting enters `configHash`. The two providers' effort ladders are **not identical**; see the appendix for the asymmetry and the two-part registration (omitted universally across arms, first-class ordinal factor within one model)._
 
+> _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 1). Appendix E item 1's third bullet — `strategy` "recorded, not rendered — yet" — is superseded: `strategy` is now a **rendered** prompt lever, with the CoT template registered verbatim. This changes the prompt actually submitted not only by the new Study 1 arms but by **arm A′** and by **every panel arm (B–H)** whose slots fall through to `DEFAULT_PERSONAS`. See the appendix for the template text and the hash consequence._
+>
+> _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 6). `max_tokens` becomes per-(model, effort), measured live 2026-09-08. The previous single per-model constant was under-sized for every effort-bearing call and for Sonnet's effort-free call too. See the appendix for the measurements and the resolution order for unmeasured pairs._
+
 ### 3.4 Replication and power
 
 **Why replicate at all:** a single run per (arm × brief) measures one draw from a stochastic process. Sampling variance in LLM generation is large relative to the between-arm effects we care about; without replication we'd be ranking noise.
@@ -138,6 +144,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 - **Power:** run a **pilot** (§8, Phase 1) at 2 arms × 4 briefs × 4 reps to estimate the between-run variance component, then _recompute_ required n before committing to the full grid. Do not trust the n=4 figure until the pilot says so — it is a placeholder chosen for budget, not derived from a variance estimate we have.
 
 > _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), item 7). The pilot's variance-component derivation and the resulting SE-vs-(briefs, replicates) table are registered, with **B = 48 briefs / R = 2 replicates as the current best estimate — explicitly provisional**, bound to Study 1's re-estimate of the dominant variance component. The n = 4 figure above is superseded by this table, not by a frozen final design. See the appendix for the derivation and why it must stay provisional._
+
+> _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 2). Stage 1a is the run that re-estimates `σ²_ba`, the exact figure Appendix E item 7 above made B = 48 / R = 2 provisional on. See the appendix for the registered screening design that produces the re-estimate._
 
 ---
 
@@ -256,6 +264,8 @@ Mixed-effects (random intercept for brief; random arm-slope-by-brief to allow ar
 - **Effect sizes with 95% CIs are the headline**, not p-values. "Arm E yields 3.1 more distinct ideas (95% CI 1.8–4.4)" is decision-relevant; "p < 0.05" is not.
 - **Multiplicity:** 5 registered hypotheses + pairwise arm contrasts → **Holm–Bonferroni** on the registered set; Benjamini–Hochberg on exploratory contrasts, reported separately and **labeled exploratory**.
 - **Pre-registered stopping rule:** the full grid runs to completion. No peeking-and-stopping.
+
+> _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 7). Study 1, Stage 1a runs **no hypothesis tests** and does not enter the Holm family: it is a screening run reporting effect sizes with confidence intervals. **H1–H5 above are untouched** — every unreachable contrast against a solo-only design is recorded as explicitly not estimable, never substituted. See the appendix for what Stage 1a does and does not license._
 
 ### 6.3 What we will NOT do
 
@@ -425,6 +435,8 @@ Both the "pilot for the pilot" (§8.3 Phase 2a) and the additive store are compa
 ### How the pilot's non-reuse is enforced: store separation
 
 The "not reused" condition in the variance-estimation row above is enforced **structurally, by running the pilot into its own results store** — `node evals/run.mjs --results-dir results-pilot ...` — while the confirmatory grid runs into the default `results/`. `evals/analysis/analysis.mjs --results-dir` reads whichever of the two is named.
+
+> _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 8). Study 1, Stage 1a uses this same mechanism: it collects into its own store, `--results-dir results-study1`, kept out of `results/` so Study 1's independently-moving configuration never stales Studies 2–4's cells or vice versa. The additive-accumulation and non-reuse rules above apply within the Stage 1a store exactly as they do within `results/`. See the appendix for the full record._
 
 This is the only mechanism that works, and the reason is worth stating because the alternatives all look plausible:
 
@@ -1234,3 +1246,155 @@ matching the pre-registered numbers exactly.
 **What `0.5.0` contains that this study can now reach.** Most directly relevant: the per-agent `effort` field (`ideate-core#146`) — `deps.agents[i].effort` forwarded verbatim to that agent's `complete()` call by plain assignment, not a `spec.X || base.X` fallback, so `undefined` stays distinguishable from an explicit value. **This is the precondition Item 3 above depends on** — the two items are otherwise registered separately in this appendix, so the dependency is stated here explicitly rather than left implicit. `0.5.0` also ships `meta.agentErrors` failure reporting (`ideate-core#154`, `ideate-core#157`) and routing parity for `effort`/`model` in the bundled adapters (`ideate-core#149`, `ideate-core#151`) — neither is exercised by this study's harness today, but both are part of what the pinned version now provides.
 
 **Interaction with Item 8's cost accounting.** This bump moved `configHash` at `94be181`, before arm AS was registered; registering AS then moved `armsConfigHash` again. Both changes stale the same 16 completed arm-B pilot cells — see the note at the end of Item 8. This item adds no additional data loss beyond what Item 8 already accounts for.
+
+---
+
+## Appendix F — Amendments (dated 2026-09-08)
+
+Per the amendment rule at the top of this document. This appendix registers **Study 1 (`#130`), Stage 1a** — the screening run — and the two harness changes it requires but the registration did not previously authorize: making `strategy` a rendered prompt lever, and sizing `max_tokens` for calls that carry an `effort` setting. It also records two corrections to `#130`'s own body, made explicit rather than silently absorbed.
+
+Every claim below was checked against `develop`, not against `#130`'s body. **Nothing in §6 (hypotheses and analysis plan) is changed by any entry below**; Stage 1a is a screening run reporting estimates with intervals, and Item 7 registers what that does and does not license.
+
+### Item 1 — §3.3: `strategy` becomes a rendered prompt lever, and the CoT template is registered verbatim
+
+**What changed.** `evals/harness/prompts.mjs`'s `buildRound1Prompt` / `buildRound2Prompt` now branch on `strategy`. Landed in `#142` (`296bbae`).
+
+**This supersedes Appendix E item 1's third bullet.** That item registered `strategy` as "recorded, not rendered — yet," pinned by a test, and stated that making it a live lever "is a registered prompt change, not a harness fix" and was out of scope for `#129`. This item is that registered prompt change. Study 1's centre point is `strategy: "cot"`, so without it every Stage 1a condition would have run `direct` while being labelled otherwise — a study that answers a different question under its own registered name.
+
+**The template text is the manipulation, so it is registered here verbatim rather than described.** When `strategy === "cot"` — and only for that exact string; `"direct"`, an unknown value, and `undefined` all render nothing — the following paragraph is inserted after the stance line and immediately before the "Generate exactly N…" sentence.
+
+Round 1:
+
+> Work through the brief before you commit to any idea: first name the distinct dimensions along which responses to this brief could differ; then consider what a response at each end of each dimension would look like; only then decide which ideas to submit. Do not include this reasoning in your reply.
+
+Round 2 (the build-on analogue):
+
+> Work through the shared pool before you commit to any idea: first name what the existing ideas have in common; then consider which dimensions they leave unexplored; only then decide which new ideas to submit. Do not include this reasoning in your reply.
+
+The closing sentence of each is load-bearing, not stylistic: the reply contract is a bare JSON array (`{"text": "…"}` objects, no surrounding prose), and `salvageCandidateArray`'s recovery walk begins at the first `[` or `{` in the reply. Reasoning emitted *into* the reply would put braces ahead of the array and could take structural text with it. Both builders keep their JSON-only contract sentence unchanged under both strategies.
+
+**`ideate-core` ships no CoT copy of its own.** `DEFAULT_PERSONAS` assigns each persona a `strategy` string (`direct` for pragmatist, `cot` for the other four), but the library supplies no prompt text — `ideateCore` requires `deps.buildRound1Prompt` from its caller and never renders prompts itself. The wording above is therefore this harness's authored operationalization of "CoT," not a reproduction of the product's, and Study 1's `strategy` factor measures *this* template. That distinction matters for any claim that transfers to `ideate-core`'s shipped behavior: what the product ships is the *label*, and each caller supplies the text behind it.
+
+**This is not an additive change, and the affected arms are named.** `UNIFORM_PERSONA.strategy` is `"cot"`, and four of five `DEFAULT_PERSONAS` are `"cot"`. Rendering the branch therefore changes the prompt actually submitted by **arm A′** and by **every panel arm (B–H)** whose slots fall through to `DEFAULT_PERSONAS` — not only by the Study 1 arms registered below. That is the intended consequence of Appendix E item 1's amendment reaching the prompt, but it is a behavior change to arms registered in this document today, and it is recorded as one.
+
+**`promptTemplateHash()` moves `0fb497a4a61d` → `b529182bea28`**, so `configHash` moves, so every stored cell becomes `stale`. See Item 8.
+
+**The hash covers both branches, by construction.** `promptTemplateHash()`'s probe arguments previously carried no `strategy`, so a single render would have left the CoT wording outside the hash — a prompt change that does not move `configHash` is precisely the defect the hash exists to prevent. Both builders are now rendered twice into the hash payload, once per strategy, as separate keys, with the existing no-argument default renders retained. Pinned by a mutation-verified test.
+
+### Item 2 — §3.1/§3.2: Study 1, Stage 1a — the registered screening design
+
+**What is registered.** A one-factor-at-a-time screening sweep from a centre point, within one model, on a 12-brief subset of the registered 48-brief corpus, at 2 replicates.
+
+**Held constant across every condition:** `claude-sonnet-5`; `mode: "solo"` (one call, no panel, no rounds — `maxRounds` 1); `personaDisabled: true` with an explicit `uniformPersona`; the persona **name** `solo_b`; `temperature` 0.4 (recorded, never sent — §3.3's universal strip stands); no sampling parameters; the same corpus subset, embedder, and clustering threshold.
+
+**The persona name is held constant deliberately.** `buildRound1Prompt` interpolates the persona name into the prompt verbatim, so a name that varied with the condition — `s1_contrarian`, say — would leak the manipulation into the text and reintroduce the demand characteristic arm AS's inert `solo_b` was chosen to remove. Every Study 1 condition carries the same inert name; the stance factor varies **only** the `stance` text.
+
+**Centre point:** N=30, `effort: "high"`, stance neutral, `strategy: "cot"`.
+
+| Arm id | N | `effort` | stance | `strategy` |
+| --- | --- | --- | --- | --- |
+| `S1-C0` (centre) | 30 | `high` | neutral | `cot` |
+| `S1-N10` | **10** | `high` | neutral | `cot` |
+| `S1-N60` | **60** | `high` | neutral | `cot` |
+| `S1-ELOW` | 30 | **`low`** | neutral | `cot` |
+| `S1-EMAX` | 30 | **`max`** | neutral | `cot` |
+| `S1-SPRAG` | 30 | `high` | **PRAGMATIST** | `cot` |
+| `S1-SCONTRA` | 30 | `high` | **CONTRARIAN** | `cot` |
+| `S1-DIRECT` | 30 | `high` | neutral | **`direct`** |
+
+**8 conditions × 12 briefs × 2 replicates = 192 cells.** See Item 4 for why this is 8 and 192 rather than `#130`'s 9 and 216.
+
+**Stance texts are registered verbatim, and their source is the point of the study.** The neutral stance is arm AS's registered text: *"No particular perspective is assigned for this task. Approach the brief however you judge best."* PRAGMATIST and CONTRARIAN are `ideate-core@0.5.0`'s `DEFAULT_PERSONAS[0]` and `[1]` stance strings, transcribed verbatim. This is what unbundles the persona lever: `DEFAULT_PERSONAS` ships stance and strategy *together* (pragmatist/`direct`, contrarian/`cot`), so a "persona effect" measured on the main grid is un-attributable between perspective and prompt strategy. Stage 1a holds `strategy` at the centre value while moving stance alone, and moves `strategy` alone in `S1-DIRECT`.
+
+**`S1-DIRECT` is behaviourally equivalent to arm AS, and that is deliberate.** Same model, same `totalIdeasRequested` (30), same `maxRounds` (1), same persona name `solo_b`, same stance, same temperature, and the same resolved `max_tokens` bucket. The two differ in exactly one respect: arm AS omits `effort` entirely, while `S1-DIRECT` sets it explicitly to `high` — which Item 5's first-party source documents as producing *"exactly the same behavior as omitting the `effort` parameter entirely."* The requests are therefore not byte-identical, and this appendix does not claim they are; they are equivalent by documented API behaviour. That gives Stage 1a a consistency check against the main grid at the cost of one condition's duplicate cells, and it makes the documented equivalence itself something the run can observe rather than merely assume — if `S1-DIRECT` and a later arm-AS cell diverge beyond replicate noise, the equivalence claim is what to doubt.
+
+### Item 3 — §3.2: the Stage 1a brief subset, and why it is not "the first three per stratum"
+
+**What is registered.** Twelve briefs, three per stratum:
+
+| Stratum | Briefs |
+| --- | --- |
+| business | `biz-01`, `biz-02`, `biz-07` |
+| product | `prod-01`, `prod-07`, `prod-08` |
+| scientific | `sci-01`, `sci-02`, `sci-07` |
+| aut | `aut-01`, `aut-07`, `aut-08` |
+
+**The rule is an exact split across the corpus expansion, not an id prefix.** Appendix E item 5 grew the corpus additively: ids `-01` through `-06` in each stratum are the pre-amendment 24, `-07` through `-12` are the 24 added by `#129`. The obvious deterministic rule — the first three ids per stratum — would have drawn **11 of 12** briefs from the pre-amendment half. Stage 1a exists to re-estimate `σ²_ba`, and Appendix E item 7 binds every downstream MDE in §3.4 to that one number; estimating it from a subset that is 92% one half of the corpus would inherit whatever that half's composition happens to be and propagate it through the entire replication plan. The registered subset is **6 pre-amendment and 6 post-amendment**, balanced across strata (business and scientific take 2+1; product and aut take 1+2), deterministic, and reproducible by inspection with no RNG.
+
+**`prod-07` is included, and it is the anchor.** Appendix E item 4's externally-published comparability anchor falls inside the subset by construction rather than by exception.
+
+### Item 4 — correction to `#130`: the screening run is 8 conditions and 192 cells, not 9 and 216
+
+**What is corrected.** `#130` specifies a fractional design that varies "one factor at a time from a centre point" and states **"9 conditions"** and **"216 cells"** (12 briefs × 2 replicates). A one-factor-at-a-time design's condition count is one centre point plus the sum of each factor's off-centre levels. The factors have 3, 3, 3, and 2 levels respectively (N: 10/30/60; effort: low/high/max; stance: neutral/PRAGMATIST/CONTRARIAN; strategy: `direct`/`cot`), giving 1 + 2 + 2 + 2 + **1** = **8** conditions and **192** cells. `#130`'s 9 counts `strategy` as contributing two off-centre levels; it has one, because it has two levels in total.
+
+**This is arithmetic, not design.** No factor, level, brief, or replicate registered in `#130` is dropped, added, or altered — the corrected count describes exactly the design that issue specifies. It is registered here rather than fixed silently because the 216 figure appears in `#130`'s own cell budget and would otherwise read as a missing condition when the run reports 192.
+
+**No ninth condition is added to preserve the figure**, and specifically no separate "engine-default effort" reference condition is needed — Item 5 records why the centre point already is one.
+
+### Item 5 — §3.3/§8: `effort` interacts with `max_tokens`, and the existing sizing was measured without it
+
+**The wire fact, verified first-party** against `platform.claude.com/docs/en/build-with-claude/effort` (fetched 2026-09-08): `max_tokens` is *"a hard limit on total output (thinking plus response text)"*, and effort *"affects **all tokens** in the response,"* thinking included.
+
+**Why that is a threat to this study specifically.** `evals/harness/prompts.mjs`'s `TOKENS_PER_IDEA_BY_MODEL` sizes `max_tokens` from live measurements taken with **no `effort` set at all** — Sonnet's 62 tokens/idea (`#93`, 2026-09-02) and Opus's 558 (`#122`, 2026-09-03) both predate `effort` being reachable from this harness. Stage 1a sets `effort` explicitly on every cell and runs `max` on one full condition. An under-sized cap does not degrade gracefully: the reply stops on `max_tokens` mid-JSON, and while `salvageCandidateArray` recovers the complete objects before the cut, a cap consumed largely by thinking yields a short pool or an `empty_pool` — a *systematic* loss concentrated in the highest-effort condition, which is precisely the condition the study is trying to measure. That is the `#93` failure mode (arm A losing 9 of 10 cells) with a new cause.
+
+**A second, documented fact that resolves Item 4's ninth-condition question.** The same page states: *"Setting `effort` to `"high"` produces exactly the same behavior as omitting the `effort` parameter entirely,"* and Claude Sonnet 5's API default is `high` (confirmed against the model-comparison table's "Default effort" row, same date). The Stage 1a centre point is therefore already request-equivalent to the effort-free arms A and AS, by documentation rather than by assumption — so the sweep needs no separate no-effort anchor condition to connect it to the main grid.
+
+### Item 6 — §3.3: `max_tokens` becomes per-(model, effort), measured live before the run
+
+**What was measured.** 20 live `claude-sonnet-5` calls on 2026-09-08, driving `evals/harness/prompts.mjs`'s real `buildRound1Prompt` at the exact Stage 1a request shape (solo, round 1, neutral stance, persona `solo_b`), at `max_tokens: 32000` so nothing truncated and the true distribution was observable. Briefs were drawn from the registered Stage 1a subset. Every reply ended on `stop_reason: "end_turn"`.
+
+| Condition | n | output tokens (min–max) | per idea (min–max) | cap the current sizing would have applied |
+| --- | --- | --- | --- | --- |
+| N=30, `low`, cot | 2 | 1,340–2,425 | 44.7–80.8 | 4,650 |
+| N=30, `high`, cot | 2 | 2,204–3,598 | 73.5–119.9 | 4,650 |
+| N=30, `high`, direct | 2 | 2,478–2,991 | 82.6–99.7 | 4,650 |
+| N=10, `high`, cot | 2 | 949–1,318 | 94.9–131.8 | 2,048 |
+| **N=60, `high`, cot** | 6 | 3,177–**10,451** | 53.0–**174.2** | **9,300** |
+| **N=30, `max`, cot** | 6 | 5,924–**23,269** | 197.5–**775.6** | **4,650** |
+
+**Two conditions would have failed systematically.** `N=30, max` ran to 23,269 output tokens — **5.0×** the cap the current constants would have set — and `N=60, high` to 10,451 against 9,300. Those replies would have stopped on `max_tokens` mid-JSON. `salvageCandidateArray` recovers the complete objects before the cut, so the failure is not total, but it is *systematic and concentrated in the highest-effort condition* — the very condition the effort factor exists to measure. A short pool at `max` and a full pool at `low` would have been read as a dose-response effect of effort on `distinct_k` when it was an artifact of the cap. That is `#93`'s arm-A failure (9 of 10 cells lost) with a new cause, and it is the specific way this study could have produced a confidently wrong headline number.
+
+**The existing Sonnet constant is under-measured even with no `effort` set.** `TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"] = 62` comes from `#93`'s 2026-09-02 probe (1,857 / 30 ideas). Because `high` is request-equivalent to omitting `effort` (Item 5), the `N=30, high` rows above measure the same request `#93` measured, and they run to 119.9 tokens/idea — and the `direct` rows, which do not carry Item 1's CoT paragraph, still reach 99.7. So this is not solely an artifact of the new template: the pinned 62 was already leaving arms A, AS, and C riding their cap, exactly the shape `#93` itself named as dangerous.
+
+**What is registered.** `TOKENS_PER_IDEA` becomes keyed by **(model, effort)**, with `undefined` effort resolving to the `high` bucket — the documented equivalence, not an assumption. Each rate is the **top** of that bucket's observed per-idea distribution, never its mean; `MAX_TOKENS_HEADROOM` stays 2.5× and `LEGACY_MAX_TOKENS` (2,048) stays a floor.
+
+| Model | effort bucket | tokens/idea | provenance |
+| --- | --- | --- | --- |
+| `claude-sonnet-5` | `low` | 81 | measured 2026-09-08, n=2 |
+| `claude-sonnet-5` | `high` (and unset) | 175 | measured 2026-09-08, n=10 |
+| `claude-sonnet-5` | `max` | 776 | measured 2026-09-08, n=6 |
+| `claude-opus-5` | effort-free | 558 | `#122`, measured 2026-09-03 |
+
+**Resolution order for an unmeasured pair**, in order: the exact (model, effort) rate; else the model's **highest** measured rate across efforts; else `DEFAULT_TOKENS_PER_IDEA`, the highest rate measured for any model at any effort — now **776**, up from 558. Every fallback is upward, because `max_tokens` is a ceiling billed as generated, so over-sizing an unmeasured pair costs nothing while under-sizing it reproduces this exact defect on the next model or the next effort level. Sonnet at `medium` and `xhigh` are unmeasured and unused by any registered arm; both resolve upward to 776.
+
+**Consequences to arms already registered in this document.** This raises the cap for arms **A**, **AS**, and **C** (Sonnet, effort unset → the `high` bucket's 175), and for every arm running an unmeasured model (**B**, **A′**, **G**, **H**) via the raised default. No request shrinks. `max_tokens` is a ceiling, not a target, so no reply gets longer merely because the cap did — but the sizing constants are inputs to `promptTemplateHash()`, so this moves the hash a second time. See Item 9.
+
+**Sizing stays inside the model's limits.** The largest cap this produces is `N=30, max` at 58,200 tokens (30 × 776 × 2.5), against Claude Sonnet 5's documented 128K max output (same source, same date).
+
+### Item 7 — §6: what Stage 1a does and does not license
+
+**Stage 1a is a screening run. It reports effect sizes with confidence intervals and runs no hypothesis tests**, exactly as `#130` specifies. Its purposes are, in order: re-estimate `σ²_ba` on 12 briefs rather than the two the Phase 2a smoke used; confirm that `effort` and stance actually move `distinct_k` before a powered run spends against them; and confirm the new plumbing records what it should.
+
+**No entry in §6's registered hypothesis family (H1–H5) is tested, adjusted, or answered by this run**, and the Holm family is not entered. The family is defined over arms A–H and A′; a solo-only sweep does not carry those coefficients, and `buildRegisteredFamily()` records each unreachable contrast as explicitly **not estimable** rather than substituting a present arm for an absent one. That recorded not-estimable state is the correct and expected output of a Stage 1a analysis run, not a failure of it.
+
+**Judge scores are collected but not analyzed, and are not reportable.** Judging cannot be disabled from the CLI — `evals/run.mjs` always supplies the registered `JUDGE_MODELS` roster, and `buildJudgeMatrix` assigns every pool two legs (one Anthropic, one OpenAI, each selected distinct from the generator), so Stage 1a's 192 cells carry 384 judge calls costing more than the generation they score. That spend is accepted rather than engineered around: exercising the judge path end to end is one of Stage 1a's three stated purposes, and `judgePoolIfEnabled` judges already-generated cells in a later session anyway, so neither collecting nor deferring forecloses anything. What the scores may NOT do is enter a result. §5.1's judge-validation gate has not been run, and Appendix B item 11 holds idea-level metrics exploratory until it passes; these rows are stored data awaiting that gate, and their presence in `results-study1/` is not evidence about any idea-level quantity.
+
+**One way this run could fabricate a registered result, recorded so it is not discovered later.** `buildRegisteredFamily()` derives H1 as `mean(panelArms) − referenceArm` from whatever arm set the caller supplies, rather than by naming specific arms as H2–H5 do. Invoked as `--panel-arms <the seven off-centre S1 arms> --reference-arm S1-C0`, it therefore returns H1 as an *estimable* contrast — the mean of N=10, N=60, `low`, `max`, two stances and `direct`, tested against the centre point — which is not the registered panel-versus-solo comparison but an arbitrary average wearing its name, complete with a Holm slot and a p-value. Verified directly: under that invocation H2–H5 each return `notEstimable: true` naming their missing arms, and H1 alone does not. **Stage 1a's analysis therefore does not build the registered family at all.** It reports each off-centre condition against the centre point as an estimate with a confidence interval, and the Holm family is not entered — which is what Item 7's "no hypothesis tests" means operationally, not merely as an intention. This is the same hazard `contrasts.mjs`'s own "ARM SUBSETS AND THE REGISTERED FAMILY" header warns about for re-pairing — answering a different question under a pre-registered hypothesis's name — reached through a parameterized contrast rather than a substituted arm.
+
+**The primary response is rarefied `distinct_k`**, per Appendix C item 3's registered treatment — mandatory here rather than merely preferred, because N is an experimental factor and raw `distinct_k` across different N is a comparison of pool sizes. The reference condition for contrasts is the centre point `S1-C0`, not arm A. Raw `distinct_k` and the `distinct_k`-vs-N curve are **also** reported, per Appendix C item 5's both-values rule.
+
+**A measured caveat on the dose-response curve.** The pool a call returns is not the N it was asked for: the probe in Item 6 observed 85 ideas returned for N=60 and 61 for another N=60 call, 40 for an N=30 call, and 31 for another N=30. The curve `#130` calls "the deliverable" is therefore a curve against *requested* N, whose realized pool sizes vary — which is precisely why the rarefied response, not the raw one, carries the comparison.
+
+**One further observed risk, recorded before the run rather than discovered in the results.** One of the six `N=60` probe replies failed a direct `JSON.parse` and lost 14 of its objects to `salvageCandidateArray`, ending on `end_turn` — malformation, not truncation, and so not fixable by the cap Item 6 raises. This is `#93`'s cause 2 at a higher rate than the smaller-N conditions showed (1 of 6 at N=60; 0 of 14 elsewhere). If `S1-N60`'s realized pools come in systematically short, malformation at large N is the first thing to check, and it is a property of the arm rather than of the night.
+
+### Item 8 — §11/§8.3: Stage 1a collects into a separate store
+
+**What is registered.** Stage 1a runs with `--results-dir results-study1`, keeping its cells out of `results/`. This is Appendix D item 3's store-separation mechanism, applied for the reason that item registered it: the studies' configurations will keep moving independently, and one shared store makes every Study 1 config edit stale Studies 2–4's cells and vice versa. §11's additive-accumulation and non-reuse rules apply within the Stage 1a store exactly as they do within `results/`.
+
+### Item 9 — cost of this amendment: two hash moves, and what was already stale
+
+**`promptTemplateHash()` moves twice** — once for Item 1's CoT branch (`0fb497a4a61d` → `b529182bea28`) and once for Item 6's sizing constants, which are inputs to the same hash. `configHash` moves with it, so every stored cell is `stale`.
+
+**Nothing further is lost.** Appendix E item 8 already accounted for the 16 completed arm-B pilot cells, staled by `#134`'s engine-pin bump and again by arm AS's `armsConfigHash` move. A cell invalidated then cannot be invalidated again for a larger loss, and no cells have been collected since. Registering the Study 1 arms (Item 2) moves `armsConfigHash` a third time, with the same nil incremental cost.
+
+**Ordering note, stated rather than smoothed over.** Item 1's code landed in `#142` (`296bbae`) before this appendix was written. The rule that matters is that **no data was collected under the unregistered design** — no run has executed since `#142` merged, and the 20 calls in Item 6 were a sizing probe whose results go nowhere near the results store. The registration is in place before the first Stage 1a cell, which is the guarantee §11 exists to give.
