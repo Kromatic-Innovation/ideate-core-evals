@@ -72,6 +72,8 @@ Verified against current sources (2026-07-30). **These are the assets that turn 
 
 Panel size fixed at **5 agents**, `ideasPerAgent: 6`, `maxRounds: 2` (blind → pool) for every panel arm, so the _only_ thing varying is model assignment.
 
+> _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), item 2). The fixed panel geometry above is now the **default**, not the only option: `size` / `ideasPerAgent` / `maxRounds` / `sharing` are per-arm overrides in `arms.config.json`, inherited field-by-field from the global `panel` block when an arm doesn't set them. No arm registered in this document exercises the override today — every panel arm above still runs 5/6/2 — so this changes what the harness can express, not what any arm currently does. See the appendix for the mechanism and why `sharing` carries no global default._
+
 | Arm   | Configuration                                                                            | Purpose                                                                                                                                                               |
 | ----- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **A** | **Solo baseline** — 1 call, "generate 30 genuinely different ideas", no panel, no rounds | **The control that can falsify the product.** This is the "most ideation wrappers are one call" strawman the README claims to beat. Matched on total ideas requested. |
@@ -87,6 +89,8 @@ Panel size fixed at **5 agents**, `ideasPerAgent: 6`, `maxRounds: 2` (blind → 
 
 > _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), items 1 and 4). Arm A's row above says "Matched on total ideas requested" — true of round-1 requests only. At the pool level (the unit `distinct_k` is computed over) Arm A's pool is ~30 and every panel arm's is ~60, including **A′** above, which is itself a panel. See the appendix for the correction and the registered rarefaction rule that operationalizes §6.1's "at matched idea count" clause against this gap._
 
+> _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), item 6). A tenth arm is registered: **AS** — solo baseline, stance-neutral control. Arm A above is **unmodified**; it remains the registered baseline. AS exists because arm A is not neutral (§3.3/#128): its slot persona `solo` is not a `DEFAULT_PERSONAS` name, so ideate-core falls through to `DEFAULT_PERSONAS[0]` (PRAGMATIST, strategy `direct`). See the appendix for the full construction, including why the arm is deliberately named `solo_b` rather than something descriptive._
+
 ### 3.2 Items (briefs) — n = 12, stratified
 
 Held constant across arms. Stratified so results generalize across task type, not just one domain:
@@ -101,6 +105,8 @@ Held constant across arms. Stratified so results generalize across task type, no
 Briefs are **frozen and hashed** into the run manifest. Adding a brief mid-study invalidates the pre-registration.
 
 > _Amended 2026-09-01 ([Appendix B](#appendix-b--amendments-dated-2026-09-01), item 13). The corpus above (n = 12, 4/3/3/2 per stratum) is expanded to **24 briefs, 6 per stratum** (`evals/corpus/briefs.mjs`, issue #43), corpus hash `55e05c2811a7`. The 3 original scientific keywords are preserved as an exact prefix under the same seed — only 3 additional scientific briefs were appended, none re-rolled. Business and product-stratum briefs are authored by the product's owner — disclosed here. See the appendix for the full record._
+
+> _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), items 4 and 5). The corpus is expanded again, **24 → 48 briefs, 12 per stratum**, corpus hash **`55e05c2811a7` → `bb26bebbf00f`**. The expansion is additive — the original 24 retain byte-identical content hashes and `preAmendmentCorpusHash` still reconstructs `55e05c2811a7` — and the product stratum gains an externally-published comparability anchor (`prod-07`, Meincke et al.'s "Base Prompt"). **Business remains the one stratum with no external anchor**, disclosed explicitly rather than left as a code comment. See the appendix for the anchor's citation, verification, and comparability caveats, none of which are as strong as issue #129 originally claimed._
 
 ### 3.3 Held constant (and the awkward part)
 
@@ -119,6 +125,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 
 > **Implementation note (2026-08-02, [Appendix A](#appendix-a--amendments-dated-2026-08-02) item 3). The registered universal-strip decision above is UNCHANGED.** Recorded so a reader can see the code matches the registered decision rather than the library default: `ideate-core@0.4.0` ships `modelAcceptsSamplingParams` (at `ideate-core/integrations/sampling-params`), which strips **per-model** and returns `true` for Haiku. Using that helper unmodified would leave the Haiku arms the diversity lever and **invert** the registered bias direction — which materially affects **H4** (Haiku panel ≥ Opus panel). The generation adapter therefore **force-strips on every model**, Haiku included, rather than deferring to the helper's per-model default.
 
+> _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), items 1 and 3). `effort` is registered as a settable sampling lever, forwarded per slot alongside the `stance`/`strategy`/`personaDisabled` levers #128 already forwarded. Both request builders now emit it — Anthropic as a nested `output_config.effort`, OpenAI as top-level `reasoning_effort` — verified first-party, and the resolved per-cell setting enters `configHash`. The two providers' effort ladders are **not identical**; see the appendix for the asymmetry and the two-part registration (omitted universally across arms, first-class ordinal factor within one model)._
+
 ### 3.4 Replication and power
 
 **Why replicate at all:** a single run per (arm × brief) measures one draw from a stochastic process. Sampling variance in LLM generation is large relative to the between-arm effects we care about; without replication we'd be ranking noise.
@@ -126,6 +134,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 - **n = 4 independent runs per (arm × brief).** 9 arms × 12 briefs × 4 = **432 runs**.
 - Runs differ only by run index (no seed control is possible — the APIs don't expose one; this is a limitation, not a choice).
 - **Power:** run a **pilot** (§8, Phase 1) at 2 arms × 4 briefs × 4 reps to estimate the between-run variance component, then _recompute_ required n before committing to the full grid. Do not trust the n=4 figure until the pilot says so — it is a placeholder chosen for budget, not derived from a variance estimate we have.
+
+> _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), item 7). The pilot's variance-component derivation and the resulting SE-vs-(briefs, replicates) table are registered, with **B = 48 briefs / R = 2 replicates as the current best estimate — explicitly provisional**, bound to Study 1's re-estimate of the dominant variance component. The n = 4 figure above is superseded by this table, not by a frozen final design. See the appendix for the derivation and why it must stay provisional._
 
 ---
 
@@ -1084,3 +1094,120 @@ not change the condition. It supersedes §8.3 Phase 2a's "explicitly excluded
 if not" as folk knowledge — that clause's exclusion is now the store boundary.
 Not in scope, and explicitly still unwired: `--phase 2` as a real alias, which
 `evals/run.mjs` continues to refuse rather than silently map.
+
+---
+
+## Appendix E — Amendments (dated 2026-09-08)
+
+Per the amendment rule at the top of this document. This appendix registers the six-part amendment issue `#129` asked for — prompt levers made settable, per-arm panel geometry, `effort` as a registered sampling lever, an externally-published comparability anchor, a corpus expansion, and a stance-neutral solo control — plus the §3.4 replication update those changes require and the `armsConfigHash` invalidation cost of registering them. Landed in **`#139`** (`020ed8a`, corpus + anchor) and **`#140`** (`d951302`, effort/geometry/control). **Nothing in §6 (hypotheses and analysis plan) is changed by any entry below.**
+
+Every claim below was checked against `develop @ d951302`, not against issue `#129`'s own body — `#129` is stale in several places (noted per item), and this appendix records what actually shipped.
+
+### Item 1 — §3.3: prompt levers made settable per slot (issue #129 amendment A)
+
+**What changed.** `resolveIdeateAgents` (`evals/harness/provider.mjs`) now forwards a slot's `effort`, on both the solo and panel paths, read from the raw slot (never from the `personaDisabled` uniform-persona overlay — a test pins this) so `undefined` stays distinguishable from an explicit value all the way to the request builders.
+
+**Correction to `#129`'s own premise.** The issue text claims `resolveIdeateAgents` "forwards only `{id, persona, model, ideasPerAgent}`" and that "the harness cannot vary any prompt-side lever at all." That was true when `#129` was filed but is stale by the time this amendment landed: `stance`, `temperature`, `strategy`, and `personaDisabled` were already forwarded, by `#128`, before this issue closed. `effort` was the one genuinely missing lever; this item closes it.
+
+**Forwarding is not rendering — the three pre-existing levers are not equally load-bearing, and `provider.mjs`'s own header comment says so:**
+
+- **`stance` reaches the wire.** `evals/harness/prompts.mjs`'s `buildRound1Prompt`/`buildRound2Prompt` render a stance line from it, so a slot-level stance genuinely changes the submitted prompt.
+- **`temperature` is recorded, not sent.** §3.3's universal strip means neither request builder ever reads it for any model; it still rides the agent record and `ideate-core`'s `normalizeExtra` context, which is why forwarding it correctly still matters — stored cells used to record five index-derived temperatures that were never actually submitted.
+- **`strategy` is recorded, not rendered — yet.** `ideate-core` passes it into the prompt-builder context, but this harness's own `buildRound1Prompt`/`buildRound2Prompt` override `ideate-core`'s and do not branch on it, so direct-vs-CoT is still not a live lever at the prompt. Making it one is a registered prompt change, not a harness fix, and is explicitly out of scope for this amendment. Pinned by a test so this boundary cannot silently rot back into a no-consumer field. This matters for Item 6 below: AS is built to differ from arm A in stance only, and part of why that claim holds is that overriding `strategy` currently has no prompt-level effect to confound it with.
+- **`effort` (this item) reaches the wire.** `ideate-core@0.5.0` forwards a slot's `effort` to `complete()` by plain assignment (`effort: agent.effort` / `effort: spec.effort`), deliberately not the `spec.X || base.X` fallback its siblings use, and both request builders forward it verbatim.
+
+### Item 2 — §3.1: panel geometry becomes per-arm, not only global (issue #129 amendment B)
+
+**What changed.** `arms.config.json`'s global `panel { size, ideasPerAgent, maxRounds }` block remains the registered default. `size`, `ideasPerAgent`, `maxRounds`, and now `sharing` are per-arm overrides, resolved by `resolvePanelGeometry(arm, armsConfig)` (`evals/harness/provider.mjs`), which inherits each field independently — an arm can override just one field and inherit the rest from the global block.
+
+**`sharing` has no global default.** `armsConfig.panel.sharing` is never set in the merged `arms.config.json`, and `resolvePanelGeometry` falls through to `undefined` when neither the arm nor the global block sets it. `buildIdeateRounds(maxRounds, sharing)` returns `undefined` for an `undefined` `sharing`, which means the harness sends no `deps.rounds` override to ideate-core at all — round 2 runs under ideate-core's own blind-then-pool behavior, unmodified. Absence is not "off" in any special harness sense; it is simply not overriding the library default.
+
+**Nothing in the registered study currently exercises this.** No arm in the merged `arms.config.json` sets `arm.panel` — every panel arm (B–H, A′) still runs the registered 5/6/2, and A/AS are solo (which throws if `arm.panel` is set at all — solo arms have no panel geometry to override, enforced by `resolveIdeateAgents`). This item registers a mechanism the follow-on sub-studies (Study 1's effort sweep, Study 3's geometry sweep) will use, not a behavior change to any arm registered in this document today.
+
+### Item 3 — §3.3: `effort` registered as the sampling lever, wire shapes verified first-party (issue #129 amendment C)
+
+**What changed.** Both request builders emit `effort` explicitly when a slot sets one, and the resolved per-cell setting enters `configHash`.
+
+- **Anthropic.** `buildAnthropicMessageParams` emits a **nested** `output_config: { effort }`, verified first-party against `platform.claude.com/docs/en/build-with-claude/effort` (fetched 2026-09-08). A bare top-level `effort` field — the shape `#129`'s own acceptance criteria left ambiguous — would be silently ignored by the API: wrong experiment, no error. Ladder for Anthropic: `low | medium | high | xhigh | max`. **Haiku 4.5 is not on the documented supported-model list** and is expected to reject `output_config.effort`; the builder throws if a slot sets `effort` on a model outside `ANTHROPIC_EFFORT_SUPPORTED_MODELS`. No arm sets `effort` on a Haiku slot today. A config-level sweep test (`evals/harness/anthropic-batch.test.mjs`, mirroring the existing `temperature` force-strip sweep) fails at `npm test` if any arm ever does — before any spend, not merely at request-build time on a live run.
+- **OpenAI.** `buildOpenAIChatParams` emits a **top-level** `reasoning_effort`, verified first-party against `developers.openai.com/api/docs/api-reference/chat/create` (fetched 2026-09-08): "Currently supported values are none, minimal, low, medium, high, xhigh, and max."
+- **The setting enters `configHash` via the declared config, not via a separately-resolved runtime value.** There is no dedicated "resolved effort" field stamped by `evals/run.mjs` — `arms.config.json` is the only place a slot's `effort` is declared today, and `armsConfigHash` (Appendix D item 1) hashes the entire file, so any arm's `effort` setting is covered by construction. This is coverage of the *declaration*, not of what a live call actually resolved to; the two coincide only because `arms.config.json` is currently the sole source of a slot's `effort`. A future config source for `effort` (a CLI override, an environment default) would need its own path into `configHash` — none exists today, and none is registered here.
+
+**The two ladders are verified but NOT identical — this is what `#129`'s "ladder not yet verified against first-party docs; do not assume it maps" now resolves to.** OpenAI's ladder has two rungs (`none`, `minimal`) below Anthropic's floor (`low`). Cross-provider effort therefore remains confounded at the bottom of the range, even though both ladders are now implementable and documented. The two-part rule `#129` specified is registered as written:
+
+1. **Across arms (Studies 2–4): `effort` is omitted universally**, exactly as `temperature` is force-stripped (§3.3). Bias direction stated the same way §3.3 states it for temperature: a model comparison at provider defaults compares *shipped defaults*, which may be the decision-relevant quantity, but it is not a matched-effort comparison and must not be reported as one.
+2. **Within one model (Study 1): `effort` is a first-class ordinal factor**, never crossed across model families — the asymmetry above is exactly why crossing it would confound model with ladder position.
+
+### Item 4 — §3.2: an externally-published comparability anchor, `prod-07` (issue #129 amendment D)
+
+**What changed.** A verbatim brief, `prod-07`, is registered in the **product** stratum (not a standalone stratum — folding it into `product` is what gives that stratum an external anchor at all), `provenance: "verbatim"`. Text: Meincke, Mollick & Terwiesch's "Base Prompt," transcribed from arXiv:2402.01727v1.
+
+**Citation correction, made explicit rather than silently fixed.** `#129`'s own body cites the originating 2023 working paper as "Girotra, Terwiesch & Ulrich" — three authors. The actual citation is **Girotra, K., Meincke, L., Terwiesch, C., & Ulrich, K. T. (2023)**, *Ideas Are Dimes A Dozen*, Mack Institute working paper, SSRN 4526071 — **four** authors; the issue text drops Meincke. `evals/corpus/briefs.mjs`'s `ANCHOR_SOURCE` records both the corrected four-author citation and the secondary citation (Meincke, Mollick & Terwiesch 2024, arXiv:2402.01727) the registered text was actually transcribed from, with an explicit comment: "#129's own citation text is WRONG (drops Meincke as an author of the 2023 paper) and must not be copied from the issue body."
+
+**Verification.** The registered string was diffed character-by-character against the retrieved PDF text. Both labelled occurrences of the "Base Prompt" row (p.12 inline, and the Appendix D prompt table, pp. 24–25) are byte-identical: both hash to **md5 `4f7d9191488a5e9f0eb6162dca94582f`**, confirming the straight apostrophe in "I'd" and the hyphen in "40-80" are genuine transcription, not extraction artifacts.
+
+**The comparability claim is ordering-only, and `#129`'s stated rationale is partly wrong.** `#129` calls this "the single most directly comparable prior result." That is only true of the *ordering* of strategies. Meincke et al. measured diversity with Google's Universal Sentence Encoder; this study uses Voyage. The paper itself warns (p.6): "changing the embeddings model could yield dramatically different results depending on the training even if it was optimized for the same purpose." Their published cosine-similarity values — Base Prompt 0.377, Chain-of-Thought 0.255, Group of Students 0.243 — are therefore **NOT comparable to this study's numbers**; only the relative ordering of strategies may transfer, not the magnitudes. `evals/corpus/briefs.mjs`'s `comparabilityCaveat` states this plainly, and this appendix does not repeat `#129`'s uncorrected framing.
+
+**No human-comparable instrument is implied.** The human-subject prompt is not available verbatim — Girotra et al. state only that they gave ChatGPT-4 "essentially the same prompt we gave the students," the authors' own characterization, not a transcript. Registered as `humanPromptCaveat` so nothing downstream treats this brief as a verbatim human baseline.
+
+**Version risk is scoped to the originating citation, not the registered string.** SSRN 4526071 (Girotra et al. 2023) has since been revised — retitled, expanded author list — and returns HTTP 403 as of 2026-09-08; its current version is unverified. That risk attaches to the *originating* citation only. The registered prompt text was transcribed from arXiv:2402.01727v1, a stable, versioned submission, re-retrievable at the exact identifier recorded in `ANCHOR_SOURCE.retrievedFrom` — no version risk attaches to the string actually registered.
+
+### Item 5 — §3.2: corpus expanded 24 → 48 briefs, 12 per stratum (issue #129 amendment E)
+
+**What changed.** `CORPUS_HASH` moves **`55e05c2811a7` → `bb26bebbf00f`**. The corpus grows from 24 briefs (6 per stratum) to **48 briefs, 12 per stratum** (business / product / scientific / aut), verified directly against `evals/corpus/briefs.mjs`.
+
+**The expansion is additive.** The original 24 briefs retain their ids, text, and content hashes byte-identical — `corpus.test.mjs` guards this — and `preAmendmentCorpusHash(CORPUS)` still reconstructs `55e05c2811a7`. Verified directly: calling `preAmendmentCorpusHash` against the current `CORPUS` returns `55e05c2811a7`. The pre-amendment corpus therefore stays derivable from the current one; nothing was re-rolled or reworded.
+
+**Parity, not weighting toward external sources — a correction made during authoring, disclosed here.** A first draft of this expansion weighted the scientific stratum to maximize the count of externally-traceable briefs, which the code comments in `briefs.mjs` record as a wrong reading of §3.2/§6.2: an unequal split would let brief-level variance (and the headline effect estimate) be dominated by whichever stratum has the most briefs, since `§6.2`'s model treats briefs as exchangeable random effects. The shipped corpus keeps strict 12/12/12/12 parity; "weight toward externally-traceable sources" is satisfied instead by which strata *gain* an anchor — scientific, aut, and now product (via `prod-07`) — 3 of 4 strata, up from 1 of 4.
+
+**Business is the one stratum with no external anchor.** No external instrument exists for it — the code comment in `briefs.mjs` disclosed this only as a comment before this amendment; this appendix is now the authoritative registration surface for that gap, per the task's requirement that the absence not be left as code-only disclosure.
+
+**Business/product briefs' authorship.** As already registered (Appendix B item 13), the original business/product briefs are authored by the product's owner. The 6 newly authored briefs in each of those strata carry the same disclosed conflict of interest; they are demoted to secondary relative to the externally-anchored briefs in the same strata (the LiveIdeaBench-sampled scientific briefs, the AUT-paradigm briefs, and `prod-07`).
+
+### Item 6 — §3.1: a stance-neutral solo control, arm AS (issue #129 amendment F)
+
+**What changed.** A tenth arm, **AS**, is registered: `mode: "solo"`, `personaDisabled: true`, with an explicit `uniformPersona`. Verified directly against `arms.config.json`.
+
+**Arm A is unmodified.** Diffed field-by-field against `arms.config.json` as it stood at `8e8c174` (the commit immediately preceding `#139`): arm A's entry — `label`, `mode`, `personaDisabled`, `purpose` prose included, `slots`, `totalIdeasRequested` — is byte-identical. Arm A remains the registered baseline; AS is additive, not a replacement.
+
+**Why arm A is not neutral, and why AS is needed.** Arm A's slot persona `solo` is not a `DEFAULT_PERSONAS` name, so ideate-core falls through to `DEFAULT_PERSONAS[0]` — PRAGMATIST, stance-assigned, strategy `direct` (the only non-CoT configuration in the grid). Against every panel arm, arm A therefore varies in stance **and** strategy **and** rounds **and** model, all at once (per `#128`). AS isolates the stance lever: `personaDisabled` (plus `uniformPersona`) forces the same explicit, perspective-free stance arm A′'s panel ablation uses, and overrides temperature/strategy back to PRAGMATIST's own values (0.4 / `direct`) rather than the uniform-persona default's CoT-leaning values — so AS is built to differ from arm A in stance only. Same model (`claude-sonnet-5`), same `totalIdeasRequested` (30), same `maxRounds` (1) as arm A.
+
+**Why the persona name is deliberately inert.** The persona *name* is transmitted verbatim into the round-1 prompt (`evals/harness/prompts.mjs`). AS's `uniformPersona.persona` is `"solo_b"` — no reference to "stance," "neutral," or the experimental construct anywhere in the string the model sees. An earlier draft used a descriptive name (`"solo_stance_neutral"`); naming the experimental construct in the prompt text the model reads would be a demand characteristic, so the shipped value is deliberately inert.
+
+### Item 7 — §3.4: replication derivation registered, B = 48 / R = 2 explicitly provisional
+
+**What's registered.** The variance-component method and the resulting SE-vs-(briefs, replicates) table from `#129`'s own analysis of the Phase 2a smoke (`results/`, cfg `0000daa58e5a`, 20 cells). **Reported, not verified against a committed artifact in this repo** — transcribed from `#129`'s issue body, not independently re-run in this session:
+
+- `brief` variance component: 21.99
+- `brief:arm` (interaction) variance component: **77.85**
+- Pooled within-(arm × brief) residual variance: 6.82 (sd 2.61)
+
+The interaction dominates the residual by more than 10×, so briefs buy far more power than replicates:
+
+| B (briefs) | R=1  | R=2  | R=3  | R=5  |
+| ---------- | ---- | ---- | ---- | ---- |
+| 6          | 5.31 | 5.20 | 5.17 | 5.14 |
+| 12         | 3.76 | 3.68 | 3.65 | 3.63 |
+| 24         | 2.66 | 2.60 | 2.58 | 2.57 |
+| 48         | 1.88 | 1.84 | 1.83 | 1.82 |
+
+**B = 48, R = 2 is registered as the current best estimate — explicitly, deliberately provisional, not a frozen design parameter.** `#129` itself flags `σ²_ba = 77.85` as "the least stable number in the study," estimated from **two briefs** in the Phase 2a smoke. Every MDE downstream of this table scales with that one number. Freezing B=48/R=2 as a binding replication target would launder a two-brief variance estimate into a settled design decision, which is precisely what §11's non-reuse and additive-accumulation machinery exists to prevent doing quietly. **This table is bound to Study 1's re-estimate of `σ²_ba`**: Study 1 re-estimates the dominant variance component from a materially larger brief count (the 48-brief corpus, Item 5), and the final replication numbers are whatever that re-estimate implies via the same SE formula — not the row above. Until Study 1 reports, the table above is the working estimate the study plans around, registered as provisional so a reader cannot mistake it for a frozen commitment.
+
+### Item 8 — cost of this amendment: `armsConfigHash` moves, invalidating every arm's cells
+
+**What's registered.** Registering arm AS (Item 6) changes `arms.config.json`, which moves `armsConfigHash` — a hash over the whole file (Appendix D item 1) — which by that item's already-registered rule invalidates **every** arm's stored cells, not only AS's. This is the same "introduce arms before a phase begins, not during one" consequence Appendix D item 1 registered in advance; this item records that it actually fired, and what it cost.
+
+**Verified decomposition of `results-pilot/index.jsonl`'s 59 records**, discriminated by the sentinel `armId` values the store actually uses (`__batch-replay__`, `__judge-call__`, `__judge-scores__`), not by any assumption about `cfg` string shape:
+
+| `armId`            | `state`     | count |
+| ------------------ | ----------- | ----- |
+| `B`                 | `completed` | 16    |
+| `D`                 | `failed`    | 3     |
+| `__batch-replay__`  | `skipped`   | 3     |
+| `__judge-call__`    | `completed` | 23    |
+| `__judge-scores__`  | `completed` | 14    |
+
+That is **19 generation cells** (16 arm-B completed, 3 arm-D already `failed` before this amendment) at `cfg=0000daa58e5a`, plus 3 skipped `__batch-replay__` records and 37 judge-bookkeeping records (23 `__judge-call__` + 14 `__judge-scores__`) — 59 total, matching the file's line count exactly.
+
+**The data actually lost to re-collection is the 16 completed arm-B generation cells.** The 3 arm-D cells were already `failed` and cost nothing beyond their original (already-sunk) spend. The judge-bookkeeping and batch-replay records key off the generation cells they describe and carry no independent value once those cells go stale. Leading with 19 would overstate the loss; 16 is the number that matters, with 19 given for the full split.
+
+`results-pilot/` is **tracked and committed** on `develop` (since `399bcc5`, landed via `#137`) — this is not a description of untracked local state; the pilot store the harness produced is part of the repository's history, and its 16 lost cells are a real, git-visible cost of this amendment rather than an ephemeral one.
