@@ -413,11 +413,53 @@ test("the anchor source states the embedding-model comparability caveat, not mat
   );
 });
 
-test("the anchor source records the Mack Institute URL, its retrieval date, and the SSRN version-risk caveat", () => {
-  assert.match(ANCHOR_SOURCE.retrievedFrom, /mackinstitute\.wharton\.upenn\.edu/);
+test("the anchor source's retrievedFrom names the Meincke arXiv PDF the text was actually transcribed from, not Girotra", () => {
+  // Sentry-flagged defect (briefs.mjs:160, 2026-09-08): an earlier revision
+  // pointed retrievedFrom at the Girotra Mack Institute URL — the wrong
+  // paper for this field, since the registered text was transcribed from
+  // Meincke et al. (2024), not from Girotra et al. (2023). That PDF is 14
+  // pages and has no p.24 / Appendix D, so a reader following retrievedFrom
+  // would never find what location claims. Fixed: retrievedFrom must name
+  // the arXiv Meincke PDF, and must NOT mention the Mack Institute URL.
+  assert.match(ANCHOR_SOURCE.retrievedFrom, /arxiv\.org\/pdf\/2402\.01727/);
+  assert.match(ANCHOR_SOURCE.retrievedFrom, /2402\.01727v1/);
   assert.match(ANCHOR_SOURCE.retrievedFrom, /2026-09-08/);
-  assert.match(ANCHOR_SOURCE.versionRisk, /SSRN 4526071/);
-  assert.match(ANCHOR_SOURCE.versionRisk, /403/);
+  assert.doesNotMatch(
+    ANCHOR_SOURCE.retrievedFrom,
+    /mackinstitute\.wharton\.upenn\.edu/,
+    "retrievedFrom must not point at the Girotra Mack Institute PDF — that is not what the registered text was transcribed from",
+  );
+});
+
+test("retrievedFrom and location are internally consistent — both name Meincke et al., not two different papers", () => {
+  // The class of bug this guards: citing paper X in one field and linking
+  // paper Y in another. `location` names where in Meincke et al. (2024) the
+  // text lives (p.12 / Appendix D p.24); `retrievedFrom` must point at that
+  // SAME work, not at Girotra et al. (2023) — even though Girotra is a
+  // legitimate citation elsewhere in this record (the originating paper).
+  assert.match(ANCHOR_SOURCE.location, /Meincke, Mollick & Terwiesch \(2024\)/);
+  assert.match(ANCHOR_SOURCE.retrievedFrom, /Meincke, Mollick & Terwiesch 2024/);
+  assert.match(ANCHOR_SOURCE.retrievedFrom, /2402\.01727/, "retrievedFrom's identifier must match the transcription-source citation (arXiv:2402.01727v1)");
+});
+
+test("versionRisk describes the registered text's own (stable arXiv) provenance, not Girotra's SSRN risk", () => {
+  assert.match(ANCHOR_SOURCE.versionRisk, /arXiv:2402\.01727v1/);
+  assert.match(ANCHOR_SOURCE.versionRisk, /stable/i);
+  assert.doesNotMatch(
+    ANCHOR_SOURCE.versionRisk,
+    /SSRN/,
+    "versionRisk (about the registered text) must not carry Girotra's SSRN caveat — that belongs on originatingCitationVersionRisk",
+  );
+});
+
+test("originatingCitationVersionRisk scopes the SSRN 403/retitle risk to the Girotra originating citation, explicitly not the registered text", () => {
+  assert.match(ANCHOR_SOURCE.originatingCitationVersionRisk, /SSRN 4526071/);
+  assert.match(ANCHOR_SOURCE.originatingCitationVersionRisk, /403/);
+  assert.match(ANCHOR_SOURCE.originatingCitationVersionRisk, /ORIGINATING/);
+  assert.match(
+    ANCHOR_SOURCE.originatingCitationVersionRisk,
+    /does NOT apply to the registered prompt text/,
+  );
 });
 
 test("the anchor source records the human-prompt caveat verbatim from Girotra et al.", () => {

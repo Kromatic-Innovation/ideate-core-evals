@@ -151,18 +151,35 @@ export const ANCHOR_SOURCE = {
   location:
     "Reproduced inline on p.12 (\"Exhaustion\" section) and in Appendix D (\"Table of " +
     "Prompts\", pp. 20-33, Base Prompt row on p.24) of Meincke, Mollick & Terwiesch (2024).",
-  // Girotra et al. (2023) is the paper that originated this exact task
-  // (target market + price ceiling framing); Meincke et al. (2024) is where
-  // the verbatim prompt text above was transcribed FROM, reusing Girotra et
-  // al.'s task as their own "Base Prompt" baseline strategy.
+  // `retrievedFrom` names the document the TEXT ABOVE was actually
+  // transcribed from — Meincke et al. (2024), the `secondaryCitation`. It
+  // must NOT point at Girotra et al. (2023): that PDF is 14 pages and has
+  // no p.24 / Appendix D to find (Sentry-flagged defect, briefs.mjs:160,
+  // 2026-09-08 — an earlier revision pointed this at the Girotra Mack URL,
+  // attaching Girotra's version risk to a string that never came from
+  // Girotra; fixed here, see originatingCitationVersionRisk below for where
+  // that risk actually belongs).
   retrievedFrom:
-    "https://mackinstitute.wharton.upenn.edu/wp-content/uploads/2023/08/LLM-Ideas-Working-Paper.pdf " +
-    "(Girotra et al. 2023 Mack Institute working paper; retrieved 2026-09-08).",
+    "https://arxiv.org/pdf/2402.01727 (Meincke, Mollick & Terwiesch 2024, arXiv:2402.01727v1; " +
+    "retrieved 2026-09-08).",
   versionRisk:
-    "SSRN 4526071 has since been revised (retitled, with an expanded author list) and " +
-    "returned HTTP 403 as of 2026-09-08, so the CURRENT SSRN version's prompt text is " +
-    "unverified. The prompt text registered here is transcribed from the July 2023 Mack " +
-    "Institute working paper PDF at the URL above, not from SSRN.",
+    "The registered prompt text is transcribed from arXiv:2402.01727v1 (Meincke, Mollick & " +
+    "Terwiesch 2024) — a stable, versioned arXiv submission, re-retrievable at the exact " +
+    "version above. No version risk attaches to this string.",
+  // Girotra et al. (2023) genuinely originated this task (target market +
+  // price ceiling framing) and Meincke et al. (2024) reuse it as their
+  // "Base Prompt" baseline — that lineage is real and worth recording. But
+  // Girotra's own version risk (SSRN 4526071 revised/retitled/expanded
+  // author list, HTTP 403 as of 2026-09-08) is a property of the
+  // ORIGINATING citation above, not of the registered text, which was never
+  // transcribed from Girotra or from SSRN.
+  originatingCitationVersionRisk:
+    "SSRN 4526071 (the Girotra et al. 2023 originating paper, `citation` above) has since " +
+    "been revised — retitled, with an expanded author list — and returned HTTP 403 as of " +
+    "2026-09-08, so its current SSRN version is unverified. This risk is scoped to the " +
+    "ORIGINATING citation only; it does NOT apply to the registered prompt text above, " +
+    "which was transcribed from Meincke et al. (2024) at the stable arXiv identifier in " +
+    "`retrievedFrom`, not from Girotra et al. (2023) or from SSRN.",
   // Published cosine-similarity results (Google Universal Sentence Encoder
   // embeddings), Table 2 of Meincke et al. (2024) — reproduced for reference
   // only; see comparabilityCaveat below for why these are NOT comparable to
