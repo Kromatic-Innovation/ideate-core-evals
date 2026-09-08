@@ -101,7 +101,14 @@ export const SCIENTIFIC_SAMPLE_SEED = 20260731; // date this stratum was drawn, 
 // Same seed means the first 3 draws are unchanged (mulberry32 is a sequential
 // draw-without-replacement walk) — sci-01..03 keep their original keyword and
 // drawIndex; sci-04..06 are new draws appended by extending count only.
-export const SCIENTIFIC_SAMPLE_COUNT = 6;
+// Bumped 6 -> 23 for the #129 amendment corpus expansion (2026-09-08). Same
+// seed, same prefix-preservation property: sci-01..sci-06 keep their original
+// keyword/drawIndex unchanged; sci-07..sci-23 are new draws appended by
+// extending count only. This stratum is the cheapest way to weight the
+// expansion toward externally-traceable content (issue #129 part E) — the
+// wrapper template is authored, but every keyword itself is an external,
+// reproducibly-sampled LiveIdeaBench item.
+export const SCIENTIFIC_SAMPLE_COUNT = 23;
 export const SCIENTIFIC_SAMPLE_ALGORITHM =
   "seeded partial Fisher-Yates draw without replacement over the de-duplicated, " +
   "lexicographically-sorted LiveIdeaBench keyword list, using the mulberry32 PRNG";

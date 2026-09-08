@@ -1,4 +1,4 @@
-// briefs.mjs — the 24 frozen briefs, stratified per §3.2 of the pre-registration.
+// briefs.mjs — the 48 frozen briefs, stratified per §3.2 of the pre-registration.
 //
 // ── Corpus expansion (issue #43, 2026-09-01) ────────────────────────────────
 // Expanded 12 -> 24 briefs (4/3/3/2 -> 6/6/6/6 per stratum) while the
@@ -6,6 +6,27 @@
 // docs/PREREGISTRATION.md §3.2 and issue #43 for the rationale; the dated
 // amendment disclosing this (including the authored-briefs conflict of
 // interest) lands separately in Appendix B per issue #44.
+//
+// ── Anchor + second expansion (issue #129 parts D/E, 2026-09-08) ───────────
+// Two ADDITIVE changes, bundled into one amendment per §3.2/§11 (adding a
+// brief invalidates the pre-registration, so batching avoids invalidating it
+// twice):
+//   D. A new `anchor` stratum (1 brief, provenance "verbatim") registers
+//      Meincke et al.'s "Base Prompt" as an externally-published
+//      comparability anchor — see ANCHOR_SOURCE below.
+//   E. 23 more briefs (24 -> 47 pre-anchor, 48 with the anchor), weighted
+//      toward externally-traceable sources: scientific 6 -> 23 (+17, all
+//      sampled from LiveIdeaBench — see sample.mjs) and aut 6 -> 12 (+6,
+//      more canonical Alternate-Uses-Task objects). business and product
+//      are UNCHANGED (6 each, still authored, now explicitly secondary
+//      per #129 part D) — no external source covers either stratum, so no
+//      new briefs were authored for them rather than inventing more
+//      unverifiable content.
+// The original 24 briefs (biz-01..06, prod-01..06, sci-01..06, aut-01..06)
+// are retained byte-identical — same id, same text, same content hash — so
+// the pre-amendment corpus (hash `55e05c2811a7`) remains reconstructible by
+// filtering to that id set. See corpus.test.mjs "the retained 24 briefs..."
+// and index.mjs's `PRE_AMENDMENT_BRIEF_IDS` / `preAmendmentCorpusHash`.
 //
 // ── Neutrality note (AC4: domain-agnostic, no unfair fit) ──────────────────────
 // This corpus feeds EVERY arm's prompt builder identically (§3.3: "same prompt
@@ -74,15 +95,86 @@ function scientificSelectionMeta(keyword, index) {
   };
 }
 
+// ── The canonical comparability anchor (issue #129 part D) ──────────────────
+// Full source record for anchor-01 below. Kept as a named constant (rather
+// than inlined in the brief) so the citation/caveats are one grep away and
+// so corpus.test.mjs can assert against it directly instead of re-deriving
+// strings.
+//
+// Citations — #129's own citation text is WRONG (drops Meincke as an author
+// of the 2023 paper) and must not be copied from the issue body:
+//   Girotra, K., Meincke, L., Terwiesch, C., & Ulrich, K. T. (2023). Ideas
+//   Are Dimes A Dozen: Large Language Models For Idea Generation In
+//   Innovation. Mack Institute working paper, July 10 2023. SSRN 4526071.
+//   DOI 10.2139/ssrn.4526071. Four authors — the issue text omits Meincke.
+//
+//   Meincke, L., Mollick, E., & Terwiesch, C. (2024). Prompting Diverse
+//   Ideas: Increasing AI Idea Variance. arXiv:2402.01727v1.
+//   DOI 10.48550/arXiv.2402.01727.
+export const ANCHOR_SOURCE = {
+  label: "Base Prompt",
+  citation:
+    "Girotra, K., Meincke, L., Terwiesch, C., & Ulrich, K. T. (2023). Ideas Are Dimes A " +
+    "Dozen: Large Language Models For Idea Generation In Innovation. Mack Institute working " +
+    "paper, July 10 2023. SSRN 4526071. DOI 10.2139/ssrn.4526071.",
+  secondaryCitation:
+    "Meincke, L., Mollick, E., & Terwiesch, C. (2024). Prompting Diverse Ideas: Increasing " +
+    "AI Idea Variance. arXiv:2402.01727v1. DOI 10.48550/arXiv.2402.01727.",
+  // Verified against the retrieved PDF text at transcription time (2026-09-08):
+  // the "Base Prompt" is reproduced inline on p.12 (the "Exhaustion" section,
+  // introducing the exhaustion-comparison prompts) AND again in Appendix D
+  // ("Table of Prompts", pp. 20-33; the Base Prompt row itself falls on p.24),
+  // Meincke, Mollick & Terwiesch (2024) working paper. Both reproductions are
+  // byte-identical.
+  location:
+    "Reproduced inline on p.12 (\"Exhaustion\" section) and in Appendix D (\"Table of " +
+    "Prompts\", pp. 20-33, Base Prompt row on p.24) of Meincke, Mollick & Terwiesch (2024).",
+  // Girotra et al. (2023) is the paper that originated this exact task
+  // (target market + price ceiling framing); Meincke et al. (2024) is where
+  // the verbatim prompt text above was transcribed FROM, reusing Girotra et
+  // al.'s task as their own "Base Prompt" baseline strategy.
+  retrievedFrom:
+    "https://mackinstitute.wharton.upenn.edu/wp-content/uploads/2023/08/LLM-Ideas-Working-Paper.pdf " +
+    "(Girotra et al. 2023 Mack Institute working paper; retrieved 2026-09-08).",
+  versionRisk:
+    "SSRN 4526071 has since been revised (retitled, with an expanded author list) and " +
+    "returned HTTP 403 as of 2026-09-08, so the CURRENT SSRN version's prompt text is " +
+    "unverified. The prompt text registered here is transcribed from the July 2023 Mack " +
+    "Institute working paper PDF at the URL above, not from SSRN.",
+  // Published cosine-similarity results (Google Universal Sentence Encoder
+  // embeddings), Table 2 of Meincke et al. (2024) — reproduced for reference
+  // only; see comparabilityCaveat below for why these are NOT comparable to
+  // this study's own numbers.
+  publishedResults: {
+    metric: "cosine similarity (Google Universal Sentence Encoder embeddings)",
+    basePrompt: 0.377,
+    chainOfThought: 0.255,
+    groupOfStudents: 0.243,
+  },
+  comparabilityCaveat:
+    "Cosine values are NOT portable. Meincke et al. used Google's Universal Sentence " +
+    "Encoder; this study uses Voyage. The paper itself warns (p.6): \"changing the " +
+    "embeddings model could yield dramatically different results depending on the " +
+    "training even if it was optimized for the same purpose.\" So Meincke's published " +
+    "numbers above are NOT comparable to this study's values — only the ORDERING of " +
+    "strategies may transfer, not the magnitudes.",
+  humanPromptCaveat:
+    "The human-subject prompt is not available verbatim. Girotra et al. (2023) state " +
+    "only that they prompted ChatGPT-4 with \"essentially the same prompt we gave the " +
+    "students\" — the authors' characterization, not a transcript. Nothing in this " +
+    "corpus implies a verbatim human-comparable instrument.",
+};
+
 /**
  * @typedef {object} Brief
  * @property {string} id
- * @property {"business"|"product"|"scientific"|"aut"} stratum
+ * @property {"business"|"product"|"scientific"|"aut"|"anchor"} stratum
  * @property {string} text
- * @property {"authored"|"sampled"} provenance
- * @property {object} [source]     required when provenance === "sampled"
+ * @property {"authored"|"sampled"|"verbatim"} provenance
  * @property {object} [selection]  required when provenance === "sampled":
  *                                 { algorithm, seed, drawIndex, source }
+ * @property {object} [source]     required when provenance === "verbatim":
+ *                                 full citation/location/caveat record (see ANCHOR_SOURCE)
  */
 
 /** @type {Brief[]} */
@@ -199,7 +291,11 @@ export const BRIEFS = [
   // matching LiveIdeaBench's own single-keyword prompt design (§2 of the
   // pre-registration: "1,180 single-keyword prompts").
   ...SCIENTIFIC_KEYWORDS.map((keyword, i) => ({
-    id: `sci-0${i + 1}`,
+    // Zero-padded to 2 digits (not `sci-0${i + 1}`, which breaks past i=8 —
+    // e.g. would emit "sci-010" for the 10th draw instead of "sci-10"). The
+    // first 6 ids (sci-01..sci-06) render identically to the pre-expansion
+    // template, so existing ids/hashes are unaffected; see index.mjs.
+    id: `sci-${String(i + 1).padStart(2, "0")}`,
     stratum: "scientific",
     provenance: "sampled",
     text: `Generate as many genuinely different research ideas as you can related to: ${keyword}.`,
@@ -244,5 +340,74 @@ export const BRIEFS = [
     stratum: "aut",
     provenance: "authored",
     text: "Generate as many genuinely different uses for a spoon as you can.",
+  },
+
+  // ── AUT expansion (6 more, authored, #129 amendment) ──────────────────────
+  // Same "genuinely different uses for X" template as aut-01..06 above,
+  // extended with 6 more objects from the standard Alternate Uses Task /
+  // divergent-thinking stimulus set used across the Guilford (1967) and
+  // Torrance Tests of Creative Thinking literature — the object choice is
+  // externally traceable to that paradigm even though (like aut-01..06) the
+  // exact sentence wrapping the object is authored, not quoted from a paper.
+  {
+    id: "aut-07",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a newspaper as you can.",
+  },
+  {
+    id: "aut-08",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a key as you can.",
+  },
+  {
+    id: "aut-09",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a shoe as you can.",
+  },
+  {
+    id: "aut-10",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for an umbrella as you can.",
+  },
+  {
+    id: "aut-11",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a tin can as you can.",
+  },
+  {
+    id: "aut-12",
+    stratum: "aut",
+    provenance: "authored",
+    text: "Generate as many genuinely different uses for a blanket as you can.",
+  },
+
+  // ── Canonical comparability anchor (1, verbatim, #129 amendment part D) ────
+  // Meincke, Mollick & Terwiesch (2024) "Base Prompt" — the same task Girotra,
+  // Meincke, Terwiesch & Ulrich (2023) used to compare ChatGPT-4 ideation
+  // against Wharton students, later re-used by Meincke et al. (2024) as the
+  // baseline strategy in their prompting-diversity study. Transcribed
+  // VERBATIM — do not reword. See ANCHOR_SOURCE below for the full citation,
+  // location, and comparability caveats; this is the point of the brief, not
+  // boilerplate. Kept as its own stratum (not folded into "product") because
+  // it is a single fixed external instrument, not a sampled or authored set.
+  {
+    id: "anchor-01",
+    stratum: "anchor",
+    provenance: "verbatim",
+    text:
+      "Generate new product ideas with the following requirements: The product will " +
+      "target college students in the United States. It should be a physical good, " +
+      "not a service or software. I'd like a product that could be sold at a retail " +
+      "price of less than about USD 50. The ideas are just ideas. The product need " +
+      "not yet exist, nor may it necessarily be clearly feasible. Number all ideas " +
+      "and give them a name. The name and idea are separated by a colon. Please " +
+      "generate 100 ideas as 100 separate paragraphs. The idea should be expressed " +
+      "as a paragraph of 40-80 words.",
+    source: ANCHOR_SOURCE,
   },
 ];
