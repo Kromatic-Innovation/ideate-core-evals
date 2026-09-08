@@ -23,14 +23,18 @@ import { tmpdir } from "node:os";
 import {
   AnthropicBatchProvider,
   resolveIdeateAgents,
+  resolvePanelGeometry,
+  buildIdeateRounds,
   buildAnthropicMessageParams,
+  buildOpenAIChatParams,
+  ANTHROPIC_EFFORT_SUPPORTED_MODELS,
   UNIFORM_PERSONA,
   DEFAULT_MAX_POLL_MS,
 } from "./provider.mjs";
 import { buildRound1Prompt } from "./prompts.mjs";
 import { runSpec } from "./runner.mjs";
 import { ResultsStore } from "../../lib/store.mjs";
-import { cellKey, configHash, planRun } from "../../lib/manifest.mjs";
+import { armsConfigHash, cellKey, configHash, planRun } from "../../lib/manifest.mjs";
 
 const armsConfigJson = JSON.parse(
   await (await import("node:fs")).promises.readFile(new URL("../../arms.config.json", import.meta.url), "utf8"),
@@ -69,6 +73,14 @@ async function fakeIdeateImpl(input, deps) {
         top_p: 0.9,
         maxTokens: 2048,
         persona: agent.persona,
+        // #129 fix round (Quine finding #1): the real ideate-core@0.5.0 always
+        // forwards `agent.effort` into this call (verified in
+        // node_modules/ideate-core/lib/ideate-core.mjs). A fake that omits it
+        // makes every seam between resolveIdeateAgents and the request
+        // builders -- including `withCellMaxTokens` -- untestable end-to-end:
+        // a mutation that silently drops effort somewhere in that chain would
+        // leave the whole suite green.
+        effort: agent.effort,
       }),
     ),
   );
@@ -325,6 +337,306 @@ test("#128: a forwarded strategy does NOT yet change the prompt -- the lever is 
   assert.equal(cot, direct);
 });
 
+// ── issue #129 amendment A: `effort` forwarding ──────────────────────────────
+// Two SEPARATE tests for the solo and panel branches: a single test covering
+// both would leave a mutation that breaks only one branch undetected.
+
+test("#129: a slot-level effort is forwarded verbatim on the SOLO path", () => {
+  const arm = {
+    mode: "solo",
+    totalIdeasRequested: 30,
+    slots: [{ persona: "solo", model: "claude-sonnet-5", effort: "low" }],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, "low");
+});
+
+test("#129: a slot-level effort is forwarded verbatim on the PANEL path", () => {
+  const arm = {
+    mode: "panel",
+    personaDisabled: false,
+    slots: [
+      { persona: "p1", model: "claude-sonnet-5", effort: "xhigh" },
+      { persona: "p2", model: "claude-sonnet-5" },
+    ],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, "xhigh");
+  // A slot that names no effort stays UNSET -- undefined must stay
+  // distinguishable from an explicit value, per ideate-core@0.5.0's own
+  // plain-assignment contract (never `||`-defaulted).
+  assert.equal(agents[1].effort, undefined);
+});
+
+test("#129: an unset solo effort resolves to undefined, not a coerced falsy value", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms.A, armsConfigJson);
+  assert.equal(agents[0].effort, undefined);
+});
+
+test("#129: effort is read from the RAW slot, not the uniformPersona overlay -- a personaDisabled arm cannot silently blank or override it", () => {
+  const arm = {
+    mode: "panel",
+    personaDisabled: true,
+    uniformPersona: { effort: "max" }, // must be IGNORED -- effort is not a persona field
+    slots: [
+      { persona: "p1", model: "claude-haiku-4-5", effort: "low" },
+      { persona: "p2", model: "claude-haiku-4-5" },
+    ],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, "low", "the slot's own effort must win over uniformPersona.effort");
+  assert.equal(agents[1].effort, undefined, "uniformPersona.effort must not backfill an unset slot effort either");
+});
+
+test("#129: effort is read from the RAW slot on the SOLO path too, not the uniformPersona overlay (Quine finding #5 -- the panel path had this test, the solo path didn't)", () => {
+  const arm = {
+    mode: "solo",
+    personaDisabled: true,
+    totalIdeasRequested: 30,
+    uniformPersona: { effort: "max" }, // must be IGNORED -- effort is not a persona field, on either path
+    slots: [{ persona: "solo", model: "claude-sonnet-5", effort: "low" }],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, "low", "the slot's own effort must win over uniformPersona.effort on the solo path too");
+});
+
+test("#129: an unset SOLO slot effort is not backfilled by uniformPersona.effort either", () => {
+  const arm = {
+    mode: "solo",
+    personaDisabled: true,
+    totalIdeasRequested: 30,
+    uniformPersona: { effort: "max" },
+    slots: [{ persona: "solo", model: "claude-sonnet-5" }], // no effort set
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, undefined, "uniformPersona.effort must not backfill an unset SOLO slot effort");
+});
+
+// ── issue #129 amendment C: effort reaches the request builders ─────────────
+
+test("#129: buildAnthropicMessageParams emits output_config.effort when the request carries one, and omits it otherwise", () => {
+  const withEffort = buildAnthropicMessageParams({ model: "claude-sonnet-5", prompt: "p", effort: "high" });
+  assert.deepEqual(withEffort.output_config, { effort: "high" });
+
+  const withoutEffort = buildAnthropicMessageParams({ model: "claude-sonnet-5", prompt: "p" });
+  assert.equal(withoutEffort.output_config, undefined);
+  assert.deepEqual(Object.keys(withoutEffort).sort(), ["max_tokens", "messages", "model"]);
+});
+
+test("#129: buildAnthropicMessageParams throws fail-loud for a model outside Anthropic's documented effort support (Haiku 4.5)", () => {
+  assert.throws(
+    () => buildAnthropicMessageParams({ model: "claude-haiku-4-5", prompt: "p", effort: "low" }),
+    /does not support output_config\.effort/,
+  );
+  // No effort at all is still fine on Haiku -- only an EXPLICIT effort is rejected.
+  assert.doesNotThrow(() => buildAnthropicMessageParams({ model: "claude-haiku-4-5", prompt: "p" }));
+});
+
+test("#129: buildOpenAIChatParams emits reasoning_effort verbatim when the request carries one, and omits it otherwise", () => {
+  const withEffort = buildOpenAIChatParams({ model: "gpt-5.6-terra", prompt: "p", effort: "medium" });
+  assert.equal(withEffort.reasoning_effort, "medium");
+
+  const withoutEffort = buildOpenAIChatParams({ model: "gpt-5.6-terra", prompt: "p" });
+  assert.equal(withoutEffort.reasoning_effort, undefined);
+  assert.deepEqual(Object.keys(withoutEffort).sort(), ["max_completion_tokens", "messages", "model"]);
+});
+
+// ── issue #129 amendment B: per-arm panel geometry overrides ────────────────
+
+test("#129: an unset per-arm panel override inherits the global panel default", () => {
+  const arm = { mode: "panel", slots: armsConfigJson.arms.C.slots };
+  const panel = resolvePanelGeometry(arm, armsConfigJson);
+  assert.equal(panel.ideasPerAgent, armsConfigJson.panel.ideasPerAgent);
+  assert.equal(panel.maxRounds, armsConfigJson.panel.maxRounds);
+  assert.equal(panel.size, armsConfigJson.panel.size);
+  assert.equal(panel.sharing, undefined, "the global block never sets sharing today -- the registered default is undefined");
+});
+
+test("#129: a per-arm panel override wins over the global default, and resolveIdeateAgents actually uses the override, not the fallen-back value", () => {
+  const arm = {
+    mode: "panel",
+    panel: { ideasPerAgent: 99, maxRounds: 7, sharing: "blind" },
+    slots: armsConfigJson.arms.C.slots,
+  };
+  const { agents, maxRounds, sharing } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.notEqual(99, armsConfigJson.panel.ideasPerAgent, "sanity: the override value must differ from the global default");
+  assert.ok(agents.every((a) => a.ideasPerAgent === 99), "resolveIdeateAgents must use the OVERRIDE, not silently fall back to the global panel.ideasPerAgent");
+  assert.equal(maxRounds, 7);
+  assert.equal(sharing, "blind");
+});
+
+test("#129: a per-arm override of only ONE field leaves the others inherited from the global default", () => {
+  const arm = { mode: "panel", panel: { maxRounds: 4 }, slots: armsConfigJson.arms.C.slots };
+  const panel = resolvePanelGeometry(arm, armsConfigJson);
+  assert.equal(panel.maxRounds, 4);
+  assert.equal(panel.ideasPerAgent, armsConfigJson.panel.ideasPerAgent, "ideasPerAgent was not overridden -- must inherit");
+});
+
+test("#129: panel.size is validated against arm.slots.length -- a mismatch throws fail-loud, not silently ignored", () => {
+  const consistent = { mode: "panel", panel: { size: 5 }, slots: armsConfigJson.arms.C.slots };
+  assert.doesNotThrow(() => resolveIdeateAgents(consistent, armsConfigJson));
+
+  const inconsistent = { mode: "panel", panel: { size: 3 }, slots: armsConfigJson.arms.C.slots };
+  assert.throws(() => resolveIdeateAgents(inconsistent, armsConfigJson), /has 5 slots but its panel\.size override is 3/);
+});
+
+test("#129: panel.size is NOT enforced against the inherited GLOBAL default -- only an arm's OWN override is validated", () => {
+  // The global panel block sets size: 5; an ad-hoc 2-slot test arm that never
+  // opts into a per-arm size override must not be held to it -- that would be
+  // a scope-creeping behavior change (see resolvePanelGeometry's header).
+  const arm = { mode: "panel", slots: [{ persona: "p1", model: "claude-haiku-4-5" }, { persona: "p2", model: "claude-haiku-4-5" }] };
+  assert.doesNotThrow(() => resolveIdeateAgents(arm, armsConfigJson));
+});
+
+test("#129: a solo arm setting arm.panel throws -- solo has no panel for geometry to attach to (COULD #7, fix round)", () => {
+  const arm = {
+    mode: "solo",
+    totalIdeasRequested: 30,
+    panel: { ideasPerAgent: 6 }, // nonsensical on a solo arm -- must not be silently ignored
+    slots: [{ persona: "solo", model: "claude-sonnet-5" }],
+  };
+  assert.throws(() => resolveIdeateAgents(arm, armsConfigJson), /is mode "solo" but sets a panel geometry override/);
+});
+
+test("#129: sharing applies to build-on rounds only -- buildIdeateRounds leaves round 1 EMPTY, not overridden", () => {
+  assert.equal(buildIdeateRounds(2, undefined), undefined, "no sharing set -> no rounds array, inherits ideate-core's own default");
+  const rounds = buildIdeateRounds(2, "pool");
+  assert.equal(rounds.length, 2);
+  // Index 0 (round 1) MUST be `{}`, never `{ sharing }` -- fix round, Quine
+  // finding #3. ideate-core's round-1 GENERATION loop never calls
+  // roundConfig, so round-1 behaviour is identical either way, but its
+  // meta.sharing PROVENANCE record does call `roundConfig(1, deps)` (see
+  // node_modules/ideate-core/lib/ideate-core.mjs's `sharing:
+  // Array.from({length: roundsRun}, (_, i) => roundConfig(i + 1, deps).sharing)`)
+  // -- an earlier version of this test asserted `rounds[0] = {sharing}`,
+  // which would make a stored cell's own metadata FALSELY claim round 1 ran
+  // under the override.
+  assert.deepEqual(rounds, [{}, { sharing: "pool" }]);
+});
+
+test("#129: buildIdeateRounds returns undefined (not an empty array) when maxRounds resolves to 0", () => {
+  assert.equal(buildIdeateRounds(0, "pool"), undefined);
+  assert.equal(buildIdeateRounds(undefined, "pool"), undefined);
+});
+
+// ── issue #129 amendment F: stance-neutral solo control (arm AS) ────────────
+
+test("#129: arm AS is registered, personaDisabled, and resolves to an explicit stance-neutral persona", () => {
+  const arm = armsConfigJson.arms.AS;
+  assert.ok(arm, "arm AS must be registered in arms.config.json");
+  assert.equal(arm.mode, "solo");
+  assert.equal(arm.personaDisabled, true);
+  const { agents, maxRounds } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(maxRounds, 1);
+  assert.equal(agents[0].stance, UNIFORM_PERSONA.stance);
+});
+
+// Fix round (Quine finding #6): the ORIGINAL version of the test below
+// compared AS's resolved strategy/temperature against hardcoded literals
+// ("direct", 0.4) rather than against arm A's own resolved values -- because
+// arm A's slot leaves strategy/temperature UNSET, `resolveIdeateAgents(arm A)`
+// itself returns `undefined` for both (the DEFAULT_PERSONAS fallback fill
+// happens one layer deeper, inside the REAL ideate-core, which this repo
+// deliberately never statically imports in a test file -- see the
+// hermetic-CI invariant at the top of this file; `node --test` runs in CI
+// with no `npm install` step at all, so a top-level `import "ideate-core"`
+// would throw ERR_MODULE_NOT_FOUND there). So "compare AS to arm A directly"
+// is not achievable at this layer without breaking that invariant -- the
+// PRAGMATIST constants below are a PINNED ASSUMPTION, sourced explicitly, not
+// a live-verified fact. An ideate-core upgrade reordering DEFAULT_PERSONAS
+// would silently reintroduce the confound this arm exists to remove; a human
+// reviewer must re-check this constant against source when ideate-core's pin
+// (package.json) moves, since no test can safely do it automatically here.
+const PRAGMATIST_TEMPERATURE = 0.4; // node_modules/ideate-core/lib/ideate-core.mjs DEFAULT_PERSONAS[0].temperature, verified 2026-09-08 against ideate-core@0.5.0
+const PRAGMATIST_STRATEGY = "direct"; // node_modules/ideate-core/lib/ideate-core.mjs DEFAULT_PERSONAS[0].strategy, verified 2026-09-08 against ideate-core@0.5.0
+
+test("#129: arm A's slot leaves strategy/temperature UNSET at this harness layer (ideate-core fills them, not us) -- the assumption AS's uniformPersona override is built against", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms.A, armsConfigJson);
+  assert.equal(agents[0].strategy, undefined, "arm A forwards no strategy -- if this ever changes, PRAGMATIST_STRATEGY above needs re-examining, not silent divergence");
+  assert.equal(agents[0].temperature, undefined, "arm A forwards no temperature -- same caveat");
+});
+
+test("#129: arm AS differs from arm A in STANCE ONLY -- model and rounds verified against arm A directly; strategy/temperature verified against the pinned PRAGMATIST assumption above", () => {
+  const a = resolveIdeateAgents(armsConfigJson.arms.A, armsConfigJson);
+  const as = resolveIdeateAgents(armsConfigJson.arms.AS, armsConfigJson);
+
+  assert.equal(as.agents[0].model, a.agents[0].model, "model must match -- AS isolates stance, not the model lever");
+  assert.equal(as.agents[0].strategy, PRAGMATIST_STRATEGY, "AS must not also flip strategy to cot -- that would confound a second lever");
+  assert.equal(as.agents[0].temperature, PRAGMATIST_TEMPERATURE, "AS must reproduce arm A's assumed resolved PRAGMATIST temperature, not UNIFORM_PERSONA's 0.8 default");
+  assert.equal(as.maxRounds, a.maxRounds);
+  assert.equal(as.agents[0].ideasPerAgent, a.agents[0].ideasPerAgent);
+
+  // The one lever that must actually differ. Arm A forwards NO stance of its
+  // own (pinned above), so this is a real, non-vacuous distinction: a
+  // non-empty explicit string vs. a genuinely absent value, not two strings
+  // being compared against each other via a defensive ternary.
+  assert.equal(a.agents[0].stance, undefined);
+  assert.equal(typeof as.agents[0].stance, "string");
+  assert.ok(as.agents[0].stance.length > 0);
+  assert.equal(as.agents[0].stance, UNIFORM_PERSONA.stance);
+});
+
+// ── Fix round 2 (Quine finding): model-facing PERSONA strings were unpinned ──
+// `stance` had a cross-reference assertion (`agents[0].stance ===
+// UNIFORM_PERSONA.stance`, above); `persona` had NO equivalent on either arm
+// A' or arm AS, despite landing in the actual submitted prompt exactly like
+// stance does -- `buildRound1Prompt` (evals/harness/prompts.mjs:62) renders
+// `(persona: ${persona || "generalist"})` into the round-1 prompt verbatim.
+// Mutating `arms.config.json`'s `AS.uniformPersona.persona` back to the
+// literal demand-characteristic string this repo already removed once
+// (`"solo_stance_neutral"`), or mutating `UNIFORM_PERSONA.persona` to
+// something equally suggestive, passed 1090/0 before the two tests below.
+//
+// The fix is two-part, per the review: (1) a cross-reference assertion for
+// `persona`, the same shape the `stance` one already has, so `UNIFORM_PERSONA`
+// stays in sync with what an unoverridden arm (A') actually resolves to; and
+// (2) a VOCABULARY sweep over every registered arm's resolved persona string,
+// because a cross-reference assertion alone only proves internal consistency
+// -- it says nothing about whether the shared string itself is safe to hand
+// to the model. The vocabulary check is what actually closes the class Quine
+// named, not just the two literals in the tree today.
+const EXPERIMENTAL_VOCABULARY = /neutral|control|ablation|disabled|baseline/i;
+
+test("#129 fix round 2: UNIFORM_PERSONA.persona is what an unoverridden personaDisabled arm (A') actually resolves to -- cross-reference, mirroring the existing stance assertion", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms["A'"], armsConfigJson);
+  assert.ok(agents.every((a) => a.persona === UNIFORM_PERSONA.persona), "A' sets no uniformPersona override, so every slot's resolved persona must equal UNIFORM_PERSONA.persona -- not a copy of it that could silently drift");
+});
+
+test("#129 fix round 2: no registered arm's resolved persona string names the experimental construct it participates in -- vocabulary sweep, closes the class rather than pinning today's two literals", () => {
+  const banned = [];
+  for (const [armId, arm] of Object.entries(armsConfigJson.arms)) {
+    const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+    for (const a of agents) {
+      if (typeof a.persona === "string" && EXPERIMENTAL_VOCABULARY.test(a.persona)) {
+        banned.push(`${armId}: "${a.persona}"`);
+      }
+    }
+  }
+  assert.deepEqual(banned, [], "a persona string reaching the model must not name the experimental construct (demand characteristic) -- see prompts.mjs:62/:99 for where it lands verbatim");
+});
+
+test("#129 fix round 2: the vocabulary sweep actually catches a violation (proof it isn't vacuous) -- re-mutating AS's persona back to the removed string", () => {
+  const mutated = JSON.parse(JSON.stringify(armsConfigJson));
+  mutated.arms.AS.uniformPersona.persona = "solo_stance_neutral"; // the exact string this repo already removed once
+  const { agents } = resolveIdeateAgents(mutated.arms.AS, mutated);
+  assert.ok(EXPERIMENTAL_VOCABULARY.test(agents[0].persona), "sanity: the mutated string must actually trip the sweep's own regex");
+});
+
+// `purpose` is on `armsConfigHash`'s DENYLIST (lib/manifest.mjs
+// ARMS_CONFIG_DOC_ONLY_KEYS) -- prose there is never hashed and no code ever
+// reads it, so a comment there explaining why the persona name matters is not
+// a guard, only documentation for a human reader. This is deliberately
+// asserted here rather than merely stated in a PR body, per the review.
+test("#129 fix round 2: arm AS's `purpose` field carries no run-time weight -- armsConfigHash denylist proof", () => {
+  const withoutPurpose = JSON.parse(JSON.stringify(armsConfigJson));
+  delete withoutPurpose.arms.AS.purpose;
+  // Both configs must hash IDENTICALLY: `purpose` prose is documentation the
+  // hash deliberately never covers, so this file's own tests cannot rely on
+  // it to prevent a persona-name regression -- only the vocabulary sweep
+  // above (which reads live resolved output, not config prose) can.
+  assert.equal(armsConfigHash(armsConfigJson), armsConfigHash(withoutPurpose));
+});
+
 test("generate() covers the solo path (Arm A) end-to-end via a fake ideateImpl and completes", async () => {
   const fetchImpl = async (url, opts) => {
     const body = JSON.parse(opts.body);
@@ -354,6 +666,42 @@ test("generate() covers the solo path (Arm A) end-to-end via a fake ideateImpl a
   assert.equal(resp.result.candidates.length, 1); // solo: one agent, one reply of one candidate in this fake
 });
 
+// ── #129 fix round (Quine finding #1): effort must survive the FULL seam --
+// resolveIdeateAgents -> fakeIdeateImpl's complete() call -> #completeSingle
+// -> withCellMaxTokens -> buildAnthropicMessageParams -> the actual submitted
+// request body. A unit test on any ONE of those functions cannot catch a
+// mutation that drops `effort` while passing THROUGH another -- only an
+// end-to-end assertion on the wire body can.
+test("#129: effort survives the full seam end-to-end -- resolveIdeateAgents through withCellMaxTokens to the submitted request body", async () => {
+  const bodies = [];
+  const arm = {
+    mode: "solo",
+    totalIdeasRequested: 30,
+    slots: [{ persona: "solo", model: "claude-sonnet-5", effort: "xhigh" }],
+  };
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("A"),
+    fetchImpl: async (url, opts) => {
+      bodies.push(JSON.parse(opts.body));
+      return jsonResponse(200, { content: [{ type: "text", text: '[{"text":"idea"}]' }], usage: { input_tokens: 10, output_tokens: 5 } });
+    },
+    ideateImpl: fakeIdeateImpl,
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  const resp = await provider.generate(cellFor("A"), arm, { mode: "single", timestamp: "2026-08-02T00:00:00Z" });
+  assert.equal(resp.terminalState, "completed");
+  assert.equal(bodies.length, 1);
+  // This is the assertion that catches `withCellMaxTokens` regressing to an
+  // explicit field rebuild that omits `effort` (Quine's mutation: rewriting
+  // it as `const {effort, ...rest} = req; return {...rest, maxTokens}`) --
+  // that mutation leaves every OTHER test in this file green.
+  assert.deepEqual(bodies[0].output_config, { effort: "xhigh" }, "effort must reach the actual submitted request body, not just an intermediate object");
+});
+
 test("generate() covers the panel path end-to-end via a fake ideateImpl and completes", async () => {
   const provider = new AnthropicBatchProvider({
     apiKey: "test-key",
@@ -375,6 +723,57 @@ test("generate() covers the panel path end-to-end via a fake ideateImpl and comp
   assert.equal(resp.result.candidates.length, 10);
 });
 
+// ── #129 fix round (Quine finding #2): the `rounds` deps built from a
+// resolved `sharing` value must actually REACH ideateImpl. Nothing exercised
+// the `...(rounds !== undefined ? { rounds } : {})` splice at either call
+// site before this -- deleting it from either provider left the whole suite
+// green, because no test ever inspected the `deps` object ideateImpl receives
+// for a `rounds` key.
+
+test("#129: an arm's panel.sharing reaches ideateImpl's deps.rounds on the ANTHROPIC path", async () => {
+  let capturedDeps;
+  const arm = { mode: "panel", panel: { sharing: "blind" }, slots: armsConfigJson.arms.C.slots };
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("C"),
+    fetchImpl: async () => jsonResponse(200, { content: [{ type: "text", text: '[{"text":"idea"}]' }], usage: { input_tokens: 10, output_tokens: 5 } }),
+    ideateImpl: async (input, deps) => {
+      capturedDeps = deps;
+      return { candidates: [], agents: deps.agents, meta: { agentsAttempted: deps.agents.length, agentsFailed: 0 } };
+    },
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  await provider.generate(cellFor("C"), arm, { mode: "single", timestamp: "2026-08-02T00:00:00Z" });
+  assert.ok(Array.isArray(capturedDeps.rounds), "panel.sharing must produce a `rounds` array on deps -- this is the exact splice that silently dropping it leaves untested");
+  assert.equal(capturedDeps.rounds.length, capturedDeps.maxRounds);
+  // round 1 (index 0) must stay EMPTY -- see buildIdeateRounds' header for why
+  // an override there would corrupt meta.sharing's provenance record.
+  assert.deepEqual(capturedDeps.rounds[0], {});
+  assert.ok(capturedDeps.rounds.slice(1).every((r) => r.sharing === "blind"), "every BUILD-ON round (index >= 1) must carry the resolved sharing value");
+});
+
+test("#129: an arm with NO panel.sharing override passes no `rounds` key at all on the ANTHROPIC path -- inherits ideate-core's own default", async () => {
+  let capturedDeps;
+  const provider = new AnthropicBatchProvider({
+    apiKey: "test-key",
+    corpus: CORPUS,
+    armsConfig: armsConfigFor("C"),
+    fetchImpl: async () => jsonResponse(200, { content: [{ type: "text", text: '[{"text":"idea"}]' }], usage: { input_tokens: 10, output_tokens: 5 } }),
+    ideateImpl: async (input, deps) => {
+      capturedDeps = deps;
+      return { candidates: [], agents: deps.agents, meta: { agentsAttempted: deps.agents.length, agentsFailed: 0 } };
+    },
+    sleep: noopSleep,
+    logger: silentLogger,
+  });
+
+  await provider.generate(cellFor("C"), armsConfigJson.arms.C, { mode: "single", timestamp: "2026-08-02T00:00:00Z" });
+  assert.ok(!("rounds" in capturedDeps), "no arm registered today sets panel.sharing, so no `rounds` key should ever reach ideateImpl for them");
+});
+
 // ── Force-strip: no temperature/top_p/top_k for ANY model, Haiku included ───
 
 test("buildAnthropicMessageParams never carries temperature/top_p/top_k, for every model in arms.config.json (Haiku included)", () => {
@@ -393,6 +792,51 @@ test("buildAnthropicMessageParams never carries temperature/top_p/top_k, for eve
     assert.ok(!("top_p" in params), `model ${model} must not carry top_p`);
     assert.ok(!("top_k" in params), `model ${model} must not carry top_k`);
   }
+});
+
+// ── #129 fix round (Quine finding #4): the Haiku-effort throw inside
+// buildAnthropicMessageParams fires AFTER ideate-core's safeComplete has
+// already swallowed it as a per-agent failure -- on a mixed-model panel, the
+// OTHER agents in that cell have already enqueued/submitted/billed by then.
+// This sweep is the REAL fail-loud-before-spend guard: it runs at `npm test`,
+// well before any real run, over the actual registered config -- mirroring
+// the existing force-strip sweep above.
+test("#129: no arm in arms.config.json sets effort on a model outside Anthropic's documented effort support (config-level invariant, fails at npm test, not at spend time)", () => {
+  // Fix round 2 (Quine finding): this test USED to also assert `checked ===
+  // 0`, on the reasoning that the sweep should prove its own loop body isn't
+  // dormant. That reasoning was sound but the assertion was a TRAP: it
+  // encoded "no arm sets effort" as the passing condition, so a perfectly
+  // legitimate future amendment -- an arm setting `effort` on a SUPPORTED
+  // model (sonnet-5, fable-5, ...) -- would trip it with nothing actually
+  // wrong. A failure here would then be ambiguous between "a real
+  // misconfiguration" and "valid effort usage, forgot to bump a stale
+  // literal" -- exactly the shape of test people learn to delete rather than
+  // diagnose. The real invariant this test exists to guard ("no arm sets
+  // effort on an UNSUPPORTED model") is asserted below with no reference to
+  // the count. The loop-body-isn't-dormant proof moved to the standalone
+  // synthetic-config test immediately following this one, which needs no
+  // dependency on what arms.config.json currently contains.
+  for (const [armId, arm] of Object.entries(armsConfigJson.arms)) {
+    for (const slot of arm.slots || []) {
+      if (slot.effort === undefined) continue;
+      if (!slot.model || !slot.model.startsWith("claude-")) continue; // OpenAI models are a separate ladder, no exclusion list applies
+      assert.ok(
+        ANTHROPIC_EFFORT_SUPPORTED_MODELS.has(slot.model),
+        `arm ${armId} sets effort on model ${slot.model}, which is not in Anthropic's documented effort-support list -- this would bill the arm's OTHER slots before failing`,
+      );
+    }
+  }
+});
+
+test("#129: the effort-on-Haiku sweep check actually catches a violation (proof the assertion isn't vacuous)", () => {
+  const synthetic = { X: { slots: [{ model: "claude-haiku-4-5", effort: "low" }] } };
+  let violation = null;
+  for (const [armId, arm] of Object.entries(synthetic)) {
+    for (const slot of arm.slots) {
+      if (slot.effort !== undefined && !ANTHROPIC_EFFORT_SUPPORTED_MODELS.has(slot.model)) violation = armId;
+    }
+  }
+  assert.equal(violation, "X", "a Haiku slot with effort set must be caught by the same logic the real sweep uses");
 });
 
 test("force-strip end-to-end: a fake fetchImpl captures every submitted batch request and none carries temperature/top_p/top_k, across a Haiku panel", async () => {

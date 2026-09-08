@@ -87,6 +87,11 @@ async function fakeIdeateImpl(input, deps) {
         top_p: 0.9,
         maxTokens: 2048,
         persona: agent.persona,
+        // #129 fix round: the real ideate-core@0.5.0 always forwards
+        // `agent.effort` -- see anthropic-batch.test.mjs's fakeIdeateImpl for
+        // the full rationale (the OpenAI path shares withCellMaxTokens with
+        // the Anthropic path, so the same seam gap applies here).
+        effort: agent.effort,
       }),
     ),
   );
@@ -295,6 +300,46 @@ test("mode: 'single' hits /v1/chat/completions, not /v1/batches", async () => {
   assert.equal(resp.terminalState, "completed");
   assert.ok(urls.every((u) => u === "https://api.openai.com/v1/chat/completions"));
   assert.ok(!urls.some((u) => u.includes("/batches")));
+});
+
+// ── #129 fix round: effort and sharing must survive the full seam on the
+// OpenAI path too -- withCellMaxTokens is the SAME shared function the
+// Anthropic path uses, so the same seam gap applies here.
+
+test("#129: effort survives the full seam end-to-end on the OpenAI path -- resolveIdeateAgents through withCellMaxTokens to the submitted request body", async () => {
+  const bodies = [];
+  const arm = { mode: "panel", personaDisabled: false, slots: [{ persona: "p1", model: "gpt-5.6-terra", effort: "medium" }] };
+  const provider = makeProvider({
+    armsConfig: armsConfigFor("H"),
+    fetchImpl: async (url, opts) => {
+      bodies.push(JSON.parse(opts.body));
+      return jsonResponse(200, { choices: [{ message: { content: '[{"text":"idea"}]' } }], usage: { prompt_tokens: 4, completion_tokens: 2 } });
+    },
+  });
+  const resp = await provider.generate(cellFor("H"), arm, { mode: "single" });
+  assert.equal(resp.terminalState, "completed");
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].reasoning_effort, "medium", "effort must reach the actual submitted request body, not just an intermediate object");
+});
+
+test("#129: an arm's panel.sharing reaches ideateImpl's deps.rounds on the OpenAI path", async () => {
+  let capturedDeps;
+  const arm = { mode: "panel", panel: { sharing: "pool" }, slots: armsConfigJson.arms.H.slots };
+  const provider = makeProvider({
+    armsConfig: armsConfigFor("H"),
+    fetchImpl: async () => jsonResponse(200, { choices: [{ message: { content: '[{"text":"idea"}]' } }], usage: { prompt_tokens: 4, completion_tokens: 2 } }),
+    ideateImpl: async (input, deps) => {
+      capturedDeps = deps;
+      return { candidates: [], agents: deps.agents, meta: { agentsAttempted: deps.agents.length, agentsFailed: 0 } };
+    },
+  });
+  await provider.generate(cellFor("H"), arm, { mode: "single" });
+  assert.ok(Array.isArray(capturedDeps.rounds));
+  assert.equal(capturedDeps.rounds.length, capturedDeps.maxRounds);
+  // round 1 (index 0) must stay EMPTY -- see buildIdeateRounds' header
+  // (provider.mjs) for why an override there would corrupt meta.sharing.
+  assert.deepEqual(capturedDeps.rounds[0], {});
+  assert.ok(capturedDeps.rounds.slice(1).every((r) => r.sharing === "pool"));
 });
 
 // ── issue #92: the batch poll ceiling, mirrored from the Anthropic path ─────

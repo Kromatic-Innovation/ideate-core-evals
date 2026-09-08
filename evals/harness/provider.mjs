@@ -989,7 +989,8 @@ export class AnthropicBatchProvider {
       };
     }
 
-    const { agents, maxRounds } = resolveIdeateAgents(arm, this.armsConfig);
+    const { agents, maxRounds, sharing } = resolveIdeateAgents(arm, this.armsConfig);
+    const rounds = buildIdeateRounds(maxRounds, sharing);
 
     // Per-call token accounting, scoped to THIS generate() invocation (one
     // cell). Populated by every `complete()` resolution below, success or
@@ -1074,6 +1075,7 @@ export class AnthropicBatchProvider {
           buildRound2Prompt,
           agents,
           maxRounds,
+          ...(rounds !== undefined ? { rounds } : {}),
           onAgentError: (err, ctx) => {
             this.logger(`AnthropicBatchProvider: agent error (round ${ctx && ctx.round}, agent ${ctx && ctx.agentId}): ${err && err.message}`);
           },
@@ -1718,6 +1720,18 @@ export class AnthropicBatchProvider {
 //               "make prompt levers settable" amendment), not a harness fix.
 //               Pinned by a test so this boundary cannot rot back into a
 //               silent no-consumer field.
+//   effort      REACHES THE WIRE (issue #129 amendment A/C). ideate-core@0.5.0
+//               forwards a slot's `effort` to `complete()` by PLAIN ASSIGNMENT
+//               (lib/ideate-core.mjs: `effort: agent.effort` / `effort:
+//               spec.effort`), deliberately not the `spec.X || base.X`
+//               fallback its siblings use, so `undefined` stays distinguishable
+//               from an explicit value all the way to the request builders
+//               (buildAnthropicMessageParams / buildOpenAIChatParams below),
+//               which forward it verbatim too -- see their headers. Read from
+//               the RAW slot, like `model`, never from the `uniformPersona`
+//               overlay: `effort` is a model-capability lever, not part of the
+//               persona bundle, so a `personaDisabled` arm's uniform persona
+//               must not silently override or blank it (a test pins this).
 
 /**
  * The single persona every slot of a `personaDisabled` arm runs under.
@@ -1750,6 +1764,98 @@ export const UNIFORM_PERSONA = Object.freeze({
   strategy: "cot",
 });
 
+/**
+ * Per-arm panel geometry overrides (issue #129 amendment B).
+ *
+ * `armsConfig.panel` remains the DEFAULT for `size` / `ideasPerAgent` /
+ * `maxRounds` and (new here) `sharing`; an arm may override any subset via
+ * its own `arm.panel` block, and a field the arm does not set inherits the
+ * global default. Both objects are plain arms.config.json DATA -- no
+ * allowlist stripping happens between the file and this function -- so any
+ * override is automatically covered by `armsConfigHash` (lib/manifest.mjs),
+ * the same as every other arms.config.json field (its denylist only excludes
+ * `label`/`purpose`/`_`-prefixed keys, never `panel`).
+ *
+ * `sharing` has no global default today -- `armsConfig.panel` never sets one
+ * -- so the REGISTERED default when nothing sets it is `undefined`: this
+ * harness passes no `rounds` array to ideate-core, and ideate-core's own
+ * `roundConfig` applies ITS default (round 1 blind, build-on rounds 2+ pool
+ * -- node_modules/ideate-core/lib/ideate-core.mjs `roundConfig`). An arm that
+ * DOES set `sharing` gets it applied to every BUILD-ON round only (round 2..
+ * maxRounds), via `buildIdeateRounds` below leaving `rounds[0]` EMPTY.
+ *
+ * CORRECTION (fix round, Quine finding #3): an earlier version of this
+ * comment and of `buildIdeateRounds` claimed `roundConfig` is "only ever
+ * called for round >= 2" and that a round-1 override was "structurally
+ * impossible" -- both false. `resolveMaxRounds`'s `meta.sharing` builder
+ * (node_modules/ideate-core/lib/ideate-core.mjs ~line 504) calls
+ * `roundConfig(i + 1, deps)` for EVERY `i` from 0, i.e. it DOES read
+ * `deps.rounds[0]` -- just for provenance metadata, not for round-1
+ * BEHAVIOUR (the round-1 generation loop above never calls `roundConfig` at
+ * all, so round 1 always runs blind regardless of `deps.rounds[0]`). Filling
+ * index 0 with `{ sharing }` therefore left round 1 correctly running blind
+ * while `meta.sharing` LIED about it (`meta.sharing[0]` would read the
+ * override value, e.g. "pool", even though round 1 ran blind) -- a
+ * provenance corruption a later audit of the study's own result record would
+ * have no way to catch. `buildIdeateRounds` leaves `rounds[0] = {}` so
+ * `roundConfig(1, deps)` falls through to its own `isFirst` default and
+ * `meta.sharing[0]` reports "blind" truthfully. Forcing "pool" onto round 1
+ * would additionally be a real method change (ideate-core documents "round 1
+ * is blind" as deliberate, not a default to override), which this amendment
+ * is geometry, not that -- a second, independent reason index 0 must stay empty.
+ *
+ * `size` is *validated when an ARM explicitly overrides it*, not merely
+ * recorded: nothing else in this harness derives panel width from a scalar
+ * (the real width is `arm.slots.length`, an ORDERED persona -> model
+ * assignment), so an inconsistent per-arm `size` override would otherwise be
+ * silently ignored -- exactly the "a declared field reads as covered but
+ * isn't" shape `lib/manifest.mjs`'s CONFIG_FIELDS header warns against.
+ * `resolveIdeateAgents` throws if an arm's OWN `panel.size` disagrees with its
+ * `slots.length`, fail-loud like `lib/price.mjs`'s `runnerPriceGrid`
+ * missing-rate guard. Deliberately NOT validated against the inherited GLOBAL
+ * default: `armsConfig.panel.size` has been documentation-only since #101
+ * (nothing has ever read it), and this repo's test suite builds small ad-hoc
+ * panels that were never meant to satisfy the registered study's width --
+ * enforcing the global default here would be a scope-creeping behavior
+ * change, not this amendment's fix.
+ */
+export function resolvePanelGeometry(arm, armsConfig) {
+  const global = (armsConfig && armsConfig.panel) || {};
+  const override = (arm && arm.panel) || {};
+  return {
+    size: override.size !== undefined ? override.size : global.size,
+    ideasPerAgent: override.ideasPerAgent !== undefined ? override.ideasPerAgent : global.ideasPerAgent,
+    maxRounds: override.maxRounds !== undefined ? override.maxRounds : global.maxRounds,
+    sharing: override.sharing !== undefined ? override.sharing : global.sharing,
+  };
+}
+
+/**
+ * Build ideate-core's `deps.rounds` array for a resolved `sharing` value
+ * (issue #129 amendment B), or `undefined` when nothing set one (see
+ * `resolvePanelGeometry` above for the inherited-default rationale).
+ *
+ * `rounds[0]` (round 1) is left as `{}`, NEVER `{ sharing }` -- see the
+ * CORRECTION in `resolvePanelGeometry`'s header above. Round-1 GENERATION
+ * behaviour is unaffected either way (ideate-core's round-1 loop never calls
+ * `roundConfig`), but `meta.sharing` DOES read `roundConfig(1, deps).sharing`
+ * for its provenance record, so an `{ sharing }` at index 0 would make the
+ * stored cell's own metadata claim round 1 ran under the override when it
+ * actually ran blind -- a silent provenance corruption, not a behavior bug.
+ */
+export function buildIdeateRounds(maxRounds, sharing) {
+  if (sharing === undefined) return undefined;
+  const n = Number.isFinite(maxRounds) && maxRounds > 0 ? Math.floor(maxRounds) : 0;
+  // An empty array is NOT the same as `undefined` to ideate-core's own
+  // `resolveMaxRounds` (`Array.isArray(deps.rounds) && deps.rounds.length`
+  // gates on a NON-EMPTY array), so a bogus `maxRounds` here would return `[]`
+  // -- which reads as absent to that check anyway, but returning `undefined`
+  // explicitly is more honest about what this function actually resolved
+  // (nothing) than handing back an array that merely happens to be empty.
+  if (n === 0) return undefined;
+  return Array.from({ length: n }, (_, i) => (i === 0 ? {} : { sharing }));
+}
+
 export function resolveIdeateAgents(arm, armsConfig) {
   if (!arm) throw new Error("resolveIdeateAgents: arm is required");
   // Resolved ABOVE the mode branch on purpose. `personaDisabled` means the same
@@ -1759,11 +1865,24 @@ export function resolveIdeateAgents(arm, armsConfig) {
   // which is precisely why it needs pinning now rather than after some future
   // solo ablation is registered and silently runs the wrong persona.
   //
-  // `model` is read from the RAW slot on both paths below, never from the
-  // uniform persona: disabling the persona lever must not disturb the model
-  // assignment, which is the study's actual independent variable (§3.1).
+  // `model` and `effort` are read from the RAW slot on both paths below, never
+  // from the uniform persona: disabling the persona lever must not disturb
+  // the model assignment (the study's actual independent variable, §3.1) or
+  // silently blank a model-capability setting that has nothing to do with
+  // persona content.
   const uniform = arm.personaDisabled ? { ...UNIFORM_PERSONA, ...(arm.uniformPersona || {}) } : null;
   if (arm.mode === "solo") {
+    // A solo arm has no panel to have geometry -- `ideasPerAgent` comes from
+    // `totalIdeasRequested` and `maxRounds` is hardcoded 1 below, so
+    // `arm.panel` (size/ideasPerAgent/maxRounds/sharing) has literally
+    // nothing to attach to on this branch. Fail loud rather than silently
+    // ignoring it (COULD #7, fix round): the same "declared field reads as
+    // covered but isn't" shape the `size` invariant above guards against.
+    if (arm.panel) {
+      throw new Error(
+        `resolveIdeateAgents: arm '${arm.label || "(unlabeled)"}' is mode "solo" but sets a panel geometry override -- solo arms have no panel; remove arm.panel or set mode to "panel"`,
+      );
+    }
     const rawSlot = (arm.slots && arm.slots[0]) || {};
     const slot = uniform ? { ...rawSlot, ...uniform } : rawSlot;
     return {
@@ -1775,14 +1894,29 @@ export function resolveIdeateAgents(arm, armsConfig) {
           temperature: slot.temperature,
           strategy: slot.strategy,
           model: rawSlot.model,
+          effort: rawSlot.effort,
           ideasPerAgent: arm.totalIdeasRequested,
         },
       ],
       maxRounds: 1,
     };
   }
-  const panel = (armsConfig && armsConfig.panel) || {};
+  const panel = resolvePanelGeometry(arm, armsConfig);
   const slots = arm.slots || [];
+  // Validated against an EXPLICIT per-arm override only, never the inherited
+  // global default: `armsConfig.panel.size` has been documentation-only since
+  // #101 (nothing ever read it), and this repo's own test suite -- and any
+  // future one -- builds small ad-hoc panels (2 slots, 3 slots) that were
+  // never meant to satisfy the registered study's panel width. Holding those
+  // to a global constant they never opted into would be a scope-creeping
+  // behavior change, not a bug fix. An arm that WRITES `panel.size` is asking
+  // to be held to it, which is exactly what makes this a real, non-decorative
+  // invariant rather than a silently-ignored field.
+  if (arm.panel && arm.panel.size !== undefined && slots.length !== arm.panel.size) {
+    throw new Error(
+      `resolveIdeateAgents: arm '${arm.label || "(unlabeled)"}' has ${slots.length} slots but its panel.size override is ${arm.panel.size} -- check arms.config.json`,
+    );
+  }
   // The persona-disabled ablation resolves ONE persona for the whole panel and
   // applies it to every slot, so the slots cannot drift apart the way five
   // hand-copied stances could.
@@ -1799,10 +1933,12 @@ export function resolveIdeateAgents(arm, armsConfig) {
         temperature: spec.temperature,
         strategy: spec.strategy,
         model: slot.model,
+        effort: slot.effort,
         ideasPerAgent: panel.ideasPerAgent,
       };
     }),
     maxRounds: panel.maxRounds,
+    sharing: panel.sharing,
   };
 }
 
@@ -1840,13 +1976,78 @@ export function withCellMaxTokens(req, cellMaxTokens) {
 // allowlist, so there is no code path that could carry a sampling param
 // through even by accident (as opposed to a strip-after-the-fact `delete`,
 // which a future edit could bypass by constructing params a different way).
+//
+// `effort` is NOT part of that strip: unlike temperature/top_p/top_k, §3.3
+// never names it, and the pre-registration amendment (issue #129) that adds
+// it is explicitly about making it a SETTABLE lever, not another one to
+// suppress. It is still added EXPLICITLY (allowlist, not a spread) so the
+// force-strip's auditability is unchanged -- a reviewer can see every field
+// this builder ever emits by reading the function.
+//
+// Wire shape verified first-party against
+// https://platform.claude.com/docs/en/build-with-claude/effort (fetched
+// 2026-09-08): the request field is `output_config.effort` (a nested object),
+// NOT a bare top-level `effort`. Ladder for this study's Anthropic models:
+// low | medium | high | xhigh | max. "Supported models" per that page:
+// claude-fable-5-1, claude-mythos-5-1, claude-fable-5, claude-mythos-5,
+// claude-mythos-preview, claude-opus-5, claude-opus-4-8, claude-opus-4-7,
+// claude-opus-4-6, claude-opus-4-5-20251101, claude-sonnet-5, claude-sonnet-4-6.
+// Of the three Anthropic models arms.config.json actually uses
+// (claude-opus-5, claude-sonnet-5, claude-haiku-4-5), Haiku 4.5 is NOT on
+// that list -- per the same source, models that support only extended
+// thinking (Haiku 4.5 among them) take `thinking: {type:"enabled",
+// budget_tokens:N}` instead and are expected to reject `output_config.effort`.
+// No arm sets `effort` on a Haiku slot today, so this throws only if a future
+// registration amendment tries to.
+//
+// CORRECTION (fix round, Quine finding #4): this throw is NOT "fail loud
+// before spend" on its own -- ideate-core calls this builder (indirectly, via
+// `complete()`) from inside its own `safeComplete`, which SWALLOWS a thrown
+// error (`catch (err) { onAgentError(err, ctx); return null; }`) so that one
+// bad agent never sinks a whole panel. On a mixed-model panel (arm G's shape:
+// 3 Anthropic + 2 OpenAI models in one cell) with `effort` set on a Haiku
+// slot, the OTHER four agents in that cell still enqueue, submit, and bill
+// before the cell fails as undersized -- this throw catches the malformed
+// REQUEST, but not before the panel's other slots have already spent. The
+// real fail-loud-before-spend guard is the config-level invariant test in
+// anthropic-batch.test.mjs (sweeping arms.config.json, mirroring the
+// existing force-strip sweep) -- that fails at `npm test`, well before any
+// run against a real API. This throw stays as defense-in-depth for a slot
+// resolved outside arms.config.json (a hand-built arm, a future config
+// source), but is not itself the before-spend guarantee.
+export const ANTHROPIC_EFFORT_SUPPORTED_MODELS = new Set([
+  "claude-fable-5-1",
+  "claude-mythos-5-1",
+  "claude-fable-5",
+  "claude-mythos-5",
+  "claude-mythos-preview",
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-opus-4-5-20251101",
+  "claude-sonnet-5",
+  "claude-sonnet-4-6",
+]);
+
 export function buildAnthropicMessageParams(req) {
-  return {
+  const params = {
     model: req.model,
     max_tokens: req.maxTokens ?? 2048,
     messages: [{ role: "user", content: req.prompt }],
     // Deliberately no temperature / top_p / top_k, for any model. See above.
   };
+  if (req.effort !== undefined) {
+    if (!ANTHROPIC_EFFORT_SUPPORTED_MODELS.has(req.model)) {
+      throw new Error(
+        `buildAnthropicMessageParams: model '${req.model}' does not support output_config.effort ` +
+          `(verified against platform.claude.com/docs/en/build-with-claude/effort, 2026-09-08) -- ` +
+          `omit effort for this slot, or use thinking:{type:"enabled",budget_tokens} instead`,
+      );
+    }
+    params.output_config = { effort: req.effort };
+  }
+  return params;
 }
 
 // ── Shared Anthropic transport, exported for reuse by the judge scorer (#21) ──
@@ -2170,7 +2371,8 @@ export class OpenAIBatchProvider {
       return { terminalState: "failed", failureKind: "harness_error", detail: `OpenAIBatchProvider: no corpus brief found for briefId '${cell.briefId}'`, tokens: { tokens_by_model: {} } };
     }
 
-    const { agents, maxRounds } = resolveIdeateAgents(arm, this.armsConfig);
+    const { agents, maxRounds, sharing } = resolveIdeateAgents(arm, this.armsConfig);
+    const rounds = buildIdeateRounds(maxRounds, sharing);
     const tokensByModel = {};
     const addUsage = (model, usage) => {
       if (!model || !usage) return;
@@ -2219,6 +2421,7 @@ export class OpenAIBatchProvider {
           buildRound2Prompt,
           agents,
           maxRounds,
+          ...(rounds !== undefined ? { rounds } : {}),
           onAgentError: (err, ctx) => {
             this.logger(`OpenAIBatchProvider: agent error (round ${ctx && ctx.round}, agent ${ctx && ctx.agentId}): ${err && err.message}`);
           },
@@ -2692,14 +2895,33 @@ export class OpenAIBatchProvider {
  * sampling param, for ANY model (§3.3 force-strip; see the class header and the
  * matching buildAnthropicMessageParams rationale). A future edit cannot leak a
  * temperature through because there is no field-copy path that would carry one.
+ *
+ * `effort` (issue #129 amendment C) IS added, explicitly, as `reasoning_effort`
+ * — verified first-party against
+ * https://developers.openai.com/api/docs/api-reference/chat/create (fetched
+ * 2026-09-08): "Constrains effort on reasoning for reasoning models. Currently
+ * supported values are none, minimal, low, medium, high, xhigh, and max" — a
+ * top-level string field on POST /v1/chat/completions, the endpoint this
+ * builder targets. This is a WIDER ladder than Anthropic's five-value one
+ * (adds `none`/`minimal`); this builder does not narrow it, since arms.config.json
+ * is the place that decides what value an arm actually sends. Unlike the
+ * Anthropic builder, no per-model support check is added here: the source
+ * page describes `reasoning_effort` as available to "reasoning models"
+ * generally (including the gpt-5.6 family arms.config.json uses) with no
+ * documented per-model exclusion the way Haiku 4.5 is excluded on the
+ * Anthropic side.
  */
 export function buildOpenAIChatParams(req) {
-  return {
+  const params = {
     model: req.model,
     messages: [{ role: "user", content: req.prompt }],
     max_completion_tokens: req.maxTokens ?? 2048,
     // Deliberately no temperature / top_p / top_k, for any model. See above.
   };
+  if (req.effort !== undefined) {
+    params.reasoning_effort = req.effort;
+  }
+  return params;
 }
 
 // Exported (issue #77): OpenAIJudgeProvider (evals/judge/score.mjs) drives the
