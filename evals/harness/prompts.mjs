@@ -84,8 +84,13 @@ export function buildRound1Prompt(args = {}) {
  * (deduped, for "pool" sharing) candidate objects from prior rounds -- each
  * already carries a `.text` field, which is all this prompt needs.
  *
- * @param {object} args  ideate-core's round2 prompt args:
- *   { context, agent, persona, stance, temperature, seeds, pool, sharing,
+ * @param {object} args  ideate-core's round2 prompt args -- ideate-core's
+ *   round2 request builder spreads `round1PromptArgs(context, agent)` first
+ *   (see node_modules/ideate-core/lib/ideate-core.mjs), so `strategy` (and
+ *   every other round-1 field) is present here too, not just the fields
+ *   added for round 2:
+ *   { context, agent, persona, stance, temperature, temperatureValue,
+ *     strategy, ideasPerAgent, model, seeds, pool, sharing,
  *     buildOnDirective, incubation, round }
  * @returns {string}
  */

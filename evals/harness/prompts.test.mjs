@@ -158,9 +158,12 @@ test("#130 mutation-proof: promptTemplateHash's payload contains BOTH the direct
   assert.notEqual(payload.round1Direct, payload.round1Cot);
   assert.notEqual(payload.round2Direct, payload.round2Cot);
 
-  // A payload built with the CoT branches swapped in for the direct ones
-  // must hash differently -- if a future edit accidentally rendered the same
-  // strategy twice under different keys, this would catch it.
+  // Sanity check on the fixture, not additional coverage: this merely
+  // re-confirms the `notEqual` assertions above by taking a visibly
+  // different payload shape and checking it hashes differently too. The
+  // real guard is the `hashOf(payload) === promptTemplateHash()` assertion
+  // earlier in this test -- that is what fails if the real payload ever
+  // stops rendering one of the four branches.
   const collapsedPayload = {
     ...payload,
     round1Direct: payload.round1Cot,
