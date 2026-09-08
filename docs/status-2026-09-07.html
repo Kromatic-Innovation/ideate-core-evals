@@ -1,0 +1,699 @@
+<title>Distinct Ideas Per Dollar</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground:      #F5F8F9;
+    --surface:     #FFFFFF;
+    --surface-sub: #ECF1F3;
+    --ink:         #0F1A1F;
+    --ink-2:       #35484F;
+    --muted:       #5D7078;
+    --rule:        #D8E3E7;
+    --rule-soft:   #E7EEF1;
+    --accent:      #0A7FA8;
+    --arm-a:       #0A7FA8;
+    --arm-b:       #C05A21;
+    --stop:        #A3352E;
+    --warn:        #8A5B0C;
+    --go:          #2C6A4F;
+    --stop-bg:     #FAEDEC;
+    --warn-bg:     #FBF3E4;
+    --go-bg:       #E9F3EE;
+
+    --f-display: "Newsreader", "Iowan Old Style", Georgia, serif;
+    --f-body:    "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --f-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0D1418;
+      --surface:     #131C21;
+      --surface-sub: #1A252B;
+      --ink:         #E4EDF1;
+      --ink-2:       #BACAD1;
+      --muted:       #8DA1AA;
+      --rule:        #24323A;
+      --rule-soft:   #1B262C;
+      --accent:      #2E9CC4;
+      --arm-a:       #2E9CC4;
+      --arm-b:       #CE7736;
+      --stop:        #E08079;
+      --warn:        #D5A353;
+      --go:          #6FBF95;
+      --stop-bg:     #2A1B1A;
+      --warn-bg:     #2A2114;
+      --go-bg:       #16281F;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #0D1418;
+    --surface:     #131C21;
+    --surface-sub: #1A252B;
+    --ink:         #E4EDF1;
+    --ink-2:       #BACAD1;
+    --muted:       #8DA1AA;
+    --rule:        #24323A;
+    --rule-soft:   #1B262C;
+    --accent:      #2E9CC4;
+    --arm-a:       #2E9CC4;
+    --arm-b:       #CE7736;
+    --stop:        #E08079;
+    --warn:        #D5A353;
+    --go:          #6FBF95;
+    --stop-bg:     #2A1B1A;
+    --warn-bg:     #2A2114;
+    --go-bg:       #16281F;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3rem;
+  }
+
+  /* ---------- masthead ---------- */
+
+  .mast { display: flex; flex-direction: column; gap: 1rem; }
+
+  .kicker {
+    font-family: var(--f-mono);
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+  }
+  .kicker span { white-space: nowrap; }
+
+  h1 {
+    font-family: var(--f-display);
+    font-size: clamp(2.1rem, 6vw, 3rem);
+    font-weight: 500;
+    line-height: 1.08;
+    letter-spacing: -0.018em;
+    text-wrap: balance;
+    margin: 0;
+  }
+
+  .standfirst {
+    font-family: var(--f-display);
+    font-size: 1.2rem;
+    line-height: 1.5;
+    color: var(--ink-2);
+    max-width: var(--measure);
+    margin: 0;
+  }
+  .standfirst strong { font-weight: 600; color: var(--ink); }
+
+  .verdict {
+    border-left: 3px solid var(--accent);
+    padding: 0.15rem 0 0.15rem 1.15rem;
+    font-size: 1rem;
+    color: var(--ink-2);
+    max-width: var(--measure);
+  }
+  .verdict b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- sections ---------- */
+
+  section { display: flex; flex-direction: column; gap: 1.1rem; }
+
+  h2 {
+    font-family: var(--f-display);
+    font-size: 1.6rem;
+    font-weight: 500;
+    letter-spacing: -0.012em;
+    line-height: 1.2;
+    margin: 0;
+    text-wrap: balance;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  h3 {
+    font-family: var(--f-body);
+    font-size: 0.94rem;
+    font-weight: 600;
+    letter-spacing: 0.005em;
+    margin: 0;
+    color: var(--ink);
+  }
+
+  p { margin: 0; max-width: var(--measure); }
+  p + p { margin-top: 0.85rem; }
+
+  a { color: var(--accent); text-underline-offset: 2px; }
+
+  code, .mono { font-family: var(--f-mono); font-size: 0.86em; }
+  code {
+    background: var(--surface-sub);
+    padding: 0.1em 0.34em;
+    border-radius: 3px;
+  }
+
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ---------- phase ledger (a real sequence) ---------- */
+
+  .ledger { display: flex; flex-direction: column; }
+
+  .phase {
+    display: grid;
+    grid-template-columns: 3.4rem 1fr auto;
+    gap: 0.4rem 1rem;
+    align-items: baseline;
+    padding: 0.95rem 0;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .phase:first-child { border-top: 1px solid var(--rule-soft); }
+
+  .phase-id {
+    font-family: var(--f-mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+  .phase-name { font-weight: 600; font-size: 0.95rem; }
+  .phase-note {
+    grid-column: 2 / -1;
+    font-size: 0.88rem;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  .chip {
+    font-family: var(--f-mono);
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 0.2rem 0.5rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .chip.pass   { background: var(--go-bg);   color: var(--go); }
+  .chip.part   { background: var(--warn-bg); color: var(--warn); }
+  .chip.none   { background: var(--stop-bg); color: var(--stop); }
+
+  /* ---------- the refusal callout ---------- */
+
+  .refusal {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--stop);
+    padding: 1.3rem 1.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .refusal .src {
+    font-family: var(--f-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .refusal .quote {
+    font-family: var(--f-mono);
+    font-size: 0.95rem;
+    font-weight: 600;
+    line-height: 1.45;
+    color: var(--stop);
+  }
+  .refusal p { font-size: 0.9rem; color: var(--muted); }
+
+  /* ---------- figure ---------- */
+
+  figure {
+    margin: 0;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 1.4rem 1.2rem 1.1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+  .fig-head { display: flex; flex-direction: column; gap: 0.3rem; }
+  .fig-title { font-weight: 600; font-size: 0.95rem; }
+  .fig-sub { font-size: 0.84rem; color: var(--muted); line-height: 1.5; }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.3rem;
+    font-size: 0.84rem;
+    color: var(--ink-2);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 0.45rem; }
+  .swatch { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+
+  .chart-scroll { overflow-x: auto; }
+  svg.chart { display: block; width: 100%; min-width: 460px; height: auto; }
+
+  figcaption { font-size: 0.82rem; color: var(--muted); line-height: 1.5; }
+
+  /* ---------- tables ---------- */
+
+  .t-wrap { overflow-x: auto; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.88rem;
+    min-width: 24rem;
+  }
+  caption {
+    text-align: left;
+    font-size: 0.8rem;
+    color: var(--muted);
+    padding-bottom: 0.55rem;
+    line-height: 1.5;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.5rem 0.85rem 0.5rem 0;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  thead th {
+    font-family: var(--f-mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--f-mono); padding-right: 0; }
+  tbody tr:last-child td { border-bottom: none; }
+  .win { font-weight: 600; }
+
+  /* ---------- checks ---------- */
+
+  .checks { display: flex; flex-direction: column; gap: 0; }
+  .check {
+    display: grid;
+    grid-template-columns: 1.5rem 1fr;
+    gap: 0.75rem;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--rule-soft);
+    align-items: start;
+  }
+  .check:first-child { border-top: 1px solid var(--rule-soft); }
+  .tick {
+    font-family: var(--f-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--go);
+    line-height: 1.62;
+  }
+  .check-body { font-size: 0.9rem; line-height: 1.55; }
+  .check-body b { font-weight: 600; }
+  .check-body .sub { color: var(--muted); }
+
+  /* ---------- limitations ---------- */
+
+  .lims { margin: 0; padding-left: 1.35rem; display: flex; flex-direction: column; gap: 0.7rem; }
+  .lims li { padding-left: 0.25rem; font-size: 0.94rem; max-width: var(--measure); }
+  .lims li::marker { font-family: var(--f-mono); font-size: 0.8rem; color: var(--muted); }
+  .lims b { font-weight: 600; }
+
+  /* ---------- asks ---------- */
+
+  .asks { display: flex; flex-direction: column; gap: 0.75rem; }
+  .ask {
+    display: grid;
+    grid-template-columns: 1.9rem 1fr;
+    gap: 0.85rem;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    padding: 0.95rem 1.1rem;
+  }
+  .ask-n {
+    font-family: var(--f-mono);
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .ask-t { font-weight: 600; font-size: 0.94rem; margin-bottom: 0.2rem; }
+  .ask-d { font-size: 0.88rem; color: var(--muted); line-height: 1.55; }
+
+  .footnote {
+    font-size: 0.8rem;
+    color: var(--muted);
+    line-height: 1.6;
+    border-top: 1px solid var(--rule);
+    padding-top: 1.1rem;
+    max-width: var(--measure);
+  }
+
+  a:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  @media (max-width: 34rem) {
+    .phase { grid-template-columns: 2.8rem 1fr; }
+    .phase .chip { grid-row: 1; grid-column: 2; justify-self: start; margin-top: 0.3rem; }
+    .phase-name { grid-column: 2; }
+  }
+</style>
+
+<div class="page">
+
+  <header class="mast">
+    <div class="kicker">
+      <span>ideate-core-evals</span>
+      <span>Status readout</span>
+      <span>7 Sep 2026</span>
+      <span>cfg 0000daa58e5a</span>
+    </div>
+    <h1>Distinct ideas per dollar</h1>
+    <p class="standfirst">The instrument is built and behaving. The study is not done — it measures diversity, not quality, and the half of the engine that turns more ideas into better ideas is never run.</p>
+    <div class="verdict">
+      <b>2 of 9 arms</b> and <b>6 of 24 briefs</b> have been touched. The registered analysis returns <b>0 of 5 hypotheses estimable</b>. What exists is a working harness plus a smoke run — not results.
+    </div>
+  </header>
+
+  <section>
+    <h2>Where the study stands</h2>
+    <p>Against the phase ladder registered in <code>PREREGISTRATION.md</code> §8.3. The phases are gated in order, so the ordering here is load-bearing, not presentational.</p>
+    <div class="ledger">
+      <div class="phase">
+        <div class="phase-id">0</div>
+        <div class="phase-name">Negative controls + DAT replication</div>
+        <div class="chip pass">Passed</div>
+        <div class="phase-note">Run live against Voyage-4-lite. All three controls cleared: duplicate pool, random-text pool, DAT ordering.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-id">2a</div>
+        <div class="phase-name">The ~20-run smoke study</div>
+        <div class="chip part">Ran, unsigned</div>
+        <div class="phase-note">20 cells in <code>results/</code> — arms A and B × 2 briefs × 5 replicates. Issue #8 is still open and marked <code>needs-decision</code>; Phase 2 does not proceed until someone signs it off.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-id">2</div>
+        <div class="phase-name">The pilot, and the replicate count it exists to determine</div>
+        <div class="chip part">Partial</div>
+        <div class="phase-note">16 arm-B cells across 4 briefs. Arm D returned 0 of 3 — Opus pools truncated by the flat <code>max_tokens</code> of issue #122. Has not produced the replicate count it exists to produce.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-id">3</div>
+        <div class="phase-name">The confirmatory grid</div>
+        <div class="chip none">Not started</div>
+        <div class="phase-note">The 9-arm × 24-brief run the whole design exists to support. Projected ~$79, ~$160 with contingency.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-id">—</div>
+        <div class="phase-name">Judge validation gate</div>
+        <div class="chip none">Not cleared</div>
+        <div class="phase-note">Issue #16, blocked on Si et al. expert-score access. Until it clears, every idea-level metric is exploratory by construction (Appendix B item 7).</div>
+      </div>
+    </div>
+
+    <div class="refusal">
+      <div class="src">evals/analysis/analysis.mjs — on results/</div>
+      <div class="quote">REGISTERED FAMILY NOT ESTIMABLE FROM THIS ARM SUBSET — 5 of 5 registered hypotheses cannot be estimated.</div>
+      <p>This refusal is the honest headline, and it is the harness working as designed: it declines to substitute a present arm for an absent one, and keeps each hypothesis in its Holm slot at p=1 rather than shrinking the family to whatever happened to run.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>The finding, and the confound that nearly ate it</h2>
+    <p>On raw pool counts the multi-agent panel looks like the winner. Arm B (five Haiku agents) reaches <span class="mono num">30.40</span> distinct ideas against arm A's <span class="mono num">27.10</span>, at slightly lower cost.</p>
+    <p>But B produced <b>60 candidates to A's 30</b>. Since <code>distinct_k</code> rises with pool size, that comparison is close to meaningless. Rarefying both arms down to a matched 27 candidates reverses the ordering — and restricting both to round-1 output only, so the round counts match too, leaves the reversal intact.</p>
+
+    <figure>
+      <div class="fig-head">
+        <div class="fig-title">The panel's advantage does not survive matching on volume</div>
+        <div class="fig-sub">Mean <code>distinct_k</code> per cell, n = 10 cells per arm. Rarefaction at r = 1000 draws, pinned seed, registered equivalence threshold.</div>
+      </div>
+      <div class="legend">
+        <span><span class="swatch" style="background: var(--arm-a);"></span> Arm A — solo Sonnet 5</span>
+        <span><span class="swatch" style="background: var(--arm-b);"></span> Arm B — 5× Haiku 4.5 panel</span>
+      </div>
+      <div class="chart-scroll">
+        <svg class="chart" viewBox="0 0 720 350" role="img" aria-label="Line chart. Arm A holds near 25 distinct ideas across all three measurement bases. Arm B starts highest at 30.4 on full pools, then drops to 17.1 when rarefied to 27 candidates and 16.4 on round-one candidates only, crossing below arm A.">
+          <!-- gridlines -->
+          <g stroke="var(--rule-soft)" stroke-width="1">
+            <line x1="150" y1="300" x2="690" y2="300"></line>
+            <line x1="150" y1="225.7" x2="690" y2="225.7"></line>
+            <line x1="150" y1="151.4" x2="690" y2="151.4"></line>
+            <line x1="150" y1="77.1" x2="690" y2="77.1"></line>
+          </g>
+          <!-- y axis labels -->
+          <g fill="var(--muted)" font-family="IBM Plex Mono, monospace" font-size="11" text-anchor="end">
+            <text x="140" y="304">0</text>
+            <text x="140" y="229.7">10</text>
+            <text x="140" y="155.4">20</text>
+            <text x="140" y="81.1">30</text>
+          </g>
+          <text x="32" y="170" fill="var(--muted)" font-family="IBM Plex Mono, monospace" font-size="11" text-anchor="middle" transform="rotate(-90 32 170)">mean distinct_k</text>
+
+          <!-- x category labels -->
+          <g fill="var(--ink-2)" font-family="IBM Plex Sans, sans-serif" font-size="12" text-anchor="middle">
+            <text x="220" y="324">Full pool</text>
+            <text x="430" y="324">Rarefied to 27</text>
+            <text x="640" y="324">Round 1 only, to 27</text>
+          </g>
+          <g fill="var(--muted)" font-family="IBM Plex Mono, monospace" font-size="10" text-anchor="middle">
+            <text x="220" y="340">A:30 vs B:60 cand.</text>
+            <text x="430" y="340">matched volume</text>
+            <text x="640" y="340">matched volume + rounds</text>
+          </g>
+
+          <!-- series lines -->
+          <polyline points="220,98.7 430,117.5 640,117.5" fill="none" stroke="var(--arm-a)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></polyline>
+          <polyline points="220,74.2 430,172.8 640,178.0" fill="none" stroke="var(--arm-b)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></polyline>
+
+          <!-- markers, 2px surface ring -->
+          <g stroke="var(--surface)" stroke-width="2">
+            <circle cx="220" cy="98.7" r="5.5" fill="var(--arm-a)"><title>Arm A, full pool: 27.10</title></circle>
+            <circle cx="430" cy="117.5" r="5.5" fill="var(--arm-a)"><title>Arm A, rarefied to 27: 24.57</title></circle>
+            <circle cx="640" cy="117.5" r="5.5" fill="var(--arm-a)"><title>Arm A, round 1 only, rarefied to 27: 24.57</title></circle>
+            <circle cx="220" cy="74.2" r="5.5" fill="var(--arm-b)"><title>Arm B, full pool: 30.40</title></circle>
+            <circle cx="430" cy="172.8" r="5.5" fill="var(--arm-b)"><title>Arm B, rarefied to 27: 17.13</title></circle>
+            <circle cx="640" cy="178.0" r="5.5" fill="var(--arm-b)"><title>Arm B, round 1 only, rarefied to 27: 16.42</title></circle>
+          </g>
+
+          <!-- direct value labels -->
+          <g font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600">
+            <text x="220" y="90" fill="var(--arm-a)" text-anchor="middle" dy="-6">27.10</text>
+            <text x="430" y="117.5" fill="var(--arm-a)" text-anchor="middle" dy="-12">24.57</text>
+            <text x="640" y="117.5" fill="var(--arm-a)" text-anchor="middle" dy="-12">24.57</text>
+            <text x="220" y="74.2" fill="var(--arm-b)" text-anchor="middle" dy="-12">30.40</text>
+            <text x="430" y="172.8" fill="var(--arm-b)" text-anchor="middle" dy="20">17.13</text>
+            <text x="640" y="178.0" fill="var(--arm-b)" text-anchor="middle" dy="20">16.42</text>
+          </g>
+
+          <!-- axis -->
+          <line x1="150" y1="300" x2="690" y2="300" stroke="var(--rule)" stroke-width="1"></line>
+        </svg>
+      </div>
+      <figcaption>The crossing between the first and second position is the whole result: arm B's lead is bought with volume. The flat segment on the right is the check that matters — arm B's second round appended 30 more candidates and moved rarefied <code>distinct_k</code> from 16.42 to 17.13, so the reversal is not an artifact of the extra round.</figcaption>
+    </figure>
+
+    <div class="t-wrap">
+      <table>
+        <caption>The same figures, with cost. Dollars priced at read time from the pinned rate table in <code>lib/price.mjs</code>.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Arm</th>
+            <th scope="col" class="n">Candidates</th>
+            <th scope="col" class="n">Full pool</th>
+            <th scope="col" class="n">Rarefied 27</th>
+            <th scope="col" class="n">Round 1 only</th>
+            <th scope="col" class="n">Mean cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">A — solo Sonnet 5</th>
+            <td class="n">30</td>
+            <td class="n">27.10</td>
+            <td class="n win">24.57</td>
+            <td class="n win">24.57</td>
+            <td class="n">$0.0397</td>
+          </tr>
+          <tr>
+            <th scope="row">B — 5× Haiku 4.5</th>
+            <td class="n">60</td>
+            <td class="n win">30.40</td>
+            <td class="n">17.13</td>
+            <td class="n">16.42</td>
+            <td class="n">$0.0382</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p><b>What this does not show.</b> Arm A is Sonnet and arm B is Haiku, so panel-versus-solo is still fully confounded with Sonnet-versus-Haiku. This cannot separate “the panel doesn't help” from “Haiku is less diverse than Sonnet.” <b>Arm C — a homogeneous Sonnet panel — is the cell that separates them, and it has not been run.</b> Present this as the signal that makes arm C urgent, not as a refutation of the product.</p>
+  </section>
+
+  <section>
+    <h2>Quantity is not quality — and quality is the part we cannot measure</h2>
+    <p>In human ideation, more ideas produce better ideas <em>only through narrowing</em>. So the honest question is whether combining models and providers yields more diverse or better ideas — and whether we can even tell.</p>
+
+    <h3>Can we identify the best ideas? No.</h3>
+    <p>Three independent reasons, all already on the record:</p>
+    <ol class="lims">
+      <li><b>“Best” has no single definition here, by design.</b> §6.3 forbids collapsing novelty and feasibility into one score, and the judge enforces it at write time with <code>assertAxesNotCollapsed</code>.</li>
+      <li><b>The answer key cannot validate a judge.</b> Human–human split-half balanced accuracy on the Si et al. slice is <b>0.5534, CI [0.4483, 0.6702]</b> — it does not exclude chance. Expert humans do not agree with each other above chance on that slice, so no LLM judge can be validated against it. Idea-level metrics are exploratory <em>by construction</em>, not pending a gate that might later pass.</li>
+      <li><b>Zero registered hypotheses are about quality.</b> H1–H4 measure <code>distinct_k</code>; H5 measures judge validity. The study measures <b>diversity per dollar</b>. That is its scope.</li>
+    </ol>
+    <p>Issue #52's crowdsourced human rating panel is the only route to a quality answer that doesn't depend on an unvalidatable judge. It is registered as exploratory, <code>moscow:could</code>, unscoped and unfunded — a fund-or-drop decision.</p>
+
+    <h3>The solo baseline is stance-handicapped</h3>
+    <p><code>arms.config.json</code> claims “the ONLY thing varying between arms is model assignment.” <b>That is false for arm A against any panel arm.</b></p>
+    <div class="t-wrap">
+      <table>
+        <thead>
+          <tr><th scope="col">&nbsp;</th><th scope="col">Arm A</th><th scope="col">Arm B</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">Agents</th><td class="n">1</td><td class="n">5</td></tr>
+          <tr><th scope="row">Stances</th><td>Pragmatist only</td><td>Pragmatist, Contrarian, Domain-expert, Outsider-analogy, Visionary</td></tr>
+          <tr><th scope="row">Temperature</th><td class="n">0.4</td><td class="n">0.4 – 1.0</td></tr>
+          <tr><th scope="row">Rounds</th><td class="n">1</td><td class="n">2</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Arm A's sole agent is instructed to <em>“prefer clarity and feasibility over cleverness.”</em> This cuts both ways, and both directions matter:</p>
+    <ul class="lims" style="list-style: disc;">
+      <li><b>On diversity the handicap runs against the finding.</b> A wins rarefied <code>distinct_k</code> despite being the narrowest stance at the lowest temperature — which strengthens that result.</li>
+      <li><b>On originality the handicap explains the finding.</b> A was told to be pragmatic and scores exactly like it.</li>
+    </ul>
+    <div class="t-wrap">
+      <table>
+        <caption>Exploratory judged originality, rarefied to 27 candidates (r = 1000, pinned seed). Judge <code>gpt-5.6-terra</code> — the only judge that scored both arms. The judge is unvalidated; these are descriptives, not results.</caption>
+        <thead>
+          <tr><th scope="col">Measure</th><th scope="col" class="n">Arm A</th><th scope="col" class="n">Arm B</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">Max originality (round 1, matched volume)</th><td class="n">3.64</td><td class="n win">6.98</td></tr>
+          <tr><th scope="row">Top-5 mean originality (round 1)</th><td class="n">3.10</td><td class="n win">6.31</td></tr>
+          <tr><th scope="row">Mean feasibility (full pool)</th><td class="n win">9.05</td><td class="n">6.92</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The originality gap is <b>not</b> a volume artifact — it survives rarefaction. But it is what the stances instructed, so it is not evidence about panels. Arm A′ does not fix this either: it varies personas <em>and</em> model relative to A. <b>The clean solo control — arm A carrying the panel's stance set, or a stance-neutral solo — does not exist in the registered grid.</b></p>
+
+    <div class="refusal">
+      <div class="src">The sharpest finding — evals/harness/provider.mjs</div>
+      <div class="quote">The convergence stage is never run.</div>
+      <p>ideate-core is a divergent→convergent engine: S3 convergence (embedding dedup, clustering, split-axis scoring, cross-cluster selection) and S4 the evaluate→regenerate loop are where more ideas would become better ideas. The harness calls <code>ideateCore()</code> with <code>complete</code>, <code>buildRound1Prompt</code>, <code>buildRound2Prompt</code>, <code>agents</code> and <code>maxRounds</code> — and passes neither <code>deps.convergence</code> nor <code>deps.feedback</code>, so that branch never fires. The study measures the raw divergent pool only. This is scope, not a defect, but extending it is a registration amendment.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Is the data clean?</h2>
+    <p>Yes, and unusually so. Every integrity check came back consistent.</p>
+    <div class="checks">
+      <div class="check">
+        <div class="tick">✓</div>
+        <div class="check-body"><b>Accounting reconciles.</b> <span class="sub">139 rows in <code>results/</code>, 59 in <code>results-pilot/</code>. Every planned cell reaches exactly one terminal state; nothing unaccounted.</span></div>
+      </div>
+      <div class="check">
+        <div class="tick">✓</div>
+        <div class="check-body"><b>Stale data is quarantined, not pooled.</b> <span class="sub">119 cells under the superseded config hash <code>5ce5478956e5</code> are excluded by the analysis run and reported as excluded rather than silently mixed in.</span></div>
+      </div>
+      <div class="check">
+        <div class="tick">✓</div>
+        <div class="check-body"><b>Judge scores attach to the live config.</b> <span class="sub">28 of 40 judge-score rows in the main store carry the current hash; all 14 in the pilot do.</span></div>
+      </div>
+      <div class="check">
+        <div class="tick">✓</div>
+        <div class="check-body"><b>The engine pin is current.</b> <span class="sub">Evals pin <code>ideate-core@0.4.0</code>; ideate-core HEAD is 0.4.0. The one post-collection commit touching <code>lib/</code> is comment-only — verified by diff. No cell is stale by engine drift.</span></div>
+      </div>
+      <div class="check">
+        <div class="tick">✓</div>
+        <div class="check-body"><b>Test suite green.</b> <span class="sub">1043 passing, 0 failing, 1 skipped.</span></div>
+      </div>
+      <div class="check">
+        <div class="tick">✓</div>
+        <div class="check-body"><b>Arm D's failure is a fact about the night, not a live blocker.</b> <span class="sub">All three cells failed 09:43–09:53Z on 3 Sep; the #122 fix merged 17:10Z the same day. Arm D is re-runnable.</span></div>
+      </div>
+    </div>
+    <p>One caveat that is not about cleanliness: until today, both result stores existed only on one laptop. <code>results-pilot/</code> is now committed; <code>results/</code> remains gitignored by design.</p>
+  </section>
+
+  <section>
+    <h2>Limitations to say out loud</h2>
+    <ol class="lims">
+      <li><b>Brief variance swamps arm variance.</b> Arm B scores 40.4 on <code>biz-01</code> and 20.4 on <code>biz-02</code>; the pilot ranges from 48.8 on <code>sci-03</code> to 25.5 on <code>biz-04</code>. Which brief you ask matters roughly twice as much as which arm answers.</li>
+      <li><b>Two briefs cannot support brief-as-random-effect.</b> The mixed model fit, but the robustness check refused outright: <em>fewer clusters (2, brief) than parameters (2)</em>. No confidence interval from this store is trustworthy.</li>
+      <li><b>Idea-level metrics are exploratory by construction</b> while the judge validation gate is uncleared — regardless of the judge rows sitting on disk.</li>
+      <li><b>H5, self-preference bias, is structurally unidentifiable</b> without arm G. With every generator on one provider, the bias column is collinear with the judge-provider dummy.</li>
+      <li><b>Cost separation is absent.</b> Distinct ideas per dollar: A 683 [657, 713], B 796 [534, 1058]. The intervals overlap; no ranking is supported. On a rarefied basis A's efficiency advantage would widen.</li>
+      <li><b>Pilot and main-store dollars are not comparable</b> and are deliberately not combined here — the main store billed at single-call rates, the pilot through the batch provider.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>What to ask for on Thursday</h2>
+    <p>Not “here are the results.” Rather: the instrument is built, validated, and has already produced one counterintuitive signal that survived a confound check. Three asks, in order.</p>
+    <div class="asks">
+      <div class="ask">
+        <div class="ask-n">1</div>
+        <div>
+          <div class="ask-t">Sign off on the Phase 2a smoke</div>
+          <div class="ask-d">Issue #8 is open and marked <code>needs-decision</code>. Phase 2 does not proceed without it. This is an unblock, not a spend.</div>
+        </div>
+      </div>
+      <div class="ask">
+        <div class="ask-n">2</div>
+        <div>
+          <div class="ask-t">Run arm C — the homogeneous Sonnet panel</div>
+          <div class="ask-d">The single highest-value cell in the grid. It separates “the panel doesn't help” from “Haiku is less diverse,” which is the product's core claim.</div>
+        </div>
+      </div>
+      <div class="ask">
+        <div class="ask-n">3</div>
+        <div>
+          <div class="ask-t">Run arm A′ against arm B — the persona ablation</div>
+          <div class="ask-d">Same model, same panel size, personas on and off. Cheap, on Haiku, and it isolates the one thing arm C cannot.</div>
+        </div>
+      </div>
+      <div class="ask">
+        <div class="ask-n">4</div>
+        <div>
+          <div class="ask-t">Decide whether convergence belongs in scope</div>
+          <div class="ask-d">Today the study tests only the divergent half of the engine. If what we are selling is “better ideas,” the narrowing stage has to be measured. A registration question, not a spend.</div>
+        </div>
+      </div>
+      <div class="ask">
+        <div class="ask-n">5</div>
+        <div>
+          <div class="ask-t">Fund or drop the human rating panel (#52)</div>
+          <div class="ask-d">The only route to a quality answer that doesn't rest on an unvalidatable judge. Currently unscoped and unfunded.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <p class="footnote">Figures generated from <code>results/</code> at config hash <code>0000daa58e5a</code> via <code>evals/analysis/analysis.mjs</code>. Rarefaction computed with the repository's own <code>evals/analysis/rarefaction.mjs</code> at r = 1000 draws and the registered seed, against the registered equivalence threshold 0.23141118234233987. Rarefied comparisons are exploratory descriptives: the registered H1 contrast is reported not-estimable for this arm subset, and no substitute arm was used under a pre-registered hypothesis's name.</p>
+
+</div>
