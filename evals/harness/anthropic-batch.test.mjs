@@ -23,7 +23,10 @@ import { tmpdir } from "node:os";
 import {
   AnthropicBatchProvider,
   resolveIdeateAgents,
+  resolvePanelGeometry,
+  buildIdeateRounds,
   buildAnthropicMessageParams,
+  buildOpenAIChatParams,
   UNIFORM_PERSONA,
   DEFAULT_MAX_POLL_MS,
 } from "./provider.mjs";
@@ -323,6 +326,176 @@ test("#128: a forwarded strategy does NOT yet change the prompt -- the lever is 
   const cot = buildRound1Prompt({ context: "ctx", persona: "p", stance: "s", ideasPerAgent: 6, strategy: "cot" });
   const direct = buildRound1Prompt({ context: "ctx", persona: "p", stance: "s", ideasPerAgent: 6, strategy: "direct" });
   assert.equal(cot, direct);
+});
+
+// ── issue #129 amendment A: `effort` forwarding ──────────────────────────────
+// Two SEPARATE tests for the solo and panel branches: a single test covering
+// both would leave a mutation that breaks only one branch undetected.
+
+test("#129: a slot-level effort is forwarded verbatim on the SOLO path", () => {
+  const arm = {
+    mode: "solo",
+    totalIdeasRequested: 30,
+    slots: [{ persona: "solo", model: "claude-sonnet-5", effort: "low" }],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, "low");
+});
+
+test("#129: a slot-level effort is forwarded verbatim on the PANEL path", () => {
+  const arm = {
+    mode: "panel",
+    personaDisabled: false,
+    slots: [
+      { persona: "p1", model: "claude-sonnet-5", effort: "xhigh" },
+      { persona: "p2", model: "claude-sonnet-5" },
+    ],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, "xhigh");
+  // A slot that names no effort stays UNSET -- undefined must stay
+  // distinguishable from an explicit value, per ideate-core@0.5.0's own
+  // plain-assignment contract (never `||`-defaulted).
+  assert.equal(agents[1].effort, undefined);
+});
+
+test("#129: an unset solo effort resolves to undefined, not a coerced falsy value", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms.A, armsConfigJson);
+  assert.equal(agents[0].effort, undefined);
+});
+
+test("#129: effort is read from the RAW slot, not the uniformPersona overlay -- a personaDisabled arm cannot silently blank or override it", () => {
+  const arm = {
+    mode: "panel",
+    personaDisabled: true,
+    uniformPersona: { effort: "max" }, // must be IGNORED -- effort is not a persona field
+    slots: [
+      { persona: "p1", model: "claude-haiku-4-5", effort: "low" },
+      { persona: "p2", model: "claude-haiku-4-5" },
+    ],
+  };
+  const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(agents[0].effort, "low", "the slot's own effort must win over uniformPersona.effort");
+  assert.equal(agents[1].effort, undefined, "uniformPersona.effort must not backfill an unset slot effort either");
+});
+
+// ── issue #129 amendment C: effort reaches the request builders ─────────────
+
+test("#129: buildAnthropicMessageParams emits output_config.effort when the request carries one, and omits it otherwise", () => {
+  const withEffort = buildAnthropicMessageParams({ model: "claude-sonnet-5", prompt: "p", effort: "high" });
+  assert.deepEqual(withEffort.output_config, { effort: "high" });
+
+  const withoutEffort = buildAnthropicMessageParams({ model: "claude-sonnet-5", prompt: "p" });
+  assert.equal(withoutEffort.output_config, undefined);
+  assert.deepEqual(Object.keys(withoutEffort).sort(), ["max_tokens", "messages", "model"]);
+});
+
+test("#129: buildAnthropicMessageParams throws fail-loud for a model outside Anthropic's documented effort support (Haiku 4.5)", () => {
+  assert.throws(
+    () => buildAnthropicMessageParams({ model: "claude-haiku-4-5", prompt: "p", effort: "low" }),
+    /does not support output_config\.effort/,
+  );
+  // No effort at all is still fine on Haiku -- only an EXPLICIT effort is rejected.
+  assert.doesNotThrow(() => buildAnthropicMessageParams({ model: "claude-haiku-4-5", prompt: "p" }));
+});
+
+test("#129: buildOpenAIChatParams emits reasoning_effort verbatim when the request carries one, and omits it otherwise", () => {
+  const withEffort = buildOpenAIChatParams({ model: "gpt-5.6-terra", prompt: "p", effort: "medium" });
+  assert.equal(withEffort.reasoning_effort, "medium");
+
+  const withoutEffort = buildOpenAIChatParams({ model: "gpt-5.6-terra", prompt: "p" });
+  assert.equal(withoutEffort.reasoning_effort, undefined);
+  assert.deepEqual(Object.keys(withoutEffort).sort(), ["max_completion_tokens", "messages", "model"]);
+});
+
+// ── issue #129 amendment B: per-arm panel geometry overrides ────────────────
+
+test("#129: an unset per-arm panel override inherits the global panel default", () => {
+  const arm = { mode: "panel", slots: armsConfigJson.arms.C.slots };
+  const panel = resolvePanelGeometry(arm, armsConfigJson);
+  assert.equal(panel.ideasPerAgent, armsConfigJson.panel.ideasPerAgent);
+  assert.equal(panel.maxRounds, armsConfigJson.panel.maxRounds);
+  assert.equal(panel.size, armsConfigJson.panel.size);
+  assert.equal(panel.sharing, undefined, "the global block never sets sharing today -- the registered default is undefined");
+});
+
+test("#129: a per-arm panel override wins over the global default, and resolveIdeateAgents actually uses the override, not the fallen-back value", () => {
+  const arm = {
+    mode: "panel",
+    panel: { ideasPerAgent: 99, maxRounds: 7, sharing: "blind" },
+    slots: armsConfigJson.arms.C.slots,
+  };
+  const { agents, maxRounds, sharing } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.notEqual(99, armsConfigJson.panel.ideasPerAgent, "sanity: the override value must differ from the global default");
+  assert.ok(agents.every((a) => a.ideasPerAgent === 99), "resolveIdeateAgents must use the OVERRIDE, not silently fall back to the global panel.ideasPerAgent");
+  assert.equal(maxRounds, 7);
+  assert.equal(sharing, "blind");
+});
+
+test("#129: a per-arm override of only ONE field leaves the others inherited from the global default", () => {
+  const arm = { mode: "panel", panel: { maxRounds: 4 }, slots: armsConfigJson.arms.C.slots };
+  const panel = resolvePanelGeometry(arm, armsConfigJson);
+  assert.equal(panel.maxRounds, 4);
+  assert.equal(panel.ideasPerAgent, armsConfigJson.panel.ideasPerAgent, "ideasPerAgent was not overridden -- must inherit");
+});
+
+test("#129: panel.size is validated against arm.slots.length -- a mismatch throws fail-loud, not silently ignored", () => {
+  const consistent = { mode: "panel", panel: { size: 5 }, slots: armsConfigJson.arms.C.slots };
+  assert.doesNotThrow(() => resolveIdeateAgents(consistent, armsConfigJson));
+
+  const inconsistent = { mode: "panel", panel: { size: 3 }, slots: armsConfigJson.arms.C.slots };
+  assert.throws(() => resolveIdeateAgents(inconsistent, armsConfigJson), /has 5 slots but its panel\.size override is 3/);
+});
+
+test("#129: panel.size is NOT enforced against the inherited GLOBAL default -- only an arm's OWN override is validated", () => {
+  // The global panel block sets size: 5; an ad-hoc 2-slot test arm that never
+  // opts into a per-arm size override must not be held to it -- that would be
+  // a scope-creeping behavior change (see resolvePanelGeometry's header).
+  const arm = { mode: "panel", slots: [{ persona: "p1", model: "claude-haiku-4-5" }, { persona: "p2", model: "claude-haiku-4-5" }] };
+  assert.doesNotThrow(() => resolveIdeateAgents(arm, armsConfigJson));
+});
+
+test("#129: sharing applies to build-on rounds only (round 1 is never consulted) -- buildIdeateRounds", () => {
+  assert.equal(buildIdeateRounds(2, undefined), undefined, "no sharing set -> no rounds array, inherits ideate-core's own default");
+  const rounds = buildIdeateRounds(2, "pool");
+  assert.equal(rounds.length, 2);
+  // Index 0 (round 1) is written but ideate-core's roundConfig(round, deps)
+  // is only ever called for round >= 2 -- see node_modules/ideate-core/lib/
+  // ideate-core.mjs's build-on-rounds loop -- so a real round-1 override is
+  // structurally impossible via this mechanism, by design.
+  assert.deepEqual(rounds, [{ sharing: "pool" }, { sharing: "pool" }]);
+});
+
+// ── issue #129 amendment F: stance-neutral solo control (arm AS) ────────────
+
+test("#129: arm AS is registered, personaDisabled, and resolves to an explicit stance-neutral persona", () => {
+  const arm = armsConfigJson.arms.AS;
+  assert.ok(arm, "arm AS must be registered in arms.config.json");
+  assert.equal(arm.mode, "solo");
+  assert.equal(arm.personaDisabled, true);
+  const { agents, maxRounds } = resolveIdeateAgents(arm, armsConfigJson);
+  assert.equal(maxRounds, 1);
+  assert.equal(agents[0].stance, UNIFORM_PERSONA.stance);
+});
+
+test("#129: arm AS differs from arm A in STANCE ONLY -- model, strategy, temperature and rounds all match arm A", () => {
+  const a = resolveIdeateAgents(armsConfigJson.arms.A, armsConfigJson);
+  const as = resolveIdeateAgents(armsConfigJson.arms.AS, armsConfigJson);
+
+  // Arm A's slot persona "solo" is not a DEFAULT_PERSONAS name, so ideate-core
+  // resolves it to DEFAULT_PERSONAS[0] (PRAGMATIST: temperature 0.4, strategy
+  // "direct") when stance/temperature/strategy are left unset, exactly as
+  // resolveIdeateAgents' arm-A-unchanged test above pins. AS's uniformPersona
+  // override reproduces those same values explicitly, so the two arms match on
+  // everything EXCEPT stance (present vs. deliberately neutral) and persona
+  // name (a labeling difference, not a measured lever).
+  assert.equal(as.agents[0].model, a.agents[0].model, "model must match -- AS isolates stance, not the model lever");
+  assert.equal(as.agents[0].strategy, "direct", "AS must not also flip strategy to cot -- that would confound a second lever");
+  assert.equal(as.agents[0].temperature, 0.4, "AS must reproduce arm A's resolved PRAGMATIST temperature, not UNIFORM_PERSONA's 0.8 default");
+  assert.equal(as.maxRounds, a.maxRounds);
+  assert.equal(as.agents[0].ideasPerAgent, a.agents[0].ideasPerAgent);
+  assert.notEqual(as.agents[0].stance, a.agents[0].stance === undefined ? "" : a.agents[0].stance, "stance is the one lever that must actually differ");
+  assert.equal(as.agents[0].stance, UNIFORM_PERSONA.stance);
 });
 
 test("generate() covers the solo path (Arm A) end-to-end via a fake ideateImpl and completes", async () => {

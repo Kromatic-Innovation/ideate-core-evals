@@ -120,6 +120,22 @@
         { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
         { "persona": "proposer_uniform", "model": "claude-haiku-4-5" }
       ]
+    },
+    "AS": {
+      "label": "Solo baseline, stance-neutral control",
+      "purpose": "issue #129 amendment F. Arm A's slot persona 'solo' is not a DEFAULT_PERSONAS name, so ideate-core falls through to DEFAULT_PERSONAS[0] -- PRAGMATIST, stance-assigned, strategy 'direct' -- which means arm A varies from the panel arms in stance AND strategy AND rounds AND model, all at once. AS isolates the STANCE lever only: personaDisabled (+ uniformPersona) forces the SAME explicit, perspective-free stance arm A' uses for its panel ablation, but uniformPersona here overrides temperature/strategy back to PRAGMATIST's own values (0.4/direct) instead of taking UNIFORM_PERSONA's cot-leaning defaults, so AS differs from arm A in stance ONLY -- not also in strategy. Same model (claude-sonnet-5), same totalIdeasRequested (30), same maxRounds (1) as arm A.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 30,
+      "uniformPersona": {
+        "persona": "solo_stance_neutral",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "direct"
+      },
+      "slots": [
+        { "persona": "solo", "model": "claude-sonnet-5" }
+      ]
     }
   }
 }
