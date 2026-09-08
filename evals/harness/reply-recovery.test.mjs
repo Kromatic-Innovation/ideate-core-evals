@@ -670,6 +670,13 @@ test("#93 comparability: promptTemplateHash covers prompt TEXT, the sizing const
   const fields = {
     round1: prompts.buildRound1Prompt(probe),
     round2: prompts.buildRound2Prompt(probe),
+    // issue #130: strategy is now a rendered lever -- both branches of both
+    // builders must be in the payload, or the cot wording could change
+    // without moving the hash.
+    round1Direct: prompts.buildRound1Prompt({ ...probe, strategy: "direct" }),
+    round1Cot: prompts.buildRound1Prompt({ ...probe, strategy: "cot" }),
+    round2Direct: prompts.buildRound2Prompt({ ...probe, strategy: "direct" }),
+    round2Cot: prompts.buildRound2Prompt({ ...probe, strategy: "cot" }),
     round1Defaults: prompts.buildRound1Prompt(),
     round2Defaults: prompts.buildRound2Prompt(),
     tokensPerIdeaByModel: prompts.TOKENS_PER_IDEA_BY_MODEL,

@@ -1711,15 +1711,18 @@ export class AnthropicBatchProvider {
 //               ctx, which is why forwarding it matters: stored cells used to
 //               record five index-derived temperatures 0.4-1.0 that were
 //               never actually submitted.
-//   strategy    RECORDED, NOT RENDERED -- yet. ideate-core passes it into the
-//               prompt-builder ctx, but THIS harness's own buildRound1Prompt /
-//               buildRound2Prompt override ideate-core's and do not branch on
-//               it, so direct-vs-CoT is still not a variable lever at the
-//               prompt. Making it one means writing a CoT prompt template,
-//               which is a registered prompt change (issue #129, the
-//               "make prompt levers settable" amendment), not a harness fix.
-//               Pinned by a test so this boundary cannot rot back into a
-//               silent no-consumer field.
+//   strategy    REACHES THE WIRE (issue #130). evals/harness/prompts.mjs's
+//               buildRound1Prompt / buildRound2Prompt now branch on it: when
+//               a slot resolves `strategy: "cot"`, both builders insert a
+//               registered chain-of-thought paragraph before the "Generate
+//               exactly N ideas" instruction; any other value ("direct", an
+//               unknown string, or unset) renders nothing extra. This is NOT
+//               additive -- UNIFORM_PERSONA.strategy is "cot" and 4 of 5
+//               DEFAULT_PERSONAS are "cot", so the prompt actually sent by
+//               arm A' and by every panel arm (B-H) whose slots fall through
+//               to DEFAULT_PERSONAS changed. promptTemplateHash() renders
+//               both the "direct" and "cot" branches of both builders so a
+//               wording change to either moves the hash.
 //   effort      REACHES THE WIRE (issue #129 amendment A/C). ideate-core@0.5.0
 //               forwards a slot's `effort` to `complete()` by PLAIN ASSIGNMENT
 //               (lib/ideate-core.mjs: `effort: agent.effort` / `effort:

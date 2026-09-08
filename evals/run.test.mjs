@@ -272,6 +272,11 @@ test("issue #99: editing a generation prompt template moves the configHash of th
   const payload = {
     round1: prompts.buildRound1Prompt(probe),
     round2: prompts.buildRound2Prompt(probe),
+    // issue #130: both strategy branches of both builders are in the payload.
+    round1Direct: prompts.buildRound1Prompt({ ...probe, strategy: "direct" }),
+    round1Cot: prompts.buildRound1Prompt({ ...probe, strategy: "cot" }),
+    round2Direct: prompts.buildRound2Prompt({ ...probe, strategy: "direct" }),
+    round2Cot: prompts.buildRound2Prompt({ ...probe, strategy: "cot" }),
     round1Defaults: prompts.buildRound1Prompt(),
     round2Defaults: prompts.buildRound2Prompt(),
     // issue #122: promptTemplateHash()'s payload folds in the per-model
