@@ -98,6 +98,27 @@ test("pooledWithinCellVariance: a singleton cell contributes NO degrees of freed
   assert.equal(withSingleton.sigma2, 2, "and the singleton does not drag the estimate toward zero");
 });
 
+test("pooledWithinCellVariance: divides by SUMMED degrees of freedom, not by cell count -- the two coincide at R=2 and diverge everywhere else", () => {
+  // Every other fixture here has exactly two replicates per cell, where df per
+  // cell is 1 and `df === cells` -- so a function that divided by the wrong one
+  // would return the right answer on all of them. (It did: this test was added
+  // after a mutation swapping df for cells survived the rest of the file.)
+  // Stage 1a ran at R=2, but Appendix G's table is read at R=1..5, so the
+  // distinction is load-bearing for any future re-estimate.
+  //
+  // One cell, three replicates 10/12/14: mean 12, ss = 4+0+4 = 8, df = 2,
+  // cells = 1. Pooled variance is 8/2 = 4. Dividing by cells gives 8.
+  const out = pooledWithinCellVariance([
+    { arm: "A", brief: "b1", distinct_k: "10" },
+    { arm: "A", brief: "b1", distinct_k: "12" },
+    { arm: "A", brief: "b1", distinct_k: "14" },
+  ]);
+  assert.equal(out.df, 2);
+  assert.equal(out.cells, 1);
+  assert.equal(out.sigma2, 4, "ss/df, not ss/cells");
+  assert.equal(out.sd, 2);
+});
+
 test("pooledWithinCellVariance: refuses rather than returning a number when nothing is estimable", () => {
   assert.throws(
     () =>
