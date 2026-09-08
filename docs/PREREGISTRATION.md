@@ -11,9 +11,11 @@
 > Nothing has been run. Every number below is a projection.
 
 **Status:** pre-registration draft.
-**Date:** 2026-07-30 · **Target engine:** ideate-core `@0.4.0` (npm, published 2026-08-02) — pinned.
+**Date:** 2026-07-30 · **Target engine:** ideate-core `@0.5.0` (npm, published 2026-09-07) — pinned.
 
 > _Amended 2026-08-02 ([Appendix A](#appendix-a--amendments-dated-2026-08-02), item 1). Was: `Target SHA: ideate-core develop @ 920c086 + fix A1`. That SHA predates the remediation; `ideate-core@0.4.0` contains the fixes for **both** registered blockers (B1, B2). The runtime `engineSha` in the manifest is now the resolved package version (`ideate-core@0.4.0`) rather than the `"unpinned"` literal `evals/run.mjs` originally shipped._
+
+> _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), item 9). Was: `ideate-core@0.4.0`. Bumped to **`ideate-core@0.5.0`** (`ideate-core-evals#134`, merged `94be181`) — the release that ships the per-agent `effort` field this very amendment's item 3 depends on. No manual `configHash` bump was made or needed: `engineSha` is derived from the installed version at runtime, so `configHash` moved on its own (`1a62e8d92d34` → `119708570b71`). See the appendix for the full verification and what else 0.5.0 contains._
 
 ---
 
@@ -1099,7 +1101,7 @@ Not in scope, and explicitly still unwired: `--phase 2` as a real alias, which
 
 ## Appendix E — Amendments (dated 2026-09-08)
 
-Per the amendment rule at the top of this document. This appendix registers the six-part amendment issue `#129` asked for — prompt levers made settable, per-arm panel geometry, `effort` as a registered sampling lever, an externally-published comparability anchor, a corpus expansion, and a stance-neutral solo control — plus the §3.4 replication update those changes require and the `armsConfigHash` invalidation cost of registering them. Landed in **`#139`** (`020ed8a`, corpus + anchor) and **`#140`** (`d951302`, effort/geometry/control). **Nothing in §6 (hypotheses and analysis plan) is changed by any entry below.**
+Per the amendment rule at the top of this document. This appendix registers the six-part amendment issue `#129` asked for — prompt levers made settable, per-arm panel geometry, `effort` as a registered sampling lever, an externally-published comparability anchor, a corpus expansion, and a stance-neutral solo control — plus the §3.4 replication update those changes require, the engine-pin bump (`#134`) that made `effort` reachable in the first place, and the `configHash`/`armsConfigHash` invalidation cost of registering all of it. Landed in **`#134`** (`94be181`, engine pin), **`#139`** (`020ed8a`, corpus + anchor), and **`#140`** (`d951302`, effort/geometry/control). **Nothing in §6 (hypotheses and analysis plan) is changed by any entry below.**
 
 Every claim below was checked against `develop @ d951302`, not against issue `#129`'s own body — `#129` is stale in several places (noted per item), and this appendix records what actually shipped.
 
@@ -1211,3 +1213,24 @@ That is **19 generation cells** (16 arm-B completed, 3 arm-D already `failed` be
 **The data actually lost to re-collection is the 16 completed arm-B generation cells.** The 3 arm-D cells were already `failed` and cost nothing beyond their original (already-sunk) spend. The judge-bookkeeping and batch-replay records key off the generation cells they describe and carry no independent value once those cells go stale. Leading with 19 would overstate the loss; 16 is the number that matters, with 19 given for the full split.
 
 `results-pilot/` is **tracked and committed** on `develop` (since `399bcc5`, landed via `#137`) — this is not a description of untracked local state; the pilot store the harness produced is part of the repository's history, and its 16 lost cells are a real, git-visible cost of this amendment rather than an ephemeral one.
+
+**Not a second, separate invalidation.** `#134`'s engine-pin bump (Item 9) also moved `configHash` — at `94be181`, before arm AS existed — and registering AS then moved `armsConfigHash` again. Both changes make the same 16 completed arm-B cells stale; a cell invalidated once cannot be invalidated a second time for a bigger loss. The 16-cell cost above is the total cost of reaching the post-amendment state, not an amount to be added to a separate figure for Item 9.
+
+### Item 9 — §0: engine pin bumped `ideate-core@0.4.0` → `ideate-core@0.5.0` (issue #134)
+
+**What changed.** §0's `Target engine` moves from `ideate-core@0.4.0` to **`ideate-core@0.5.0`**, landed via `ideate-core-evals#134` (merged `94be181`). Verified: `package.json`/`package-lock.json` pin `0.5.0`; `ideate-core@0.5.0` is published on the public npm registry (dist-tag `latest`; registry timestamp `2026-09-08T03:10 UTC`, `CHANGELOG.md` dates the release `2026-09-07`) and tagged `v0.5.0` in `Kromatic-Innovation/ideate-core` (`e8e0c4c`, tag date `2026-09-08T03:09 UTC`) — the small UTC/local discrepancy is noted rather than smoothed over, since the appendix's own discipline is to state the number actually measured, not the rounder one.
+
+**Why this belongs in this appendix rather than a separate one.** §0's pin is the registered statement of which engine produced the data, and `engineSha` feeds `configHash` (Appendix A item 1: pinning the real version "is what makes `configHash` actually change when the engine changes — the whole point of pinning it"). Leaving §0 at `0.4.0` after `#134` landed would mean the registration named a different engine than the one every future cell actually runs under.
+
+**No manual `configHash` bump was needed or made — verified, not merely asserted.** `engineSha` is derived from the *installed* version at runtime (`evals/run.mjs`'s `getEngineVersion()` / `IDEATE_CORE_ENGINE_SHA || `ideate-core@${engineVersion}``), so the hash moves on its own when the pin changes. `IDEATE_CORE_ENGINE_SHA` is confirmed unset in this environment, so the derivation is real rather than an env override. Reconstructed directly against the tree at `94be181` (a temporary worktree, all six other `CONFIG_FIELDS` inputs — `promptHash`, `judgeHash`, `embedderId`, `corpusHash`, `armsConfigHash`, `clusterDistanceThreshold` — held to their actual values at that commit, since only `package.json`/`package-lock.json` changed in `#134`):
+
+```
+configHash(engineSha: ideate-core@0.4.0, ...)  →  1a62e8d92d34
+configHash(engineSha: ideate-core@0.5.0, ...)  →  119708570b71
+```
+
+matching the pre-registered numbers exactly.
+
+**What `0.5.0` contains that this study can now reach.** Most directly relevant: the per-agent `effort` field (`ideate-core#146`) — `deps.agents[i].effort` forwarded verbatim to that agent's `complete()` call by plain assignment, not a `spec.X || base.X` fallback, so `undefined` stays distinguishable from an explicit value. **This is the precondition Item 3 above depends on** — the two items are otherwise registered separately in this appendix, so the dependency is stated here explicitly rather than left implicit. `0.5.0` also ships `meta.agentErrors` failure reporting (`ideate-core#154`, `ideate-core#157`) and routing parity for `effort`/`model` in the bundled adapters (`ideate-core#149`, `ideate-core#151`) — neither is exercised by this study's harness today, but both are part of what the pinned version now provides.
+
+**Interaction with Item 8's cost accounting.** This bump moved `configHash` at `94be181`, before arm AS was registered; registering AS then moved `armsConfigHash` again. Both changes stale the same 16 completed arm-B pilot cells — see the note at the end of Item 8. This item adds no additional data loss beyond what Item 8 already accounts for.
