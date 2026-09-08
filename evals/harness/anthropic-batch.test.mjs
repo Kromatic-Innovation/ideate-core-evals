@@ -34,7 +34,7 @@ import {
 import { buildRound1Prompt } from "./prompts.mjs";
 import { runSpec } from "./runner.mjs";
 import { ResultsStore } from "../../lib/store.mjs";
-import { cellKey, configHash, planRun } from "../../lib/manifest.mjs";
+import { armsConfigHash, cellKey, configHash, planRun } from "../../lib/manifest.mjs";
 
 const armsConfigJson = JSON.parse(
   await (await import("node:fs")).promises.readFile(new URL("../../arms.config.json", import.meta.url), "utf8"),
@@ -576,6 +576,67 @@ test("#129: arm AS differs from arm A in STANCE ONLY -- model and rounds verifie
   assert.equal(as.agents[0].stance, UNIFORM_PERSONA.stance);
 });
 
+// ── Fix round 2 (Quine finding): model-facing PERSONA strings were unpinned ──
+// `stance` had a cross-reference assertion (`agents[0].stance ===
+// UNIFORM_PERSONA.stance`, above); `persona` had NO equivalent on either arm
+// A' or arm AS, despite landing in the actual submitted prompt exactly like
+// stance does -- `buildRound1Prompt` (evals/harness/prompts.mjs:62) renders
+// `(persona: ${persona || "generalist"})` into the round-1 prompt verbatim.
+// Mutating `arms.config.json`'s `AS.uniformPersona.persona` back to the
+// literal demand-characteristic string this repo already removed once
+// (`"solo_stance_neutral"`), or mutating `UNIFORM_PERSONA.persona` to
+// something equally suggestive, passed 1090/0 before the two tests below.
+//
+// The fix is two-part, per the review: (1) a cross-reference assertion for
+// `persona`, the same shape the `stance` one already has, so `UNIFORM_PERSONA`
+// stays in sync with what an unoverridden arm (A') actually resolves to; and
+// (2) a VOCABULARY sweep over every registered arm's resolved persona string,
+// because a cross-reference assertion alone only proves internal consistency
+// -- it says nothing about whether the shared string itself is safe to hand
+// to the model. The vocabulary check is what actually closes the class Quine
+// named, not just the two literals in the tree today.
+const EXPERIMENTAL_VOCABULARY = /neutral|control|ablation|disabled|baseline/i;
+
+test("#129 fix round 2: UNIFORM_PERSONA.persona is what an unoverridden personaDisabled arm (A') actually resolves to -- cross-reference, mirroring the existing stance assertion", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms["A'"], armsConfigJson);
+  assert.ok(agents.every((a) => a.persona === UNIFORM_PERSONA.persona), "A' sets no uniformPersona override, so every slot's resolved persona must equal UNIFORM_PERSONA.persona -- not a copy of it that could silently drift");
+});
+
+test("#129 fix round 2: no registered arm's resolved persona string names the experimental construct it participates in -- vocabulary sweep, closes the class rather than pinning today's two literals", () => {
+  const banned = [];
+  for (const [armId, arm] of Object.entries(armsConfigJson.arms)) {
+    const { agents } = resolveIdeateAgents(arm, armsConfigJson);
+    for (const a of agents) {
+      if (typeof a.persona === "string" && EXPERIMENTAL_VOCABULARY.test(a.persona)) {
+        banned.push(`${armId}: "${a.persona}"`);
+      }
+    }
+  }
+  assert.deepEqual(banned, [], "a persona string reaching the model must not name the experimental construct (demand characteristic) -- see prompts.mjs:62/:99 for where it lands verbatim");
+});
+
+test("#129 fix round 2: the vocabulary sweep actually catches a violation (proof it isn't vacuous) -- re-mutating AS's persona back to the removed string", () => {
+  const mutated = JSON.parse(JSON.stringify(armsConfigJson));
+  mutated.arms.AS.uniformPersona.persona = "solo_stance_neutral"; // the exact string this repo already removed once
+  const { agents } = resolveIdeateAgents(mutated.arms.AS, mutated);
+  assert.ok(EXPERIMENTAL_VOCABULARY.test(agents[0].persona), "sanity: the mutated string must actually trip the sweep's own regex");
+});
+
+// `purpose` is on `armsConfigHash`'s DENYLIST (lib/manifest.mjs
+// ARMS_CONFIG_DOC_ONLY_KEYS) -- prose there is never hashed and no code ever
+// reads it, so a comment there explaining why the persona name matters is not
+// a guard, only documentation for a human reader. This is deliberately
+// asserted here rather than merely stated in a PR body, per the review.
+test("#129 fix round 2: arm AS's `purpose` field carries no run-time weight -- armsConfigHash denylist proof", () => {
+  const withoutPurpose = JSON.parse(JSON.stringify(armsConfigJson));
+  delete withoutPurpose.arms.AS.purpose;
+  // Both configs must hash IDENTICALLY: `purpose` prose is documentation the
+  // hash deliberately never covers, so this file's own tests cannot rely on
+  // it to prevent a persona-name regression -- only the vocabulary sweep
+  // above (which reads live resolved output, not config prose) can.
+  assert.equal(armsConfigHash(armsConfigJson), armsConfigHash(withoutPurpose));
+});
+
 test("generate() covers the solo path (Arm A) end-to-end via a fake ideateImpl and completes", async () => {
   const fetchImpl = async (url, opts) => {
     const body = JSON.parse(opts.body);
@@ -741,23 +802,30 @@ test("buildAnthropicMessageParams never carries temperature/top_p/top_k, for eve
 // well before any real run, over the actual registered config -- mirroring
 // the existing force-strip sweep above.
 test("#129: no arm in arms.config.json sets effort on a model outside Anthropic's documented effort support (config-level invariant, fails at npm test, not at spend time)", () => {
-  let checked = 0;
+  // Fix round 2 (Quine finding): this test USED to also assert `checked ===
+  // 0`, on the reasoning that the sweep should prove its own loop body isn't
+  // dormant. That reasoning was sound but the assertion was a TRAP: it
+  // encoded "no arm sets effort" as the passing condition, so a perfectly
+  // legitimate future amendment -- an arm setting `effort` on a SUPPORTED
+  // model (sonnet-5, fable-5, ...) -- would trip it with nothing actually
+  // wrong. A failure here would then be ambiguous between "a real
+  // misconfiguration" and "valid effort usage, forgot to bump a stale
+  // literal" -- exactly the shape of test people learn to delete rather than
+  // diagnose. The real invariant this test exists to guard ("no arm sets
+  // effort on an UNSUPPORTED model") is asserted below with no reference to
+  // the count. The loop-body-isn't-dormant proof moved to the standalone
+  // synthetic-config test immediately following this one, which needs no
+  // dependency on what arms.config.json currently contains.
   for (const [armId, arm] of Object.entries(armsConfigJson.arms)) {
     for (const slot of arm.slots || []) {
       if (slot.effort === undefined) continue;
       if (!slot.model || !slot.model.startsWith("claude-")) continue; // OpenAI models are a separate ladder, no exclusion list applies
-      checked++;
       assert.ok(
         ANTHROPIC_EFFORT_SUPPORTED_MODELS.has(slot.model),
         `arm ${armId} sets effort on model ${slot.model}, which is not in Anthropic's documented effort-support list -- this would bill the arm's OTHER slots before failing`,
       );
     }
   }
-  // No arm sets effort today -- this assertion exists so the sweep itself is
-  // known to run its loop body at least once if a future arm ever DOES set
-  // one, rather than passing vacuously with zero iterations forever. It is
-  // intentionally NOT asserting `checked > 0` today.
-  assert.equal(checked, 0, "sanity: no registered arm sets effort yet -- update this count when one does");
 });
 
 test("#129: the effort-on-Haiku sweep check actually catches a violation (proof the assertion isn't vacuous)", () => {
