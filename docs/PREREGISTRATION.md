@@ -146,6 +146,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 > _Amended 2026-09-08 ([Appendix E](#appendix-e--amendments-dated-2026-09-08), item 7). The pilot's variance-component derivation and the resulting SE-vs-(briefs, replicates) table are registered, with **B = 48 briefs / R = 2 replicates as the current best estimate — explicitly provisional**, bound to Study 1's re-estimate of the dominant variance component. The n = 4 figure above is superseded by this table, not by a frozen final design. See the appendix for the derivation and why it must stay provisional._
 
 > _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 2). Stage 1a is the run that re-estimates `σ²_ba`, the exact figure Appendix E item 7 above made B = 48 / R = 2 provisional on. See the appendix for the registered screening design that produces the re-estimate._
+>
+> _Amended 2026-09-08 ([Appendix G](#appendix-g--amendments-dated-2026-09-08), items 1–4). Stage 1a has run, and the re-estimate the amendment above promised is in: `σ²_ba` is **1.21**, not 77.85 — a factor of 64. **Appendix E item 7's B = 48 / R = 2 table is superseded**, re-derived on the same SE formula from the new components, and the recommended design becomes **B = 24 briefs / R = 2 replicates** — chosen on brief-coverage and estimability grounds, not on power, because power stopped being the binding constraint. The table is valid only for contrasts rarefied at a ~30-idea pool; a design targeting ~60 needs its own variance basis. See the appendix for the derivation, the two verification checks, and the scope bound._
 
 ---
 
@@ -1398,3 +1400,90 @@ The closing sentence of each is load-bearing, not stylistic: the reply contract 
 **Nothing further is lost.** Appendix E item 8 already accounted for the 16 completed arm-B pilot cells, staled by `#134`'s engine-pin bump and again by arm AS's `armsConfigHash` move. A cell invalidated then cannot be invalidated again for a larger loss, and no cells have been collected since. Registering the Study 1 arms (Item 2) moves `armsConfigHash` a third time, with the same nil incremental cost.
 
 **Ordering note, stated rather than smoothed over.** Item 1's code landed in `#142` (`296bbae`) before this appendix was written. The rule that matters is that **no data was collected under the unregistered design** — no run has executed since `#142` merged, and the 20 calls in Item 6 were a sizing probe whose results go nowhere near the results store. The registration is in place before the first Stage 1a cell, which is the guarantee §11 exists to give.
+
+---
+
+## Appendix G — Amendments (dated 2026-09-08)
+
+Per the amendment rule at the top of this document. Appendix E item 7 registered `σ²_ba = 77.85` as **provisional** and bound its B = 48 / R = 2 table to "Study 1's re-estimate of `σ²_ba`." Study 1, Stage 1a has now run (191 of 192 cells completed; raw records at `data/study1-stage1a/cells.jsonl`, per-cell metrics at `docs/study1-stage1a-cells.csv`). **This appendix is that re-estimate, and the table it supersedes.**
+
+It registers the recomputed design **before any run sized by it**. No cells have been collected since Stage 1a. **Nothing in §6 (hypotheses and analysis plan) is changed by any entry below** — this is a design-size amendment to §3.4, not an analysis-plan change.
+
+### Item 1 — §3.4: the variance components, re-estimated from 12 briefs
+
+**What's registered.** The R0 fit (`evals/analysis/sidecar/fit_mixedlm.py`, `referenceArm: "S1-C0"`, response `distinct_k`), run over the **matched-N=30 subset** of Stage 1a: the six arms whose `totalIdeasRequested` is 30 (`S1-C0`, `S1-ELOW`, `S1-EMAX`, `S1-SPRAG`, `S1-SCONTRA`, `S1-DIRECT`) × 12 briefs × 2 replicates = **144 cells, complete and balanced** — Stage 1a's single failed cell was `S1-N10`, outside this subset, so no cell is missing from it. Converged.
+
+| Component                                     | Registered (Appendix E item 7) | **Stage 1a, matched N=30 (n = 144)** | Stage 1a, pooled across N (n = 191) |
+| --------------------------------------------- | ------------------------------ | ------------------------------------ | ----------------------------------- |
+| `brief:arm` (`σ²_ba`)                         | 77.85                          | **1.2088**                           | 2.4885                              |
+| `brief`                                       | 21.99                          | **4.9786**                           | 5.5447                              |
+| Pooled within-(arm × brief) residual (`σ²_e`) | 6.82 (sd 2.61)                 | **5.1181** (sd 2.262, df 72)         | 4.5421 (sd 2.131, df 95)            |
+
+`σ²_ba` is smaller than the registered figure by a factor of **64**. Appendix E item 7 called 77.85 "the least stable number in the study," estimated from two briefs; that judgement is now measured rather than suspected.
+
+**The matched-N=30 fit is the registered basis, and the reason is a property of the response, not a preference.** `distinct_k` is a count, and the variance of a count scales with the count — the same principle Appendix E item 6 already registered when it ruled that a 30-pool arm's variance does not transfer to a 60-pool arm. Stage 1a measures it directly: the pooled within-cell residual is **0.50** at `S1-N10`, **2.46** at the N=30 centre point and **4.79** at `S1-N60`, and raw `distinct_k` sd across all cells of an arm runs 1.53 / 2.81 / 5.40 across the same three. Fitting one model across all three pool sizes forces a single residual and a single interaction term to absorb that heteroscedasticity, and the interaction is where it lands: **2.49 pooled versus 1.21 matched**. That inflation is very likely the mechanism behind 77.85 itself — the Phase 2a smoke pooled arm A (~30 ideas, `maxRounds: 1`) with arm B (~60 ideas, `maxRounds: 2`), exactly the mixed-pool-size fit this item declines to use. Both fits are recorded above; only the matched one is the basis.
+
+### Item 2 — §3.4: the re-derived SE table, on the same formula
+
+**The formula is unchanged.** Appendix E item 7 registered a method, not just a table; the standard error of a two-arm contrast under the R0 model is
+
+```
+SE(B, R) = sqrt( 2 · ( σ²_ba / B  +  σ²_e / (B · R) ) )
+```
+
+for B briefs and R replicates per (arm × brief).
+
+**Two verification checks, both passed — this is what makes the supersession auditable rather than asserted.**
+
+1. **The formula reproduces the superseded table.** Fed the registered components (77.85, 6.82), it returns all sixteen cells of Appendix E item 7's table to the two decimals that table prints — 5.31/5.20/5.17/5.14, 3.76/3.68/3.65/3.63, 2.66/2.60/2.58/2.57, 1.88/1.84/1.83/1.82. The formula being applied here is therefore the one already registered, not a new one wearing its name.
+2. **The formula reproduces Stage 1a's own achieved SE.** At B = 12, R = 2 the new components give **0.7925**, and the matched fit's `vcov` reports the off-centre arm contrasts' standard error as **0.7925**. The design-size arithmetic and the fitted model agree to four decimals on the one design actually executed.
+
+**The registered table**, on `σ²_ba = 1.2088` and `σ²_e = 5.1181`:
+
+| B (briefs) | R=1  | R=2  | R=3  | R=5  |
+| ---------- | ---- | ---- | ---- | ---- |
+| 6          | 1.45 | 1.12 | 0.99 | 0.86 |
+| 12         | 1.03 | 0.79 | 0.70 | 0.61 |
+| 24         | 0.73 | 0.56 | 0.49 | 0.43 |
+| 48         | 0.51 | 0.40 | 0.35 | 0.30 |
+
+**Registered design: B = 24 briefs, R = 2 replicates.** SE 0.56; the corresponding MDE at 80% power and α = 0.05 two-sided (multiplier ≈ 2.8) is **1.57 distinct ideas**, against the **5.15** the superseded B = 48 / R = 2 row predicted. The MDE is **reported, not targeted** — §3.4 has never registered an MDE floor, and inventing one here to justify a design would be the move §5.1 explicitly refuses when it sets the judge gate to the human-human figure "rather than to a number we like."
+
+**What actually pins B and R, now that power does not.** At these components every design in the table above is far inside the effect sizes this study is about, so the binding constraints are the other two:
+
+- **B = 24 is a coverage decision.** Appendix F item 3 registered the 12-brief Stage 1a subset with an exact 6-pre-amendment / 6-post-amendment split, for the stated reason that a composition-biased subset propagates through everything downstream. Sizing B on SE alone re-opens precisely that. B = 24 is **6 briefs per stratum, 12 pre-amendment and 12 post-amendment**, balanced by the same rule — the smallest brief count that gives every stratum a within-stratum estimate rather than a pair of draws, on a 48-brief corpus, at half the cell count of the superseded B = 48.
+- **R = 2 is an estimability decision.** R = 1 is the cheaper design and, per Item 3 below, the cost-optimal one; it is rejected because at R = 1 `σ²_e` and `σ²_ba` are confounded and **this table could never be re-derived again**. Appendix E item 7 made 77.85 provisional precisely so a variance estimate could be re-measured rather than inherited; a design that cannot re-measure its own components forfeits that. R = 2 is the minimum that keeps the re-estimation path open, and it is chosen for that, not by inertia from the superseded row.
+
+**Multiplicity is not in these numbers, deliberately.** The table applies the same SE formula §3.4 registers, whose MDE multiplier (≈ 2.8) is uncorrected. §6's Holm family over H1–H5 moves the effective multiplier to roughly 3.4, scaling every MDE above by about 1.2×. That is stated here in prose rather than folded into the table, because baking it in would quietly re-register the formula under cover of a re-estimate.
+
+**Cost.** Relative to B = 48 / R = 2, the confirmatory grid halves. §8's ledger is not restated here — `#143` has the model-price row wrong for `claude-sonnet-5` ($3/$15 per MTok applied against a first-party $2/$10), so a re-priced budget belongs in that fix, not in a variance amendment.
+
+### Item 3 — §3.4: what inverted, and what did not
+
+**Recorded because the obvious reading of Item 1 is wrong and expensive.** Appendix E item 7's stated rationale was that "the interaction dominates the residual by more than 10×, so briefs buy far more power than replicates." The first clause no longer holds: `σ²_e` (5.12) now exceeds `σ²_ba` (1.21) by about 4×, the reverse ordering. Replicates are consequently no longer inert **at fixed B** — at B = 12, going R = 1 → 2 moves SE from 1.03 to 0.79 (a 23% reduction), where under the superseded components the same step moved 3.76 → 3.68 (2%).
+
+**The design principle nevertheless did not invert.** At a fixed total cell budget C = B · R, substituting B = C/R gives
+
+```
+SE² = (2/C) · ( R · σ²_ba  +  σ²_e )
+```
+
+which is increasing in R for any positive `σ²_ba`. **Per cell spent, briefs win at every ratio, and did so under the registered components too.** The second clause of item 7's rationale therefore survives its first. A reader who takes "replicates now buy real power" as licence to spend budget on R rather than B builds a design strictly worse than the one being superseded here, and this item exists so that reading is closed off in the registration rather than discovered in a run.
+
+### Item 4 — §3.4: the scope bound on this basis, stated so it is not transferred
+
+**This table is registered for contrasts whose rarefaction target is a ~30-idea pool, and for no others.** Appendix C's rarefaction rule applies per contrast at the minimum pool size on the two sides, which for the registered arm-A-versus-panel contrast is ~30 — the scale the matched-N=30 basis is estimated at, which is what makes it the right basis for the design §3.4 sizes today.
+
+**It is not the right basis for a ~60-pool contrast.** Stage 1a measures the gap in the same run: within-cell residual **2.46** at N=30 against **4.79** at `S1-N60`. A contrast rarefied at ~60 sized on the components above would understate `σ²_e` by roughly 2× and SE by roughly 1.4×, and would under-power itself by exactly the mechanism Item 1 attributes 77.85 to. **Any design whose rarefaction target is not ~30 requires its own variance basis, estimated at that pool size, registered as its own dated amendment.**
+
+This is stated explicitly because the transfer is the failure mode this appendix exists to correct. 77.85 became binding on a whole replication plan by being carried from the design that produced it to designs that did not share its scale; 1.21 is a better number and would fail in exactly the same way if carried the same distance.
+
+### Item 5 — reproduction
+
+**What was run**, so the numbers above are checkable rather than reported:
+
+- Inputs: `docs/study1-stage1a-cells.csv`, rows with `state == "completed"`; response `y = distinct_k`; the matched subset is the six arms named in Item 1.
+- Fit: `evals/analysis/sidecar/.venv/bin/python evals/analysis/sidecar/fit_mixedlm.py`, rung `R0`, `referenceArm: "S1-C0"`, `armLevels` the fitted arm set. `varianceComponents` gives `brief` and `brief:arm`; the diagonal of `vcov` gives the achieved contrast SE.
+- `σ²_e` is **not** a sidecar output and is not read from one: it is the pooled within-(arm × brief) variance across replicate pairs — Σ(y − cell mean)² / Σ(cell n − 1) — computed directly from the same rows, which is the quantity Appendix E item 7's own "pooled within-(arm × brief) residual variance" line names. df 72 over 72 complete replicate pairs for the matched subset; df 95 over 95 for the pooled one.
+
+**No judge score enters anything above.** Appendix F item 7 holds Stage 1a's judge rows as stored data awaiting §5.1's gate; the response fitted here is `distinct_k`, a pool-level metric, throughout.
