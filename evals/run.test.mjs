@@ -9,7 +9,16 @@
 // every cell through unthrottled instead of erroring).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, main, formatSpendSummary, formatPhase0Report, formatPrunePlan, resolveStoreDir, DEFAULT_RESULTS_DIR } from "./run.mjs";
+import {
+  parseArgs,
+  main,
+  formatSpendSummary,
+  formatPhase0Report,
+  formatPrunePlan,
+  resolveStoreDir,
+  DEFAULT_RESULTS_DIR,
+  DEFAULT_CONCURRENT_BATCH_WINDOW_MS,
+} from "./run.mjs";
 // The real judge-call writer (issue #108) -- the CLI prune tests below use it
 // rather than hand-built keys, so the fixture cannot drift from the writer.
 import { meterJudgeCall } from "./judge/gate.mjs";
@@ -183,6 +192,76 @@ test("main() wires --max-poll-minutes through to the real AnthropicBatchProvider
 });
 
 // ── issue #103: batch resume, and the two off-switches ─────────────────────
+
+test("parseArgs validates --cell-concurrency and --batch-window-ms at the CLI (issue #148)", () => {
+  assert.equal(parseArgs(["--cell-concurrency", "8"]).cellConcurrency, 8);
+  assert.equal(parseArgs(["--batch-window-ms", "0"]).batchWindowMs, 0, "0 is explicitly settable -- 'give me the historical debounce anyway'");
+  assert.equal(parseArgs([]).cellConcurrency, undefined);
+  assert.equal(parseArgs([]).batchWindowMs, undefined);
+  for (const bad of ["0", "-1", "1.5"]) {
+    assert.throws(() => parseArgs(["--cell-concurrency", bad]), /--cell-concurrency must be a positive integer/, `--cell-concurrency ${bad}`);
+  }
+  assert.throws(() => parseArgs(["--batch-window-ms", "-1"]), /--batch-window-ms must be 0 or greater/);
+});
+
+test("main() pairs --cell-concurrency with a real coalescing window by DEFAULT -- concurrency without a window buys nothing (issue #148)", async (t) => {
+  const priorKey = process.env.ANTHROPIC_API_KEY;
+  const priorVoyageKey = process.env.VOYAGE_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "test-key-not-real";
+  process.env.VOYAGE_API_KEY = "test-voyage-key-not-real";
+  t.after(() => {
+    if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = priorKey;
+    if (priorVoyageKey === undefined) delete process.env.VOYAGE_API_KEY;
+    else process.env.VOYAGE_API_KEY = priorVoyageKey;
+  });
+
+  // The failure this guards: `--cell-concurrency 24` with the window left at 0
+  // gives an operator 24 concurrent cells that still submit one batch each,
+  // AND silences the all-solo warning (gated on concurrency 1). The fix would
+  // look like it did not work.
+  const raised = spyRunSpec();
+  await main(["--max-spend", "999", "--cell-concurrency", "24"], { runSpecFn: raised, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(raised.calls[0].opts.cellConcurrency, 24, "concurrency reaches runSpec");
+  assert.equal(
+    raised.calls[0].opts.provider.batchWindowMs,
+    DEFAULT_CONCURRENT_BATCH_WINDOW_MS,
+    "and a window reaches the provider WITHOUT the operator naming one",
+  );
+
+  // An explicit window still wins, including an explicit 0.
+  const explicit = spyRunSpec();
+  await main(["--max-spend", "999", "--cell-concurrency", "24", "--batch-window-ms", "0"], {
+    runSpecFn: explicit,
+    store: FAKE_STORE,
+    getEngineVersion: STUB_ENGINE_VERSION,
+  });
+  assert.equal(explicit.calls[0].opts.provider.batchWindowMs, 0, "--batch-window-ms overrides the pairing default, 0 included");
+
+  // And the default path is untouched.
+  const dflt = spyRunSpec();
+  await main(["--max-spend", "999"], { runSpecFn: dflt, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(dflt.calls[0].opts.provider.batchWindowMs, 0, "an unraised concurrency keeps the historical per-round debounce");
+  assert.equal(dflt.calls[0].opts.cellConcurrency, undefined, "and runSpec falls through to its own default of 1");
+});
+
+test("--cell-concurrency and --batch-window-ms are refused by --prune and --phase 0, like every other run-only flag (issue #148)", async () => {
+  for (const flag of [
+    ["--cell-concurrency", "4"],
+    ["--batch-window-ms", "2000"],
+  ]) {
+    await assert.rejects(
+      () => main(["--prune", ...flag], { store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION }),
+      new RegExp(`--prune does not accept .*${flag[0]}`),
+      `--prune ${flag[0]}`,
+    );
+    await assert.rejects(
+      () => main(["--phase", "0", ...flag], { store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION }),
+      new RegExp(`--phase 0 does not accept .*${flag[0]}`),
+      `--phase 0 ${flag[0]}`,
+    );
+  }
+});
 
 test("parseArgs accepts --no-resume and --no-cancel-on-abandon (issue #103)", () => {
   assert.equal(parseArgs(["--no-resume"]).noResume, true);

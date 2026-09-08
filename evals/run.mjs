@@ -78,6 +78,18 @@ const REPO_ROOT = join(__dirname, "..");
 export const DEFAULT_RESULTS_DIR = join(REPO_ROOT, "results");
 
 /**
+ * The coalescing window applied when `--cell-concurrency` is raised and
+ * `--batch-window-ms` is not given (issue #148).
+ *
+ * Lives here rather than in provider.mjs because it is a CLI-ergonomics
+ * decision, not a provider default: the provider's own default stays 0 (the
+ * historical per-round debounce) so a programmatic caller gets exactly the old
+ * behaviour unless it asks otherwise. See the wiring site for why the pairing
+ * is defaulted rather than left to the operator to remember.
+ */
+export const DEFAULT_CONCURRENT_BATCH_WINDOW_MS = 2000;
+
+/**
  * Resolve --results-dir (issue #120) to an absolute directory, refusing a
  * path that exists but is not a results store.
  *
@@ -345,6 +357,40 @@ export function parseArgs(argv) {
         break;
       case "--no-batch":
         args.noBatch = true;
+        break;
+      // ── --cell-concurrency (issue #148) ───────────────────────────────
+      // How many cells run at once. The default of 1 is the historical
+      // sequential loop; raising it is what lets several cells' requests reach
+      // ONE Message Batch instead of one batch per cell (see the all-solo
+      // warning below for why that matters, and runner.mjs's own note for how
+      // admission control stays exact under concurrency).
+      //
+      // Validated as a positive integer HERE as well as in
+      // runCellsWithConcurrency, for the same reason --max-poll-minutes is:
+      // a typo at the CLI should be rejected at the CLI, before an API key is
+      // read and a store is opened.
+      case "--cell-concurrency":
+        args.cellConcurrency = parseRequiredNumber(argv, ++i, "--cell-concurrency");
+        if (!Number.isInteger(args.cellConcurrency) || args.cellConcurrency < 1) {
+          throw new Error(`run.mjs: --cell-concurrency must be a positive integer, got ${args.cellConcurrency}`);
+        }
+        break;
+      // ── --batch-window-ms (issue #148) ───────────────────────────────
+      // How long the provider's barrier holds its buffer open before
+      // submitting. Separate from --cell-concurrency because they answer
+      // different questions -- how many cells may overlap, versus how long to
+      // wait for their requests to arrive -- and an operator tuning one should
+      // not be forced to guess the other. 0 is legal (the historical per-round
+      // debounce); a negative value is not.
+      // Explicitly settable to 0 ("give me the historical debounce even at
+      // concurrency > 1"), which is why the pairing default at the provider
+      // construction is applied by ABSENCE of the flag, never by the value
+      // being falsy.
+      case "--batch-window-ms":
+        args.batchWindowMs = parseRequiredNumber(argv, ++i, "--batch-window-ms");
+        if (!(args.batchWindowMs >= 0)) {
+          throw new Error(`run.mjs: --batch-window-ms must be 0 or greater, got ${args.batchWindowMs}`);
+        }
         break;
       // ── --results-dir (issue #120) ──────────────────────────────────────
       // Which results store this invocation reads and writes. Mirrors the
@@ -686,6 +732,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (args.noResume) runOnlyFlags.push("--no-resume");
     if (args.noCancelOnAbandon) runOnlyFlags.push("--no-cancel-on-abandon");
     if (args.maxPollMinutes !== undefined) runOnlyFlags.push("--max-poll-minutes");
+    // issue #148: both are live-run-only for the same reason as the flags above
+    // -- a prune runs no cells and submits no batch, so neither could do
+    // anything but be silently dropped.
+    if (args.cellConcurrency !== undefined) runOnlyFlags.push("--cell-concurrency");
+    if (args.batchWindowMs !== undefined) runOnlyFlags.push("--batch-window-ms");
     if (args.phase !== undefined) runOnlyFlags.push("--phase");
     if (runOnlyFlags.length) {
       // Same non-negotiable --phase 0 applies: a flag silently ignored on a
@@ -788,6 +839,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     // silently dropping a flag on a live code path is the pattern this branch
     // exists to refuse.
     if (args.maxPollMinutes !== undefined) ignoredFlags.push("--max-poll-minutes");
+    // issue #148: Phase 0 runs no cells and submits no batch either.
+    if (args.cellConcurrency !== undefined) ignoredFlags.push("--cell-concurrency");
+    if (args.batchWindowMs !== undefined) ignoredFlags.push("--batch-window-ms");
     if (ignoredFlags.length > 0) {
       throw new Error(
         `run.mjs: --phase 0 does not accept ${ignoredFlags.join(", ")} -- Phase 0 is a fixed three-control run ` +
@@ -1014,6 +1068,31 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       corpus: CORPUS,
       armsConfig,
       ...(args.maxPollMinutes !== undefined ? { maxPollMs: args.maxPollMinutes * 60 * 1000 } : {}),
+      // batchWindowMs (issue #148). This is the ONE place the "pass only what
+      // the operator set" discipline does not apply, and the exception is the
+      // point of the fix.
+      //
+      // Concurrency and the window are not two independent knobs: raising
+      // concurrency while the window stays 0 buys nothing. A zero window closes
+      // on the next macrotask, so it coalesces only cells that arrive together
+      // -- true of a run's first burst and false in steady state, where a worker
+      // picks up its next cell when its previous batch returns, minutes after
+      // its peers. So `--cell-concurrency 24` alone would give an operator 24
+      // concurrent cells, one batch each, and no warning (the all-solo guard
+      // below is silenced by concurrency > 1). The documented recommendation
+      // would be a thing to remember, and forgetting it would look like the fix
+      // not working.
+      //
+      // So concurrency > 1 defaults the window to something useful, and
+      // --batch-window-ms still overrides. 2000ms is chosen against the thing it
+      // trades off: a batch queue wait measured in minutes to hours, against
+      // which two seconds of coalescing is free. Concurrency 1 keeps 0 -- the
+      // historical per-round debounce, unchanged.
+      ...(args.batchWindowMs !== undefined
+        ? { batchWindowMs: args.batchWindowMs }
+        : (args.cellConcurrency ?? 1) > 1
+          ? { batchWindowMs: DEFAULT_CONCURRENT_BATCH_WINDOW_MS }
+          : {}),
       // Same "pass only what the operator actually set" discipline as
       // maxPollMs above: an unset off-switch leaves the provider's own
       // default-on in place rather than re-specifying it here, where it could
@@ -1076,6 +1155,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     batch: !args.noBatch,
     resume: !args.noResume, // issue #103
     dryRun: args.dryRun,
+    ...(args.cellConcurrency !== undefined ? { cellConcurrency: args.cellConcurrency } : {}), // issue #148
     // judgeModels/judgeProviders/corpus (issue #68): THE wiring that makes
     // judging reachable from a real CLI run at all -- before this, nothing
     // outside a test ever called runJudgeMatrix/runJudgeValidation (see the
@@ -1122,6 +1202,35 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     replicates: args.replicates,
     log, // same injectable log this function's own end-of-run summary uses
   };
+  // ── The all-solo batch warning (issue #148) ────────────────────────────────
+  // Batch mode buys two things: a 50% discount and throughput. The discount is
+  // per batch regardless of size, so it is earned either way. The throughput is
+  // not: a solo arm produces exactly ONE request per cell, and at
+  // `--cell-concurrency 1` that is a one-request Message Batch which pays the
+  // full queue wait for zero parallelism -- once per cell, serially. Measured on
+  // Study 1 Stage 1a: 2h34m on a single-request batch, zero cells collected.
+  //
+  // Warn rather than refuse. The configuration is legal, it is still cheaper
+  // than `--no-batch`, and an operator may genuinely want it (a handful of
+  // cells, or a deliberate re-poll of an outstanding handle). What it must not
+  // be is silent, because the failure mode is a run that looks alive and
+  // collects nothing.
+  //
+  // Deliberately checks ALL arms rather than any: a grid with even one panel arm
+  // gets 5-request batches, so the pathological shape is specifically
+  // "everything is solo."
+  if (!args.noBatch && !args.dryRun && (args.cellConcurrency ?? 1) === 1) {
+    const plannedArms = armIds.map((id) => armsConfig.arms[id]).filter(Boolean);
+    if (plannedArms.length > 0 && plannedArms.every((a) => a.mode === "solo")) {
+      log(
+        `[batch] WARNING: every planned arm is solo, so each cell submits a Message Batch containing exactly ONE request, ` +
+          `and --cell-concurrency 1 waits for each batch before submitting the next. The 50% batch discount still applies, ` +
+          `but there is no parallelism to pay the queue wait for. Pass --cell-concurrency N (with --batch-window-ms, e.g. 2000) ` +
+          `to coalesce several cells into one batch, or --no-batch to trade the discount for predictable wall-clock. See issue #148.`,
+      );
+    }
+  }
+
   const result = await runSpecFn(spec, runSpecOpts);
   // Print the spend summary (issue #64 follow-up, PR #72 review, HIGH) --
   // the ONLY place any of runSpec()'s spend accounting reaches the operator.
