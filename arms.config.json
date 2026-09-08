@@ -1,5 +1,5 @@
 {
-  "_comment": "arms.config.json — arm -> model configuration (issue #5, pre-registration §3.1). Config, not code: the runner (evals/harness/runner.mjs) READS this file; it never hardcodes a model ID. Panel size is fixed at 5 agents / ideasPerAgent: 6 / maxRounds: 2 for every panel arm (A is the one exception - a single solo call, no panel) so the ONLY thing varying between arms is model assignment, per the pre-registration's design intent ('the only thing varying is model assignment').",
+  "_comment": "arms.config.json — arm -> model configuration (issue #5, pre-registration §3.1). Config, not code: the runner (evals/harness/runner.mjs) READS this file; it never hardcodes a model ID. Panel size is fixed at 5 agents / ideasPerAgent: 6 / maxRounds: 2 for every panel arm (A is the one exception - a single solo call, no panel) so the ONLY thing varying between arms is model assignment, per the pre-registration's design intent ('the only thing varying is model assignment') -- true of arms A through AS. The eight S1-* arms (issue #130, Appendix F item 2) are a SEPARATE one-factor-at-a-time screening design layered on top: each varies exactly one of N / effort / stance / strategy off a centre point (S1-C0), so 'the only thing varying' does not hold across the S1-* family as a whole -- see each S1-* arm's own `purpose` for which single factor it moves.",
   "_modelIdSource": "Anthropic model IDs verified against the claude-api skill (cached 2026-06-24) and docs/PREREGISTRATION.md §8.1: claude-opus-5, claude-sonnet-5, claude-haiku-4-5. OpenAI model IDs verified first-party against developers.openai.com/api/docs/pricing (2026-08-02, issue #22) -- see lib/price.mjs's OPENAI_PRICE_VERIFICATION record; the earlier UNVERIFIED placeholders (openai-mid-tier / openai-large-tier) are removed. Tier-matching judgment (issue #22): the study varies model configuration only, so G's two OpenAI slots sit at tiers comparable to the Anthropic slots they contrast with -- gpt-5.6-terra (mid tier, ~Sonnet-comparable) and gpt-5.6-sol (flagship tier, ~Opus-comparable); H is homogeneous OpenAI at the mid tier (gpt-5.6-terra x5), the OpenAI analogue of arm C (homogeneous Sonnet).",
   "panel": {
     "size": 5,
@@ -136,6 +136,118 @@
       "slots": [
         { "persona": "solo", "model": "claude-sonnet-5" }
       ]
+    },
+    "S1-C0": {
+      "label": "Study 1 Stage 1a — centre point",
+      "purpose": "Appendix F item 2. The centre of the one-factor-at-a-time screening design: N=30, effort high, stance neutral, strategy cot. Every other S1 arm differs from this one in exactly ONE factor, which is what makes the sweep attributable. `effort: high` is documented as behaviourally equivalent to omitting the parameter (Appendix F item 5), so this centre point is also the sweep's bridge to the effort-free arms A and AS.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 30,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+    },
+    "S1-N10": {
+      "label": "Study 1 Stage 1a — N=10",
+      "purpose": "Appendix F item 2. Off-centre on N only (10 vs the centre's 30). Feeds the distinct_k-vs-N dose-response curve, which is the study's headline deliverable and the denominator every later panel comparison needs.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 10,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+    },
+    "S1-N60": {
+      "label": "Study 1 Stage 1a — N=60",
+      "purpose": "Appendix F item 2. Off-centre on N only (60 vs 30). Appendix F item 7 records a measured risk specific to this arm: 1 of 6 probe replies at N=60 failed a direct JSON.parse and lost 14 objects to salvage while ending on end_turn — malformation, not truncation, so the raised max_tokens cap does not address it. Short realized pools here should be checked against that first.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 60,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+    },
+    "S1-ELOW": {
+      "label": "Study 1 Stage 1a — effort low",
+      "purpose": "Appendix F item 2. Off-centre on effort only (low vs high). Within-model by construction: Appendix E item 3 registers effort as a first-class ordinal factor ONLY within one model family, because the Anthropic and OpenAI ladders are verified but not identical.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 30,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "low" }]
+    },
+    "S1-EMAX": {
+      "label": "Study 1 Stage 1a — effort max",
+      "purpose": "Appendix F item 2. Off-centre on effort only (max vs high). This is the arm the effort-aware max_tokens sizing (Appendix F item 6) exists for: measured live at up to 775.6 output tokens per idea, 5.0x the cap the pre-#130 constants would have applied, so under the old sizing it would have truncated systematically and read as a dose-response effect of effort on distinct_k.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 30,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "max" }]
+    },
+    "S1-SPRAG": {
+      "label": "Study 1 Stage 1a — stance PRAGMATIST",
+      "purpose": "Appendix F item 2. Off-centre on stance only. The stance string is ideate-core@0.5.0's DEFAULT_PERSONAS[0] text, transcribed VERBATIM — but its bundled strategy ('direct') is deliberately NOT carried over: strategy stays at the centre value 'cot'. That separation is the point of the arm. DEFAULT_PERSONAS ships stance and strategy together, so a persona effect measured on the main grid is un-attributable between perspective and prompt strategy; this arm moves perspective alone.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 30,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "PRAGMATIST: practical, resource-aware, shippable. Favor ideas that a small team could start on Monday. Prefer clarity and feasibility over cleverness.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+    },
+    "S1-SCONTRA": {
+      "label": "Study 1 Stage 1a — stance CONTRARIAN",
+      "purpose": "Appendix F item 2. Off-centre on stance only. DEFAULT_PERSONAS[1]'s stance text verbatim, with its bundled strategy ('cot') coinciding with the centre value rather than being carried over — the same unbundling as S1-SPRAG. The persona NAME stays the inert 'solo_b' on every S1 arm: buildRound1Prompt interpolates the name into the prompt verbatim, so a descriptive name here would leak the manipulation into the text and reintroduce the demand characteristic arm AS's inert name was chosen to remove.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 30,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "CONTRARIAN: challenge the obvious. Invert the default assumption, argue the opposite of the expected move, and surface what everyone is ignoring.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+    },
+    "S1-DIRECT": {
+      "label": "Study 1 Stage 1a — strategy direct",
+      "purpose": "Appendix F item 2. Off-centre on strategy only (direct vs the centre's cot). This is the only S1 arm that does NOT render the registered CoT paragraph (Appendix F item 1). It is behaviourally equivalent to arm AS — same model, N, rounds, persona name, stance, temperature and resolved max_tokens bucket — differing only in that AS omits `effort` while this arm sets it explicitly to high, which the API documents as identical behaviour. That makes the documented equivalence itself observable rather than merely assumed: if this arm and a later arm-AS cell diverge beyond replicate noise, the equivalence claim is what to doubt.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 30,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "direct"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
     }
   }
 }
