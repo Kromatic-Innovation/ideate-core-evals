@@ -1480,7 +1480,9 @@ This is stated explicitly because the transfer is the failure mode this appendix
 
 ### Item 5 — reproduction
 
-**What was run**, so the numbers above are checkable rather than reported:
+**The script that produced every number above is committed**: `evals/analysis/variance-components.mjs`. Run `node evals/analysis/variance-components.mjs --all-arms` to reproduce both fits, the residual, the achieved SE and item 2's table from the committed CSV. This is deliberate rather than incidental — the figure this appendix supersedes was "reported, not verified against a committed artifact in this repo," transcribed from an issue body and never independently re-run, which is exactly how a two-brief estimate became binding on an entire replication plan. A number that replaces it on those grounds ships with its derivation, not with a prose description of a derivation someone else would have to reimplement. The registered arm set and reference arm are named as constants in that file rather than derived from `arms.config.json`, so a later arm edit cannot silently change which cells reproduce a registered number.
+
+**What it runs**, stated here too so the appendix stands on its own:
 
 - Inputs: `docs/study1-stage1a-cells.csv`, rows with `state == "completed"`; response `y = distinct_k`; the matched subset is the six arms named in Item 1.
 - Fit: `evals/analysis/sidecar/.venv/bin/python evals/analysis/sidecar/fit_mixedlm.py`, rung `R0`, `referenceArm: "S1-C0"`, `armLevels` the fitted arm set. `varianceComponents` gives `brief` and `brief:arm`; the diagonal of `vcov` gives the achieved contrast SE.
