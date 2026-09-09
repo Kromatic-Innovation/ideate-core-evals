@@ -318,6 +318,56 @@ export const MAX_TOKENS_HEADROOM = 2.5;
  *  sends a different request than it did before. */
 export const LEGACY_MAX_TOKENS = 2048;
 
+// -- issue #160: a per-IDEA rate cannot size a SMALL request ----------------
+// Stage 1b (docs/status-2026-09-09.md) ran its panel arms at ideasPerAgent 6
+// on claude-sonnet-5/high, which `maxTokensForIdeas` sized at
+// 6 * 175 * 2.5 = 2625. 19 of 45 S1B-PANEL cells came back with pools short of
+// the 60 the arm specifies, against 3 of 48 for the matched solo arm at the
+// same nominal pool size. A live probe of that exact request shape (49 replies,
+// claude-sonnet-5 effort high, ideasPerAgent 6, rounds 1 and 2, briefs
+// sci-08/sci-09/biz-01/prod-07/aut-01, 2026-09-09) found 2 of 49 replies over
+// the 2625 cap -- ~4% per REPLY, which compounds to ~34% per CELL across the
+// 10 calls a 5-slot two-round panel makes, and that is the ~42% short-pool rate
+// the run observed.
+//
+// The defect is in the UNIT, not the number. `ideas * rate` treats output as
+// proportional to the ideas asked for, but a reply has a FIXED cost -- framing,
+// reasoning, the JSON scaffold -- that does not shrink with the request. The
+// probe measures that directly, and the argument needs no comparison to any
+// other probe: at a FIXED 6 ideas, round-1 output ran 604-2631 tokens, a 4.4x
+// spread at constant idea count. Idea count cannot explain a spread it is held
+// constant across. So per-idea is the wrong unit at small request sizes, and
+// the instrument is a per-REQUEST floor rather than an inflated per-idea rate
+// (which would over-size the 30- and 60-idea solo calls, where the unit is
+// sound, by the same multiple).
+//
+// The floor is set by the SAME convention every rate in this file uses -- the
+// TOP of the observed distribution times MAX_TOKENS_HEADROOM, not the mean:
+// 2749 (the probe's largest single reply, round 2 on sci-08, stop_reason
+// end_turn) * 2.5 = 6873. No new multiplier is introduced.
+//
+// Two things this deliberately does NOT do:
+//   - It does not re-measure claude-sonnet-5's per-idea rate. At 6 ideas the
+//     floor (6873) already dominates what the probe's top per-idea reply would
+//     justify (6 * 439 * 2.5 = 6585), so a rate change would be inert here
+//     while silently moving the 30/60-idea solo calls the rate is sound for.
+//   - It does not claim to fix FORMAT failures. The same probe recorded 2 of 49
+//     replies that stopped on `end_turn` and still yielded nothing usable (one
+//     unparseable at 2032 tokens, one returning a single idea) -- ~4% per reply,
+//     unaffected by any ceiling. Registered as a measured residual so the next
+//     run's losses are read against a stated baseline (see PREREGISTRATION.md
+//     Appendix J item 3), not mistaken for truncation returning.
+//
+// It is a FLOOR, applied flat to every model, for the same reason
+// DEFAULT_TOKENS_PER_IDEA is generous: `max_tokens` is a CEILING billed as
+// generated, so this is upward for every model and free where it does not bind.
+// It binds only where the per-idea unit is unsound -- small `ideas`. It is inert
+// for claude-opus-5 at 6 ideas (8370 > 6873) and for every solo call in this
+// study (Sonnet at 30 ideas: 13125; at 60: 26250).
+/** Per-REQUEST output-token floor, from the top of the observed panel-shape
+ *  distribution times MAX_TOKENS_HEADROOM (issue #160). See above. */
+export const MIN_REQUEST_MAX_TOKENS = 6873;
+
 /** Fallback ideas-per-agent when a caller supplies nothing usable -- matches
  *  the same fallback the prompt builders above apply to `ideasPerAgent`. */
 export const DEFAULT_IDEAS_PER_AGENT = 6;
@@ -372,12 +422,13 @@ function tokensPerIdeaFor(model, effort) {
  *   slot.effort string, e.g. "low"/"high"/"max"), or `undefined` when the
  *   slot sets none -- see `tokensPerIdeaFor` above for how `undefined` is
  *   resolved (issue #130).
- * @returns {number} a max_tokens value, never below LEGACY_MAX_TOKENS.
+ * @returns {number} a max_tokens value, never below LEGACY_MAX_TOKENS nor
+ *   below MIN_REQUEST_MAX_TOKENS (issue #160).
  */
 export function maxTokensForIdeas(ideas, model, effort) {
   const n = Number.isFinite(ideas) && ideas > 0 ? ideas : DEFAULT_IDEAS_PER_AGENT;
   const rate = tokensPerIdeaFor(model, effort);
-  return Math.max(LEGACY_MAX_TOKENS, Math.ceil(n * rate * MAX_TOKENS_HEADROOM));
+  return Math.max(LEGACY_MAX_TOKENS, MIN_REQUEST_MAX_TOKENS, Math.ceil(n * rate * MAX_TOKENS_HEADROOM));
 }
 
 // ── Salvage (issue #93, cause 2) ────────────────────────────────────
@@ -602,6 +653,9 @@ export function promptTemplateHash() {
     defaultTokensPerIdea: DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: MAX_TOKENS_HEADROOM,
     legacyMaxTokens: LEGACY_MAX_TOKENS,
+    // issue #160: a second floor, and a change to it is a change to what was
+    // requested -- it must move the hash exactly as a rate change does.
+    minRequestMaxTokens: MIN_REQUEST_MAX_TOKENS,
     salvageVersion: SALVAGE_VERSION,
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 12);

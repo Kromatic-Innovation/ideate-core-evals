@@ -53,6 +53,7 @@ import {
 import {
   DEFAULT_TOKENS_PER_IDEA,
   LEGACY_MAX_TOKENS,
+  MIN_REQUEST_MAX_TOKENS,
   MAX_TOKENS_HEADROOM,
   TOKENS_PER_IDEA_BY_MODEL,
   maxTokensForIdeas,
@@ -261,15 +262,24 @@ test("#122: maxTokensForIdeas gives a 6-idea Opus request 2x-3x headroom over th
   assert.ok(panel > LEGACY_MAX_TOKENS, "the whole point of #122: Opus's real ceiling must clear the pre-#122 flat floor");
 });
 
-test("#130: a 6-idea Sonnet request explicitly at effort:\"low\" still floors to the legacy 2048", () => {
-  // The `low` bucket (81/idea) is the only Sonnet path left that still
-  // computes below the floor (6 * 81 * 2.5 = 1215 < 2048) -- this is the one
-  // remaining sliver of #93's original "byte-identical with run #8"
-  // comparability guarantee. No arm in arms.config.json actually sets
-  // effort:"low" today, so this documents the invariant rather than
-  // asserting anything about a live arm.
-  assert.equal(maxTokensForIdeas(armsConfigJson.panel.ideasPerAgent, "claude-sonnet-5", "low"), LEGACY_MAX_TOKENS);
-  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "low"), 2048);
+test("#160: LEGACY_MAX_TOKENS no longer binds anywhere -- MIN_REQUEST_MAX_TOKENS is the floor that does", () => {
+  // Before #160, a 6-idea Sonnet request at effort:"low" (6 * 81 * 2.5 = 1215)
+  // was the last path that still floored to LEGACY_MAX_TOKENS, and this test
+  // pinned it as the surviving sliver of #93's "byte-identical with run #8"
+  // comparability guarantee. #160 raises the floor above it, so that sliver is
+  // gone -- deliberately, and priced: promptTemplateHash() moves for every
+  // model in this change, so there was no byte-identical claim left to protect.
+  // What this test now pins is the replacement invariant: a computed value
+  // below the floor still yields the floor, and the floor that wins is the
+  // higher of the two.
+  assert.equal(maxTokensForIdeas(armsConfigJson.panel.ideasPerAgent, "claude-sonnet-5", "low"), MIN_REQUEST_MAX_TOKENS);
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "low"), 6873);
+  assert.ok(MIN_REQUEST_MAX_TOKENS > LEGACY_MAX_TOKENS, "#160's floor must dominate #93's, or nothing changed");
+  // LEGACY_MAX_TOKENS is kept in the Math.max (and in the hash payload) rather
+  // than deleted: it is a registered constant of the sizing rule, and dropping
+  // it would make a future lowering of MIN_REQUEST_MAX_TOKENS silently reopen
+  // the pre-#93 defect.
+  assert.ok(maxTokensForIdeas(1, "claude-sonnet-5", "low") >= LEGACY_MAX_TOKENS);
 });
 
 test("#130: a 6-idea Sonnet request with no effort set resolves to EXACTLY the explicit high-effort figure, and both exceed the legacy floor", () => {
@@ -283,7 +293,16 @@ test("#130: a 6-idea Sonnet request with no effort set resolves to EXACTLY the e
   const explicitHigh = maxTokensForIdeas(6, "claude-sonnet-5", "high");
   assert.equal(noEffort, explicitHigh, "undefined effort must resolve to the high bucket");
   assert.ok(noEffort > LEGACY_MAX_TOKENS, "issue #130's whole point: the last floor-pinned Sonnet cell is now raised");
-  assert.equal(noEffort, Math.ceil(6 * TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"].high * MAX_TOKENS_HEADROOM));
+  // issue #160: at 6 ideas BOTH sides now floor to MIN_REQUEST_MAX_TOKENS, so
+  // the equality above no longer demonstrates the resolution on its own -- it
+  // would hold even if undefined resolved to "low". The resolution is therefore
+  // re-asserted at an idea count where the rate, not the floor, decides.
+  assert.equal(noEffort, MIN_REQUEST_MAX_TOKENS);
+  assert.equal(
+    maxTokensForIdeas(60, "claude-sonnet-5"),
+    Math.ceil(60 * TOKENS_PER_IDEA_BY_MODEL["claude-sonnet-5"].high * MAX_TOKENS_HEADROOM),
+  );
+  assert.notEqual(maxTokensForIdeas(60, "claude-sonnet-5"), maxTokensForIdeas(60, "claude-sonnet-5", "low"));
 });
 
 test("#93 AC1: maxTokensForCell degrades safely on an empty/garbage agent list (never -Infinity or NaN)", () => {
@@ -754,6 +773,7 @@ test("#93 comparability: promptTemplateHash covers prompt TEXT, the sizing const
     defaultTokensPerIdea: prompts.DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: prompts.MAX_TOKENS_HEADROOM,
     legacyMaxTokens: prompts.LEGACY_MAX_TOKENS,
+    minRequestMaxTokens: prompts.MIN_REQUEST_MAX_TOKENS,
     salvageVersion: prompts.SALVAGE_VERSION,
   };
   const hashOf = (o) => createHash("sha256").update(JSON.stringify(o)).digest("hex").slice(0, 12);

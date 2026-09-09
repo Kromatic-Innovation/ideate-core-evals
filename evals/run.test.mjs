@@ -364,6 +364,8 @@ test("issue #99: editing a generation prompt template moves the configHash of th
     defaultTokensPerIdea: prompts.DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: prompts.MAX_TOKENS_HEADROOM,
     legacyMaxTokens: prompts.LEGACY_MAX_TOKENS,
+    // issue #160: the per-request floor is a sizing constant too.
+    minRequestMaxTokens: prompts.MIN_REQUEST_MAX_TOKENS,
     salvageVersion: prompts.SALVAGE_VERSION,
   };
   const hashOf = (o) => createHash("sha256").update(JSON.stringify(o)).digest("hex").slice(0, 12);

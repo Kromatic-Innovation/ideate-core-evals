@@ -17,6 +17,7 @@ import {
   DEFAULT_TOKENS_PER_IDEA,
   MAX_TOKENS_HEADROOM,
   LEGACY_MAX_TOKENS,
+  MIN_REQUEST_MAX_TOKENS,
   SALVAGE_VERSION,
   EFFORT_FREE,
   maxTokensForIdeas,
@@ -150,6 +151,7 @@ test("#130 mutation-proof: promptTemplateHash's payload contains BOTH the direct
     defaultTokensPerIdea: DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: MAX_TOKENS_HEADROOM,
     legacyMaxTokens: LEGACY_MAX_TOKENS,
+    minRequestMaxTokens: MIN_REQUEST_MAX_TOKENS,
     salvageVersion: SALVAGE_VERSION,
   };
   const hashOf = (o) => createHash("sha256").update(JSON.stringify(o)).digest("hex").slice(0, 12);
@@ -184,22 +186,71 @@ test("#130 mutation-proof: promptTemplateHash's payload contains BOTH the direct
 // a different request, so the sizing-constants payload changing is exactly
 // the intended effect (see the PR body for the develop value this moved from:
 // b529182bea28).
-test("#130: promptTemplateHash() is pinned to the post-#130 (effort-aware sizing) value", () => {
-  assert.equal(promptTemplateHash(), "c6c2a60a4fe8");
+test("#160: promptTemplateHash() is pinned to the post-#160 (per-request floor) value", () => {
+  // Moved from #130's c6c2a60a4fe8 by adding MIN_REQUEST_MAX_TOKENS to the
+  // payload. That is the intended effect: every panel arm now sends a
+  // different max_tokens, so no Stage 1b cell collected under the old ceiling
+  // may be pooled with one collected under the new one.
+  assert.equal(promptTemplateHash(), "12b0a1a414c2");
+});
+
+// ── issue #160: the per-REQUEST floor ──────────────────────────────────────
+
+test("#160: the floor is the probe's observed maximum times MAX_TOKENS_HEADROOM, and it covers every reply the probe saw", () => {
+  // The probe's largest single reply (round 2, sci-08, stop_reason end_turn),
+  // 2026-09-09, claude-sonnet-5 effort high, ideasPerAgent 6. The floor is
+  // derived from it by the SAME convention every rate in prompts.mjs uses --
+  // the TOP of the observed distribution times MAX_TOKENS_HEADROOM -- so this
+  // pins the derivation, not just the literal.
+  const PROBE_MAX_OUTPUT_TOKENS = 2749;
+  assert.equal(MIN_REQUEST_MAX_TOKENS, Math.ceil(PROBE_MAX_OUTPUT_TOKENS * MAX_TOKENS_HEADROOM));
+
+  // The defect #160 fixes: the Stage 1b panel ceiling (6 * 175 * 2.5) sat BELOW
+  // replies the probe actually observed. Two of 49 exceeded it.
+  const STAGE_1B_PANEL_CEILING = 2625;
+  assert.ok(
+    STAGE_1B_PANEL_CEILING < PROBE_MAX_OUTPUT_TOKENS,
+    "if the old ceiling were above the observed max there would have been no truncation to explain",
+  );
+  assert.ok(MIN_REQUEST_MAX_TOKENS > PROBE_MAX_OUTPUT_TOKENS, "the floor must clear the observed max outright");
+});
+
+test("#160: the floor binds at the panel shape and is inert at every solo shape in this study", () => {
+  // Binds: the shape that truncated.
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "high"), MIN_REQUEST_MAX_TOKENS);
+  // Inert: the per-idea unit is sound at solo sizes, and #160 must not disturb
+  // them -- an inflated per-idea RATE would have, which is why the instrument
+  // is a floor.
+  for (const ideas of [30, 60]) {
+    const v = maxTokensForIdeas(ideas, "claude-sonnet-5", "high");
+    assert.equal(v, Math.ceil(ideas * 175 * MAX_TOKENS_HEADROOM), `solo ${ideas} must be rate-decided, not floor-decided`);
+    assert.ok(v > MIN_REQUEST_MAX_TOKENS);
+  }
+  // Inert for a model whose own measured rate already clears it at 6 ideas.
+  assert.ok(maxTokensForIdeas(6, "claude-opus-5") > MIN_REQUEST_MAX_TOKENS);
+  assert.equal(maxTokensForIdeas(6, "claude-opus-5"), Math.ceil(6 * 558 * MAX_TOKENS_HEADROOM));
 });
 
 // ── issue #130: maxTokensForIdeas's (model, effort) resolution order ────────
 
 test("#130 resolution order (1): an exact (model, effort) bucket wins", () => {
-  // 6 * 81 * 2.5 = 1215, below LEGACY_MAX_TOKENS -- Math.max(floor, computed)
-  // applies here too, so this also confirms the floor still binds correctly
-  // after the (model, effort) re-key.
-  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "low"), LEGACY_MAX_TOKENS);
+  // issue #160 raised the request floor to MIN_REQUEST_MAX_TOKENS (6873), which
+  // is ABOVE what several of these buckets compute at 6 ideas -- so the idea
+  // counts here are chosen to clear it, or the assertion would be about the
+  // floor rather than about which bucket was read. That masking is the intended
+  // effect (#160: per-idea is the wrong unit at small request sizes), not a
+  // weakening of this test: every bucket is still distinguished, just at a size
+  // where the per-idea unit is the binding one.
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "low"), MIN_REQUEST_MAX_TOKENS);
   // A larger idea count clears the floor, proving the "low" bucket really is
-  // being read (not silently falling through to "high").
-  assert.equal(maxTokensForIdeas(30, "claude-sonnet-5", "low"), Math.ceil(30 * 81 * MAX_TOKENS_HEADROOM));
-  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "high"), Math.ceil(6 * 175 * MAX_TOKENS_HEADROOM));
+  // being read (not silently falling through to "high"). 30 no longer suffices
+  // under #160 (30 * 81 * 2.5 = 6075 < 6873); 60 does.
+  assert.equal(maxTokensForIdeas(60, "claude-sonnet-5", "low"), Math.ceil(60 * 81 * MAX_TOKENS_HEADROOM));
+  assert.equal(maxTokensForIdeas(60, "claude-sonnet-5", "high"), Math.ceil(60 * 175 * MAX_TOKENS_HEADROOM));
   assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "max"), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
+  // The three buckets remain mutually distinct where the rate binds -- the
+  // masking above is a property of small requests, not of the resolution.
+  assert.equal(new Set([60, 60, 60].map((n, i) => maxTokensForIdeas(n, "claude-sonnet-5", ["low", "high", "max"][i]))).size, 3);
 });
 
 test("#130 resolution order: undefined effort resolves to the SAME rate as explicit \"high\" -- the documented omit-equals-high equivalence, not an assumption", () => {
