@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { contrastSE, pooledWithinCellVariance, MATCHED_N30_ARMS, REFERENCE_ARM } from "./variance-components.mjs";
+import { contrastSE, pooledWithinCellVariance, n60ScaleBasis, MATCHED_N30_ARMS, REFERENCE_ARM, N60_ARM, N30_CENTRE_ARM } from "./variance-components.mjs";
 
 // ── The auditable check Appendix G item 2 claims ─────────────────────────────
 
@@ -32,12 +32,95 @@ test("the SE formula reproduces Appendix E item 7's published table from the SUP
   }
 });
 
+// ── Appendix I item 3: the ~60-pool basis ─────────────────────────────────
+
+/** Two replicates of one (arm x brief) cell, as CSV-shaped rows. */
+function cell(arm, brief, a, b) {
+  return [
+    { arm, brief, state: "completed", distinct_k: String(a) },
+    { arm, brief, state: "completed", distinct_k: String(b) },
+  ];
+}
+
+test("n60ScaleBasis: sigma^2_e at ~60 is MEASURED and sigma^2_ba at ~60 is the measured ratio applied to the ~30 fit", () => {
+  // Centre arm: within-cell deviations +/-1 -> ss = 2 per cell, df 1 -> 2.0.
+  // N=60 arm: deviations +/-2 -> ss = 8 per cell, df 1 -> 8.0. Ratio 4.
+  const rows = [
+    ...cell(N30_CENTRE_ARM, "b1", 9, 11),
+    ...cell(N30_CENTRE_ARM, "b2", 19, 21),
+    ...cell(N60_ARM, "b1", 18, 22),
+    ...cell(N60_ARM, "b2", 38, 42),
+  ];
+  const basis = n60ScaleBasis(rows, 1.5);
+  assert.equal(basis.sigma2eAt60, 8);
+  assert.equal(basis.sigma2eAt30Centre, 2);
+  assert.equal(basis.varianceRatio, 4);
+  assert.equal(basis.sigma2BriefArmAt60, 6, "the ~30 interaction term transported by the measured ratio");
+});
+
+test("n60ScaleBasis: the ratio's denominator is the CENTRE arm alone, not a pool that a high-variance arm can dominate", () => {
+  // The appendix's actual reason for choosing S1-C0 over the pooled matched
+  // residual: S1-SPRAG's within-cell variance is ~4x every other arm's, so
+  // pooling drags a STANCE effect into a POOL-SIZE ratio and pushes it below
+  // one. Here a wild third arm at the ~30 scale must not move the answer.
+  const base = [
+    ...cell(N30_CENTRE_ARM, "b1", 9, 11),
+    ...cell(N60_ARM, "b1", 18, 22),
+  ];
+  const withWildArm = [...base, ...cell("S1-SPRAG", "b1", 0, 100)];
+  assert.equal(n60ScaleBasis(withWildArm, 1).varianceRatio, n60ScaleBasis(base, 1).varianceRatio);
+});
+
+test("n60ScaleBasis: the mean ratio is reported alongside, as the independent count-variance corroboration", () => {
+  const rows = [
+    ...cell(N30_CENTRE_ARM, "b1", 9, 11), // mean 10
+    ...cell(N60_ARM, "b1", 18, 22), // mean 20
+  ];
+  const basis = n60ScaleBasis(rows, 1);
+  assert.equal(basis.meanRatio, 2, "distinct_k is a count; if variance tracks the mean these two ratios should agree");
+  assert.equal(basis.varianceRatio, 4);
+  // Deliberately DISAGREEING fixture: the two ratios are computed from
+  // different quantities and must not be wired to each other.
+  assert.notEqual(basis.meanRatio, basis.varianceRatio);
+});
+
+test("n60ScaleBasis: the ratio ships with its interval, because the sizing inherits the imprecision", () => {
+  const rows = [...cell(N30_CENTRE_ARM, "b1", 9, 11), ...cell(N60_ARM, "b1", 18, 22)];
+  const { varianceRatio, varianceRatioCI } = n60ScaleBasis(rows, 1);
+  const [lo, hi] = varianceRatioCI;
+  assert.ok(lo < varianceRatio && varianceRatio < hi, "the point estimate sits inside its own interval");
+  assert.ok(Math.abs(lo * hi - varianceRatio ** 2) < 1e-9, "an F-based ratio interval is multiplicatively symmetric about the estimate");
+  assert.ok(hi / varianceRatio > 3, "a ratio on df 12 vs df 12 is imprecise, and the appendix must not present it as measured");
+});
+
 test("the same formula on the matched-N=30 components reproduces Appendix G item 2's registered table", () => {
   const G = { 6: [1.45, 1.12, 0.99, 0.86], 12: [1.03, 0.79, 0.7, 0.61], 24: [0.73, 0.56, 0.49, 0.43], 48: [0.51, 0.4, 0.35, 0.3] };
   for (const [B, expected] of Object.entries(G)) {
     const actual = [1, 2, 3, 5].map((R) => Number(contrastSE(1.2088343623079842, 5.118055555555555, Number(B), R).toFixed(2)));
     assert.deepEqual(actual, expected, `B=${B}`);
   }
+});
+
+test("the SE formula on the ~60 basis reproduces Appendix I item 3's registered Stage 1b table", () => {
+  // Verbatim from Appendix I item 3, on the transported components
+  // (sigma^2_ba 2.3562, sigma^2_e 4.7917). Same formula as §3.4 and Appendix
+  // G -- a different one here would mean the appendix sized Stage 1b under a
+  // rule the registration does not contain.
+  const I = {
+    6: [1.544, 1.259, 1.148],
+    12: [1.091, 0.89, 0.812],
+    24: [0.772, 0.629, 0.574],
+    36: [0.63, 0.514, 0.469],
+    48: [0.546, 0.445, 0.406],
+  };
+  for (const [B, expected] of Object.entries(I)) {
+    const actual = [1, 2, 3].map((R) => Number(contrastSE(2.3562, 4.7917, Number(B), R).toFixed(3)));
+    assert.deepEqual(actual, expected, `B=${B}`);
+  }
+  // And the registered design's MDE, at the Holm-adjusted multiplier for a
+  // family of two -- the number a Stage 1b result is read against.
+  const se = contrastSE(2.3562, 4.7917, 24, 2);
+  assert.equal(Number((3.08 * se).toFixed(2)), 1.94);
 });
 
 test("the formula reproduces Stage 1a's OWN achieved contrast SE -- the design arithmetic and the fitted model agree on the design actually executed", () => {

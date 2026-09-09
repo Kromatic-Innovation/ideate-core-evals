@@ -95,6 +95,8 @@ Panel size fixed at **5 agents**, `ideasPerAgent: 6`, `maxRounds: 2` (blind → 
 
 > _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 2). Eight Study 1 screening arms are registered for Stage 1a: `S1-C0`, `S1-N10`, `S1-N60`, `S1-ELOW`, `S1-EMAX`, `S1-SPRAG`, `S1-SCONTRA`, `S1-DIRECT`. Arms A–H, A′ and AS above are **unmodified**. See the appendix for the design, the centre point, and the held-constant factors._
 
+> _Amended 2026-09-08 ([Appendix I](#appendix-i--amendments-dated-2026-09-08), item 1). Three Study 1 **Stage 1b** arms are registered: `S1B-SOLO60` (solo, N=60), `S1B-PANEL` (the first panel this study runs) and `S1B-APRIME` (its persona ablation), model held at `claude-sonnet-5` throughout. Arms A–H, A′, AS and the eight `S1-*` arms above are **unmodified**. Adding them moves `armsConfigHash` `ea1849cd1ac8` → `0c05795c6b00`, so every existing cell goes stale and `S1-N60`'s 24 cells are **not** reusable — which is why `S1B-SOLO60` re-collects that condition. See the appendix for the design and the hash cost._
+
 ### 3.2 Items (briefs) — n = 12, stratified
 
 Held constant across arms. Stratified so results generalize across task type, not just one domain:
@@ -148,6 +150,8 @@ We strip it universally and **state the bias direction explicitly**: if the haik
 > _Amended 2026-09-08 ([Appendix F](#appendix-f--amendments-dated-2026-09-08), item 2). Stage 1a is the run that re-estimates `σ²_ba`, the exact figure Appendix E item 7 above made B = 48 / R = 2 provisional on. See the appendix for the registered screening design that produces the re-estimate._
 >
 > _Amended 2026-09-08 ([Appendix G](#appendix-g--amendments-dated-2026-09-08), items 1–4). Stage 1a has run, and the re-estimate the amendment above promised is in: `σ²_ba` is **1.21**, not 77.85 — a factor of 64. **Appendix E item 7's B = 48 / R = 2 table is superseded**, re-derived on the same SE formula from the new components, and the recommended design becomes **B = 24 briefs / R = 2 replicates** — chosen on brief-coverage and estimability grounds, not on power, because power stopped being the binding constraint. The table is valid only for contrasts rarefied at a ~30-idea pool; a design targeting ~60 needs its own variance basis. See the appendix for the derivation, the two verification checks, and the scope bound._
+>
+> _Amended 2026-09-08 ([Appendix I](#appendix-i--amendments-dated-2026-09-08), item 3). The separate basis the scope bound above demands is registered, for Stage 1b's ~60-pool contrasts. **`σ²_e` = 4.7917 is MEASURED** at `S1-N60`; **`σ²_ba` = 2.3562 is TRANSPORTED** from the matched-N=30 fit by a ratio of 1.949 and is a registered **assumption**, because an interaction term at that pool size needs two or more arms there and Stage 1a ran exactly one. The registered design is **B = 24 / R = 2**, SE 0.629, **MDE 1.94** at Holm m = 2. The formula is unchanged. See the appendix for the ratio's justification, its 95% interval (0.595–6.387), the independent count-variance corroboration, and the sizing's sensitivity across that interval._
 
 ---
 
@@ -252,6 +256,8 @@ Wataoka et al. 2024: models rate their own output higher. Every arm here is scor
 | **H5** | Same-provider judging inflates scores vs cross-provider                        | bias > 0                 | Judge validity                                                                                                                                               |
 
 > _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 2). H1's "at matched idea count" clause above is unchanged — this is a specification of how it is operationalized, not an amendment to the hypothesis: rarefy every pool in an Arm-A contrast to the minimum pool size present, `distinct_k` averaged over `RAREFACTION_R = 1000` random subsamples at seed `RAREFACTION_SEED = 20260901` (`evals/analysis/rarefaction.mjs`). See the appendix for the full rule, why no pool size is hardcoded, and why truncation to the first n is ruled out._
+
+> _Amended 2026-09-08 ([Appendix I](#appendix-i--amendments-dated-2026-09-08), items 4 and 5). Stage 1b registers **its own two-contrast family** — `S1B-PANEL` − `S1B-SOLO60` and `S1B-PANEL` − `S1B-APRIME`, Holm at m = 2 — and **does not build the H1–H5 family above**, the same posture Appendix F item 7 took for Stage 1a. H1's question is Stage 1b's question, but H1's **contrast** is `mean(A′, B–H) − A` over eight model configurations, and substituting a differently-scoped quantity under a registered name is the hazard `#145` exists to refuse; H1's form would also average the ablation into the effect the run measures. H1 is recorded not estimable for this store, and `REGISTERED_H1_ARM_SETS` gains **no new key**. The appendix also registers, in advance, what a **null** licenses — the panel issues ten model calls to the solo arm's one, so bounding its advantage below ≈ 4% of a 49-idea pool is a decisive result on §4.1's per-dollar metric, not a failed one._
 
 ### 6.2 Model
 
@@ -1327,6 +1333,8 @@ The closing sentence of each is load-bearing, not stylistic: the reply contract 
 
 **`prod-07` is included, and it is the anchor.** Appendix E item 4's externally-published comparability anchor falls inside the subset by construction rather than by exception.
 
+> _Amended 2026-09-08 ([Appendix I](#appendix-i--amendments-dated-2026-09-08), item 2). Stage 1b registers **24 briefs** on the same reasoning — the first three ids from each half of each stratum (`-01`, `-02`, `-03`, `-07`, `-08`, `-09`), six per stratum, three pre-amendment and three post. The Stage 1a subset above is **unmodified** and is contained in it exactly, so the two stages are directly comparable on the overlapping twelve._
+
 ### Item 4 — correction to `#130`: the screening run is 8 conditions and 192 cells, not 9 and 216
 
 **What is corrected.** `#130` specifies a fractional design that varies "one factor at a time from a centre point" and states **"9 conditions"** and **"216 cells"** (12 briefs × 2 replicates). A one-factor-at-a-time design's condition count is one centre point plus the sum of each factor's off-centre levels. The factors have 3, 3, 3, and 2 levels respectively (N: 10/30/60; effort: low/high/max; stance: neutral/PRAGMATIST/CONTRARIAN; strategy: `direct`/`cot`), giving 1 + 2 + 2 + 2 + **1** = **8** conditions and **192** cells. `#130`'s 9 counts `strategy` as contributing two off-centre levels; it has one, because it has two levels in total.
@@ -1545,4 +1553,173 @@ Every Stage 1a cost row is timestamped 2026-09-08 — after the former boundary 
 A dated pin makes staleness **detectable**; nothing in this repo **detected** it. The row carried an honest source and an honest date and was simply wrong for ten weeks, surfacing only because a run happened to be priced by hand. That is the same second-hand-source shape Appendix A item 5 corrected once already for the OpenAI rows.
 
 What this amendment adds is narrower than a fix for that: the rates are now first-party with the check recorded in code, and a test holds the table and its verification record to each other, so a half-applied correction fails loudly. **It does not detect a vendor-side change** — nothing offline can. §8.1's rates are hereby registered as requiring **re-verification against the vendor's own page, with the date recorded, before any run that reports a dollar figure**, rather than being trusted to age quietly.
+
+---
+
+## Appendix I — Amendments (dated 2026-09-08)
+
+**Study 1, Stage 1b: the panel benchmark.** Registered here in full, before its first cell.
+
+Stage 1a established a **denominator, not a comparison**. Only pool size moved `distinct_k` — rarefied to a matched pool of 30, N=30 and N=60 were indistinguishable (26.58 vs 26.45), and effort, stance and chain-of-thought each had a confidence interval containing zero. And **every Stage 1a condition was a solo call: no panel has ever run in this study.** One solo call at N=60 yields ≈ **49.4** distinct ideas. A panel produces a ~60-idea pool from **five agents over two rounds**. Whether the panel clears 49.4 is the question this study exists to answer, and it is untested.
+
+Stage 1b answers it, and nothing else. It is deliberately not `#131` (model comparison) and not `#132`'s four-factor process design: ranking models through machinery that has never been shown to do anything ranks a difference we have no evidence exists, and a factorial over panel size, stance, sharing and rounds prices a design whose simplest cell is still unrun. Both become worth their cost once this run reports.
+
+> Consequence for the issue graph: `#131`'s "blocked by Study 1" now means **blocked until Stage 1b**, not Stage 1a.
+
+### Item 1 — §3.1: three Stage 1b arms
+
+| Arm | Configuration | Purpose |
+| --- | --- | --- |
+| **`S1B-SOLO60`** | Solo, `totalIdeasRequested: 60`, `claude-sonnet-5`, `effort: high`, neutral persona (`solo_b`) | The benchmark. Configured identically to `S1-N60`. |
+| **`S1B-PANEL`** | Panel, 5 agents × `ideasPerAgent: 6` × `maxRounds: 2` (blind → pool), every slot `claude-sonnet-5`, **differentiated** personas | The first panel this study has run. Pool ~60, matched to the solo arm by construction. |
+| **`S1B-APRIME`** | Same panel geometry and model, `personaDisabled: true` under one explicit neutral persona | Arm A′'s construction at Stage 1b's model. Separates "the personas did it" from "we sampled five times". |
+
+**Model is held constant at `claude-sonnet-5` across all three arms**, so the contrast is process and not model. That is the whole reason `#131` is not this run: a model comparison inside an unvalidated panel confounds the two.
+
+**`S1B-APRIME` is not optional.** Without it, a panel-beats-solo result cannot distinguish the product's persona claim from the effect of issuing five requests instead of one — and Stage 1a's own finding that a stance barely changes what *one* agent produces weakens the prior for the persona claim without testing it. Three arms is the minimum design that answers the question asked.
+
+**Cost of this amendment: `armsConfigHash` moves, and every existing cell goes stale.** Verified rather than assumed — `armsConfigHash` hashes the whole `arms.config.json` (Appendix D item 1's registered rule), and adding these three arms moves it from `ea1849cd1ac8` to `0c05795c6b00`, which moves `configHash` and therefore every cell key. **`S1-N60`'s 24 cells are not reusable**, which is why `S1B-SOLO60` re-collects that condition rather than citing it: panel-versus-solo is then a within-run contrast under one hash, not a comparison across two.
+
+**Appendix G's derivation is unaffected.** `evals/analysis/variance-components.mjs` reads the committed CSV and names its arms as constants precisely so a config edit cannot move a registered number; a stale store does not restale a published figure.
+
+### Item 2 — §3.2: the 24-brief subset, and the rule
+
+**B = 24: six per stratum, `-01`, `-02`, `-03`, `-07`, `-08`, `-09`.**
+
+| Stratum | Briefs |
+| --- | --- |
+| business | `biz-01`, `biz-02`, `biz-03`, `biz-07`, `biz-08`, `biz-09` |
+| product | `prod-01`, `prod-02`, `prod-03`, `prod-07`, `prod-08`, `prod-09` |
+| scientific | `sci-01`, `sci-02`, `sci-03`, `sci-07`, `sci-08`, `sci-09` |
+| aut | `aut-01`, `aut-02`, `aut-03`, `aut-07`, `aut-08`, `aut-09` |
+
+The rule is **the first three ids from each half of each stratum** — `-01..-06` being the pre-amendment 24 and `-07..-12` the 24 added by `#129` (Appendix E item 5). It carries forward Appendix F item 3's reasoning without restating it: a subset drawn 92% from one half of the corpus would inherit that half's composition. It is deterministic, reproducible by inspection, needs no RNG, contains `prod-07` (Appendix E item 4's externally-published anchor), and **contains Stage 1a's twelve briefs exactly**, so Stage 1a's per-brief results are directly comparable on the overlapping half.
+
+**R = 2 replicates. 3 arms × 24 briefs × 2 = 144 cells.**
+
+### Item 3 — §3.4: the ~60-pool variance basis
+
+Appendix G item 4 registered that its table is valid for contrasts rarefied at a ~30-idea pool **and for no others**, and required any design at another scale to register its own basis. Stage 1b's contrasts rarefy at ~60. This is that basis.
+
+**The SE formula is unchanged** — §3.4's, as Appendix G item 2 re-derives it:
+
+```
+SE(B, R) = sqrt( 2 · ( σ²_ba / B  +  σ²_e / (B · R) ) )
+```
+
+**One of its two inputs is measured and the other is assumed.** That distinction is the most important line in this appendix:
+
+| Quantity | Value at ~60 | Status |
+| --- | --- | --- |
+| `σ²_e` | **4.7917** (sd 2.189, df 12) | **MEASURED**, directly at `S1-N60`. No scaling. |
+| `σ²_ba` | **2.3562** | **TRANSPORTED** from the matched-N=30 fit's 1.2088 by a ratio of 1.9492. A registered assumption. |
+
+`σ²_ba` is **not estimable at this pool size from Stage 1a**: a `brief:arm` interaction needs two or more arms at the scale in question, and Stage 1a ran exactly one (`S1-N60`). No amount of care recovers it from data that cannot contain it, so it is registered as an assumption and labelled as one wherever it appears.
+
+**Why the ratio is `S1-N60` ÷ `S1-C0` and not ÷ the pooled matched residual.** Those two arms differ in pool size and in nothing else — same model, effort, stance, strategy, briefs, replicates — with df 12 each. The pooled matched residual (5.1181) is dominated by `S1-SPRAG`, whose within-cell variance is **18.17**, roughly four times any other arm's. That is a *stance* effect on output stability at the *same* N, and it has no business in a pool-size scaling ratio. Using it as denominator gives a ratio of **0.936** — below one, for a quantity we are arguing grows with pool size. The contamination is the argument for the single-factor comparison, not merely a preference for it.
+
+> Recorded, not reopened: the same `S1-SPRAG` contribution inflates Appendix G's own registered `σ²_e` of 5.1181, which makes that appendix's SE table **conservative**. Appendix G stands as registered.
+
+**An independent mechanism predicts the same number.** `distinct_k` is a **count**, and if its variance tracks its mean the variance ratio should sit near the mean ratio. Mean `distinct_k` is 26.79 at the centre and 49.38 at `S1-N60` — a ratio of **1.843**, against a measured variance ratio of **1.949**. Appendix G item 1 already invokes count-variance scaling to explain the inflated pooled interaction term; here the same mechanism corroborates the transport by a second route. Two routes to ≈ 1.9 is materially better evidence than one empirical ratio.
+
+**The assumption's precision, stated rather than implied.** A variance ratio on df 12 against df 12 is imprecise: the two-sided 95% interval is **0.595 to 6.387**. The sizing inherits that, and the appendix registers the ratio *with* its interval.
+
+**SE at the ~60 basis:**
+
+| B (briefs) | R=1 | R=2 | R=3 |
+| --- | --- | --- | --- |
+| 6 | 1.544 | 1.259 | 1.148 |
+| 12 | 1.091 | 0.890 | 0.812 |
+| **24** | 0.772 | **0.629** | 0.574 |
+| 36 | 0.630 | 0.514 | 0.469 |
+| 48 | 0.546 | 0.445 | 0.406 |
+
+**The registered design is B = 24 / R = 2**, matching Appendix G item 2's recommendation: B on brief-coverage grounds (six per stratum, balanced across the corpus expansion), R = 2 on estimability grounds — at R = 1, `σ²_e` and `σ²_ba` are confounded and this table could never be re-derived from the run that used it.
+
+**MDE = 1.94 distinct ideas**, at 80% power. That is the **Holm-adjusted** figure: two registered contrasts (item 4) means Holm's first step spends α = 0.025, a multiplier of 3.08 rather than the unadjusted 2.80 — quoting 1.76 would be quoting an MDE no test in this run will actually be read against.
+
+**Sensitivity across the assumption's interval**, so the run is not sized on a point estimate presented as certain:
+
+| Ratio | `σ²_ba` at ~60 | SE at B=24, R=2 | MDE (Holm) |
+| --- | --- | --- | --- |
+| 0.595 (lower) | 0.719 | 0.509 | **1.57** |
+| 1.949 (point) | 2.356 | 0.629 | **1.94** |
+| 6.387 (upper) | 7.721 | 0.918 | **2.83** |
+
+The registered design's MDE is between 1.6 and 2.8 across the full interval. Item 5 turns on that range being small relative to what a positive result would have to be, so the imprecision does not undermine the design — but it is registered, not hidden.
+
+### Item 4 — §6: Stage 1b's contrast family, and why H1–H5 is not built
+
+**Two registered confirmatory contrasts, on rarefied `distinct_k`, brief as a random effect, Holm-Bonferroni at m = 2:**
+
+| # | Contrast | What it settles |
+| --- | --- | --- |
+| **S1b-1** | `S1B-PANEL` − `S1B-SOLO60` | Does the panel beat one call at matched pool size? |
+| **S1b-2** | `S1B-PANEL` − `S1B-APRIME` | Is any difference the personas, or is it sampling five times? |
+
+Both two-sided at α = 0.05, Holm-corrected across the pair. `S1B-APRIME` − `S1B-SOLO60` is reported as an **exploratory** estimate with a confidence interval, BH-corrected alongside the other exploratory contrasts per §6.3 — it is the second arm of a decomposition whose two confirmatory halves are already registered, and promoting it would spend a third Holm slot to learn nothing the pair does not already carry.
+
+**The registered H1–H5 family is NOT built for this run**, the same posture Appendix F item 7 took for Stage 1a. This needs saying plainly, because Stage 1b's primary contrast is unmistakably **H1's question**:
+
+- H1 is registered as `mean(panel arms) − A`, where the panel arms are §3.1's `A′` and B–H — **eight different model configurations**. Stage 1b has one panel configuration and its ablation. Evaluating `mean(S1B-PANEL, S1B-APRIME) − S1B-SOLO60` under H1's name would substitute a differently-scoped quantity for the registered one: exactly the hazard `#145` names, one layer up from where it was found.
+- H1's *form* is also wrong for this design, independent of registration. `S1B-APRIME` is the **ablation**: averaging it with the panel dilutes the effect the run exists to measure. If personas do nothing, panel ≈ A′ and the mean is harmless; if personas do everything, the mean halves the estimate. The two pairwise contrasts are the decisive ones and the mean of them is not.
+- So H1 is recorded **not estimable** for Stage 1b, keeping its Holm slot at p = 1 if the family is ever built over this store, and Stage 1b's own two-contrast family is what is registered and reported.
+
+`#145`'s guard is what makes that a fact about the code and not a promise: since it landed, H1's arm set is registered data (`REGISTERED_H1_ARM_SETS` in `evals/analysis/contrasts.mjs`) and its weights come from that set rather than from whatever arms a run happens to carry, so a Stage 1b store **cannot** produce an estimable H1 by accident. **No new key is added to that constant by this appendix**, deliberately: the mechanism exists so a future A–H-shaped run can extend the registration, not so that each run can rename its own contrast into H1's slot.
+
+### Item 5 — §6: what a null result licenses, registered before the run
+
+**The likely outcome of this run is no detectable difference, and that is a decisive result rather than a failed one.** Registering the interpretation now is the point of registering it at all — afterwards, a null reads as an underpowered non-answer.
+
+The asymmetry that makes it decisive: at matched pool size, `S1B-PANEL` issues **5 agents × 2 rounds = 10 model calls** where `S1B-SOLO60` issues **one**. The panel is not asked to be better per idea; it is asked to be better at all, at ten times the requests.
+
+So:
+
+- **If S1b-1 is null**, the run bounds the panel's advantage below **1.94 distinct ideas** (1.6–2.8 across the assumption's interval) on a ~49-idea pool — under 4% — **at 10× the calls**. On §4.1's registered `distinct_k`-per-dollar metric the panel then loses outright, and that conclusion is licensed by this run without further data.
+- **A null on S1b-1 also makes `#131` and `#132` cheaper questions, not urgent ones**: ranking models through the panel, or crossing four process factors over it, both presuppose the machinery does something. `#132`'s Stage 3a would then be re-scoped to ask whether *any* configuration of it clears the benchmark, rather than which configuration is best.
+- **If S1b-1 is positive and S1b-2 is null**, the gain is sampling five times, not persona engineering — the cheapest reproduction of the product's benefit is repeated sampling, and that is a finding about the product, not about this harness.
+- **If both are positive**, the persona lever is doing real work and `#132`'s factorial is the right next spend.
+
+For comparison against the MDE: Stage 1a's rarefied N=30-versus-N=60 difference was **0.13**. This design cannot see effects of that size and is not meant to; it is sized to see whether ten calls beat one by an amount anyone would pay for.
+
+### Item 6 — three limitations that belong in the registration, not in a footnote afterwards
+
+**1. Panel arms are differentiated by stance and strategy only — never temperature.** §3.3 strips sampling parameters universally, and both request builders are allowlists that never send `temperature`. Shipped `ideate-core`'s `DEFAULT_PERSONAS` varies temperature across personas (0.4 / 0.9 / 0.6 / 1.0 / 1.0). **`S1B-PANEL` is therefore less differentiated than the product it measures**, and a null on S1b-2 is confounded with that. The strip is deliberate — it exists so H4's bias direction is not inverted — so this is a **stated limitation, not a thing to change**, and any report of a Stage 1b persona result states it.
+
+**2. The persona ablation moves one slot's `strategy` as well as its stance, and the size of that is known.** `S1B-PANEL`'s five slots fall through to `DEFAULT_PERSONAS`, of which **four carry `strategy: "cot"` and one — `pragmatist` — carries `"direct"`**. `strategy` reaches the wire as a rendered prompt lever (Appendix F item 1): `"cot"` inserts the registered chain-of-thought paragraph and `"direct"` inserts nothing. `S1B-APRIME`'s uniform bundle is `"cot"` — chosen as the panel's own modal value rather than to make the arms match — so **one slot in five differs in strategy as well as in stance**, and S1b-2 is not a perfectly clean single-lever ablation.
+
+This is registered rather than removed, because removing it is worse: pinning every `S1B-PANEL` slot to `"cot"` would make the panel *less* like the product it measures, and stance and strategy are bundled together in `DEFAULT_PERSONAS` exactly as they ship. **The confound's magnitude is already bounded by Stage 1a's own measurement**: `strategy: direct` versus `cot`, solo, moved `distinct_k` by **−0.58 [−2.14, 0.97]** — an effect indistinguishable from zero, here carried by one agent of five. It is registered so a Stage 1b result is read against a stated bound rather than an unstated assumption.
+
+**3. §5.1's judge-validation gate has never run** (`#16`). Every idea-level metric therefore stays exploratory and unreportable per Appendix B item 11, and Stage 1b's primary response is **rarefied `distinct_k`** per Appendix C item 3, exactly as Stage 1a's was. Judge rows collected during Stage 1b are stored data awaiting that gate, not results.
+
+### Item 7 — §8: cost, at the corrected rates
+
+Priced at Appendix H's corrected `claude-sonnet-5` rate ($2/$10 per MTok), for the registered 144 cells:
+
+| | Batch | No-batch |
+| --- | --- | --- |
+| Harness pre-flight projection (`--dry-run`) | **$18.35** | $36.69 |
+
+That is `interimPriceGrid`'s coarse estimator, which prices a *plan* from §8.2's assumed ~16k in / 9k out per run. Stage 1a's realized per-cell costs are the better anchor and say the estimator **over-projects**: `S1-N60` actually cost **$0.0425** per cell un-batched against the estimator's $0.093, because the realized token shape was ~365 in / ~4,000 out, not 16k/9k. Anchored on those realized figures, generation should land near **$5–6 batched**, with judging (two judges per cell, unbatched, ~$0.021 per judge call at Stage 1a's realized rate, scaling with pool size) adding roughly **$6–9**, and embeddings effectively free — so an expected **$12–$15** against a projection of $18.35.
+
+Over-projection is the safe direction: `--max-spend` refuses earlier than it needs to, never later. **The registered ceiling is `--max-spend 45`**, the same as Stage 1a's, which clears both the projection and the expected actual with room for re-runs.
+
+**This run uses batch mode.** Stage 1a forfeited the 50% batch discount by running `--no-batch`, because the harness submitted one Message Batch per cell and serialized 192 queue waits (`#148`). That is fixed, so the discount is available and the projection above assumes it. Concurrency starts at `--cell-concurrency 4` to `8` and no higher: judging and metric computation run inside the per-cell task, so concurrency K puts up to K embedder calls and 2K unbatched judge calls in flight. Nothing is lost if they throttle — `rate_limited` is transient and the cell re-plans — but the run can thrash.
+
+### Item 8 — reproduction
+
+`node evals/analysis/variance-components.mjs --n60-scale` reproduces item 3 in full from the committed CSV: both measured residuals, the ratio and its interval, the mean-ratio corroboration, the transported `σ²_ba`, every arm's within-cell variance (so the choice of denominator is inspectable rather than asserted), the SE table and the sensitivity rows.
+
+The arm names it uses are constants in that file rather than reads of `arms.config.json`, for the reason Appendix G item 5 gives: a registered number must not move when a config does. `N60_ARM` and `N30_CENTRE_ARM` join `MATCHED_N30_ARMS` on that footing.
+
+The pre-flight cost figures in item 7 are reproduced by:
+
+```
+node evals/run.mjs --dry-run \
+  --arms S1B-SOLO60,S1B-PANEL,S1B-APRIME \
+  --briefs aut-01,aut-02,aut-03,aut-07,aut-08,aut-09,biz-01,biz-02,biz-03,biz-07,biz-08,biz-09,prod-01,prod-02,prod-03,prod-07,prod-08,prod-09,sci-01,sci-02,sci-03,sci-07,sci-08,sci-09 \
+  --replicates 2
+```
+
+**No cell of this design has been collected.** This appendix is the registration, and it lands first.
 
