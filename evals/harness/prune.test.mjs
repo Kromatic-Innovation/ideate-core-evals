@@ -47,14 +47,40 @@ function tempStore(t) {
   return new ResultsStore(dir);
 }
 
+// ── The straddle fixture (#143) ─────────────────────────────────────────
+// Three tests below exercise the fold's refusal to collapse cost rows that
+// straddle a DATED RATE CHANGE. They used to read that boundary off the live
+// RATE_TABLE, where claude-sonnet-5 carried `introUntil: 2026-08-31`. #143
+// removed it: the announced increase to $3/$15 was cancelled, so Sonnet 5 has
+// billed at one rate for its whole life and the pinned table now carries no
+// dated regime at all.
+//
+// The BEHAVIOUR is still real and still needs guarding -- the first genuine
+// vendor rate change puts a regime back on a row -- so these tests inject a
+// fixture table instead: the real table with one model given a synthetic
+// dated change. `planPrune`/`pruneStore` take `rateTable` for exactly this
+// reason. What is under test is the guard, never a vendor's price.
+const STRADDLE_MODEL = "claude-sonnet-5";
+const STRADDLE_BOUNDARY = "2026-08-31";
+const BEFORE_BOUNDARY = "2026-08-30T00:00:00Z";
+const AFTER_BOUNDARY = "2026-09-01T00:00:00Z";
+const STRADDLE_RATE_TABLE = {
+  ...RATE_TABLE,
+  [STRADDLE_MODEL]: {
+    ...RATE_TABLE[STRADDLE_MODEL],
+    introUntil: STRADDLE_BOUNDARY,
+    introRate: { in: 1.0, out: 5.0 },
+  },
+};
+
 const CONFIG = { harnessVersion: "0.0.1", engineSha: "920c086", promptHash: "p1" };
 const CFG = configHash(CONFIG);
 const SPEC = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CONFIG };
 
 /** A generation cost row, priced by the real pinned rate table. `2026-09-01`
- *  is deliberately AFTER claude-sonnet-5's `introUntil` (2026-08-31) so the
- *  default fixtures never straddle a dated rate change -- the test that DOES
- *  straddle it does so on purpose and says so. */
+ *  is deliberately AFTER STRADDLE_BOUNDARY so the default fixtures never
+ *  straddle a dated rate change even when a test injects STRADDLE_RATE_TABLE
+ *  -- the tests that DO straddle it do so on purpose and say so. */
 function row(cellKeyStr, { model = "claude-haiku-4-5", input = 1000, output = 500, timestamp = "2026-09-01T00:00:00Z" } = {}) {
   return { cellKey: cellKeyStr, timestamp, billing_mode: "api", model, input_tokens: input, output_tokens: output };
 }
@@ -303,14 +329,14 @@ test("attempt families are compacted independently -- a metrics attempt never fo
 test("foldCostRows refuses to fold rows that straddle a dated rate change, and spend survives anyway", (t) => {
   const store = tempStore(t);
   const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
-  // claude-sonnet-5 carries introUntil 2026-08-31 with a cheaper introRate.
-  // Rows on either side of that boundary price differently, so collapsing
-  // them under one timestamp would silently reprice the ledger.
+  // Under STRADDLE_RATE_TABLE this model carries a dated rate change. Rows on
+  // either side of that boundary price differently, so collapsing them under
+  // one timestamp would silently reprice the ledger.
   const straddling = [
-    row(cell, { model: "claude-sonnet-5", timestamp: "2026-08-01T00:00:00Z", input: 1_000_000, output: 1_000_000 }),
-    row(cell, { model: "claude-sonnet-5", timestamp: "2026-10-01T00:00:00Z", input: 1_000_000, output: 1_000_000 }),
+    row(cell, { model: STRADDLE_MODEL, timestamp: "2026-08-01T00:00:00Z", input: 1_000_000, output: 1_000_000 }),
+    row(cell, { model: STRADDLE_MODEL, timestamp: "2026-10-01T00:00:00Z", input: 1_000_000, output: 1_000_000 }),
   ];
-  const fold = foldCostRows(straddling, RATE_TABLE, { batch: false });
+  const fold = foldCostRows(straddling, STRADDLE_RATE_TABLE, { batch: false });
   assert.equal(fold.folded, false);
   assert.match(fold.reason, /reprice/);
   assert.deepEqual(fold.rows, straddling, "the original rows are returned untouched");
@@ -318,9 +344,9 @@ test("foldCostRows refuses to fold rows that straddle a dated rate change, and s
   // And end to end: a prune over such records still preserves the money --
   // the bound degrades, the ledger does not.
   for (let n = 0; n < 6; n++) putAttempt(store, { cell, attempt: n, rows: straddling.map((r) => ({ ...r })) });
-  const before = spendToDate(store).totalUsd;
-  pruneStore(store, { keepAttempts: 2 });
-  assert.ok(Math.abs(spendToDate(store).totalUsd - before) <= 1e-9);
+  const before = spendToDate(store, STRADDLE_RATE_TABLE).totalUsd;
+  pruneStore(store, { keepAttempts: 2, rateTable: STRADDLE_RATE_TABLE });
+  assert.ok(Math.abs(spendToDate(store, STRADDLE_RATE_TABLE).totalUsd - before) <= 1e-9);
 });
 
 test("foldCostRows never folds a row carrying a null token count", (t) => {
@@ -654,21 +680,21 @@ test("#108: judge-call attempts are numbered and compacted per (cell, judge mode
 test("#108 AC4: a judge-call fold whose rows straddle a dated rate change is abandoned, not mispriced", (t) => {
   const store = tempStore(t);
   const cell = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
-  // claude-sonnet-5 is the one model in the pinned RATE_TABLE with an
-  // introductory regime (`introUntil: 2026-08-31`). Read from the table
-  // rather than hardcoded, so this test fails loudly if the fixture stops
-  // being a straddle case at all.
-  assert.ok(RATE_TABLE["claude-sonnet-5"].introUntil, "precondition: the straddle fixture needs a model with a dated rate change");
-  const STRADDLE_JUDGE = "claude-sonnet-5";
-  const beforeIntroEnd = "2026-08-30T00:00:00Z";
-  const afterIntroEnd = "2026-09-01T00:00:00Z";
+  // The straddle case comes from the injected fixture table, not the live
+  // one -- see STRADDLE_RATE_TABLE's header. The precondition is asserted
+  // rather than assumed so this fails loudly if the fixture ever stops being
+  // a straddle case at all.
+  assert.ok(STRADDLE_RATE_TABLE[STRADDLE_MODEL].introUntil, "precondition: the straddle fixture needs a model with a dated rate change");
+  const STRADDLE_JUDGE = STRADDLE_MODEL;
+  const beforeIntroEnd = BEFORE_BOUNDARY;
+  const afterIntroEnd = AFTER_BOUNDARY;
 
   // Direction 1: a straddling group is refused.
   const straddling = [
     row(cell, { model: STRADDLE_JUDGE, timestamp: beforeIntroEnd }),
     row(cell, { model: STRADDLE_JUDGE, timestamp: afterIntroEnd }),
   ];
-  const refused = foldCostRows(straddling, RATE_TABLE, { batch: true });
+  const refused = foldCostRows(straddling, STRADDLE_RATE_TABLE, { batch: true });
   assert.equal(refused.folded, false);
   assert.match(refused.reason, /reprice/);
   assert.deepEqual(refused.rows, straddling, "the ORIGINAL rows come back, untouched");
@@ -680,7 +706,7 @@ test("#108 AC4: a judge-call fold whose rows straddle a dated rate change is aba
     row(cell, { model: STRADDLE_JUDGE, timestamp: afterIntroEnd }),
     row(cell, { model: STRADDLE_JUDGE, timestamp: afterIntroEnd }),
   ];
-  assert.equal(foldCostRows(sameSide, RATE_TABLE, { batch: true }).folded, true);
+  assert.equal(foldCostRows(sameSide, STRADDLE_RATE_TABLE, { batch: true }).folded, true);
 
   // And end to end through the prune: the RECORD count still comes down (the
   // bound is the point), the ROWS are carried through unfolded, the reason is
@@ -688,9 +714,9 @@ test("#108 AC4: a judge-call fold whose rows straddle a dated rate change is aba
   for (let n = 0; n < 8; n++) {
     meterJudge(store, cell, STRADDLE_JUDGE, { timestamp: n % 2 === 0 ? beforeIntroEnd : afterIntroEnd });
   }
-  const before = spendToDate(store);
+  const before = spendToDate(store, STRADDLE_RATE_TABLE);
   const keysBefore = store.keys().length;
-  const result = pruneStore(store, { keepAttempts: 5 });
+  const result = pruneStore(store, { keepAttempts: 5, rateTable: STRADDLE_RATE_TABLE });
 
   assert.equal(result.plan.compactions.length, 1);
   const c = result.plan.compactions[0];
@@ -698,8 +724,8 @@ test("#108 AC4: a judge-call fold whose rows straddle a dated rate change is aba
   assert.match(c.foldSkippedReason, /reprice/);
   assert.equal(c.rows.length, c.rowsBefore, "every original row survives verbatim");
   assert.ok(store.keys().length < keysBefore, "but the record count still comes down");
-  assert.equal(spendToDate(store).totalUsd, before.totalUsd);
-  assert.deepEqual(spendToDate(store).byProvider, before.byProvider);
+  assert.equal(spendToDate(store, STRADDLE_RATE_TABLE).totalUsd, before.totalUsd);
+  assert.deepEqual(spendToDate(store, STRADDLE_RATE_TABLE).byProvider, before.byProvider);
 });
 
 test("#108: compaction removes `completed` judge-call records without the operator reaching for --allow-completed", (t) => {
@@ -1041,10 +1067,9 @@ test("#115: a salvage already folded into a compacted record is still recognised
 test("#115: a pruned-cell fold whose rows straddle a dated rate change is abandoned, not mispriced (#98/#108 precedent)", (t) => {
   const store = tempStore(t);
   const cellK = cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: CFG });
-  assert.ok(RATE_TABLE["claude-sonnet-5"].introUntil, "precondition: the straddle fixture needs a model with a dated rate change");
-  const STRADDLE_MODEL = "claude-sonnet-5";
-  const beforeIntroEnd = "2026-08-30T00:00:00Z";
-  const afterIntroEnd = "2026-09-01T00:00:00Z";
+  assert.ok(STRADDLE_RATE_TABLE[STRADDLE_MODEL].introUntil, "precondition: the straddle fixture needs a model with a dated rate change");
+  const beforeIntroEnd = BEFORE_BOUNDARY;
+  const afterIntroEnd = AFTER_BOUNDARY;
 
   // Four real failures, alternating sides of the dated rate change, each
   // cleanly evicted on its own so the pile is four RAW pruned-cell records
@@ -1057,12 +1082,12 @@ test("#115: a pruned-cell fold whose rows straddle a dated rate change is abando
       storedAt: `2026-09-0${n + 1}T00:00:00.000Z`,
       rows: [row(cellK, { model: STRADDLE_MODEL, timestamp: n % 2 === 0 ? beforeIntroEnd : afterIntroEnd })],
     });
-    pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null });
+    pruneStore(store, { kinds: ["rate_limited"], keepAttempts: null, rateTable: STRADDLE_RATE_TABLE });
   }
 
-  const before = spendToDate(store);
+  const before = spendToDate(store, STRADDLE_RATE_TABLE);
   const keysBefore = store.keys().length;
-  const result = pruneStore(store, { keepAttempts: 1 });
+  const result = pruneStore(store, { keepAttempts: 1, rateTable: STRADDLE_RATE_TABLE });
 
   const c = result.plan.compactions.find((x) => x.family === "pruned-cell");
   assert.ok(c, "a pruned-cell compaction was planned");
@@ -1070,5 +1095,5 @@ test("#115: a pruned-cell fold whose rows straddle a dated rate change is abando
   assert.match(c.foldSkippedReason, /reprice/);
   assert.equal(c.rows.length, c.rowsBefore, "every original row survives verbatim, unfolded");
   assert.ok(store.keys().length < keysBefore, "but the record count still comes down -- the bound is the point");
-  assertSpendPreserved(spendToDate(store), before, "an abandoned fold must still preserve the ledger exactly");
+  assertSpendPreserved(spendToDate(store, STRADDLE_RATE_TABLE), before, "an abandoned fold must still preserve the ledger exactly");
 });
