@@ -248,6 +248,52 @@
         "strategy": "direct"
       },
       "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+    },
+    "S1B-SOLO60": {
+      "label": "Study 1 Stage 1b — solo comparator, N=60",
+      "purpose": "Appendix I item 2. The benchmark a panel must clear. Configured identically to S1-N60 (same model, N, effort, persona bundle) because it IS that condition re-collected: adding the Stage 1b arms moves armsConfigHash, which moves configHash, which stales every S1-* cell (Appendix D item 1). Stage 1a's ~49.4 distinct ideas from one call is the number this arm re-measures under the new hash, so panel-vs-solo is a within-run contrast rather than a comparison across two hashes.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 60,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+    },
+    "S1B-PANEL": {
+      "label": "Study 1 Stage 1b — panel, differentiated stances",
+      "purpose": "Appendix I item 2. The first panel this study has ever run. Default geometry (5 agents x ideasPerAgent 6 x maxRounds 2, blind then pool) gives a ~60-idea pool, matched to S1B-SOLO60 by construction. Model held at claude-sonnet-5 across every slot so the contrast is process, not model. Personas are DIFFERENTIATED -- but by stance and strategy only, never temperature (§3.3 strips sampling parameters universally), which is less differentiation than shipped DEFAULT_PERSONAS carries; Appendix I item 5 registers that as a stated limitation on any null result rather than a thing to change.",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        { "persona": "proposer_1", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_2", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_3", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_4", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_5", "model": "claude-sonnet-5", "effort": "high" }
+      ]
+    },
+    "S1B-APRIME": {
+      "label": "Study 1 Stage 1b — panel ablation, identical personas",
+      "purpose": "Appendix I item 2. Arm A' 's construction at Stage 1b's model and geometry: five identical agents under one explicit neutral persona, so it differs from S1B-PANEL in the persona lever and NOTHING else. This is what separates 'the personas did it' from 'we sampled five times' -- without it, a panel-beats-solo result cannot distinguish the product's claim from repeated sampling. The uniform persona is Stage 1a's own neutral bundle (solo_b), so the ablation is also directly comparable to the solo arm's persona.",
+      "mode": "panel",
+      "personaDisabled": true,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [
+        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
+        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" }
+      ]
     }
   }
 }
