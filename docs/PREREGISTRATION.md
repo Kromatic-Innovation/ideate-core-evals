@@ -1682,11 +1682,15 @@ So:
 
 For comparison against the MDE: Stage 1a's rarefied N=30-versus-N=60 difference was **0.13**. This design cannot see effects of that size and is not meant to; it is sized to see whether ten calls beat one by an amount anyone would pay for.
 
-### Item 6 — two limitations that belong in the registration, not in a footnote afterwards
+### Item 6 — three limitations that belong in the registration, not in a footnote afterwards
 
 **1. Panel arms are differentiated by stance and strategy only — never temperature.** §3.3 strips sampling parameters universally, and both request builders are allowlists that never send `temperature`. Shipped `ideate-core`'s `DEFAULT_PERSONAS` varies temperature across personas (0.4 / 0.9 / 0.6 / 1.0 / 1.0). **`S1B-PANEL` is therefore less differentiated than the product it measures**, and a null on S1b-2 is confounded with that. The strip is deliberate — it exists so H4's bias direction is not inverted — so this is a **stated limitation, not a thing to change**, and any report of a Stage 1b persona result states it.
 
-**2. §5.1's judge-validation gate has never run** (`#16`). Every idea-level metric therefore stays exploratory and unreportable per Appendix B item 11, and Stage 1b's primary response is **rarefied `distinct_k`** per Appendix C item 3, exactly as Stage 1a's was. Judge rows collected during Stage 1b are stored data awaiting that gate, not results.
+**2. The persona ablation moves one slot's `strategy` as well as its stance, and the size of that is known.** `S1B-PANEL`'s five slots fall through to `DEFAULT_PERSONAS`, of which **four carry `strategy: "cot"` and one — `pragmatist` — carries `"direct"`**. `strategy` reaches the wire as a rendered prompt lever (Appendix F item 1): `"cot"` inserts the registered chain-of-thought paragraph and `"direct"` inserts nothing. `S1B-APRIME`'s uniform bundle is `"cot"` — chosen as the panel's own modal value rather than to make the arms match — so **one slot in five differs in strategy as well as in stance**, and S1b-2 is not a perfectly clean single-lever ablation.
+
+This is registered rather than removed, because removing it is worse: pinning every `S1B-PANEL` slot to `"cot"` would make the panel *less* like the product it measures, and stance and strategy are bundled together in `DEFAULT_PERSONAS` exactly as they ship. **The confound's magnitude is already bounded by Stage 1a's own measurement**: `strategy: direct` versus `cot`, solo, moved `distinct_k` by **−0.58 [−2.14, 0.97]** — an effect indistinguishable from zero, here carried by one agent of five. It is registered so a Stage 1b result is read against a stated bound rather than an unstated assumption.
+
+**3. §5.1's judge-validation gate has never run** (`#16`). Every idea-level metric therefore stays exploratory and unreportable per Appendix B item 11, and Stage 1b's primary response is **rarefied `distinct_k`** per Appendix C item 3, exactly as Stage 1a's was. Judge rows collected during Stage 1b are stored data awaiting that gate, not results.
 
 ### Item 7 — §8: cost, at the corrected rates
 
