@@ -294,8 +294,18 @@ test("#128: slot-level stance/temperature/strategy are forwarded on the SOLO pat
   assert.equal(agents[0].ideasPerAgent, 30);
 });
 
+// The ORIGINALLY REGISTERED arms this test is about. It used to iterate every
+// arm in the file, which was broader than its own name and than #128's subject:
+// the claim is that A-H name no lever and therefore fall through to
+// DEFAULT_PERSONAS, not that no arm anywhere may ever name one. S1C-RICH
+// (Appendix L) names all three deliberately, and the test below asserts that it
+// does -- so the scope is narrowed here rather than the contract weakened.
+const PERSONA_LEVER_FREE_ARMS = ["A", "B", "C", "D", "E", "F", "G", "H"];
+
 test("#128: arms.config.json's registered arms A-H are unchanged by the forwarding -- they name no lever", () => {
-  for (const [id, arm] of Object.entries(armsConfigJson.arms)) {
+  for (const id of PERSONA_LEVER_FREE_ARMS) {
+    const arm = armsConfigJson.arms[id];
+    assert.ok(arm, `arms.config.json must still carry the registered arm '${id}'`);
     if (arm.personaDisabled) continue;
     const { agents } = resolveIdeateAgents(arm, armsConfigJson);
     for (const a of agents) {
@@ -304,6 +314,39 @@ test("#128: arms.config.json's registered arms A-H are unchanged by the forwardi
       assert.equal(a.strategy, undefined, `arm ${id} must forward no strategy of its own`);
     }
   }
+});
+
+test("Appendix L: S1C-RICH forwards a DISTINCT stance, strategy and effort per slot -- the arm's whole point", () => {
+  const { agents } = resolveIdeateAgents(armsConfigJson.arms["S1C-RICH"], armsConfigJson);
+  assert.equal(agents.length, 5);
+
+  // Every slot names all three levers, and no slot is a duplicate of another --
+  // an arm whose "differentiated" personas collapsed to one value would test
+  // nothing, and that is exactly the failure Stage 1b attributed the panel's
+  // deficit to (cross-agent duplication).
+  for (const a of agents) {
+    assert.ok(a.stance && a.stance.length > 200, `slot ${a.persona} must carry a RICH stance, not a one-liner`);
+    assert.ok(["cot", "direct"].includes(a.strategy), `slot ${a.persona} must name a strategy`);
+    assert.ok(["low", "high", "max"].includes(a.effort), `slot ${a.persona} must name an effort`);
+  }
+  assert.equal(new Set(agents.map((a) => a.stance)).size, 5, "all five stances must differ");
+
+  // Both strategies and all three effort levels are actually exercised.
+  assert.deepEqual([...new Set(agents.map((a) => a.strategy))].sort(), ["cot", "direct"]);
+  assert.deepEqual([...new Set(agents.map((a) => a.effort))].sort(), ["high", "low", "max"]);
+
+  // temperature stays absent: claude-sonnet-5 rejects it outright (#165), so
+  // this is a property of the model, not a lever we declined to use.
+  for (const a of agents) assert.equal(a.temperature, undefined);
+});
+
+test("Appendix L: S1C-SOLO6X10 is ten blind agents in ONE round with no sharing -- the missing control", () => {
+  const { agents, maxRounds } = resolveIdeateAgents(armsConfigJson.arms["S1C-SOLO6X10"], armsConfigJson);
+  assert.equal(agents.length, 10, "per-arm panel.size override (#129 amendment B) must reach the agent list");
+  assert.equal(maxRounds, 1, "one round: no build-on, no pooled visibility -- that is what makes it a control");
+  assert.equal(new Set(agents.map((a) => a.stance)).size, 1, "all ten agents must be identical");
+  // 10 agents x 6 ideas = 60, matched to S1C-SOLO60's single 60-idea call.
+  assert.equal(agents.length * agents[0].ideasPerAgent, armsConfigJson.arms["S1C-SOLO60"].totalIdeasRequested);
 });
 
 // ── The forwarded fields' real reach, pinned (issue #128) ────────────────────
