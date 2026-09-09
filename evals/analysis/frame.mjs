@@ -182,10 +182,50 @@ export function buildFrame(store, opts = {}) {
   const entries = store.list().sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
   for (const entry of entries) {
+    // Only STUDY CELLS are arms. A store also holds records that borrow the
+    // cell-key grammar without being cells -- `judge-call|cell=<cellKey>|...`,
+    // `judge-scores|...`, and `batch-replay|cell=<cellKey>|attempt=N` -- and
+    // each carries a SENTINEL armId (`__judge-call__`, `__batch-replay__`)
+    // precisely so it can never be mistaken for a real arm.
+    //
+    // Without this filter a `batch-replay` record is: state `skipped`, cfg
+    // equal to the run's real configHash (it is derived from the cell key it
+    // resumes), armId `__batch-replay__`. It therefore survives the stale
+    // check, enters `seenArms`, and contributes zero completed rows --
+    // so the differential-attrition guard at the end of this function fires
+    // on a PSEUDO-ARM and refuses to build the frame at all. Every real arm
+    // can be perfectly healthy and the analysis still dies, with a message
+    // about attrition that describes nothing that happened.
+    //
+    // Found on Study 1 Stage 1b: 141 of 144 cells completed, three panel
+    // cells failed, each leaving one batch-replay resume record, and the
+    // registered analysis could not run. Stage 1a never hit it only because
+    // it ran `--no-batch` and so wrote no such records -- fixing #148 (batch
+    // mode submitting one Message Batch per cell) is what made this
+    // reachable.
+    //
+    // The check sits AFTER the stale test on purpose, and the ordering is
+    // load-bearing rather than incidental. A judge-call record's index `cfg`
+    // is a judge MODEL ID, so it is already excluded as stale, and
+    // storeConfig.test.mjs pins that: the "store holds" candidate list drops
+    // it while the raw stale COUNT still reports it, so an operator reading
+    // "N excluded as stale" is told about everything that was set aside.
+    // Moving this filter above the stale test would silently change that
+    // count. The bug being fixed is narrower than that contract, so the fix
+    // is too.
+    //
+    // `isStudyCellKey(key, entry.cfg)` -- the entry's OWN cfg, matching
+    // storeConfig.mjs's tallyStoredConfigs -- asks "is this a well-formed
+    // cell key whose embedded cfg agrees with its index entry". A
+    // batch-replay record fails the key shape, so it lands in NO bucket,
+    // which is right: it is not a study cell in any config, and it is not
+    // recoverable by passing --config-hash.
     if (entry.cfg !== cfg) {
       excluded.stale.push({ key: entry.key, armId: entry.armId, briefId: entry.briefId, cfg: entry.cfg });
       continue;
     }
+    if (!isStudyCellKey(entry.key, entry.cfg)) continue;
+
     seenArms.add(entry.armId);
     seenBriefs.add(entry.briefId);
 

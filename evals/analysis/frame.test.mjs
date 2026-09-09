@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeTempStore } from "../../lib/store.mjs";
+import { makeTempStore, writeBatchResumeRecord } from "../../lib/store.mjs";
 import { cellKey, configHash } from "../../lib/manifest.mjs";
 import { buildFrame, summarizeByArm, DifferentialAttritionError } from "./frame.mjs";
 
@@ -180,6 +180,45 @@ test("buildFrame: an arm with zero completed rows (all skipped) also throws Diff
   put(store, { armId: "A", briefId: "b1", replicate: 0 });
   put(store, { armId: "B", briefId: "b1", replicate: 0, state: "skipped" });
   assert.throws(() => buildFrame(store, { config: CONFIG }), DifferentialAttritionError);
+});
+
+// ── Records that borrow the cell-key grammar are NOT arms ───────────────────
+//    A batch-replay record is state `skipped`, carries the run's real cfg,
+//    and carries the sentinel armId `__batch-replay__`. Before this filter it
+//    entered seenArms with zero completed rows and tripped the attrition
+//    guard, so a batched run with ANY failed cell could not be analysed at
+//    all. Found on Study 1 Stage 1b (141/144 completed, 3 resume records).
+
+test("buildFrame: a batch-replay resume record is not an arm and does not trip differential attrition", () => {
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 });
+  put(store, { armId: "B", briefId: "b1", replicate: 0 });
+  const failedKey = put(store, { armId: "B", briefId: "b2", replicate: 0, state: "failed" });
+  writeBatchResumeRecord(store, { cellKey: failedKey, cfg: CFG, pricingLever: "batch" });
+
+  const frame = buildFrame(store, { config: CONFIG });
+  assert.deepEqual(frame.armLevels, ["A", "B"], "__batch-replay__ must never become an arm level");
+  assert.equal(frame.rows.length, 2);
+  assert.ok(!frame.excluded.stale.some((s) => s.key.startsWith("batch-replay")), "nor be reported to an operator as a stale study cell");
+});
+
+test("buildFrame: excluding the pseudo-arm does NOT disable the attrition guard for a real arm", () => {
+  // The mutation this catches: filtering the pseudo-arm out of `rows` but not
+  // out of `seenArms`, or dropping the guard wholesale. A fixture carrying
+  // ONLY the pseudo-arm cannot tell "excluded correctly" from "guard off" --
+  // this one carries a batch-replay record AND a genuinely attrited arm, and
+  // demands the guard still fire, naming the real arm.
+  const store = makeTempStore();
+  put(store, { armId: "A", briefId: "b1", replicate: 0 });
+  const failedKey = put(store, { armId: "B", briefId: "b1", replicate: 0, state: "failed" });
+  writeBatchResumeRecord(store, { cellKey: failedKey, cfg: CFG, pricingLever: "batch" });
+
+  assert.throws(() => buildFrame(store, { config: CONFIG }), DifferentialAttritionError);
+  assert.throws(() => buildFrame(store, { config: CONFIG }), /arm 'B' has zero completed rows/);
+  assert.throws(() => buildFrame(store, { config: CONFIG }), (err) => {
+    assert.ok(!/__batch-replay__/.test(err.message), "and the message must name the REAL arm, never the pseudo-arm");
+    return true;
+  });
 });
 
 test("buildFrame: a caller-pinned armLevel the store has NO cells for at all is 'not yet run', not attrition", () => {
