@@ -1560,6 +1560,8 @@ What this amendment adds is narrower than a fix for that: the rates are now firs
 
 **Study 1, Stage 1b: the panel benchmark.** Registered here in full, before its first cell.
 
+> _Amended 2026-09-09 by Appendix J: this design ran (`docs/status-2026-09-09.md`) under a `max_tokens` ceiling too low for its panel arms, and is re-collected at B=48, R=3. The arms, the contrast family and the null clause below are unchanged; the ceiling, the size and the variance basis are amended there._
+
 Stage 1a established a **denominator, not a comparison**. Only pool size moved `distinct_k` — rarefied to a matched pool of 30, N=30 and N=60 were indistinguishable (26.58 vs 26.45), and effort, stance and chain-of-thought each had a confidence interval containing zero. And **every Stage 1a condition was a solo call: no panel has ever run in this study.** One solo call at N=60 yields ≈ **49.4** distinct ideas. A panel produces a ~60-idea pool from **five agents over two rounds**. Whether the panel clears 49.4 is the question this study exists to answer, and it is untested.
 
 Stage 1b answers it, and nothing else. It is deliberately not `#131` (model comparison) and not `#132`'s four-factor process design: ranking models through machinery that has never been shown to do anything ranks a difference we have no evidence exists, and a factorial over panel size, stance, sharing and rounds prices a design whose simplest cell is still unrun. Both become worth their cost once this run reports.
@@ -1584,6 +1586,8 @@ Stage 1b answers it, and nothing else. It is deliberately not `#131` (model comp
 
 ### Item 2 — §3.2: the 24-brief subset, and the rule
 
+> _Amended 2026-09-09 by Appendix J item 4: retired. The re-run uses all 48 briefs, so there is no subset rule left to justify._
+
 **B = 24: six per stratum, `-01`, `-02`, `-03`, `-07`, `-08`, `-09`.**
 
 | Stratum | Briefs |
@@ -1598,6 +1602,8 @@ The rule is **the first three ids from each half of each stratum** — `-01..-06
 **R = 2 replicates. 3 arms × 24 briefs × 2 = 144 cells.**
 
 ### Item 3 — §3.4: the ~60-pool variance basis
+
+> _Amended 2026-09-09 by Appendix J item 5: superseded. `σ²_ba` no longer has to be transported — this run measured it directly at the ~60 scale across three arms, at **7.8266**, which is 3.3× the 2.3562 assumed below. The assumption was wrong in the direction that flattered the design._
 
 Appendix G item 4 registered that its table is valid for contrasts rarefied at a ~30-idea pool **and for no others**, and required any design at another scale to register its own basis. Stage 1b's contrasts rarefy at ~60. This is that basis.
 
@@ -1694,6 +1700,8 @@ This is registered rather than removed, because removing it is worse: pinning ev
 
 ### Item 7 — §8: cost, at the corrected rates
 
+> _Amended 2026-09-09 by Appendix J item 6: superseded for the re-run (432 cells, projection $55.04, ceiling `--max-spend 90`). The realized cost of the run registered here — **$15.3969** against this projection's $18.35 — is what calibrates the estimator's 1.19× over-projection factor there._
+
 Priced at Appendix H's corrected `claude-sonnet-5` rate ($2/$10 per MTok), for the registered 144 cells:
 
 | | Batch | No-batch |
@@ -1722,4 +1730,148 @@ node evals/run.mjs --dry-run \
 ```
 
 **No cell of this design has been collected.** This appendix is the registration, and it lands first.
+
+---
+
+## Appendix J — Amendments (dated 2026-09-09)
+
+**Study 1, Stage 1b is re-collected.** Appendix I's run completed (141/144 cells, `docs/status-2026-09-09.md`) under a `max_tokens` ceiling that was too low for the panel arms. This appendix registers the corrected ceiling, the re-sized design, and the residual the correction does *not* fix — before any cell of the re-run is collected.
+
+Appendix I is **not withdrawn**. Its design, its arms, its contrast family and its "what a null licenses" clause all stand unchanged. What changes here is the request ceiling (item 1), the design's size (item 4), the basis that sizes it (item 5), and the rule for reading a rarefaction floor this design does not get to choose (item 8).
+
+### Item 1 — §4: the sizing defect, measured
+
+`maxTokensForIdeas` sized the panel arms' requests at `6 × 175 × 2.5 = 2625` output tokens. **19 of 45 `S1B-PANEL` cells returned pools short of the 60 the arm specifies, against 3 of 48 for `S1B-SOLO60` — the matched solo arm at the same nominal pool size.** The asymmetry is the finding: the shortfall is a property of the request *shape*, not of the pool size.
+
+A live probe of that exact shape (49 replies, `claude-sonnet-5` effort `high`, `ideasPerAgent: 6`, rounds 1 and 2, briefs `sci-08`/`sci-09`/`biz-01`/`prod-07`/`aut-01`, 2026-09-09):
+
+| bucket | n | output tokens | per-idea |
+| --- | --- | --- | --- |
+| round 1 / cot | 20 | 604–2631 | 100.7–438.5 |
+| round 1 / direct | 5 | — | 129.7–207.8 |
+| round 2 / cot | 19 | 1066–2749 | 245.3–458.2 |
+| round 2 / direct | 5 | — | 177.7–391.8 |
+
+**Two of 49 replies exceeded the 2625 cap.** ~4% per reply.
+
+**The defect is the unit, not the number.** `ideas × rate` treats output as proportional to the ideas asked for; a reply has a fixed cost — framing, reasoning, the JSON scaffold — that does not shrink with the request. The probe shows this without appeal to any other probe: **at a fixed 6 ideas, round-1 output ran 604–2631 tokens, a 4.4× spread at constant idea count.** Idea count cannot explain a spread it is held constant across.
+
+So the instrument is a per-**request** floor, not a larger per-idea rate. `MIN_REQUEST_MAX_TOKENS = ceil(2749 × 2.5) = 6873` — the top of the observed distribution times the existing `MAX_TOKENS_HEADROOM`, the same convention every rate in `prompts.mjs` already uses. No new multiplier is introduced. An inflated *rate* would reach the same 6-idea ceiling and silently re-size the 30- and 60-idea solo calls, where the unit is sound and which are this study's comparator (`#160`, merged as `ce7a06e`).
+
+What the evidence does **not** support: that `sci-08` and `sci-09` are special briefs. `biz-01` topped out at 2596, within 6% of `sci-09`'s maximum. The supportable claim is the weaker and sufficient one — **several briefs ride the cap and two crossed it.**
+
+### Item 2 — §3.1: why a 4% per-reply rate cost 42% of the panel's cells
+
+A solo cell is **one** call. A 5-slot, 2-round panel cell is **ten**. A per-reply failure rate `p` therefore reaches a panel cell at `1 − (1−p)¹⁰`: 4% per reply becomes **~34% per cell**, against the ~42% short-pool rate observed.
+
+This is registered as a structural property of any multi-agent arm, not as a tuning note about this one run. **A panel's exposure to any per-reply failure is an order of magnitude greater than a solo arm's, by construction.** Two consequences follow, and both are registered rather than left to be rediscovered:
+
+1. Sizing rules for panel arms must be conservative in a way solo arms never needed. "Over-sizing is free" (`max_tokens` is a ceiling billed as generated) is not merely a convenience here — it is the only reason a 10× exposure is affordable.
+2. It scales with panel size. `#132`'s factorial varies exactly that parameter, so this multiplier is an input to its design, not a footnote of this one.
+
+### Item 3 — §5: the format-failure residual, measured and registered as a baseline
+
+**The corrected ceiling does not fix every reply-level failure, and this appendix refuses to let the next run's losses be read as truncation returning.**
+
+The same 49-reply probe recorded **two replies that stopped on `stop_reason: "end_turn"` and still yielded nothing usable**: one unparseable at 2032 tokens, and one that returned a single idea at 2311 tokens. The model finished; the output was malformed or degenerate. **~4% per reply, unaffected by any ceiling.** This is the same failure mode as Stage 1a's single loss and as `#93` cause 2 (which is why `salvageCandidateArray` exists).
+
+Registered consequences:
+
+- **The re-run's expected format-failure rate is ~4% per reply.** A residual at or below that rate is the baseline behaving as measured, not a new defect.
+- The degenerate 1-idea reply is excluded from the per-idea denominator in item 1. Including it would have reported a rate of 2311/idea and set the ceiling from an artefact rather than from output length. **It is a format failure wearing a truncation costume, and it must not size anything.**
+- **Its blast radius is bounded, and this was checked rather than assumed.** `classifyUndersizedPool` (`evals/harness/provider.mjs`) counts a reply as non-contributing only when `d.candidateCount === 0`, so a *partially salvaged* truncation never triggers `#102`'s undersized-pool discard. That matches the run: 141 of 144 cells **completed**. Truncation degraded pool size; it did not destroy cells. A format failure that yields zero candidates *does* trigger the discard, which is why its rate is registered here as a number to check the re-run against.
+
+### Item 4 — §3.2: B = 48, R = 3
+
+**All 48 briefs, three replicates. 3 arms × 48 briefs × 3 = 432 cells.**
+
+Appendix I item 2's 24-brief subset rule is **retired, not amended**: at B = 48 the design uses the entire corpus, so there is no selection rule left to justify and no composition question to answer. Stage 1a's twelve briefs remain contained, trivially.
+
+Why the size moves at all is item 5. What it costs is item 6.
+
+### Item 5 — §3.4: the basis is now ACHIEVED, not transported — the one thing the failed run bought
+
+Appendix I item 3 had to *transport* `σ²_ba` from a matched-N=30 fit by a ratio of 1.9492, and registered that as an assumption in as many words. **That is no longer necessary.** Appendix I's run fitted both components directly at the ~60 scale, across three arms — which is exactly the condition Stage 1a could not satisfy (only one arm ran at N=60, and a `brief:arm` interaction needs two or more).
+
+| Quantity | Appendix I (registered) | Appendix I (achieved) | Status now |
+| --- | --- | --- | --- |
+| `σ²_ba` | 2.3562 (transported) | **7.8266** | **MEASURED**, three arms at the ~60 scale |
+| `σ²_e` | 4.7917 | **3.6348** | **MEASURED**, rarefied |
+
+The transported figure understated `σ²_ba` by 3.3×. That is the whole reason Appendix I's design was under-powered, and it is registered plainly rather than buried: **the assumption was wrong in the direction that flatters the design**, which is the direction an assumption is most dangerous in.
+
+On §3.4's unchanged formula, `SE(B,R) = sqrt(2·(σ²_ba/B + σ²_e/(B·R)))`, with the achieved components:
+
+| Design | cells | SE | MDE (Holm, m=2) | power vs. the −1.767 observed |
+| --- | --- | --- | --- | --- |
+| B=24, R=2 (Appendix I) | 144 | 0.897 | 2.761 | **39%** |
+| B=48, R=2 | 288 | 0.634 | 1.952 | 71% |
+| **B=48, R=3 (registered here)** | **432** | **0.614** | **1.890** | **74%** |
+
+Repeating Appendix I's size would have had **39% power against the effect Appendix I's own run measured** — it would very likely have returned "unresolved" a second time, at full cost. B=48 restores the MDE Appendix I registered (1.94). R=3 is a deliberate purchase of the remaining margin; it buys little (`σ²_ba` dominates and only `B` divides it) and that is registered as known in advance, not discovered afterwards.
+
+**A note on what the re-run's effect size may be.** The −1.767 above is contaminated in a known direction: `S1B-PANEL` truncated at 19/45 while `S1B-SOLO60` truncated at 3/48, so the panel was penalised and the contrast is a **lower bound** on panel performance. The re-run's point estimate may move toward zero or past it. Sizing against −1.767 is therefore sizing against the best available estimate, not a prediction — and this paragraph is here so that a smaller effect in the re-run is read as the correction working, not as a surprise.
+
+The truncation also cost the analysis a second way, registered so it is not repeated: rarefaction takes the **minimum** pool present in a contrast (Appendix C item 2), so the panel's short pools dragged the common rarefaction floor from 60 down to **45 for every arm** — including the two that had not truncated. Item 8 registers how that floor is to be read for the re-run, before the re-run can determine it.
+
+**A caveat on `σ²_e`, stated rather than left implicit in the table above.** The 3.6348 is the **rarefied-at-45** residual, measured under truncation. Two things follow, and neither is a reason to re-size, but both bear on how the table should be read:
+
+- The corrected ceiling should *reduce* panel `σ²_e`, because truncation was itself injecting variance. If it does, `R = 3` buys even less than the 3 points the table credits it with — `R` divides only the `σ²_e/(B·R)` term, which is already the smaller of the two.
+- The re-run rarefies at a higher floor (item 8), so its `σ²_e` is **not the same estimand** as the 3.6348 being used to size it. The transfer is an approximation, and it is the *second* input to this table that does not transfer cleanly — which is precisely the class of thing Appendix I item 3 got caught by.
+
+`σ²_ba` — the term that actually decides the design, at 7.8266 against `σ²_e`'s 3.6348 — is the measured one and is unaffected by this. The design is sized on the term that dominates it; `R = 3` is registered as a deliberate purchase of margin whose marginal value may prove smaller than 3 points, and that is known here rather than discovered afterwards.
+
+### Item 6 — §8: cost, and the hash consequence
+
+**`promptTemplateHash()` moves `c6c2a60a4fe8` → `12b0a1a414c2`**, because `MIN_REQUEST_MAX_TOKENS` is a sizing constant and joins its payload — a change to it is a change to what was requested. That moves `configHash`, so **every Appendix I cell is stale and Stage 1b re-collects in full.** This is the same consequence Appendix F item 6 recorded for `#122`, and it is the intended one: the run being replaced is the one whose ceiling was wrong, and pooling cells across the two ceilings would be pooling two different experiments.
+
+The re-run writes to a **fresh store, `results-study1b-r2/`**, rather than reusing `results-study1b/`. The stale check would have excluded the old cells correctly, but keeping the defective run intact and separately inspectable is worth more than the disk.
+
+| | Batch | No-batch |
+| --- | --- | --- |
+| Harness pre-flight projection (`--dry-run`, 432 cells) | **$55.04** | $110.07 |
+
+The estimator over-projects, and Appendix I's run now measures by how much: it projected $18.35 for 144 cells and the run cost **$15.3969** — a factor of 1.19. Applied here, expected actual is **~$46**, plus a small increase for the panel replies that will now run to completion instead of being cut (~4% of replies, each by a modest amount — so a few percent, not a quarter). Call it **$46–$52**.
+
+**The registered ceiling is `--max-spend 90`**, which clears the projection and leaves room for a re-plan without a second registration.
+
+`--cell-concurrency 4` to `8` and no higher, for Appendix I item 7's unchanged reason.
+
+### Item 7 — what survives from Appendix I's run, and what does not
+
+Registered before the re-run so that the re-run cannot be read selectively afterwards:
+
+- **S1b-1 (`S1B-PANEL − S1B-SOLO60`) is re-collected, not superseded by fiat.** Its Appendix I value (−1.7672, Holm p 0.052) stands as what was measured under the defective ceiling. The re-run replaces it.
+- **S1b-2 (`S1B-PANEL − S1B-APRIME`, +14.9052, p ≈ 0) survives directionally.** `S1B-PANEL` truncated more than `S1B-APRIME` (19/45 vs 6/48), so the defect penalised the arm the contrast favours: the true effect is at least this large. The re-run measures it cleanly, but a reversal is not a live possibility.
+- **All five of H1–H5 remain NOT ESTIMABLE**, for `#145`'s reason — the registered panel arms `A′, B…H` are not in this arm set. That is unaffected by anything here and is not revisited.
+- **Appendix I item 6's three limitations carry forward unchanged**, including that §5.1's judge gate has never run (`#16`), so idea-level metrics stay unreportable.
+
+### Item 8 — §4.1: the rarefaction floor is data-determined, and here is the rule for reading it
+
+**This item exists because the registration would otherwise be ambiguous about what number the run produces**, and the whole point of landing an appendix before collection is that this class of question is answered while no data exists to answer it with.
+
+Appendix C item 2 rarefies every pool in a contrast to **the minimum pool size present**. That rule is unchanged and is not amended here: every rarefied figure this study has published — all of Stage 1a's — uses it, and pinning a fixed target for one run would make that run non-comparable with all of them. The consequence is that the re-run's rarefaction floor is **determined by its own worst cell**, not by design.
+
+And item 3 registers that a ~4% per-reply format-failure residual survives the ceiling correction, so at least one panel cell landing short is expected, not exceptional. **The floor will therefore be below 60, and the design does not get to choose where.**
+
+Registered before collection:
+
+1. **The achieved rarefaction floor is reported alongside every contrast**, with the cell that set it identified by key. It is a result, not a parameter.
+2. **A floor of 48 or above (80% of the design pool) makes the contrast primary as registered.** 48 is chosen so the re-run cannot be *worse* than the run it replaces — Appendix I's run achieved 45 — and so that the loss of a single agent's contribution from a single cell does not disqualify a design that expects exactly that at a ~4% rate.
+3. **A floor below 48 is reported, not discarded, and is explicitly marked as not comparable to the registered target**, naming the cell responsible. It does not license a re-plan of that cell to raise the floor: re-planning the cell that sets the floor, *because* it sets the floor, would be selecting on the outcome.
+4. The full-pool `distinct_k` remains the secondary descriptive it is under Appendix C item 5, and is reported whatever the floor does. It is the check that a low floor is a rarefaction artefact rather than a real collapse in pool quality.
+
+### Item 9 — reproduction
+
+```
+node evals/run.mjs --dry-run \
+  --arms S1B-SOLO60,S1B-PANEL,S1B-APRIME \
+  --replicates 3
+```
+
+reproduces item 6's projection (432 todo, $55.0368 batched). The brief list is omitted because the design is the whole corpus.
+
+The sizing constant and its derivation are pinned in `evals/harness/prompts.test.mjs` (`#160`): the floor must equal `ceil(2749 × MAX_TOKENS_HEADROOM)`, must bind at the panel shape, and must be inert at 30 and 60 ideas. Mutations that derive it from a mid-distribution reply, that drop the headroom, or that reach the same 6-idea ceiling through a per-idea *rate* bump instead all fail — the last of which is what makes item 1's floor-versus-rate argument a tested claim rather than a stated preference.
+
+**No cell of the re-run has been collected.** This appendix is the registration, and it lands first.
 
