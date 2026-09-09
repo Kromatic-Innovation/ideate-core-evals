@@ -18,6 +18,7 @@ import {
   MAX_TOKENS_HEADROOM,
   LEGACY_MAX_TOKENS,
   MIN_REQUEST_MAX_TOKENS,
+  MIN_REQUEST_MAX_TOKENS_BY_EFFORT,
   SALVAGE_VERSION,
   EFFORT_FREE,
   maxTokensForIdeas,
@@ -151,6 +152,7 @@ test("#130 mutation-proof: promptTemplateHash's payload contains BOTH the direct
     defaultTokensPerIdea: DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: MAX_TOKENS_HEADROOM,
     legacyMaxTokens: LEGACY_MAX_TOKENS,
+    minRequestMaxTokensByEffort: MIN_REQUEST_MAX_TOKENS_BY_EFFORT,
     minRequestMaxTokens: MIN_REQUEST_MAX_TOKENS,
     salvageVersion: SALVAGE_VERSION,
   };
@@ -186,12 +188,19 @@ test("#130 mutation-proof: promptTemplateHash's payload contains BOTH the direct
 // a different request, so the sizing-constants payload changing is exactly
 // the intended effect (see the PR body for the develop value this moved from:
 // b529182bea28).
-test("#160: promptTemplateHash() is pinned to the post-#160 (per-request floor) value", () => {
-  // Moved from #130's c6c2a60a4fe8 by adding MIN_REQUEST_MAX_TOKENS to the
-  // payload. That is the intended effect: every panel arm now sends a
-  // different max_tokens, so no Stage 1b cell collected under the old ceiling
+test("#168: promptTemplateHash() is pinned to the post-#168 (effort-keyed floor) value", () => {
+  // Moved from #160's 12b0a1a414c2 by adding MIN_REQUEST_MAX_TOKENS_BY_EFFORT
+  // to the payload (which itself moved from #130's c6c2a60a4fe8 by adding the
+  // flat floor). That is the intended effect: a different max_tokens is a
+  // different request, so no cell collected under the old max-effort ceiling
   // may be pooled with one collected under the new one.
-  assert.equal(promptTemplateHash(), "12b0a1a414c2");
+  //
+  // What this hash move does NOT mean is that every stale cell must be
+  // re-collected. #168 changes the `max` bucket only, so a request that names
+  // no max-effort slot resolves to the SAME max_tokens on both sides of it --
+  // see the S1C control-arm invariance test below, which is the evidence
+  // behind pooling the two hashes with `--config-hash a,b`.
+  assert.equal(promptTemplateHash(), "52989c87b3e9");
 });
 
 // ── issue #160: the per-REQUEST floor ──────────────────────────────────────
@@ -231,6 +240,68 @@ test("#160: the floor binds at the panel shape and is inert at every solo shape 
   assert.equal(maxTokensForIdeas(6, "claude-opus-5"), Math.ceil(6 * 558 * MAX_TOKENS_HEADROOM));
 });
 
+// ── issue #168: the effort-keyed floor, and what it leaves untouched ────────
+
+test("#168: the max floor is the probe's observed maximum times MAX_TOKENS_HEADROOM, and it clears every reply the probe saw", () => {
+  // The probe's largest single reply at effort max (round 1, sci-08, persona
+  // weirdo, stop_reason end_turn -- so the top is observed, not censored),
+  // 2026-09-09, claude-sonnet-5, ideasPerAgent 6. Derived by the SAME
+  // convention every other number in prompts.mjs uses, so this pins the
+  // derivation and not just the literal.
+  const PROBE_MAX_OUTPUT_TOKENS_AT_MAX_EFFORT = 18209;
+  assert.equal(
+    MIN_REQUEST_MAX_TOKENS_BY_EFFORT.max,
+    Math.ceil(PROBE_MAX_OUTPUT_TOKENS_AT_MAX_EFFORT * MAX_TOKENS_HEADROOM),
+  );
+
+  // The defect #168 fixes: the Stage 1c max-effort ceiling sat BELOW replies
+  // the probe actually observed -- 6 of 12, a 50% per-REPLY rate.
+  const STAGE_1C_MAX_EFFORT_CEILING = 11640;
+  assert.equal(STAGE_1C_MAX_EFFORT_CEILING, Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM), "the ceiling that truncated");
+  assert.ok(
+    STAGE_1C_MAX_EFFORT_CEILING < PROBE_MAX_OUTPUT_TOKENS_AT_MAX_EFFORT,
+    "if the old ceiling were above the observed max there would have been no truncation to explain",
+  );
+  assert.ok(MIN_REQUEST_MAX_TOKENS_BY_EFFORT.max > PROBE_MAX_OUTPUT_TOKENS_AT_MAX_EFFORT);
+});
+
+test("#168: low and high are NOT raised -- the probe cleared the existing floor in both, so touching them would be unmeasured", () => {
+  // Probe tops: low 814, high 2980, both under the 6873 flat floor. #160's
+  // floor is correct for them and #168 changes nothing there. This is the
+  // assertion that keeps a future edit from "tidying" the two buckets into the
+  // keyed table on symmetry grounds, which would stale every cell in the study
+  // for a change no measurement asked for.
+  for (const effort of ["low", "high", undefined]) {
+    assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", effort), MIN_REQUEST_MAX_TOKENS, `effort=${effort}`);
+  }
+  assert.deepEqual(Object.keys(MIN_REQUEST_MAX_TOKENS_BY_EFFORT), ["max"]);
+});
+
+test("#168: both Stage 1c SOLO control arms resolve to an UNCHANGED max_tokens -- the evidence behind pooling their configHash", () => {
+  // This test is the argument, not a formality. #168 moves promptTemplateHash,
+  // which stales all 432 Stage 1c cells -- including the 288 control cells.
+  // Those were kept and pooled via `--config-hash <old>,<new>` (see
+  // evals/analysis/storeConfig.mjs) on the claim that their REQUESTS did not
+  // change. Here is that claim, checked.
+  //
+  // Both control arms run entirely at effort `high`, which #168 does not touch:
+  //   S1C-SOLO60    60 ideas -> rate-decided, 60 * 175 * 2.5 = 26250
+  //   S1C-SOLO6X10   6 ideas -> floor-decided, MIN_REQUEST_MAX_TOKENS = 6873
+  // The pre-#168 values are hard-coded rather than recomputed, so this compares
+  // against what the store's cells were ACTUALLY collected under. Recomputing
+  // them from the current constants would make the test vacuous -- it would
+  // pass no matter what #168 did.
+  const PRE_168_SOLO60 = 26250;
+  const PRE_168_SOLO6X10 = 6873;
+  assert.equal(maxTokensForIdeas(60, "claude-sonnet-5", "high"), PRE_168_SOLO60);
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "high"), PRE_168_SOLO6X10);
+
+  // And the treatment arm's max-effort slots DID change -- otherwise the fix
+  // would not have fixed anything, and there would be nothing to re-collect.
+  assert.notEqual(maxTokensForIdeas(6, "claude-sonnet-5", "max"), 11640);
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "max"), 45523);
+});
+
 // ── issue #130: maxTokensForIdeas's (model, effort) resolution order ────────
 
 test("#130 resolution order (1): an exact (model, effort) bucket wins", () => {
@@ -247,7 +318,12 @@ test("#130 resolution order (1): an exact (model, effort) bucket wins", () => {
   // under #160 (30 * 81 * 2.5 = 6075 < 6873); 60 does.
   assert.equal(maxTokensForIdeas(60, "claude-sonnet-5", "low"), Math.ceil(60 * 81 * MAX_TOKENS_HEADROOM));
   assert.equal(maxTokensForIdeas(60, "claude-sonnet-5", "high"), Math.ceil(60 * 175 * MAX_TOKENS_HEADROOM));
-  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "max"), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
+  // #168 keyed the request floor by effort, and at `max` that floor (45523) is
+  // far above what the rate computes at 6 ideas -- so the assertion has to move
+  // to a size where the RATE is the binding term, or it would be about the
+  // floor. Same masking #160 introduced at `low`/`high` above, one bucket over.
+  assert.equal(maxTokensForIdeas(6, "claude-sonnet-5", "max"), MIN_REQUEST_MAX_TOKENS_BY_EFFORT.max);
+  assert.equal(maxTokensForIdeas(30, "claude-sonnet-5", "max"), Math.ceil(30 * 776 * MAX_TOKENS_HEADROOM));
   // The three buckets remain mutually distinct where the rate binds -- the
   // masking above is a property of small requests, not of the resolution.
   assert.equal(new Set([60, 60, 60].map((n, i) => maxTokensForIdeas(n, "claude-sonnet-5", ["low", "high", "max"][i]))).size, 3);
@@ -261,13 +337,28 @@ test("#130 resolution order: undefined effort resolves to the SAME rate as expli
 
 test("#130 resolution order (2): a model's EFFORT_FREE rate wins over falling through to the model's highest bucket or the global default, for ANY effort argument", () => {
   const opusEffortFree = TOKENS_PER_IDEA_BY_MODEL["claude-opus-5"][EFFORT_FREE];
+  // 40 ideas, not 6: #168's effort-keyed floor (45523 at `max`) dominates the
+  // EFFORT_FREE rate at 6 ideas, which would make this test assert the floor
+  // rather than the resolution order it exists to pin. 40 * 558 * 2.5 = 55800
+  // clears the floor in every bucket, so the rate is the binding term for all
+  // six effort arguments and the comparison is the intended one.
+  const IDEAS = 40;
+  assert.ok(
+    Math.ceil(IDEAS * opusEffortFree * MAX_TOKENS_HEADROOM) > MIN_REQUEST_MAX_TOKENS_BY_EFFORT.max,
+    "the idea count must clear the highest effort-keyed floor or this test is about the floor",
+  );
   for (const effort of [undefined, "low", "high", "max", "medium", "xhigh"]) {
     assert.equal(
-      maxTokensForIdeas(6, "claude-opus-5", effort),
-      Math.ceil(6 * opusEffortFree * MAX_TOKENS_HEADROOM),
+      maxTokensForIdeas(IDEAS, "claude-opus-5", effort),
+      Math.ceil(IDEAS * opusEffortFree * MAX_TOKENS_HEADROOM),
       `effort=${effort}`,
     );
   }
+  // The floor still applies to Opus at `max` -- every fallback in this file is
+  // upward, and an unmeasured (model, effort) pair is exactly where the
+  // generous direction is the safe one (#168: it is a FIXED per-reply cost, so
+  // there is no reason to believe it vanishes on a model we have not probed).
+  assert.equal(maxTokensForIdeas(6, "claude-opus-5", "max"), MIN_REQUEST_MAX_TOKENS_BY_EFFORT.max);
 });
 
 test("#130 resolution order (3): an unmeasured effort bucket on an otherwise-measured model falls back to that model's OWN highest measured rate", () => {
@@ -288,6 +379,10 @@ test("#130 resolution order (3): an unmeasured effort bucket on an otherwise-mea
 test("#130 resolution order (4): a wholly unmeasured model falls back to DEFAULT_TOKENS_PER_IDEA, the highest rate measured for ANY model at ANY effort (776)", () => {
   assert.equal(DEFAULT_TOKENS_PER_IDEA, 776);
   assert.equal(maxTokensForIdeas(6, "claude-haiku-4-5"), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
-  assert.equal(maxTokensForIdeas(6, "gpt-5.6-terra", "max"), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM));
   assert.equal(maxTokensForIdeas(6), Math.ceil(6 * 776 * MAX_TOKENS_HEADROOM), "omitted model, too");
+  // At `max` the #168 floor outranks the default rate at 6 ideas; 30 puts the
+  // rate back in charge (30 * 776 * 2.5 = 58200) so this still pins the
+  // fallback RATE for a wholly unmeasured model rather than the floor.
+  assert.equal(maxTokensForIdeas(6, "gpt-5.6-terra", "max"), MIN_REQUEST_MAX_TOKENS_BY_EFFORT.max);
+  assert.equal(maxTokensForIdeas(30, "gpt-5.6-terra", "max"), Math.ceil(30 * 776 * MAX_TOKENS_HEADROOM));
 });
