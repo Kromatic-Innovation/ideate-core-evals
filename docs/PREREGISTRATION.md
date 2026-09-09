@@ -1891,10 +1891,12 @@ A probe on 2026-09-09 submitted batches of **1, 6 and 30** requests at the same 
 
 | submission | wait |
 | --- | --- |
-| batch of 1 | **20.9 min** (ended) |
-| batch of 6 | **> 55 min**, still `in_progress`, 0 of 6 succeeded |
-| batch of 30 | **> 55 min**, still `in_progress`, 0 of 30 succeeded |
+| batch of 1 | **20.9 min** |
+| batch of 6 | **260.4 min** (4.3 h) |
+| batch of 30 | **406.9 min** (6.8 h) — 29 of 30 succeeded, 1 errored |
 | direct call, no batch | **12.8s**, **14.0s** |
+
+> _Completed 2026-09-09. This table originally registered the size-6 and size-30 rows as "> 55 min, still `in_progress`", because the probe's own 45-minute ceiling expired before they ended. They were left running to completion and the true figures are above: **12x and 19x the size-1 wait**. The conclusion this appendix rests on is not merely supported but understated — batch latency scales hard with batch size, so coalescing more cells per batch is actively punitive, not neutral._
 
 This is consistent with the four size-1 batches already recorded above `DEFAULT_MAX_POLL_MS` in `evals/harness/provider.mjs` (2m24s, 9m53s, 21m07s, one past 20m).
 
