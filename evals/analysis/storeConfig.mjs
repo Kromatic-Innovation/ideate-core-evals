@@ -35,6 +35,35 @@
 // Picking is precisely the silent-pooling judgment call `lib/manifest.mjs`
 // exists to forbid; the operator names the one they mean with
 // `--config-hash`.
+//
+// ── Naming SEVERAL is allowed; guessing several is not (issue #168) ─────────
+// `--config-hash` accepts a LIST. That is not a weakening of the rule above:
+// the rule forbids this module CHOOSING, and a list is the operator choosing,
+// out loud, in the invocation, where it is visible in the shell history and in
+// any script that reproduces the run. Refusal is still the default — omitting
+// the flag on a two-hash store throws exactly as before.
+//
+// It exists because `configHash` is deliberately COARSE. It folds nine
+// CONFIG_FIELDS into one value, so a change to any of them stales every cell —
+// including cells whose actual request bytes did not change at all. Stage 1c
+// hit this: raising the max-effort output ceiling (issue #168) altered
+// `promptHash`, and therefore the hash of all 432 cells, while leaving both
+// solo control arms sending byte-identical requests (their resolved
+// `max_tokens` is unchanged — 26250 and 6873 before and after, asserted in
+// prompts.test.mjs so the claim is checked rather than argued). Re-collecting
+// 288 physically-identical cells to make one hash string match is a cost with
+// no measurement behind it.
+//
+// ── What pooling a list does NOT license ────────────────────────────────────
+// Two of the nine CONFIG_FIELDS — `embedderId` and `clusterDistanceThreshold`
+// — ARE the definition of `distinct_k`. Pooling across a change to either
+// averages ideas counted by two different rulers and reports it as one number.
+// So this flag is not "ignore the hash": the check stays, and the operator
+// takes on the obligation to have established that what differs between the
+// hashes they name does not touch the cells they are pooling. Dropping the
+// comparison in `frame.mjs` outright would have been the same number of lines
+// and would have made that failure unreachable from the type system AND
+// invisible in the invocation.
 
 /** Thrown when the store carries no usable `cfg` at all (empty store, or an
  *  index whose every entry predates cfg-stamping). Named so the CLI can say
@@ -144,24 +173,40 @@ export function tallyStoredConfigs(store) {
  *
  * @param {import("../../lib/store.mjs").ResultsStore} store
  * @param {object} [opts]
- *   @param {string} [opts.configHash]  operator's explicit choice
+ *   @param {string|string[]} [opts.configHash]  operator's explicit choice
  *     (`--config-hash`). Validated against the store: naming a hash the store
- *     does not hold is an error HERE, not an empty frame later.
+ *     does not hold is an error HERE, not an empty frame later. A LIST pools
+ *     the named hashes — see "Naming SEVERAL is allowed" above for what that
+ *     does and does not license. EVERY named hash is validated, so a typo in
+ *     the second of two is caught with the same message as a typo in the
+ *     first; a list that names the same hash twice is de-duplicated rather
+ *     than double-counting its cells.
  *   @param {string} [opts.resultsDir]  only for error messages.
- * @returns {{configHash: string, tally: ReturnType<typeof tallyStoredConfigs>}}
+ * @returns {{configHash: string, configHashes: string[],
+ *            tally: ReturnType<typeof tallyStoredConfigs>}}
+ *   `configHashes` is always the full selected set. `configHash` is the single
+ *   selected hash, kept for the (overwhelmingly common) one-hash case and for
+ *   callers that predate the list form; when several are pooled it carries the
+ *   first, and any message built from it alone would understate the selection,
+ *   so downstream reporting should prefer `configHashes`.
  */
 export function resolveStoreConfigHash(store, opts = {}) {
   const resultsDir = opts.resultsDir || (store && store.dir) || "<store>";
   const tally = tallyStoredConfigs(store);
 
-  if (opts.configHash) {
-    if (!tally.some((t) => t.cfg === opts.configHash)) {
-      throw new UnknownStoredConfigError(resultsDir, opts.configHash, tally);
-    }
-    return { configHash: opts.configHash, tally };
+  const requested = opts.configHash === undefined || opts.configHash === null ? [] : [].concat(opts.configHash);
+  const named = Array.from(new Set(requested.filter((h) => typeof h === "string" && h !== "")));
+
+  if (named.length) {
+    // Validate EVERY named hash, not just the first miss: an operator pooling
+    // two hashes has typed two 12-hex strings, and reporting only the first
+    // bad one costs them a second round trip to find the second.
+    const missing = named.filter((h) => !tally.some((t) => t.cfg === h));
+    if (missing.length) throw new UnknownStoredConfigError(resultsDir, missing.join(", "), tally);
+    return { configHash: named[0], configHashes: named, tally };
   }
 
   if (tally.length === 0) throw new NoStoredConfigError(resultsDir);
   if (tally.length > 1) throw new AmbiguousStoredConfigError(resultsDir, tally);
-  return { configHash: tally[0].cfg, tally };
+  return { configHash: tally[0].cfg, configHashes: [tally[0].cfg], tally };
 }

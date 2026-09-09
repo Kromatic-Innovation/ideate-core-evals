@@ -169,7 +169,17 @@ export function buildFrame(store, opts = {}) {
         "store by evals/analysis/storeConfig.mjs) — never both, since the two could disagree and only one can win",
     );
   }
-  const cfg = opts.configHash !== undefined ? opts.configHash : computeConfigHash(opts.config || {});
+  // `opts.configHash` may be a single hash or a LIST (issue #168 -- see
+  // storeConfig.mjs's "Naming SEVERAL is allowed" for why a list is the
+  // operator choosing out loud rather than this module guessing). Normalized
+  // to a Set here so the per-entry test below stays one comparison either way.
+  const cfgList =
+    opts.configHash !== undefined ? [].concat(opts.configHash) : [computeConfigHash(opts.config || {})];
+  const cfgSet = new Set(cfgList);
+  // The single-hash face of the selection, for `frame.configHash` and every
+  // message built from it. With a pooled list this understates the selection,
+  // which is why `frame.configHashes` carries the whole set.
+  const cfg = cfgList[0];
 
   const rows = [];
   const excluded = { failed: [], skipped: [], stale: [] };
@@ -220,7 +230,7 @@ export function buildFrame(store, opts = {}) {
     // batch-replay record fails the key shape, so it lands in NO bucket,
     // which is right: it is not a study cell in any config, and it is not
     // recoverable by passing --config-hash.
-    if (entry.cfg !== cfg) {
+    if (!cfgSet.has(entry.cfg)) {
       excluded.stale.push({ key: entry.key, armId: entry.armId, briefId: entry.briefId, cfg: entry.cfg });
       continue;
     }
@@ -317,6 +327,7 @@ export function buildFrame(store, opts = {}) {
     responseField,
     poolField,
     configHash: cfg,
+    configHashes: cfgList,
     excluded,
     failuresByArm,
     skippedByArm,

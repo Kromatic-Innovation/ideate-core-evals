@@ -12,6 +12,13 @@
 //
 // Add --config-hash <hash> only when the store holds more than one
 // configHash; the error you get in that case names every candidate.
+// --config-hash accepts a COMMA-SEPARATED LIST to POOL the named hashes
+// (issue #168) -- for the case where a CONFIG_FIELDS change staled cells whose
+// actual requests did not change. Pooling is never inferred: an unnamed
+// two-hash store still refuses. See evals/analysis/storeConfig.mjs's
+// "Naming SEVERAL is allowed" for what that does and does not license --
+// notably NOT pooling across an `embedderId` or `clusterDistanceThreshold`
+// change, which would average `distinct_k` measured by two different rulers.
 //
 // --cluster-distance-threshold (issue #73) is REQUIRED to actually compute
 // H1's rarefied estimand (Appendix C) once stored cells carry embedded pools
@@ -136,7 +143,17 @@ function parseArgs(argv) {
     // configHash and you must say which is yours. It is validated against the
     // store (storeConfig.mjs) rather than passed through to produce an empty
     // frame.
-    else if (a === "--config-hash") args.configHash = argv[++i];
+    // A COMMA-SEPARATED LIST pools the named hashes (issue #168). Repeating
+    // the flag accumulates too, so `--config-hash a --config-hash b` and
+    // `--config-hash a,b` mean the same thing -- an operator should not have to
+    // remember which form this CLI happens to take.
+    else if (a === "--config-hash") {
+      const named = String(argv[++i] || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      args.configHash = [...(args.configHash || []), ...named];
+    }
     else if (a === "--pool-field") args.poolField = argv[++i];
     else throw new Error(`analysis.mjs: unrecognized argument '${a}'`);
   }
@@ -188,7 +205,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // holding several incomparable experiments (it refuses to choose), and a
   // --config-hash the store does not carry — the last being exactly the state
   // that used to surface four modules downstream as `armLevels []`.
-  const { configHash: selectedCfg } = resolveStoreConfigHash(store, {
+  const { configHashes: selectedCfg } = resolveStoreConfigHash(store, {
     configHash: args.configHash,
     resultsDir: args.resultsDir,
   });

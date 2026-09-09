@@ -253,3 +253,67 @@ test("buildFrame: opts.config and opts.configHash together are refused — two s
     /never both/,
   );
 });
+
+// ── issue #168: an operator may NAME several hashes; the tool still never guesses ─
+//
+// The pooling flag's whole justification is that `configHash` is coarse enough
+// to stale cells whose requests did not change. These tests pin the two halves
+// that matter: a named list pools, and an UNnamed two-hash store still refuses.
+
+/** Seed a store holding two hashes, as the Stage 1c store does after the
+ *  max-effort ceiling fix: controls under the old cfg, treatment under the new. */
+function twoHashStore(prefix) {
+  const store = makeTempStore(prefix);
+  for (const [arm, cfg] of [["CTRL", "aaaaaaaaaaaa"], ["CTRL", "aaaaaaaaaaaa"], ["TREAT", "bbbbbbbbbbbb"]]) {
+    const briefId = `b${store.list().length}`;
+    putCell(store, { key: cellKey({ armId: arm, briefId, replicate: 0, cfg }), armId: arm, briefId, replicate: 0, cfg });
+  }
+  return store;
+}
+
+test("#168: a two-hash store with NO --config-hash still refuses — the default is unchanged", () => {
+  const store = twoHashStore("storeconfig-168-refuse-");
+  assert.throws(() => resolveStoreConfigHash(store, {}), /holds 2 distinct configHashes/);
+});
+
+test("#168: naming BOTH hashes pools them, and reports the whole set in configHashes", () => {
+  const store = twoHashStore("storeconfig-168-pool-");
+  const r = resolveStoreConfigHash(store, { configHash: ["aaaaaaaaaaaa", "bbbbbbbbbbbb"] });
+  assert.deepEqual(r.configHashes, ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
+
+  const frame = buildFrame(store, { configHash: r.configHashes });
+  // Both arms are present -- which is the entire point: under a single hash one
+  // of them has zero rows and buildFrame's differential-attrition guard fires.
+  assert.deepEqual(frame.armLevels.slice().sort(), ["CTRL", "TREAT"]);
+  assert.equal(frame.rows.length, 3);
+  assert.equal(frame.excluded.stale.length, 0);
+  assert.deepEqual(frame.configHashes, ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
+});
+
+test("#168: naming ONE of two hashes selects only that one — a list is opt-in, not implied", () => {
+  const store = twoHashStore("storeconfig-168-one-");
+  const frame = buildFrame(store, { configHash: "aaaaaaaaaaaa" });
+  assert.deepEqual(frame.armLevels, ["CTRL"]);
+  assert.equal(frame.excluded.stale.length, 1);
+  // Back-compat: the single-hash face is still a bare string, not an array.
+  assert.equal(frame.configHash, "aaaaaaaaaaaa");
+});
+
+test("#168: EVERY named hash is validated, so a typo in the second is caught too", () => {
+  const store = twoHashStore("storeconfig-168-typo-");
+  assert.throws(
+    () => resolveStoreConfigHash(store, { configHash: ["aaaaaaaaaaaa", "ffffffffffff"] }),
+    (err) => {
+      assert.equal(err.name, "UnknownStoredConfigError");
+      assert.match(err.message, /ffffffffffff/);
+      return true;
+    },
+  );
+});
+
+test("#168: a hash named twice is de-duplicated — pooling must not double-count its cells", () => {
+  const store = twoHashStore("storeconfig-168-dupe-");
+  const r = resolveStoreConfigHash(store, { configHash: ["aaaaaaaaaaaa", "aaaaaaaaaaaa"] });
+  assert.deepEqual(r.configHashes, ["aaaaaaaaaaaa"]);
+  assert.equal(buildFrame(store, { configHash: r.configHashes }).rows.length, 2);
+});
