@@ -111,7 +111,13 @@ import { poolMetricsSummary } from "../metrics/operational.mjs";
 // the ledger records tokens x model x timestamp (lib/accounting.mjs costRow)
 // and is repriced at READ time by lib/price.mjs once #7 lands. This estimator
 // exists ONLY to give --max-spend a number to compare against pre-flight.
-const INTERIM_RATES_USD_PER_MTOK = {
+// Exported for one test only (#143): the comment above claims these
+// "mirror the real rates so the pre-flight projection is not wildly off",
+// and until #143 nothing checked that claim -- correcting the Sonnet 5 rate
+// in lib/price.mjs while leaving this table stale was a mutation the suite
+// did not catch. Production code never reads this export; it reads the
+// constant directly.
+export const INTERIM_RATES_USD_PER_MTOK = {
   "claude-opus-5": { in: 5.0, out: 25.0 },
   // Corrected 2026-09-08 (#143): was 3.0/15.0, mirroring lib/price.mjs's
   // then-stale row. First-party pricing is 2.00/10.00.
