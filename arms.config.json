@@ -14,7 +14,10 @@
       "personaDisabled": false,
       "totalIdeasRequested": 30,
       "slots": [
-        { "persona": "solo", "model": "claude-sonnet-5" }
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5"
+        }
       ]
     },
     "B": {
@@ -23,11 +26,26 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_2", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_3", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_4", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_5", "model": "claude-haiku-4-5" }
+        {
+          "persona": "proposer_1",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "claude-haiku-4-5"
+        }
       ]
     },
     "C": {
@@ -36,11 +54,26 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "claude-sonnet-5" },
-        { "persona": "proposer_2", "model": "claude-sonnet-5" },
-        { "persona": "proposer_3", "model": "claude-sonnet-5" },
-        { "persona": "proposer_4", "model": "claude-sonnet-5" },
-        { "persona": "proposer_5", "model": "claude-sonnet-5" }
+        {
+          "persona": "proposer_1",
+          "model": "claude-sonnet-5"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "claude-sonnet-5"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "claude-sonnet-5"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "claude-sonnet-5"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "claude-sonnet-5"
+        }
       ]
     },
     "D": {
@@ -49,11 +82,26 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "claude-opus-5" },
-        { "persona": "proposer_2", "model": "claude-opus-5" },
-        { "persona": "proposer_3", "model": "claude-opus-5" },
-        { "persona": "proposer_4", "model": "claude-opus-5" },
-        { "persona": "proposer_5", "model": "claude-opus-5" }
+        {
+          "persona": "proposer_1",
+          "model": "claude-opus-5"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "claude-opus-5"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "claude-opus-5"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "claude-opus-5"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "claude-opus-5"
+        }
       ]
     },
     "E": {
@@ -62,11 +110,26 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_2", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_3", "model": "claude-sonnet-5" },
-        { "persona": "proposer_4", "model": "claude-sonnet-5" },
-        { "persona": "proposer_5", "model": "claude-opus-5" }
+        {
+          "persona": "proposer_1",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "claude-sonnet-5"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "claude-sonnet-5"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "claude-opus-5"
+        }
       ]
     },
     "F": {
@@ -75,11 +138,26 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "claude-opus-5" },
-        { "persona": "proposer_2", "model": "claude-opus-5" },
-        { "persona": "proposer_3", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_4", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_5", "model": "claude-haiku-4-5" }
+        {
+          "persona": "proposer_1",
+          "model": "claude-opus-5"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "claude-opus-5"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "claude-haiku-4-5"
+        }
       ]
     },
     "G": {
@@ -88,11 +166,26 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_2", "model": "claude-sonnet-5" },
-        { "persona": "proposer_3", "model": "claude-opus-5" },
-        { "persona": "proposer_4", "model": "gpt-5.6-terra" },
-        { "persona": "proposer_5", "model": "gpt-5.6-sol" }
+        {
+          "persona": "proposer_1",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "claude-sonnet-5"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "claude-opus-5"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "gpt-5.6-terra"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "gpt-5.6-sol"
+        }
       ]
     },
     "H": {
@@ -101,11 +194,26 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "gpt-5.6-terra" },
-        { "persona": "proposer_2", "model": "gpt-5.6-terra" },
-        { "persona": "proposer_3", "model": "gpt-5.6-terra" },
-        { "persona": "proposer_4", "model": "gpt-5.6-terra" },
-        { "persona": "proposer_5", "model": "gpt-5.6-terra" }
+        {
+          "persona": "proposer_1",
+          "model": "gpt-5.6-terra"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "gpt-5.6-terra"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "gpt-5.6-terra"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "gpt-5.6-terra"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "gpt-5.6-terra"
+        }
       ]
     },
     "A'": {
@@ -114,11 +222,26 @@
       "mode": "panel",
       "personaDisabled": true,
       "slots": [
-        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" },
-        { "persona": "proposer_uniform", "model": "claude-haiku-4-5" }
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-haiku-4-5"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-haiku-4-5"
+        }
       ]
     },
     "AS": {
@@ -134,7 +257,10 @@
         "strategy": "direct"
       },
       "slots": [
-        { "persona": "solo", "model": "claude-sonnet-5" }
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5"
+        }
       ]
     },
     "S1-C0": {
@@ -149,7 +275,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
     },
     "S1-N10": {
       "label": "Study 1 Stage 1a — N=10",
@@ -163,7 +295,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
     },
     "S1-N60": {
       "label": "Study 1 Stage 1a — N=60",
@@ -177,7 +315,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
     },
     "S1-ELOW": {
       "label": "Study 1 Stage 1a — effort low",
@@ -191,7 +335,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "low" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "low"
+        }
+      ]
     },
     "S1-EMAX": {
       "label": "Study 1 Stage 1a — effort max",
@@ -205,7 +355,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "max" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "max"
+        }
+      ]
     },
     "S1-SPRAG": {
       "label": "Study 1 Stage 1a — stance PRAGMATIST",
@@ -219,7 +375,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
     },
     "S1-SCONTRA": {
       "label": "Study 1 Stage 1a — stance CONTRARIAN",
@@ -233,7 +395,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
     },
     "S1-DIRECT": {
       "label": "Study 1 Stage 1a — strategy direct",
@@ -247,7 +415,13 @@
         "temperature": 0.4,
         "strategy": "direct"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
     },
     "S1B-SOLO60": {
       "label": "Study 1 Stage 1b — solo comparator, N=60",
@@ -261,7 +435,13 @@
         "temperature": 0.4,
         "strategy": "cot"
       },
-      "slots": [{ "persona": "solo", "model": "claude-sonnet-5", "effort": "high" }]
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
     },
     "S1B-PANEL": {
       "label": "Study 1 Stage 1b — panel, differentiated stances",
@@ -269,11 +449,31 @@
       "mode": "panel",
       "personaDisabled": false,
       "slots": [
-        { "persona": "proposer_1", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_2", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_3", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_4", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_5", "model": "claude-sonnet-5", "effort": "high" }
+        {
+          "persona": "proposer_1",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_2",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_3",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_4",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_5",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
       ]
     },
     "S1B-APRIME": {
@@ -288,11 +488,163 @@
         "strategy": "cot"
       },
       "slots": [
-        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" },
-        { "persona": "proposer_uniform", "model": "claude-sonnet-5", "effort": "high" }
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "proposer_uniform",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
+    },
+    "S1C-SOLO60": {
+      "label": "Study 1 Stage 1c -- solo comparator, N=60",
+      "purpose": "Appendix L item 1. The benchmark, and the CROSS-RUN BRIDGE. Byte-identical in what it sends to S1B-SOLO60; only the hash label differs, because adding the S1C arms moves armsConfigHash and therefore stales every S1B cell (Appendix D item 1). The thin S1B-PANEL is deliberately NOT re-run, so a RICH-vs-PANEL comparison would cross a configHash boundary -- forbidden as a primary. This arm is what makes a SECONDARY one defensible: Appendix L item 4 registers that if this arm's rarefied mean reproduces Stage 1b's 44.570 within its CI and the rarefaction floors match, the cross-run comparison is reportable as clearly-labelled secondary, and if it does not reproduce, that claim is not made at all.",
+      "mode": "solo",
+      "personaDisabled": true,
+      "totalIdeasRequested": 60,
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [
+        {
+          "persona": "solo",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
+    },
+    "S1C-SOLO6X10": {
+      "label": "Study 1 Stage 1c -- ten blind solo calls, no sharing",
+      "purpose": "Appendix L item 2. THE MISSING CONTROL. S1b-1 confounded four things at once: agent count (1 vs 5), ideas per call (60 vs 6), rounds (1 vs 2) and visibility (none vs pooled). This arm holds agent count and ideas-per-call at the panel's values while removing BOTH rounds and sharing -- ten identical agents, six ideas each, one round, blind, pooled only at the end. Without it, 'the panel loses to one call' cannot be separated from 'ten small calls lose to one big call', which is a materially different and more actionable claim. Stage 1a showed per-idea distinctness is flat between N=30 and N=60, but 6 is far below that range and untested. Uses the per-arm panel geometry override registered by issue #129 amendment B, so no harness change is required.",
+      "mode": "panel",
+      "personaDisabled": true,
+      "panel": {
+        "size": 10,
+        "ideasPerAgent": 6,
+        "maxRounds": 1
+      },
+      "uniformPersona": {
+        "persona": "solo_b",
+        "stance": "No particular perspective is assigned for this task. Approach the brief however you judge best.",
+        "temperature": 0.4,
+        "strategy": "cot"
+      },
+      "slots": [
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        },
+        {
+          "persona": "solo_b",
+          "model": "claude-sonnet-5",
+          "effort": "high"
+        }
+      ]
+    },
+    "S1C-RICH": {
+      "label": "Study 1 Stage 1c -- panel, richly differentiated personas",
+      "purpose": "Appendix L item 3. The treatment. Stage 1b's panel was differentiated by one-sentence stances falling through to DEFAULT_PERSONAS, and its deficit was 4.1 distinct ideas against 5.30 CROSS-AGENT duplications per cell -- a deficit SMALLER than the duplication causing it. Differentiation demonstrably suppresses that duplication (A' 13.68 -> PANEL 5.30). This arm turns differentiation up on every axis reachable on claude-sonnet-5: rich multi-sentence stance text, strategy (cot/direct) and effort (low/high/max). temperature is absent by NECESSITY not choice -- Sonnet 5 rejects it outright ('temperature is deprecated for this model', verified live 2026-09-09), so it is unavailable to the shipped product on this model too (#165). The three axes are BUNDLED BY DESIGN: if this arm wins, no single-axis claim may be read from the result (Appendix L item 6). The MBA slot is deliberately the conventional pole -- its job is to occupy the obvious region so the other four are pushed off it, since a panel whose members all reach for novelty may re-correlate on 'novel-sounding', which is the failure mode being tested. The 'weird but mechanically coherent' clause in the weirdo stance is load-bearing: without it the instruction degenerates toward word salad, which would INFLATE distinct_k while making the arm meaningless.",
+      "mode": "panel",
+      "personaDisabled": false,
+      "slots": [
+        {
+          "persona": "weirdo",
+          "model": "claude-sonnet-5",
+          "stance": "WEIRDO: you are constitutionally unable to give an expected answer. Reach for what sounds absurd on first hearing and defensible on second. Take a mechanism from somewhere nobody would look -- a subculture, a failed product, a children's game, an animal behaviour -- and force it onto this brief. If an idea could plausibly appear in a consulting deck, discard it and try again. You are not trying to be useful; you are trying to be unlike. Weird but mechanically coherent beats sensible every time.",
+          "strategy": "cot",
+          "effort": "max"
+        },
+        {
+          "persona": "philosopher",
+          "model": "claude-sonnet-5",
+          "stance": "PHILOSOPHER: interrogate the question before answering it. What is being assumed about who wants this, what counts as success, and why the current framing feels natural? Name the assumption, then generate the idea that becomes obvious once the assumption is dropped. Work from first principles and from the definition of the thing, not from what similar organisations do. An idea that reframes the problem is worth more here than one that solves it as stated.",
+          "strategy": "cot",
+          "effort": "high"
+        },
+        {
+          "persona": "mba",
+          "model": "claude-sonnet-5",
+          "stance": "MBA: you think in markets, margins, and defensibility. Where is the willingness to pay, what is the acquisition channel, and what makes this hard to copy in eighteen months? Favour ideas with a clear unit-economic story and a named customer segment. Reach for the proven playbook -- pricing changes, channel partnerships, segmentation, bundling -- and apply it precisely. Be the disciplined, conventional voice; do not try to be surprising.",
+          "strategy": "direct",
+          "effort": "low"
+        },
+        {
+          "persona": "poet",
+          "model": "claude-sonnet-5",
+          "stance": "POET: attend to language, image, and feeling. What does this brief actually feel like to the person living inside the problem? Name the experience precisely, find the metaphor that captures it, and let the idea fall out of the metaphor. Notice what is unsaid, what is embarrassing, what people would only admit at 2am. Concrete sensory detail over abstraction. You are looking for the idea that lands emotionally before it is justified rationally.",
+          "strategy": "direct",
+          "effort": "high"
+        },
+        {
+          "persona": "product-manager",
+          "model": "claude-sonnet-5",
+          "stance": "PRODUCT-MANAGER: a senior product management specialist. Think in terms of the user's job-to-be-done, the activation and retention loop, and the smallest testable slice. Apply craft knowledge: what actually moves adoption, where teams reliably fool themselves, which discovery method answers which uncertainty. Cite the mechanism -- why this changes behaviour -- not just the tactic. Prefer ideas you could put in front of five users next week and learn something falsifiable from.",
+          "strategy": "cot",
+          "effort": "max"
+        }
       ]
     }
   }

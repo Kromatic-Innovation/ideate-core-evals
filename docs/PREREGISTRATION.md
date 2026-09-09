@@ -1930,3 +1930,108 @@ node evals/run.mjs \
 
 **No cell of the re-run has been collected.** This appendix lands first.
 
+---
+
+## Appendix L — Amendments (dated 2026-09-09)
+
+**Study 1, Stage 1c: does a richly differentiated panel clear one call?** Registered in full, before its first cell.
+
+Stage 1b (`docs/status-2026-09-09b.md`) found the panel **loses** to a single solo call at matched pool size — `S1b-1` = −2.1338, Holm p 0.0007. Attributing every cluster to the agent that produced it located the whole deficit precisely:
+
+| Arm | merged clusters: **cross-agent** | within-one-agent | distinct_k |
+| --- | --- | --- | --- |
+| `S1B-SOLO60` | **0** (single agent) | 6.18 | 53.3 |
+| `S1B-PANEL` | **5.30** | 2.31 | 49.2 |
+| `S1B-APRIME` | **13.68** | 0.11 | 27.9 |
+
+**The deficit (4.1 distinct ideas) is smaller than the cross-agent duplication causing it (5.30).** And differentiation demonstrably suppresses that duplication — it is the entire difference between A′'s 13.68 and the panel's 5.30. Stage 1b's panel was differentiated only by one-sentence stances falling through to `DEFAULT_PERSONAS`. Stage 1c turns differentiation up on every axis reachable and asks whether that closes the gap.
+
+### Item 1 — §3.1: `S1C-SOLO60`, the benchmark and the cross-run bridge
+
+Solo, `totalIdeasRequested: 60`, neutral persona — byte-identical in what it sends to `S1B-SOLO60`. Adding the Stage 1c arms moves `armsConfigHash` (`0c05795c6b00` → `9e282a29467f`), staling every Stage 1b cell, so this condition re-collects. See item 4 for the second job it does.
+
+### Item 2 — §3.1: `S1C-SOLO6X10`, the control Stage 1b lacked
+
+`mode: panel`, per-arm geometry override `{size: 10, ideasPerAgent: 6, maxRounds: 1}`, `personaDisabled: true`. **Ten identical agents, six ideas each, one round, blind, pooled only at the end.**
+
+`S1b-1` confounded four things at once: agent count (1 vs 5), ideas per call (60 vs 6), rounds (1 vs 2) and visibility (none vs pooled). This arm holds agent count and ideas-per-call at the panel's values while removing **both** rounds and sharing. Without it, "the panel loses to one call" cannot be separated from **"ten small calls lose to one big call"** — a materially different and more actionable claim. Stage 1a showed per-idea distinctness is flat between N=30 and N=60, but 6 is far below that range and untested.
+
+It uses the per-arm panel override registered by `#129` amendment B, so **no harness change is required by this appendix.**
+
+### Item 3 — §3.1: `S1C-RICH`, the treatment
+
+Five slots, all `claude-sonnet-5`, differentiated on **stance text, `strategy` and `effort` simultaneously**:
+
+| # | persona | strategy | effort |
+| --- | --- | --- | --- |
+| 1 | `weirdo` | cot | **max** |
+| 2 | `philosopher` | cot | high |
+| 3 | `mba` | direct | **low** |
+| 4 | `poet` | direct | high |
+| 5 | `product-manager` | cot | **max** |
+
+The stances are registered **verbatim in `arms.config.json`** rather than restated here, so the registration and the executed config cannot drift; `armsConfigHash` covers them.
+
+Three design decisions, registered so they are not re-litigated after the result:
+
+- **The MBA slot is deliberately the conventional pole.** Its job is not to produce good ideas but to occupy the obvious region so the other four are pushed off it. `direct` + `effort: low` reinforce that. A panel whose members all reach for novelty may re-correlate on "novel-sounding", which is the failure mode being tested.
+- **`weirdo`'s stance says "weird but mechanically coherent".** That clause is load-bearing: without it the instruction degenerates toward word salad, which would **inflate `distinct_k` while making the arm meaningless**, since an incoherent idea still occupies its own semantic cluster.
+- **The `product-manager` domain is fixed across all 48 briefs**, so it fits the `prod` stratum and mismatches the other three. That mismatch is the registered price of deferring topic-specific personas, which would need new harness machinery and would risk authoring personas against briefs whose results are already known.
+
+**`temperature` is absent by necessity, not choice.** `claude-sonnet-5` rejects it outright (`"temperature is deprecated for this model"`, verified live against the API 2026-09-09), so it is unavailable to the shipped product on this model too. See `#165`, whose original premise this corrected.
+
+### Item 4 — §6: the two-contrast family, and the SOLO60 bridge
+
+```
+S1c-1 = S1C-RICH − S1C-SOLO60      does a richly differentiated panel beat one call?
+S1c-2 = S1C-RICH − S1C-SOLO6X10    is it the personas, or just ten small calls?
+```
+
+Holm at **m = 2**. H1–H5 remain NOT ESTIMABLE for `#145`'s reason and no slot may be occupied by a differently-based contrast.
+
+**The thin `S1B-PANEL` is deliberately NOT re-run.** A `RICH`-vs-`PANEL` comparison would therefore cross a `configHash` boundary, which is forbidden as a primary. `S1C-SOLO60` is what makes a secondary one defensible, and the rule is registered **now, with its threshold, before the data exists**:
+
+- If `S1C-SOLO60`'s rarefied mean reproduces Stage 1b's **44.570** within its CI **and** the rarefaction floors match (Stage 1b's was 50), then `RICH` vs `S1B-PANEL` is reportable as a **clearly-labelled secondary** comparison.
+- If it does not reproduce, **that claim is not made at all** — we will have learned the two runs are not comparable, which is itself a result.
+
+`evals/analysis/stage1c.mjs` computes and prints this check; it is not left to judgement.
+
+### Item 5 — the prediction, registered in advance
+
+**If rich differentiation drives cross-agent duplication toward zero, `S1C-RICH` should clear `S1C-SOLO60`.** The arithmetic: the thin panel trailed by 4.1 while losing 5.30 to cross-agent duplication, so eliminating that duplication puts it near 54.5 against solo's 53.3.
+
+**If `S1C-RICH` does not clear it, the panel ARCHITECTURE — not persona thinness — is the binding constraint**, because this arm exhausts the differentiation available on this model. That is the more consequential outcome for the product, and it is registered here so it cannot be reframed afterwards as "the personas still weren't rich enough."
+
+### Item 6 — the three axes are BUNDLED BY DESIGN
+
+`S1C-RICH` varies stance, `strategy` and `effort` together. **If it wins, no single-axis claim may be read from the result.** This is the right trade for a first "does rich differentiation work at all" test — it maximises the chance of detecting an effect that exists — but decomposing it belongs to `#132`'s factorial. Registered so the bundling cannot be forgotten when the result is written up.
+
+### Item 7 — §8: cost, and why the projection under-states it
+
+`--dry-run` projects **$55.04** batched / **$110.07** un-batched for 432 cells. **That projection is known to be too low here**, and the reason is registered rather than discovered: `interimPriceGrid` prices a plan from a flat assumed token shape and **has no model of `effort`**. Stage 1a measured `effort: max` at roughly **4.5×** the output tokens of `high`, and `S1C-RICH` runs two of its five slots at `max` and one at `low`.
+
+Anchoring instead on Stage 1b's realized **$0.2172 per cell all-in** and scaling `S1C-RICH`'s generation by its effort mix gives an expected **$120–$135**.
+
+**The registered ceiling is `--max-spend 180`.** It clears that estimate with room for a re-plan, and over-projection is the safe direction: `--max-spend` refuses earlier than it needs to, never later.
+
+The run uses `--no-batch` for Appendix K's measured reason, and `--cell-concurrency 8`, the top of Appendix I item 7's registered band.
+
+### Item 8 — what this run still cannot say
+
+Unchanged from Stage 1b and repeated because this arm makes the first one **more** consequential, not less:
+
+- **Idea-level quality is untested.** §5.1's judge gate has never run (`#16`). `distinct_k` counts semantic clusters, and an incoherent idea occupies one as readily as a brilliant one. `weirdo` and `poet` are the two slots most likely to produce unusable output, so this run can report that the rich panel produces more distinct ideas **without being able to say they are better**. `#16` is the binding constraint on every remaining claim in this study.
+- The panel remains less differentiated than a human panel in the way that matters to the product's pitch: five instances of one model, not five people.
+
+### Item 9 — reproduction
+
+```
+./scripts/run-study1c.sh --dry-run     # plan and price, collects nothing
+./scripts/run-study1c.sh               # the registered run
+node evals/analysis/stage1c.mjs --results-dir results-study1c
+```
+
+The arms, replicate count, store, ceiling and concurrency are baked into that script because they are **registered values, not operator choices** — and because Stage 1b's first headline numbers came from an uncommitted script and could not be reproduced from the repo. The script refuses to start on a dirty working tree, so the `armsConfigHash` stamped on every cell is always one a commit reproduces.
+
+**No cell of this design has been collected.** This appendix is the registration, and it lands first.
+
