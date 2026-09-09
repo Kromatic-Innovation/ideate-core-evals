@@ -1737,7 +1737,7 @@ node evals/run.mjs --dry-run \
 
 **Study 1, Stage 1b is re-collected.** Appendix I's run completed (141/144 cells, `docs/status-2026-09-09.md`) under a `max_tokens` ceiling that was too low for the panel arms. This appendix registers the corrected ceiling, the re-sized design, and the residual the correction does *not* fix — before any cell of the re-run is collected.
 
-Appendix I is **not withdrawn**. Its design, its arms, its contrast family and its "what a null licenses" clause all stand unchanged. What changes here is the request ceiling (item 1), the design's size (item 4), and the basis that sizes it (item 5).
+Appendix I is **not withdrawn**. Its design, its arms, its contrast family and its "what a null licenses" clause all stand unchanged. What changes here is the request ceiling (item 1), the design's size (item 4), the basis that sizes it (item 5), and the rule for reading a rarefaction floor this design does not get to choose (item 8).
 
 ### Item 1 — §4: the sizing defect, measured
 
@@ -1812,7 +1812,14 @@ Repeating Appendix I's size would have had **39% power against the effect Append
 
 **A note on what the re-run's effect size may be.** The −1.767 above is contaminated in a known direction: `S1B-PANEL` truncated at 19/45 while `S1B-SOLO60` truncated at 3/48, so the panel was penalised and the contrast is a **lower bound** on panel performance. The re-run's point estimate may move toward zero or past it. Sizing against −1.767 is therefore sizing against the best available estimate, not a prediction — and this paragraph is here so that a smaller effect in the re-run is read as the correction working, not as a surprise.
 
-The truncation also cost the analysis a second way, registered so it is not repeated: rarefaction takes the **minimum** pool present in a contrast (Appendix C item 2), so the panel's short pools dragged the common rarefaction floor from 60 down to **45 for every arm** — including the two that had not truncated.
+The truncation also cost the analysis a second way, registered so it is not repeated: rarefaction takes the **minimum** pool present in a contrast (Appendix C item 2), so the panel's short pools dragged the common rarefaction floor from 60 down to **45 for every arm** — including the two that had not truncated. Item 8 registers how that floor is to be read for the re-run, before the re-run can determine it.
+
+**A caveat on `σ²_e`, stated rather than left implicit in the table above.** The 3.6348 is the **rarefied-at-45** residual, measured under truncation. Two things follow, and neither is a reason to re-size, but both bear on how the table should be read:
+
+- The corrected ceiling should *reduce* panel `σ²_e`, because truncation was itself injecting variance. If it does, `R = 3` buys even less than the 3 points the table credits it with — `R` divides only the `σ²_e/(B·R)` term, which is already the smaller of the two.
+- The re-run rarefies at a higher floor (item 8), so its `σ²_e` is **not the same estimand** as the 3.6348 being used to size it. The transfer is an approximation, and it is the *second* input to this table that does not transfer cleanly — which is precisely the class of thing Appendix I item 3 got caught by.
+
+`σ²_ba` — the term that actually decides the design, at 7.8266 against `σ²_e`'s 3.6348 — is the measured one and is unaffected by this. The design is sized on the term that dominates it; `R = 3` is registered as a deliberate purchase of margin whose marginal value may prove smaller than 3 points, and that is known here rather than discovered afterwards.
 
 ### Item 6 — §8: cost, and the hash consequence
 
@@ -1839,7 +1846,22 @@ Registered before the re-run so that the re-run cannot be read selectively after
 - **All five of H1–H5 remain NOT ESTIMABLE**, for `#145`'s reason — the registered panel arms `A′, B…H` are not in this arm set. That is unaffected by anything here and is not revisited.
 - **Appendix I item 6's three limitations carry forward unchanged**, including that §5.1's judge gate has never run (`#16`), so idea-level metrics stay unreportable.
 
-### Item 8 — reproduction
+### Item 8 — §4.1: the rarefaction floor is data-determined, and here is the rule for reading it
+
+**This item exists because the registration would otherwise be ambiguous about what number the run produces**, and the whole point of landing an appendix before collection is that this class of question is answered while no data exists to answer it with.
+
+Appendix C item 2 rarefies every pool in a contrast to **the minimum pool size present**. That rule is unchanged and is not amended here: every rarefied figure this study has published — all of Stage 1a's — uses it, and pinning a fixed target for one run would make that run non-comparable with all of them. The consequence is that the re-run's rarefaction floor is **determined by its own worst cell**, not by design.
+
+And item 3 registers that a ~4% per-reply format-failure residual survives the ceiling correction, so at least one panel cell landing short is expected, not exceptional. **The floor will therefore be below 60, and the design does not get to choose where.**
+
+Registered before collection:
+
+1. **The achieved rarefaction floor is reported alongside every contrast**, with the cell that set it identified by key. It is a result, not a parameter.
+2. **A floor of 48 or above (80% of the design pool) makes the contrast primary as registered.** 48 is chosen so the re-run cannot be *worse* than the run it replaces — Appendix I's run achieved 45 — and so that the loss of a single agent's contribution from a single cell does not disqualify a design that expects exactly that at a ~4% rate.
+3. **A floor below 48 is reported, not discarded, and is explicitly marked as not comparable to the registered target**, naming the cell responsible. It does not license a re-plan of that cell to raise the floor: re-planning the cell that sets the floor, *because* it sets the floor, would be selecting on the outcome.
+4. The full-pool `distinct_k` remains the secondary descriptive it is under Appendix C item 5, and is reported whatever the floor does. It is the check that a low floor is a rarefaction artefact rather than a real collapse in pool quality.
+
+### Item 9 — reproduction
 
 ```
 node evals/run.mjs --dry-run \
