@@ -2037,3 +2037,95 @@ The arms, replicate count, store, ceiling and concurrency are baked into that sc
 
 **No cell of this design has been collected.** This appendix is the registration, and it lands first.
 
+---
+
+## Appendix M — Amendments (dated 2026-09-09)
+
+Stage 1c ran and **lost 139 of 144 `S1C-RICH` cells**. This appendix registers the instrument fix, what is deliberately *not* changed, and the rule under which the surviving control data is reused. It lands **before** the re-collect.
+
+### Item 1 — What happened, and why it is an instrument defect and not a result
+
+The run completed 293 of 432 cells for **$117.4871**. Both control arms finished (144 each). `S1C-RICH` completed **5**.
+
+Every one of the 139 failures is the same record: `parse_failure`, `cause=partial_truncated`, with **all five agents replying** and a **healthy pool** discarded —
+
+```
+agents_attempted=5 agents_failed=0 agents_realized=5
+replies=10 truncated=1 unparseable=0 refused=0
+discarding an UNDERSIZED pool of 54 candidate(s)
+```
+
+Across the 139, discarded pools ran 32–56 candidates (median 48), and truncated replies per cell ran 1–4 — **never more than 4**, which is exactly the number of `effort: max` replies the arm makes (2 max slots × 2 rounds). Truncation is confined to the max-effort replies.
+
+The amplification is `classifyUndersizedPool` (#102) meeting panel geometry: one truncated reply of ten discards the cell, so an 18.5% per-reply rate became a 96.5% per-cell rate. **That rule is correct and is not being changed** — see item 4.
+
+### Item 2 — The measured ceiling, and a correction to Appendix J
+
+The first diagnosis — that `maxTokensForIdeas` has no model of `effort` — was **wrong**, and is recorded here rather than quietly dropped. `TOKENS_PER_IDEA_BY_MODEL` *is* effort-keyed (`claude-sonnet-5: {low: 81, high: 175, max: 776}`), so those replies were sized at 6 × 776 × 2.5 = **11,640** and truncated anyway.
+
+The actual defect is narrower. #160's `MIN_REQUEST_MAX_TOKENS = 6873` is right that a reply carries a **fixed** cost that does not shrink with the ideas asked for — but **that fixed cost is itself a function of `effort`, and #160's probe ran entirely at `high`.** The flat floor is a `high` measurement wearing a flat name. Appendix L item 5 recorded the same blind spot on the *cost* side (`interimPriceGrid` has no model of `effort`) and did not carry it to the token ceiling.
+
+A 30-reply probe of the exact `S1C-RICH` shape (3 briefs × 5 slots × 2 rounds, `claude-sonnet-5`, `ideasPerAgent` 6, `max_tokens` 60000 so nothing truncates, **every reply `stop_reason: end_turn`** so the top is observed and not censored, 2026-09-09):
+
+| effort | n | output tokens | median | over the cap in force |
+|---|---|---|---|---|
+| low | 6 | 454–814 | 667 | 0/6 (cap 6,873) |
+| high | 12 | 771–2,980 | 1,782 | **0/12** (cap 6,873) |
+| max | 12 | 6,586–**18,209** | 12,917 | **6/12** (cap 11,640) |
+
+50% per reply across 4 max-effort replies predicts **6.25%** cell survival; **3.5%** was observed. The arithmetic closes, which is what makes this a diagnosed defect rather than a hypothesis.
+
+**Registered:** `MIN_REQUEST_MAX_TOKENS_BY_EFFORT = { max: 45523 }`, from 18,209 × `MAX_TOKENS_HEADROOM` — the same top-of-observed-distribution convention every other number in `prompts.mjs` uses. No new multiplier and no new mechanism: this is #160's floor, keyed.
+
+A floor rather than a larger `max` **rate**, because the cost is fixed per reply: lifting the rate would inflate a 60-idea max-effort solo call by the same multiple, which is #160's own error one level up.
+
+### Item 3 — `low` and `high` are deliberately NOT raised
+
+The probe cleared the existing floor in both buckets outright. Raising them on symmetry grounds would stale every cell in the study for a change **no measurement asked for**, and would break the control-arm invariance item 5 depends on. Pinned by test, so a future tidy-up cannot do it silently.
+
+This also **falsifies a worry raised before the probe**: post-#160 Stage 1b panel cells short of 60 fell 42% → 22%, and 22% looked like a ceiling still biting. At `high` it is not — 0/12 over cap. Whatever the Stage 1b residual is, it is not truncation, and Appendix J item 3's format-failure residual remains the standing explanation.
+
+### Item 4 — `classifyUndersizedPool` is NOT touched
+
+The #102 discard rule is what converted a 18.5% per-reply defect into a 96.5% per-cell loss, and loosening it would "recover" all 139 cells at a stroke. **It is not being loosened.** Editing an inclusion criterion after discovering that it killed the treatment arm is the same failure as re-planning the rarefaction floor-setting cell (Appendix J item 8) — selecting on the outcome. The instrument gets fixed; the rule stands.
+
+If `S1C-RICH` still shows differential attrition after the ceiling is correct, that is a **finding about the arm**, and `buildFrame`'s `DifferentialAttritionError` is expected to refuse the analysis rather than quietly fit a selected subset.
+
+### Item 5 — The hash moves; the control cells are reused, per-arm and by name
+
+`promptTemplateHash()` moves **`12b0a1a414c2` → `52989c87b3e9`**, so `configHash` moves and all 432 stored cells read as stale.
+
+**They are not all re-collected.** `configHash` is coarse — it folds nine `CONFIG_FIELDS` into one value, so it stales cells whose actual requests did not change. Both control arms run entirely at `high`, which item 3 leaves untouched, so they send **byte-identical requests** across the move:
+
+| arm | shape | `max_tokens` before | after |
+|---|---|---|---|
+| `S1C-SOLO60` | 60 ideas, high | 26,250 (rate-decided) | **26,250** |
+| `S1C-SOLO6X10` | 6 ideas, high | 6,873 (floor-decided) | **6,873** |
+
+This is asserted in `prompts.test.mjs` against **hard-coded pre-#168 literals** rather than recomputed constants — a recomputed comparison would pass no matter what the change did. Mutation-checked: keying the floor to `high` instead of `max` fails that test.
+
+`--config-hash` therefore accepts an explicit **list**, pooling the named hashes. Refusal stays the default: an *unnamed* two-hash store throws exactly as before. This is **not** "ignore the hash" — two of the nine fields, `embedderId` and `clusterDistanceThreshold`, *are* the definition of `distinct_k`, and pooling across a change to either would average ideas counted by two different rulers. The operator names the hashes, so the pooling is visible in the invocation.
+
+**The pooling is PER ARM, and this is load-bearing.** The 5 surviving `S1C-RICH` cells sit under the old hash, and they are precisely the cells in which **none of the four max-effort replies truncated** — the most outcome-selected subset in the store. Pooling both hashes wholesale would fold that censored subsample into the corrected treatment arm. Registered rule:
+
+> **`S1C-SOLO60` and `S1C-SOLO6X10` are taken from `12b0a1a414c2` only; `S1C-RICH` is taken from `52989c87b3e9` only.** The 5 old-hash `S1C-RICH` cells are excluded from every contrast. They are retained in the store as evidence of the defect, never pruned, and never analysed.
+
+### Item 6 — Cost
+
+`--max-spend` is **cumulative over the store**, not per-invocation — a fact Appendix L item 7 did not state, and which meant the $180 ceiling was never the binding constraint (the account balance was, at $39.50). Raised to **$220**: $117.49 already spent + ~$85 for `S1C-RICH`'s 144 cells + headroom.
+
+The corrected arm costs **more** per cell than the broken one, not less: a max-effort reply now runs to completion (~18k output tokens) instead of being cut off at 11,640. Any projection from `evals/run.mjs --dry-run` remains a **floor, not a forecast**, for the reason Appendix L item 5 gives.
+
+### Item 7 — What was NOT looked at
+
+**No `distinct_k` value from any Stage 1c cell has been inspected**, and no contrast has been computed. The diagnosis in this appendix rests entirely on pool sizes, token counts, failure kinds and `stop_reason` — operational fields, not the response variable. In particular the 5 surviving `S1C-RICH` cells have not been scored, which is what makes item 5's exclusion a rule set in advance rather than a reaction to what they said.
+
+### Item 8 — Reproduction
+
+```bash
+./scripts/run-study1c.sh S1C-RICH          # treatment arm only; controls are reused
+node evals/analysis/stage1c.mjs --results-dir results-study1c
+```
+
+The arm override exists because a bare resume would re-collect the 288 physically-identical control cells. The analysis applies item 5's per-arm hash rule itself, so the reproduction command carries no hashes by hand.
+
