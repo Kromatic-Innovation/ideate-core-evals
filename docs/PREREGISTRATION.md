@@ -1875,3 +1875,58 @@ The sizing constant and its derivation are pinned in `evals/harness/prompts.test
 
 **No cell of the re-run has been collected.** This appendix is the registration, and it lands first.
 
+> _Amended 2026-09-09 by Appendix K: the re-run drops batch mode. Item 6's ceiling rises to `--max-spend 120`. Nothing else in this appendix changes — batch mode is not a `CONFIG_FIELD`, so the estimand, the arms, the design and the analysis are all untouched._
+
+---
+
+## Appendix K — Amendments (dated 2026-09-09)
+
+**The Stage 1b re-run drops batch mode.** Registered before its first cell, for the same reason Appendix J was: a spend ceiling and a transport choice are both registered parameters, and neither is changed in place.
+
+### Item 1 — §8: what the Message Batches queue actually costs
+
+Appendix I's run took **5.82 hours** of cell completions (141 cells, 02:03Z–07:52Z) — ~24 cells/hour. The store's timestamps say where that went: the median gap between consecutive completions was 69s, p90 400s, max 49 min, and **5.26 of the 5.82 hours sit inside gaps longer than two minutes.** The run was waiting, not computing. Batch polling is not the cause (`pollIntervalMs` is 2s); the Message Batches queue is.
+
+A probe on 2026-09-09 submitted batches of **1, 6 and 30** requests at the same instant, at the re-run's real request shape (`claude-sonnet-5`, effort `high`, `ideasPerAgent: 6`, `max_tokens` 6873):
+
+| submission | wait |
+| --- | --- |
+| batch of 1 | **20.9 min** (ended) |
+| batch of 6 | **> 55 min**, still `in_progress`, 0 of 6 succeeded |
+| batch of 30 | **> 55 min**, still `in_progress`, 0 of 30 succeeded |
+| direct call, no batch | **12.8s**, **14.0s** |
+
+This is consistent with the four size-1 batches already recorded above `DEFAULT_MAX_POLL_MS` in `evals/harness/provider.mjs` (2m24s, 9m53s, 21m07s, one past 20m).
+
+**Two caveats, stated because they bound what the table proves.** The probe did not cancel batches that hit its own 45-minute ceiling, so the size-6 and size-30 batches kept running and contended with a later trial; and two orphaned batches (31 requests) from an aborted smoke test were draining when these were submitted. **The absolute waits are therefore inflated by contention the probe itself created.** What contention does *not* explain is the ordering: all three batches entered the same queue at the same instant, and the size-1 batch finished while neither of the others had scheduled a single request.
+
+**The consequence that decides this amendment:** batch wait **grows with batch size** rather than being amortized by it. So raising `--batch-window-ms` to coalesce more cells per batch — the lever `#148` built and the obvious first thing to try — buys no throughput. That was the hypothesis this probe was run to test, and it failed.
+
+### Item 2 — what this changes, and what it provably does not
+
+**Batch mode is not a `CONFIG_FIELD`** (`lib/manifest.mjs`). It is a transport and pricing choice: the same `params` object reaches the same model either way. So dropping it moves neither `configHash` nor any cell key, and **the estimand, the three arms, B=48/R=3, the contrast family, the rarefaction rule and every limitation registered in Appendix J are untouched.** Stage 1a ran `--no-batch` throughout; this returns the re-run to that footing.
+
+What it changes is exactly two things:
+
+| | Batch (Appendix J) | No-batch (registered here) |
+| --- | --- | --- |
+| Projected cost, 432 cells | $55.04 | **$110.07** |
+| Expected actual (÷1.19 over-projection) | ~$46 | **~$92** |
+| Expected wall clock | ~18 h | **~2 h** |
+
+The 50% batch discount is real and is being given up deliberately. It is registered as a **priced trade, not an oversight**: ~$46 of additional spend to convert an 18-hour run into a 2-hour one, on a study whose last run needed re-collecting and may need it again.
+
+### Item 3 — §8: the revised ceiling and the exact invocation
+
+**`--max-spend 120`**, replacing Appendix J item 6's 90. It clears the $110.07 projection and leaves room for a re-plan without a third registration. `--cell-concurrency` stays within Appendix J's registered 4–8 band, for its unchanged reason: judging and metric computation run inside the per-cell task, so concurrency K puts K embedder calls and 2K unbatched judge calls in flight.
+
+```
+node evals/run.mjs \
+  --arms S1B-SOLO60,S1B-PANEL,S1B-APRIME \
+  --replicates 3 \
+  --results-dir results-study1b-r2 \
+  --no-batch --max-spend 120 --cell-concurrency 8
+```
+
+**No cell of the re-run has been collected.** This appendix lands first.
+
