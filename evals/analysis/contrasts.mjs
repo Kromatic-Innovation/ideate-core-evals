@@ -75,13 +75,49 @@
 // analysis of H1-H5 runs ONCE, at the pre-registered n).
 //
 // H1 has one extra wrinkle. Its registered form is mean(panel arms) - A.
-// With exactly ONE panel arm present, that expression is arithmetically
-// (armX - A) -- a PER-ARM comparison, which docs/PREREGISTRATION.md
-// (Appendix B item 5) explicitly moves to the §6.3 EXPLORATORY section,
-// BH-corrected, and says is "never folded into the confirmatory Holm
-// family". Computing it would put an exploratory contrast inside the Holm
-// family wearing H1's registered name, so H1 is recorded NOT ESTIMABLE
-// whenever fewer than two panel arms are present.
+// With exactly ONE panel arm in the registered set, that expression is
+// arithmetically (armX - A) -- a PER-ARM comparison, which
+// docs/PREREGISTRATION.md (Appendix B item 5) explicitly moves to the §6.3
+// EXPLORATORY section, BH-corrected, and says is "never folded into the
+// confirmatory Holm family". Computing it would put an exploratory contrast
+// inside the Holm family wearing H1's registered name, so H1 is recorded NOT
+// ESTIMABLE whenever the registered set holds fewer than two panel arms.
+//
+// ── H1'S ARM SET IS REGISTERED DATA, NOT A CALLER PARAMETER (issue #145) ──
+// The subset discipline above has a hole H2-H5 do not, and it is worth
+// naming precisely because the reasoning that produced it was sound.
+//
+// H2-H5 name specific arms, so "is this contrast estimable" is answered by
+// checking whether those arms are present. H1 named none: it was
+// PARAMETERIZED over whatever `opts.panelArms` the caller supplied, and its
+// weights were built from that list. Under Study 1's eight solo screening
+// arms it therefore returned a FULLY ESTIMABLE contrast -- the mean of
+// N=10, N=60, effort low, effort max, two stances and strategy:direct
+// against the centre point -- carrying H1's registered name, H1's Holm slot,
+// and a p-value. That is not H1. H1 is panel-versus-solo.
+//
+// It is the same error option (1) above calls DEFINITELY WRONG ("answers a
+// different question under a registered hypothesis's name"), reached by a
+// different route: not by substituting a present arm for an absent one, but
+// by a contrast whose members were never pinned in the first place. The CLI
+// deliberately ships no --h2-pair / --h3-target-vs-best / --h4-pair flags to
+// close the first route; H1 walked through the second.
+//
+// The fix has two halves, and the SECOND is the load-bearing one:
+//
+//   a. H1's estimability is checked against a REGISTERED arm set, producing
+//      the same `notEstimable` + `missingArms` record H2-H5 already produce.
+//   b. H1's WEIGHTS are built from that registered set, never from
+//      `opts.panelArms`. Half (a) alone would still let a caller who
+//      happens to supply the right arms plus others average the others in.
+//      With (b), what H1 means stops depending on the caller at all: arms
+//      present in a run but outside the registered set are simply not in the
+//      mean, which is correct and leaves a legitimate superset run (the full
+//      grid plus a debug arm) estimable rather than refusing it.
+//
+// The registered sets live in REGISTERED_H1_ARM_SETS below, hardcoded in
+// this module rather than read from arms.config.json -- a config edit must
+// not be able to redefine what a registered hypothesis is about.
 //
 // H5: same-provider judging inflates scores — a judge_provider /
 //     judge_provider x generator_provider bias term from the JUDGE-SCORE
@@ -99,6 +135,88 @@
 
 import { tQuantile, tTwoSidedP, tUpperTailP } from "./distributions.mjs";
 import { JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
+
+/**
+ * The arm sets H1 is REGISTERED over, keyed by the registration that
+ * established each one (issue #145).
+ *
+ * This is pre-registration content expressed as code. Adding a key is a
+ * REGISTRATION ACT, not a refactor: a new panel design that wants H1
+ * evaluated over its own arms lands its key here **with a dated appendix in
+ * docs/PREREGISTRATION.md that names those arms**, in the same commit. A key
+ * added casually -- to make an existing run's H1 come out estimable -- is
+ * precisely the fabrication this constant exists to prevent, just performed
+ * one layer up.
+ *
+ * Values are hardcoded rather than derived from arms.config.json on purpose.
+ * `armsConfigHash` covers the whole config, so an arm edit already stales
+ * every cell; it must not ALSO be able to silently change which arms a
+ * registered hypothesis is about.
+ */
+export const REGISTERED_H1_ARM_SETS = {
+  // docs/PREREGISTRATION.md §3.1 (arms A-H plus the A' ablation) and §6.1/
+  // §6.2 / Appendix B item 5, which register H1 as mean(panel arms) - A.
+  // A' is included because it IS a panel -- Appendix C item 1 says so
+  // explicitly ("including A' above, which is itself a panel") -- and
+  // because issue #145 names "the panel arms B-H and A' " as H1's set. AS
+  // is NOT included: it is a second SOLO baseline (Appendix E item 6), not
+  // a panel. A is the reference and by construction never a member.
+  "prereg-2026-08-01": {
+    referenceArm: "A",
+    panelArms: ["A'", "B", "C", "D", "E", "F", "G", "H"],
+    registration: "docs/PREREGISTRATION.md §3.1 / §6.2 / Appendix B item 5",
+  },
+};
+
+/** The key `buildRegisteredFamily()` uses when a caller names none. */
+export const DEFAULT_H1_ARM_SET = "prereg-2026-08-01";
+
+/**
+ * Structural validation of one REGISTERED_H1_ARM_SETS entry (issue #145).
+ *
+ * These are invariants of a REGISTRATION, not of a run, so they are checked
+ * against the constant rather than branched on per-call: a registered set
+ * that violates one is a bug in this file, and the honest response is to
+ * refuse to build a family at all rather than to quietly report H1
+ * not-estimable and let a reader conclude the RUN was at fault.
+ *
+ * Exported so the invariants are testable directly against a malformed
+ * literal -- otherwise the only way to exercise them would be to temporarily
+ * corrupt the real constant, which is not a test.
+ *
+ * @param {object} set  a REGISTERED_H1_ARM_SETS entry
+ * @param {string} key  its key, for the error message
+ */
+export function assertRegisteredH1ArmSet(set, key) {
+  if (!set || !Array.isArray(set.panelArms) || typeof set.referenceArm !== "string") {
+    throw new Error(`REGISTERED_H1_ARM_SETS['${key}']: must be {referenceArm: string, panelArms: string[]}`);
+  }
+  // Fewer than two panel arms makes H1 arithmetically a PER-ARM comparison,
+  // which Appendix B item 5 assigns to the §6.3 exploratory (BH-corrected)
+  // section and excludes from the confirmatory Holm family. A registration
+  // cannot ask for that under H1's name.
+  if (set.panelArms.length < 2) {
+    throw new Error(
+      `REGISTERED_H1_ARM_SETS['${key}']: H1 needs at least two panel arms, got [${set.panelArms.join(", ")}] -- ` +
+        "over one arm the registered mean collapses to a per-arm comparison, which docs/PREREGISTRATION.md " +
+        "Appendix B item 5 excludes from the confirmatory Holm family.",
+    );
+  }
+  if (new Set(set.panelArms).size !== set.panelArms.length) {
+    throw new Error(`REGISTERED_H1_ARM_SETS['${key}']: duplicate panel arm in [${set.panelArms.join(", ")}] -- a duplicate silently rescales H1's weights`);
+  }
+  // The H1-intercept bug (issue #46), checked against the REGISTERED set:
+  // armCoefficientName(ref, ref) resolves to "Intercept", which IS a valid
+  // coefficient name, so contrastVector()'s unknown-coefficient check can
+  // never catch a reference arm smuggled into the mean.
+  if (set.panelArms.includes(set.referenceArm)) {
+    throw new Error(
+      `REGISTERED_H1_ARM_SETS['${key}']: lists its own reference arm '${set.referenceArm}' as a panel arm -- ` +
+        'armCoefficientName() would resolve it to "Intercept", putting contrast weight on the reference arm\'s own ' +
+        "mean (the H1-intercept bug, verbatim).",
+    );
+  }
+}
 
 /**
  * Build a dense contrast vector aligned to `coefficientNames`, from a sparse
@@ -286,6 +404,14 @@ function zQuantile(p) {
  *     outside this set is returned as a NOT-ESTIMABLE record (see
  *     notEstimableSpec()) instead of a weights map that would blow up as
  *     `contrastVector: unknown coefficient 'arm[T.E]'` four modules later.
+ *   @param {string} [opts.h1ArmSet=DEFAULT_H1_ARM_SET]  issue #145. Which
+ *     REGISTERED arm set H1 is evaluated over -- a key into
+ *     REGISTERED_H1_ARM_SETS, never a list of arms. H1's weights come from
+ *     that set and from nothing else, so `opts.panelArms` no longer decides
+ *     what H1 means; it decides only which arms this run can estimate. An
+ *     unknown key throws rather than falling back to the default: silently
+ *     evaluating a different registration than the one asked for is the
+ *     failure this whole mechanism exists to prevent.
  *   @param {boolean} [opts.h5Wired=false]  issue #80. When true, H5's entry
  *     is a real weights-based spec (targeting JUDGE_SCORE_BIAS_COEFFICIENT)
  *     instead of the `{unimplemented: true}` stub — the caller is asserting
@@ -307,6 +433,19 @@ export function buildRegisteredFamily(opts = {}) {
   const [h3Challenger, ...h3Baselines] = opts.h3TargetVsBest || ["G", "D", "H"];
   const deltaDeviatesFromRegistration = opts.delta !== undefined && opts.delta !== null;
   const delta = deltaDeviatesFromRegistration ? opts.delta : 0;
+
+  // ── H1's registered arm set (issue #145) ──────────────────────────────
+  const h1ArmSetKey = opts.h1ArmSet || DEFAULT_H1_ARM_SET;
+  const h1Registered = REGISTERED_H1_ARM_SETS[h1ArmSetKey];
+  if (!h1Registered) {
+    throw new Error(
+      `buildRegisteredFamily: unknown h1ArmSet '${h1ArmSetKey}' -- known keys are ` +
+        `[${Object.keys(REGISTERED_H1_ARM_SETS).join(", ")}]. H1's arm set is registered data, not a caller ` +
+        "parameter: a new one is added to REGISTERED_H1_ARM_SETS together with the dated appendix that registers it.",
+    );
+  }
+  // Structural invariants of the REGISTRATION -- see assertRegisteredH1ArmSet.
+  assertRegisteredH1ArmSet(h1Registered, h1ArmSetKey);
 
   // Guard against the H1-intercept bug's unguarded siblings (issue #46 QA
   // MUST #3): armCoefficientName(referenceArm, referenceArm) resolves to
@@ -335,8 +474,13 @@ export function buildRegisteredFamily(opts = {}) {
   // NOT also subtract Intercept: offset_X already equals (mean(armX) -
   // mean(referenceArm)), so an extra "- Intercept" term would double-count
   // the reference arm's mean and silently flip/shift every H1 estimate.
+  //
+  // The mean is over h1Registered.panelArms -- the REGISTERED set -- and not
+  // over opts.panelArms (issue #145, half (b)). This is the line that makes
+  // H1 mean the same thing on every run.
+  const h1PanelArms = h1Registered.panelArms;
   const h1Weights = {};
-  for (const arm of panelArms) h1Weights[armCoefficientName(arm, referenceArm)] = 1 / panelArms.length;
+  for (const arm of h1PanelArms) h1Weights[armCoefficientName(arm, h1Registered.referenceArm)] = 1 / h1PanelArms.length;
 
   // ── Arm-subset scoping (issue #97) ────────────────────────────────────
   // `panelArms` IS "every non-reference arm id" present in this run, so
@@ -349,10 +493,17 @@ export function buildRegisteredFamily(opts = {}) {
   const availableSet = new Set(availableArms);
   const absentAmong = (arms) => Array.from(new Set(arms.filter((a) => !availableSet.has(a))));
 
-  const h1Description = `mean(panel arms) - ${referenceArm}`;
+  const h1Description = `mean(registered panel arms: ${h1PanelArms.join(", ")}) - ${h1Registered.referenceArm} [set '${h1ArmSetKey}']`;
   const h2Description = `${h2Challenger} >= ${h2Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`;
   const h3Description = `${h3Challenger} > max(${h3Baselines.join(", ")}) -- intersection-union test (IUT): one Holm slot, p = max over the one-sided sub-contrast p-values (Berger's IUT result -- see module doc comment)`;
   const h4Description = `${h4Challenger} >= ${h4Baseline} (one-sided, delta=${delta}${deltaDeviatesFromRegistration ? ", DEVIATES from registration" : " -- registered default"})`;
+
+  // H1's own not-estimable conditions (issue #145), in the order an operator
+  // would want to hear about them: the wrong baseline, then absent arms. (A
+  // registered set that could not be a mean at all is a registration bug and
+  // throws above, rather than being reported as a property of the run.)
+  const h1ReferenceMismatch = referenceArm !== h1Registered.referenceArm;
+  const h1Missing = h1ReferenceMismatch ? [] : absentAmong(h1PanelArms);
 
   const h2Missing = absentAmong([h2Challenger, h2Baseline]);
   const h3Missing = absentAmong([h3Challenger, ...h3Baselines]);
@@ -365,25 +516,43 @@ export function buildRegisteredFamily(opts = {}) {
     // BH-corrected section and says is never folded into the Holm family.
     // Computing it would put an exploratory contrast inside the registered
     // family under H1's name -- see this module's header.
-    panelArms.length < 2
+    h1ReferenceMismatch
       ? notEstimableSpec({
-          id: "H1",
-          description: h1Description,
-          kind: "superiority",
-          missingArms: [],
-          availableArms,
-          why:
-            `H1 is registered as mean(panel arms) - ${referenceArm}; with only ${panelArms.length} panel arm ` +
-            `[${panelArms.join(", ")}] that mean collapses to a single PER-ARM comparison, which ` +
-            "docs/PREREGISTRATION.md Appendix B item 5 assigns to the §6.3 exploratory (BH-corrected) section and " +
-            "explicitly excludes from the confirmatory Holm family.",
-        })
-      : {
-          id: "H1",
-          description: h1Description,
-          kind: "superiority",
-          weights: h1Weights,
-        },
+            id: "H1",
+            description: h1Description,
+            kind: "superiority",
+            missingArms: [],
+            availableArms,
+            why:
+              `H1 is registered as mean(panel arms) - ${h1Registered.referenceArm} (registered set '${h1ArmSetKey}', ` +
+              `${h1Registered.registration}); this run's reference arm is '${referenceArm}'. A contrast against a ` +
+              "different baseline is a different quantity, not a weaker H1, and must not occupy H1's Holm slot.",
+          })
+        : h1Missing.length
+          ? notEstimableSpec({
+              id: "H1",
+              description: h1Description,
+              kind: "superiority",
+              missingArms: h1Missing,
+              availableArms,
+              why:
+                `H1 is registered as the mean of ALL ${h1PanelArms.length} panel arms in set '${h1ArmSetKey}' ` +
+                `[${h1PanelArms.join(", ")}] against ${h1Registered.referenceArm} (${h1Registered.registration}). ` +
+                "The mean of the subset that happens to be present is a DIFFERENT quantity, not a weaker estimate of " +
+                "the same one -- the same error as substituting a present arm for an absent one in H2-H4, which this " +
+                "module refuses by design.",
+            })
+          : {
+              id: "H1",
+              description: h1Description,
+              kind: "superiority",
+              weights: h1Weights,
+              // Recorded on the spec so a report can say WHICH registration
+              // this H1 was evaluated under, rather than leaving the reader
+              // to assume there has only ever been one.
+              h1ArmSet: h1ArmSetKey,
+              registeredPanelArms: h1PanelArms,
+            },
     h2Missing.length
       ? notEstimableSpec({
           id: "H2",
