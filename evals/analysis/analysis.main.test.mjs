@@ -107,14 +107,23 @@ async function fakeSidecarRunner(request) {
 
 // buildRegisteredFamily()'s DEFAULTS name arms B, D, E, G, H directly
 // (H2: E vs D, H3: G vs D/H, H4: B vs D), so this fixture uses the REAL
-// registered arm set (reference A + the five registered panel arms).
+// registered arm set (reference A + every registered panel arm).
 //
 // Until issue #97 that was not a choice but a constraint: a smaller store
 // made the family name arms the fit did not carry, and the run died as
 // `contrastVector: unknown coefficient 'arm[T.E]'`. #97 fixed that -- see
 // the two-arm end-to-end test at the bottom of this file, which is the
 // #8 smoke study's shape (arms A and B only).
-const ARMS = ["A", "B", "D", "E", "G", "H"];
+//
+// This list was ["A", "B", "D", "E", "G", "H"] until issue #145 -- the five
+// arms H2-H4 happen to name, which the comment above called "the REAL
+// registered arm set" and which is not: A', C and F are registered panel
+// arms too (§3.1). Nothing noticed, because H1 averaged whatever it was
+// handed. Now that H1's mean is the REGISTERED set, an end-to-end test that
+// wants H1 computed has to seed the whole thing -- which is the correct
+// shape for a fixture standing in for the confirmatory run.
+const ARMS = ["A", "A'", "B", "C", "D", "E", "F", "G", "H"];
+const PANEL_ARMS = ARMS.filter((a) => a !== "A");
 
 function seedStore(config, { withPools, arms = ARMS }) {
   const dir = mkdtempSync(join(tmpdir(), "ideate-store-main-"));
@@ -212,7 +221,7 @@ test("main(): wires the rarefied lane end to end -- H1 is fit on a DIFFERENT fit
     // H1 must have been evaluated against the RAREFIED fit, not the
     // full-pool one -- prove it by independently evaluating H1's spec
     // against the full-pool `ladder.fit` and showing the two disagree.
-    const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
+    const family = buildRegisteredFamily({ referenceArm: "A", panelArms: PANEL_ARMS });
     const h1Spec = family.find((s) => s.id === "H1");
     const fullPoolH1 = evaluateSpec(h1Spec, result.ladder.fit);
     assert.notEqual(

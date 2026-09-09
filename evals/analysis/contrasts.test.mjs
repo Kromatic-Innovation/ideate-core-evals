@@ -1,6 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { contrastVector, armCoefficientName, evaluateContrast, buildRegisteredFamily, evaluateSpec, registeredFamilySlotCount, applyHolmVerdicts, familyEstimability } from "./contrasts.mjs";
+import {
+  contrastVector,
+  armCoefficientName,
+  evaluateContrast,
+  buildRegisteredFamily,
+  evaluateSpec,
+  registeredFamilySlotCount,
+  applyHolmVerdicts,
+  familyEstimability,
+  REGISTERED_H1_ARM_SETS,
+  DEFAULT_H1_ARM_SET,
+  assertRegisteredH1ArmSet,
+} from "./contrasts.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
 import { JUDGE_SCORE_BIAS_COEFFICIENT } from "./judgeScoreFrame.mjs";
 
@@ -98,11 +110,21 @@ test("buildRegisteredFamily: returns exactly 5 entries H1..H5", () => {
   assert.deepEqual(family.map((f) => f.id), ["H1", "H2", "H3", "H4", "H5"]);
 });
 
+// The arms H1 is registered over (docs/PREREGISTRATION.md §3.1: the A'
+// ablation plus B-H, against reference A). Since #145 H1's mean is over THIS
+// set and not over whatever a caller passes, so a fixture that wants H1
+// estimable has to supply all of them.
+const REG = REGISTERED_H1_ARM_SETS[DEFAULT_H1_ARM_SET];
+const REGISTERED_PANEL_ARMS = REG.panelArms;
+const H1_WEIGHT = 1 / REGISTERED_PANEL_ARMS.length;
+
 test("buildRegisteredFamily: H1 is mean(panel arms) - reference, expressed purely as offset coefficients", () => {
-  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D"] });
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: REGISTERED_PANEL_ARMS });
   const h1 = family[0];
-  assert.equal(h1.weights["arm[T.B]"], 0.5);
-  assert.equal(h1.weights["arm[T.D]"], 0.5);
+  for (const arm of REGISTERED_PANEL_ARMS) {
+    assert.equal(h1.weights[armCoefficientName(arm, "A")], H1_WEIGHT, `${arm} must carry equal weight in H1's mean`);
+  }
+  assert.equal(Object.keys(h1.weights).length, REGISTERED_PANEL_ARMS.length, "H1's mean carries one term per registered panel arm and nothing else");
   // Must NOT also subtract Intercept -- each offset coefficient already IS
   // (mean(armX) - mean(reference)), so an extra -1*Intercept would
   // double-count the reference arm's mean and flip the sign of a positive
@@ -111,18 +133,20 @@ test("buildRegisteredFamily: H1 is mean(panel arms) - reference, expressed purel
 });
 
 test("buildRegisteredFamily: H1 estimate is correctly signed against a fit where every panel arm exceeds the reference", () => {
-  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D"] });
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: REGISTERED_PANEL_ARMS });
   const h1 = family[0];
-  // Intercept (A's mean) = 10, B offset = +2, D offset = +4 -> H1 should be
+  // Intercept (A's mean) = 10; every panel arm offset = +3 -> H1 should be
   // the mean of the OFFSETS, +3 -- not -7 (which is what double-subtracting
-  // Intercept would produce: mean(2,4) - 10 = -7).
+  // Intercept would produce: 3 - 10 = -7).
+  const names = ["Intercept", ...REGISTERED_PANEL_ARMS.map((a) => armCoefficientName(a, "A"))];
+  const coefficients = [10, ...REGISTERED_PANEL_ARMS.map(() => 3)];
   const fit = {
-    coefficients: [10, 2, 4],
-    coefficientNames: ["Intercept", "arm[T.B]", "arm[T.D]"],
-    vcov: [[0.01, 0, 0], [0, 0.01, 0], [0, 0, 0.01]],
+    coefficients,
+    coefficientNames: names,
+    vcov: names.map((_, i) => names.map((__, j) => (i === j ? 0.01 : 0))),
   };
   const result = evaluateSpec(h1, fit);
-  assert.equal(result.estimate, 3);
+  assert.ok(Math.abs(result.estimate - 3) < 1e-12, `H1 estimate should be +3, got ${result.estimate}`);
 });
 
 test("buildRegisteredFamily: H2/H4 default to delta=0 (registered default), not estimation-only", () => {
@@ -403,29 +427,130 @@ test("#97: a PARTIAL arm subset still estimates the entries whose arms are all p
 });
 
 test("#97: the full registered arm set is UNAFFECTED -- every entry stays estimable", () => {
-  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E", "G", "H"] });
+  const family = buildRegisteredFamily({ referenceArm: "A", panelArms: REGISTERED_PANEL_ARMS });
   for (const f of family) assert.equal(f.notEstimable, undefined, `${f.id} must stay estimable on the full grid`);
   assert.ok(family.find((f) => f.id === "H3").components.length === 2);
 });
 
-// H1's registered form is mean(panel arms) - A. Over ONE panel arm that is
-// arithmetically (armX - A), a per-arm comparison that Appendix B item 5
-// assigns to the §6.3 exploratory BH section and says is "never folded into
-// the confirmatory Holm family". Computing it would put an exploratory
-// contrast inside the Holm family under a registered hypothesis's name.
-test("#97: H1 is NOT ESTIMABLE with a single panel arm (it would be a §6.3 exploratory per-arm contrast under H1's name)", () => {
+// Since #145, a run carrying only SOME of H1's registered panel arms is the
+// missing-arms case, reported exactly the way H2-H5 report theirs. Before
+// #145 this same call returned an estimable mean(B) - A: a per-arm
+// comparison, which Appendix B item 5 assigns to the §6.3 exploratory BH
+// section and says is "never folded into the confirmatory Holm family".
+test("#145: H1 is NOT ESTIMABLE when only some registered panel arms are present", () => {
   const family = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B"] });
   const h1 = family.find((f) => f.id === "H1");
   assert.equal(h1.notEstimable, true);
   assert.equal(h1.weights, undefined);
-  assert.match(h1.reason, /per-arm/i);
-  assert.match(h1.reason, /exploratory/i);
+  assert.deepEqual(
+    h1.missingArms,
+    REGISTERED_PANEL_ARMS.filter((a) => a !== "B"),
+    "missingArms names every absent REGISTERED panel arm, the same shape H2-H5 produce",
+  );
 });
 
-test("#97: H1 IS estimable with two or more panel arms", () => {
-  const h1 = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D"] }).find((f) => f.id === "H1");
+// The mutation this catches: `every registered arm present` weakened to
+// `some registered arm present`. A full-set fixture and a zero-overlap
+// fixture cannot separate those two; a PARTIAL overlap can.
+test("#145: a partial overlap is not a weaker H1, it is a different quantity -- notEstimable, naming exactly what is absent", () => {
+  const present = ["B", "C", "D"];
+  const h1 = buildRegisteredFamily({ referenceArm: "A", panelArms: present }).find((f) => f.id === "H1");
+  assert.equal(h1.notEstimable, true, "three of the registered panel arms is not enough -- H1 is the mean of ALL of them");
+  const absent = REGISTERED_PANEL_ARMS.filter((a) => !present.includes(a));
+  assert.deepEqual(h1.missingArms, absent);
+  assert.equal(absent.length, REGISTERED_PANEL_ARMS.length - present.length);
+  assert.match(h1.reason, /DIFFERENT quantity/i);
+});
+
+test("#145: H1 IS estimable when every registered panel arm is present", () => {
+  const h1 = buildRegisteredFamily({ referenceArm: "A", panelArms: REGISTERED_PANEL_ARMS }).find((f) => f.id === "H1");
   assert.equal(h1.notEstimable, undefined);
-  assert.equal(h1.weights["arm[T.B]"], 0.5);
+  assert.equal(h1.weights["arm[T.B]"], H1_WEIGHT);
+  assert.equal(h1.h1ArmSet, DEFAULT_H1_ARM_SET, "the spec records WHICH registration it was built under");
+});
+
+// ── Issue #145: H1's arm set is registered data, not a caller parameter ────
+
+// The reproduction from the issue, verbatim: Study 1's eight SOLO screening
+// arms, no panel among them, evaluated against the screening centre point.
+// Before the fix this returned a fully estimable contrast -- the mean of
+// N=10, N=60, effort low, effort max, two stances and strategy:direct --
+// wearing H1's registered name, holding H1's Holm slot, emitting a p-value.
+test("#145: H1 refuses an arm set it was never registered over (the Study 1 screening reproduction)", () => {
+  const family = buildRegisteredFamily({
+    referenceArm: "S1-C0",
+    panelArms: ["S1-N10", "S1-N60", "S1-ELOW", "S1-EMAX", "S1-SPRAG", "S1-SCONTRA", "S1-DIRECT"],
+  });
+  const h1 = family.find((f) => f.id === "H1");
+  assert.equal(h1.notEstimable, true, "H1 is panel-versus-solo; none of these arms is a panel and none is registered under H1");
+  assert.equal(h1.weights, undefined, "and it emits NO weights -- there is nothing for evaluateSpec to compute");
+  assert.match(h1.reason, /S1-C0/, "the reason names the run's reference arm");
+  assert.match(h1.reason, /A\b/, "and the registered one");
+  // Still five slots: the Holm multiplier is the REGISTERED family size.
+  assert.equal(family.length, 5);
+  assert.equal(registeredFamilySlotCount(family), 5, "refusing H1 must not shrink the family and inflate the other p-values");
+});
+
+test("#145: a run against the wrong reference arm is refused with its own reason, not reported as missing arms", () => {
+  const h1 = buildRegisteredFamily({
+    referenceArm: "AS", // the OTHER registered solo baseline (Appendix E item 6)
+    panelArms: REGISTERED_PANEL_ARMS,
+  }).find((f) => f.id === "H1");
+  assert.equal(h1.notEstimable, true);
+  assert.deepEqual(h1.missingArms, [], "every registered panel arm IS present -- the baseline is what is wrong");
+  assert.match(h1.reason, /reference arm is 'AS'/);
+  assert.match(h1.reason, /different quantity/i);
+});
+
+// The load-bearing half of #145: H1's WEIGHTS come from the registered set.
+// Estimability checking alone would still let a caller who supplies the
+// right arms PLUS others average the others into H1's mean.
+test("#145: an extra arm present in the run does not enter H1's mean", () => {
+  const withExtra = buildRegisteredFamily({
+    referenceArm: "A",
+    panelArms: [...REGISTERED_PANEL_ARMS, "DEBUG-ARM"],
+  }).find((f) => f.id === "H1");
+  assert.equal(withExtra.notEstimable, undefined, "a superset run is still a run of the registered design -- refusing it would be wrong");
+  assert.equal(withExtra.weights["arm[T.DEBUG-ARM]"], undefined, "the unregistered arm carries NO weight in H1");
+  assert.equal(Object.keys(withExtra.weights).length, REGISTERED_PANEL_ARMS.length);
+  const plain = buildRegisteredFamily({ referenceArm: "A", panelArms: REGISTERED_PANEL_ARMS }).find((f) => f.id === "H1");
+  assert.deepEqual(withExtra.weights, plain.weights, "H1 means the same thing whether or not the run carried extra arms");
+});
+
+test("#145: REGISTERED_H1_ARM_SETS matches §3.1's arm table", () => {
+  // Asserted against the registration's own contents, hardcoded here rather
+  // than derived from the constant under test -- otherwise dropping an arm
+  // from the constant would silently agree with every other test in this
+  // file. A' is a panel (Appendix C item 1 says so explicitly); AS is a
+  // second SOLO baseline (Appendix E item 6) and is correctly absent.
+  assert.deepEqual(REG.referenceArm, "A");
+  assert.deepEqual(REG.panelArms, ["A'", "B", "C", "D", "E", "F", "G", "H"]);
+  assert.ok(!REG.panelArms.includes("AS"), "AS is a solo baseline, not a panel arm");
+  assert.match(REG.registration, /PREREGISTRATION/);
+});
+
+test("#145: an unknown h1ArmSet key throws rather than falling back to the default", () => {
+  assert.throws(
+    () => buildRegisteredFamily({ referenceArm: "A", panelArms: REGISTERED_PANEL_ARMS, h1ArmSet: "panel-run-that-was-never-registered" }),
+    /unknown h1ArmSet/,
+  );
+});
+
+test("#145: every registered arm set satisfies the registration invariants", () => {
+  for (const [key, set] of Object.entries(REGISTERED_H1_ARM_SETS)) {
+    assert.doesNotThrow(() => assertRegisteredH1ArmSet(set, key), `REGISTERED_H1_ARM_SETS['${key}'] is malformed`);
+  }
+  assert.ok(REGISTERED_H1_ARM_SETS[DEFAULT_H1_ARM_SET], "the default key must name a real registered set");
+});
+
+test("#145: the registration invariants reject a malformed set", () => {
+  // A registered set that cannot be a mean at all is a bug in contrasts.mjs,
+  // not a property of the run -- so it throws rather than reporting H1
+  // not-estimable and letting a reader blame the data.
+  assert.throws(() => assertRegisteredH1ArmSet({ referenceArm: "A", panelArms: ["B"] }, "k"), /at least two panel arms/);
+  assert.throws(() => assertRegisteredH1ArmSet({ referenceArm: "A", panelArms: ["B", "B"] }, "k"), /duplicate panel arm/);
+  assert.throws(() => assertRegisteredH1ArmSet({ referenceArm: "A", panelArms: ["A", "B"] }, "k"), /H1-intercept bug/);
+  assert.throws(() => assertRegisteredH1ArmSet({ referenceArm: "A" }, "k"), /must be/);
 });
 
 // The belt behind buildRegisteredFamily()'s spec-time scoping: H1 is
