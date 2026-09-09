@@ -111,9 +111,17 @@ import { poolMetricsSummary } from "../metrics/operational.mjs";
 // the ledger records tokens x model x timestamp (lib/accounting.mjs costRow)
 // and is repriced at READ time by lib/price.mjs once #7 lands. This estimator
 // exists ONLY to give --max-spend a number to compare against pre-flight.
-const INTERIM_RATES_USD_PER_MTOK = {
+// Exported for one test only (#143): the comment above claims these
+// "mirror the real rates so the pre-flight projection is not wildly off",
+// and until #143 nothing checked that claim -- correcting the Sonnet 5 rate
+// in lib/price.mjs while leaving this table stale was a mutation the suite
+// did not catch. Production code never reads this export; it reads the
+// constant directly.
+export const INTERIM_RATES_USD_PER_MTOK = {
   "claude-opus-5": { in: 5.0, out: 25.0 },
-  "claude-sonnet-5": { in: 3.0, out: 15.0 },
+  // Corrected 2026-09-08 (#143): was 3.0/15.0, mirroring lib/price.mjs's
+  // then-stale row. First-party pricing is 2.00/10.00.
+  "claude-sonnet-5": { in: 2.0, out: 10.0 },
   "claude-haiku-4-5": { in: 1.0, out: 5.0 },
   // OpenAI arms (G, H) now use real, first-party-verified ids and rates (#22 /
   // lib/price.mjs RATE_TABLE). These INTERIM figures remain a coarse pre-flight
@@ -791,6 +799,12 @@ export function planPrune(store, opts = {}) {
     allowCompleted = false,
     keepAttempts = DEFAULT_ATTEMPT_RETENTION,
     keepBatchReplays = DEFAULT_BATCH_REPLAY_RETENTION,
+    // The pinned, dated rate table the fold's straddle guard prices against.
+    // Injectable for the same reason runSpec's own `rateTable` is (#143): the
+    // live table currently carries NO dated rate regime, so the guard that
+    // refuses to fold rows across one can only be exercised against a fixture
+    // table. Production callers never pass this.
+    rateTable = DEFAULT_RATE_TABLE,
   } = opts;
 
   const selectorsGiven = Boolean(configHash || armIds || briefIds || kinds || states);
@@ -945,7 +959,7 @@ export function planPrune(store, opts = {}) {
       for (const entry of entries) {
         if (entry.key === contributors[0].key) cfg = entry.cfg;
       }
-      const fold = foldCostRows(rawRows, DEFAULT_RATE_TABLE, { batch: true });
+      const fold = foldCostRows(rawRows, rateTable, { batch: true });
       const removeKeys = foldSet.map((r) => r.key).filter((k) => k !== newKey);
       if (removeKeys.length === 0) continue; // nothing would actually go away
 
@@ -1066,9 +1080,9 @@ export function planPrune(store, opts = {}) {
  *   removed: string[], written: string[], duplicateSpendUsd: number}}
  */
 export function pruneStore(store, opts = {}) {
-  const { log = () => {} } = opts;
+  const { log = () => {}, rateTable = DEFAULT_RATE_TABLE } = opts;
   const plan = planPrune(store, opts);
-  const spendBefore = spendToDate(store);
+  const spendBefore = spendToDate(store, rateTable);
 
   const removed = [];
   const written = [];
@@ -1174,9 +1188,9 @@ export function pruneStore(store, opts = {}) {
   // The last line of defence, and the only one that runs in production: a
   // fold bug or a lost salvage shows up here, on the operator's terminal,
   // rather than three weeks later in a cost figure nobody can reconcile.
-  const spendAfter = spendToDate(store);
-  const duplicates = priceRows(knownDuplicateRows, DEFAULT_RATE_TABLE, { batch: true });
-  const duplicatesByProvider = priceRowsByProvider(knownDuplicateRows, DEFAULT_RATE_TABLE, { batch: true });
+  const spendAfter = spendToDate(store, rateTable);
+  const duplicates = priceRows(knownDuplicateRows, rateTable, { batch: true });
+  const duplicatesByProvider = priceRowsByProvider(knownDuplicateRows, rateTable, { batch: true });
   const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
   const providers = new Set([...Object.keys(spendBefore.byProvider), ...Object.keys(spendAfter.byProvider)]);
   const expectedTotal = spendBefore.totalUsd - duplicates.totalUsd;

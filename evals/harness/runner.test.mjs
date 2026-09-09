@@ -19,7 +19,8 @@ import { ResultsStore } from "../../lib/store.mjs";
 import { configHash, cellKey, planRun } from "../../lib/manifest.mjs";
 import { costRow } from "../../lib/accounting.mjs";
 import { priceRowByProvider, priceRowsByProvider, priceRows } from "../../lib/price.mjs";
-import { runSpec, planAndPrice, interimPriceGrid, spendToDate, foldCostRows } from "./runner.mjs";
+import { runSpec, planAndPrice, interimPriceGrid, spendToDate, foldCostRows, INTERIM_RATES_USD_PER_MTOK } from "./runner.mjs";
+import { RATE_TABLE } from "../../lib/price.mjs";
 import { MockProvider } from "./provider.mjs";
 
 function tempDir(t) {
@@ -756,6 +757,26 @@ test("--replicates overrides the spec's replicate count", async (t) => {
 });
 
 // ── interimPriceGrid unit coverage ───────────────────────────────────────────
+
+test("the interim estimator's rates mirror the authoritative RATE_TABLE (#143)", () => {
+  // The interim table is a COARSE estimate by design -- it prices a planned
+  // grid from an assumed token volume, not from stored rows -- but its rates
+  // are not supposed to be independent guesses: its own header says they
+  // mirror lib/price.mjs's so `--max-spend` does not over- or under-project.
+  //
+  // This test exists because that invariant was unguarded and it cost
+  // something: #143's correction to claude-sonnet-5 landed in RATE_TABLE
+  // while this table still said $3/$15, and the whole suite passed. A
+  // pre-flight ceiling computed from a rate 50% too high refuses runs that
+  // should proceed, which is the safe direction and therefore the kind of
+  // wrongness that survives indefinitely unless something asserts it.
+  for (const [model, interim] of Object.entries(INTERIM_RATES_USD_PER_MTOK)) {
+    const authoritative = RATE_TABLE[model];
+    assert.ok(authoritative, `the interim estimator prices '${model}', which lib/price.mjs's RATE_TABLE does not carry`);
+    assert.equal(interim.in, authoritative.in, `interim input rate for '${model}' has drifted from RATE_TABLE`);
+    assert.equal(interim.out, authoritative.out, `interim output rate for '${model}' has drifted from RATE_TABLE`);
+  }
+});
 
 test("interimPriceGrid throws on an unknown arm id rather than silently pricing it at zero", () => {
   assert.throws(

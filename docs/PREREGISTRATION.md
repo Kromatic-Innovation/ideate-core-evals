@@ -305,6 +305,8 @@ A separate `price.mjs` applies a **pinned, dated rate table** at read time. Re-p
 | OpenAI `gpt-5.6-sol` (large tier) | 5.00                           | 30.00               | same                                                                         |
 | Voyage-4-lite embeddings          | 0.02                           | —                   | + **200M free tokens/account**; batch −33%                                   |
 
+> _Amended 2026-09-08 ([Appendix H](#appendix-h--amendments-dated-2026-09-08), items 1-2). **The Claude Sonnet 5 row above is superseded: the rate is $2.00 / $10.00 per MTok, flat, with no introductory regime.** The `3.00 (2.00 intro → 2026-08-31)` reading came from a cached second-hand table; the announced 2026-09-01 increase was cancelled and $2/$10 has been the price throughout. Verified first-party 2026-09-08 against `platform.claude.com/docs/en/about-claude/pricing`, which also confirms Opus 5, Haiku 4.5 and (for the judge roster) Sonnet 4.6 as written. Every dollar figure this study has reported for a Sonnet-containing arm was **50% overstated**; Stage 1a's ledger reprices from $19.6927 to **$15.7902**._
+
 > _Amended 2026-08-02 ([Appendix A](#appendix-a--amendments-dated-2026-08-02), item 5). The OpenAI row previously read `~2.00–5.00 / ~12.00–30.00` sourced from "aggregator sites, not openai.com — must verify before running". Now verified first-party against `developers.openai.com/api/docs/pricing` (2026-08-02); the **50% Batch API discount** is confirmed on the same page. The full per-model OpenAI rate table lives with the OpenAI adapter (#22) and in `lib/price.mjs`'s dated `RATE_TABLE` + `OPENAI_PRICE_VERIFICATION` record. **Anthropic rates are correct as written and are unchanged.**_
 
 **Two levers cut this roughly in half:**
@@ -1489,3 +1491,58 @@ This is stated explicitly because the transfer is the failure mode this appendix
 - `σ²_e` is **not** a sidecar output and is not read from one: it is the pooled within-(arm × brief) variance across replicate pairs — Σ(y − cell mean)² / Σ(cell n − 1) — computed directly from the same rows, which is the quantity Appendix E item 7's own "pooled within-(arm × brief) residual variance" line names. df 72 over 72 complete replicate pairs for the matched subset; df 95 over 95 for the pooled one.
 
 **No judge score enters anything above.** Appendix F item 7 holds Stage 1a's judge rows as stored data awaiting §5.1's gate; the response fitted here is `distinct_k`, a pool-level metric, throughout.
+
+---
+
+## Appendix H — Amendments (dated 2026-09-08)
+
+Raised as `#143` while pricing Stage 1a by hand. §8.1's Anthropic rates were never verified first-party — they were transcribed from a cached model table dated 2026-06-24 — and one of the four rows was wrong in the direction that matters most, on the model the study uses most. This appendix records the verification, the correction, and what the correction does and does not move.
+
+This is a **re-price, not a re-collection.** §7's cost contract records tokens × model × timestamp × billing regime and never a derived dollar figure, and pricing is applied at read time from the dated table. No collected cell is invalidated and nothing is re-run; this is the change that contract exists to absorb.
+
+### Item 1 — §8.1: the Anthropic rates, verified first-party
+
+Checked 2026-09-08 against `platform.claude.com/docs/en/about-claude/pricing` (the model-pricing table) and `.../models/overview` (the model-comparison table). The check is recorded in code as `ANTHROPIC_PRICE_VERIFICATION` in `lib/price.mjs`, alongside the `OPENAI_PRICE_VERIFICATION` record Appendix A item 5 established the precedent for, so it travels with the table it backs.
+
+| Model | §8.1 as registered | **Verified 2026-09-08** | Moves? |
+|---|---|---|---|
+| Claude Opus 5 | 5.00 / 25.00 | **5.00 / 25.00** | no |
+| Claude Sonnet 5 | 3.00 (2.00 intro → 2026-08-31) / 15.00 (10.00 intro) | **2.00 / 10.00**, flat | **yes — −33% on every Sonnet dollar** |
+| Claude Haiku 4.5 | 1.00 / 5.00 | **1.00 / 5.00** | no |
+| Claude Sonnet 4.6 (judge roster, not in §8.1's table) | 3.00 / 15.00 | **3.00 / 15.00** | no |
+
+The three unchanged rows are recorded as **checked and correct**, not merely left alone: `#143` item 2 asks for exactly that, because the whole table shared one provenance and one date, and "only the row someone happened to notice" is not a verification. The Batch API discount is confirmed on the same page at 50% on both input and output, unchanged.
+
+**One row is still second-hand.** `voyage-4-lite` (0.02 / —) is a Voyage AI product priced on a different vendor's page and is outside this check; it keeps its 2026-06-24 cached provenance and is named as `notCovered` in the verification record rather than quietly implied to have been checked.
+
+### Item 2 — §8.1: the introductory regime is removed rather than kept as history
+
+`#143` item 3 proposed keeping the expired `introUntil` / `introRate` pair on the Sonnet 5 row as history, on the principle that a cell collected during an introductory window must still price at the rate that actually billed it. **That principle is right and this is not a case of it.** The pricing page's own note records that the $2/$10 launch pricing, announced as introductory through 2026-08-31, is now the standard price, and that the scheduled 2026-09-01 increase to $3/$15 will not occur.
+
+So Sonnet 5 has billed at $2/$10 for its entire life. The registered row described a **rate change that never happened**; keeping the regime would preserve a fiction, and removing it reprices no historical row, because both sides of that boundary were always $2/$10.
+
+The dated-regime machinery itself is retained in `lib/price.mjs` (`resolveBaseRate`) and in the fold's straddle guard, because the first genuine vendor rate change puts a regime back on a row and §7's read-time pricing is built on being able to represent one. No live row carries one today, so those guards are now exercised against an injected fixture table rather than the live one.
+
+### Item 3 — §7/§4.1: what the correction moves
+
+**Stage 1a's ledger, repriced from the same stored rows:**
+
+| | As reported 2026-09-08 | **Repriced** |
+|---|---|---|
+| Anthropic | $14.4655 | **$10.5630** |
+| OpenAI | $5.2238 | $5.2238 (unchanged) |
+| Excluded (embedder) | $0.0034 | $0.0034 |
+| **Total** | **$19.6927** | **$15.7902** |
+
+Every Stage 1a cost row is timestamped 2026-09-08 — after the former boundary — so every one of them priced at the overstated $3/$15. The arithmetic is one fact stated three ways, and it is worth stating precisely because two of the three readings are easy to write down wrong: the rate was **50% too high**, the dollar figure falls by **33% on the Sonnet share** (19.8% of this run's total, the rest being Haiku and OpenAI), and `distinct_k` **per dollar** — §4.1's headline metric and the README's leading claim — rises by **1.5× on a Sonnet-only figure**, 1.25× on this run's total.
+
+**Arm rankings on the cost/diversity Pareto frontier move non-uniformly**, since Sonnet appears at different weights across the registered arms; the error is not a constant offset and cannot be divided out of a published ranking after the fact.
+
+**`--max-spend` pre-flight projections over-projected**, which is the safe direction — a run refuses earlier than it needs to, never later — and is why this was not a blocker for Stage 1a. `evals/harness/runner.mjs`'s coarse `INTERIM_RATES_USD_PER_MTOK` estimator mirrored the same stale figure and is corrected in the same change. **§8.2's projection table is not restated here**: it prices the original A–H grid, whose design Appendix F and Appendix G have already superseded, and re-deriving it would register a budget for a run this study is no longer planning. Any future run's cost note is derived at the corrected rates from that run's own registered design.
+
+### Item 4 — the provenance failure, named
+
+A dated pin makes staleness **detectable**; nothing in this repo **detected** it. The row carried an honest source and an honest date and was simply wrong for ten weeks, surfacing only because a run happened to be priced by hand. That is the same second-hand-source shape Appendix A item 5 corrected once already for the OpenAI rows.
+
+What this amendment adds is narrower than a fix for that: the rates are now first-party with the check recorded in code, and a test holds the table and its verification record to each other, so a half-applied correction fails loudly. **It does not detect a vendor-side change** — nothing offline can. §8.1's rates are hereby registered as requiring **re-verification against the vendor's own page, with the date recorded, before any run that reports a dollar figure**, rather than being trusted to age quietly.
+

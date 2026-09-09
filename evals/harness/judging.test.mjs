@@ -448,9 +448,11 @@ test("judge cost rows reach recordActualSpend -- real judge spend (not generatio
   // disagree by construction with either of those and can't pin an exact
   // ceiling. Rather than hand-computing the expected price (which drifted
   // from the real run once already in review -- lib/price.mjs's RATE_TABLE
-  // carries a time-limited `introRate` window, so a HARDCODED timestamp
-  // silently prices differently than whatever `new Date().toISOString()`
-  // the real per-cell loop stamps "now"), CALIBRATE empirically: run one
+  // can carry time-limited rate regimes, so a HARDCODED timestamp could
+  // silently price differently than whatever `new Date().toISOString()`
+  // the real per-cell loop stamps "now"; no live row carries one today
+  // (#143), but the calibration is what makes that irrelevant either way),
+  // CALIBRATE empirically: run one
   // real cell with NO ceiling and read its ACTUAL spend back, so this
   // test's expectation always matches the SAME rate window the real run
   // below will price under, however RATE_TABLE evolves.
