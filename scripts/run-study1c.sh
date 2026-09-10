@@ -45,7 +45,25 @@ ARMS="${ARMS_ARG:-S1C-SOLO60,S1C-SOLO6X10,S1C-RICH}"
 REPLICATES=3
 STORE="results-study1c"
 # --max-spend is CUMULATIVE over the store, across every prior invocation and
-# configHash in it -- not per-invocation. $117.49 was already spent before the
+# configHash in it -- not per-invocation. It counts what this STORE has already
+# recorded, so the number below is a TOTAL for results-study1c, not a budget for
+# this invocation. `node evals/run.mjs --help` and docs/spend-ceilings.md carry
+# the full guarantee; the three things that bite when sizing this constant:
+#
+#   1. It is enforced MID-FLIGHT against actual spend (between cell dispatches
+#      and before every judge leg), not only pre-flight against a projection.
+#      A skipped cell is store-absent and re-plans as `todo`, so a ceiling that
+#      trips early costs a re-run, never data.
+#   2. A cell already IN FLIGHT when the ceiling trips is allowed to COMPLETE.
+#      At CONCURRENCY=8 below, the bound is the ceiling plus up to eight cells'
+#      actual cost -- not the ceiling exactly. Budget that headroom in.
+#   3. The ceiling is decorative above the ACCOUNT BALANCE. The first Stage 1c
+#      run aborted at $39.4965 against a $180 ceiling on a billing refusal.
+#      Pass --account-balance (or set IDEATE_ACCOUNT_BALANCE_USD) to have that
+#      checked at plan time; it is asserted by you, not queried -- neither
+#      provider exposes a balance an API key can read.
+#
+# $117.49 was already spent before the
 # #168 re-collect (Appendix L item 7 registered $180 against an expected
 # $120-135; the arm that overran it was the one whose ceiling was wrong).
 # Raised to $220 = $117.49 spent + ~$85 for S1C-RICH's 144 cells + headroom,
@@ -56,7 +74,16 @@ CONCURRENCY=8          # top of Appendix I item 7's registered 4-8 band
 LOG=".tmp/stage1c-run.log"
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  exec node evals/run.mjs --dry-run --arms "$ARMS" --replicates "$REPLICATES"
+  # --results-dir and --max-spend belong here too (issue #169). Without them the
+  # dry run priced against the DEFAULT store -- a different, near-empty ledger --
+  # so it reported neither this study's spent-to-date nor the projection the real
+  # invocation would be admission-controlled against. A dry run that prices the
+  # wrong store is worse than no dry run: it reads as a rehearsal and is not one.
+  exec node evals/run.mjs --dry-run \
+    --arms "$ARMS" \
+    --replicates "$REPLICATES" \
+    --results-dir "$STORE" \
+    --max-spend "$MAX_SPEND"
 fi
 
 # Keys live in 1Password, never the shell profile: generation, judging and
