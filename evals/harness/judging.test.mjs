@@ -987,3 +987,142 @@ test("N6: a reused cell whose arm was removed from armsConfig between sessions f
     /unknown arm 'Z'/,
   );
 });
+
+// ── issue #169: the mid-flight ceiling gates JUDGE LEGS, not only cells ──────
+//
+// Judging was the one spend path with no admission control at all. A judge leg
+// was dispatched from judgePoolIfEnabled unconditionally and only recorded
+// afterwards, so a run could stop admitting generation cells at the ceiling
+// and keep spending on judging past it, indefinitely.
+//
+// These tests drive that through runSpec -- the COMPOSITION, not the checker.
+// A unit test on a price comparison would have passed just as happily while
+// the gate was never wired into the dispatch path, which is the exact shape of
+// the "unit test on the callee is not a test of the wiring" failure this repo
+// has already recorded once.
+
+test("issue #169: a judge leg that would cross the GLOBAL ceiling is never dispatched, and is recorded as budget_exceeded", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // Learn the real per-cell generation cost the same way every other ceiling
+  // test in this file does -- MockProvider's token volumes are not either
+  // pricer's estimate, so a hand-computed ceiling would drift.
+  const calibStore = new ResultsStore(tempDir(t));
+  const { summary: calib } = await runSpec(soloSpec, { store: calibStore, armsConfig: soloArms, provider: new MockProvider(), log: silentLog });
+  const genUsd = calib.spendByProvider.anthropic;
+  assert.ok(genUsd > 0);
+
+  const exactPriceGrid = (cells) => ({
+    usd: cells.length * genUsd,
+    breakdown: cells.map((c) => ({ cellKey: c.key, usd: genUsd, byProvider: { anthropic: genUsd } })),
+  });
+
+  const logged = [];
+  // Ceiling = exactly the generation, with nothing left for a judge leg
+  // priced at half a cell. Generation is admitted; the judge leg is not.
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    priceGrid: exactPriceGrid,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    judgeLegPrice: () => ({ usd: genUsd / 2, byProvider: { anthropic: genUsd / 2 } }),
+    maxSpendUsd: genUsd,
+    log: (m) => logged.push(m),
+  });
+
+  assert.equal(summary.completed, 1, "the generation cell itself fit under the ceiling and was admitted");
+  assert.equal(anthropicJudge.calls.length, 0, "the judge was NEVER CALLED -- the gate ran before dispatch, not after");
+  assert.equal(summary.judge.skippedByReason.budget_exceeded, 1, "the anthropic leg is classified budget_exceeded, not deferred or failed");
+  assert.ok(
+    logged.some((m) => m.includes("judge leg SKIPPED (budget_exceeded)")),
+    "the operator is told which judge leg was gated and why",
+  );
+  // Store-absent, exactly like a budget-skipped generation cell: the next
+  // invocation under a higher ceiling must see this leg as unscored.
+  assert.ok(
+    !store.keys().some((k) => k.includes("judge")),
+    "a budget-skipped judge leg writes NOTHING to the store, so it re-plans cleanly",
+  );
+});
+
+test("issue #169: a PER-PROVIDER ceiling gates a judge leg under that provider", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const calibStore = new ResultsStore(tempDir(t));
+  const { summary: calib } = await runSpec(soloSpec, { store: calibStore, armsConfig: soloArms, provider: new MockProvider(), log: silentLog });
+  const genUsd = calib.spendByProvider.anthropic;
+
+  const exactPriceGrid = (cells) => ({
+    usd: cells.length * genUsd,
+    breakdown: cells.map((c) => ({ cellKey: c.key, usd: genUsd, byProvider: { anthropic: genUsd } })),
+  });
+
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    priceGrid: exactPriceGrid,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    judgeLegPrice: () => ({ usd: genUsd / 2, byProvider: { anthropic: genUsd / 2 } }),
+    maxSpendByProviderUsd: { anthropic: genUsd },
+    log: silentLog,
+  });
+
+  assert.equal(anthropicJudge.calls.length, 0, "the anthropic judge leg was gated by the anthropic ceiling");
+  assert.equal(summary.judge.skippedByReason["budget_exceeded"], 1, "the reason names the tripped provider after the colon");
+});
+
+test("issue #169: a judge leg with headroom IS dispatched -- the gate is a ceiling, not a blanket refusal to judge", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    maxSpendUsd: 1000,
+    log: silentLog,
+  });
+
+  assert.equal(anthropicJudge.calls.length, 1, "ample headroom -- the leg ran");
+  assert.equal(summary.judge.completed, 1);
+});
+
+test("issue #169: with NO ceiling active, judging is untouched -- the gate costs a ceiling-free run nothing", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    // deliberately no maxSpendUsd / maxSpendByProviderUsd, and a judgeLegPrice
+    // that would gate everything if it were ever consulted
+    judgeLegPrice: () => ({ usd: 1e9, byProvider: { anthropic: 1e9 } }),
+    log: silentLog,
+  });
+
+  assert.equal(anthropicJudge.calls.length, 1, "no ceiling means no gate -- judgeLegPrice is never even called");
+  assert.equal(summary.judge.completed, 1);
+});
