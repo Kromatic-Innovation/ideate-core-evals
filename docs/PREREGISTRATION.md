@@ -2418,3 +2418,101 @@ Every observation in this item originated with the operator's read of the packet
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.
 
+
+## Appendix O — Amendments (dated 2026-09-10)
+
+Two amendments, neither of which retracts a registered result. **Items 1–5** resolve **#165** (§3.3, the universal `temperature` strip) — the issue's central claim does not hold for the contrast it is about, and what replaces it is a **tighter** bound on `S1b-1` than the caveat the issue asked for. **Items 6–8** record that **#170**'s hash gap is **CLOSED** (merged as `7f3f359`, PR #173) and supersede, by dated cross-reference, the two statements in [Appendix N](#appendix-n--amendments-dated-2026-09-09) item 8 that the merge made false.
+
+### Item 1 — §3.3: the `temperature` strip is not a bias against panel arms (#165)
+
+**A live probe.** Run 2026-09-10 against `api.anthropic.com/v1/messages`, one 4-token request per model carrying `temperature: 0.9`:
+
+| model | result |
+| --- | --- |
+| `claude-sonnet-5` | **HTTP 400** — ``temperature` is deprecated for this model.` |
+| `claude-opus-5` | **HTTP 400** — same message |
+| `claude-haiku-4-5` | **HTTP 200** — accepted |
+
+This **confirms §3.3 finding B2**, recorded 2026-07-31, and adds one first-party word worth registering: the API says **"deprecated,"** not "unsupported."
+
+**Every Study 1 arm runs on `claude-sonnet-5`.** Re-verified against `arms.config.json` at `7f3f359`, over the full arm set — `S1-C0`, `S1-N10`, `S1-N60`, `S1-ELOW`, `S1-EMAX`, `S1-SPRAG`, `S1-SCONTRA`, `S1-DIRECT`, `S1B-SOLO60`, `S1B-PANEL`, `S1B-APRIME`, `S1C-SOLO60`, `S1C-SOLO6X10`, `S1C-RICH`. Every slot of every one of those fourteen arms resolves to `claude-sonnet-5`. **There is no Haiku slot anywhere in Study 1.**
+
+**Therefore #165's central claim does not hold for the contrast it is about.** #165 argues that force-stripping `temperature` *biases* panel arms against solo arms. **A bias requires a foregone alternative.** On `claude-sonnet-5` there is none: a panel on that model could never have carried a temperature axis, because the API rejects the parameter outright. **The strip changed nothing for any Stage 1b or Stage 1c arm.**
+
+**§3.3's registered bias direction is UNAFFECTED and stands.** It is written against the **Haiku** arms **B / E / F**, where the force-strip does override a real `modelAcceptsSamplingParams` → `true` (the implementation fact recorded in [Appendix A](#appendix-a--amendments-dated-2026-08-02) item 3). That is a model on which the parameter is accepted, so there the foregone alternative is real. #165's extension of that direction to the panel-vs-solo contrast is what does not hold — because that contrast never ran on a model that accepts the parameter.
+
+### Item 2 — #165's two proposed fixes are WITHDRAWN as unimplementable
+
+Registered explicitly so neither is re-litigated:
+
+1. **"Forward per-slot `temperature` where the API accepts it."** It is accepted **nowhere** in Study 1. On this model class the forwarding forwards nothing. The issue's supporting argument — that §3.3's model-versus-sampling-policy objection may not apply because Stage 1b holds model constant — is sound reasoning and **moot**: the parameter cannot be sent at all.
+2. **"Run a differentiated-temperature panel arm as its own registered comparison."** It could only run on **Haiku 4.5**, which reintroduces exactly the **model-versus-sampling-policy confound §3.3 rejected**, and would answer a different question from the one `S1b-1` reports on.
+
+Both remain live only for a future arm set on a model that accepts the parameter (e.g. `#132`'s factorial, `#131`'s mixed-model panel). Nothing about Study 1 changes.
+
+### Item 3 — #165 item 3 was already satisfied; cross-referenced, NOT re-registered
+
+#165 asks for "a solo agent making ten independent 6-idea calls, pooled, no sharing."
+
+That is **`S1C-SOLO6X10`**, registered in [Appendix L](#appendix-l--amendments-dated-2026-09-09) **item 2** under the heading *"THE MISSING CONTROL"* — `{size: 10, ideasPerAgent: 6, maxRounds: 1}`, `personaDisabled: true`, blind, pooled only at the end — collected, and reported in [Appendix M](#appendix-m--amendments-dated-2026-09-09) item 9. The gap was real when the issue was filed and was closed the same afternoon, before the issue was acted on.
+
+**This item registers nothing new.** It records only that the request is already met, so no second registration of the same arm exists in this document.
+
+### Item 4 — What survives, registered as a claim-breadth bound on `S1b-1`
+
+**The strip is not an artefact of the study. It is a faithful reproduction of what the product can do on this model class.**
+
+`DEFAULT_PERSONAS` ships a deliberate **0.4–1.0** temperature spread as its per-agent diversity lever. On `claude-sonnet-5` and `claude-opus-5` that lever **does not exist**. The values ride the agent record and the config but are never submitted: §3.3's universal strip drops them client-side ([Appendix E](#appendix-e--amendments-dated-2026-09-08) item 1, "recorded, not sent" — "neither request builder ever reads it for any model"), and on this model class the API would reject them if they were sent. **The strip therefore removed nothing that could have been sent** — item 1's finding restated at the level of the product.
+
+So a panel on a frontier Anthropic model differentiates on **stance alone** — and **Stage 1a measured stance as inert** for a solo agent, every confidence interval containing zero.
+
+**Registered bound on `S1b-1`:** the honest statement is **not** *"this panel lost with one lever switched off"* but ***"on this model class the panel has only one differentiation lever, and that lever has already been measured as weak."***
+
+Two things follow, and both are the point of this item:
+
+- This bounds `S1b-1` **more tightly** than the caveat #165 asked for. "We disabled temperature" invites the reply *"then re-run it enabled"*; this statement forecloses that reply on this model class.
+- It bounds `S1b-1` as a **fact about the shipped product**, not as a limitation of the experiment. The differentiation the product advertises is not available where the study ran it.
+
+### Item 5 — This does NOT retract `S1b-1`, `S1c-1` or `S1c-2`
+
+Stated explicitly so item 4 is not read as a withdrawal. The contrasts are **correctly computed and correctly registered**, and every figure reported for them stands unchanged. What item 4 changes is the **breadth of claim they license**, and nothing else. The cluster attribution that located Stage 1b's deficit — cross-agent duplication of 5.30 merges/cell against solo's 0, a deficit (4.1 distinct ideas) smaller than the duplication causing it — was **measured rather than inferred** and never depended on temperature.
+
+### Item 6 — §5: the hash gap is CLOSED, and two statements in Appendix N item 8 are SUPERSEDED (#170)
+
+#170 merged as **`7f3f359`** (PR #173). [Appendix N](#appendix-n--amendments-dated-2026-09-09) item 8 is **not edited**; the two statements below are superseded here, by dated cross-reference.
+
+**Superseded statement 1.** Item 8 states that `validationKey` is *"exactly `{judgeHash, sliceId}`"*. It is now **`{judgeHash, judgeRequestHash, sliceId}`**. `judgeRequestHash` is **optional on `validationKey` only** — omitting it reproduces the pre-#170 key byte-for-byte, which is what keeps the one stored record reachable (Appendix N item 8's own concern; see item 8 of this appendix for the verification).
+
+**Superseded statement 2.** Item 8 states that *"a thinking judge and a direct judge collide on one key."* They no longer do. `computeJudgeRequestHash` covers `{maxTokens, thinking}` — the two halves whose **interaction** broke the first real §5.1 run (Appendix N item 7) — so two instruments occupy two keys.
+
+**What in item 8 is NOT superseded, and is reaffirmed:**
+
+- Its observation that **the real backstop was `ResultsStore.put`'s append-only invariant** is still true and still worth preserving. The key now **separates instruments in addition to** that guard, rather than replacing it.
+- Its **decision not to fold the request shape into `judgeHash`** was upheld, not reversed. #170 shipped Option 1: a **separate** hash, not a `CONFIG_FIELDS` entry, never folded into `configHash`.
+
+**Verified: `configHash` did not move.** `computeJudgeHash`'s canonical payload is **byte-identical** to its pre-#170 form — the merge changed only the comment block above the function — and it still produces the golden **`16812833fcd2`** that the stored §5.1 verdict is keyed under. **None of the 431 collected Stage 1c cells were re-keyed.** That is the whole reason Option 1 was chosen.
+
+### Item 7 — The current instrument's `judgeRequestHash`, as an addition to Appendix N item 9
+
+Appendix N item 9's record table carries a `judgeHash` row and a `requestShape` row. It gains one figure, **recorded here rather than in that table**:
+
+| Field | Value |
+| --- | --- |
+| `judgeHash` | `16812833fcd2` (unchanged) |
+| **`judgeRequestHash`** | **`d1554a8ca60c`** |
+| `requestShape` | `{maxTokens: 256, thinking: {type: "disabled"}}` |
+
+The two hashes together are the full instrument identity of the passing 0.5833 verdict. `d1554a8ca60c` is the hash **a run happening now would write**, and it is also the hash of the **stored** record's `requestShape` — which is the fact item 8 below turns on.
+
+### Item 8 — The existing §5.1 verdict remains valid, and the gate does NOT need re-running
+
+**This is the load-bearing claim of the #170 half of this appendix, and it was verified against the merged code rather than inferred from the change description.**
+
+- **The stored record is not migrated.** It keeps its pre-#170 key, `judge-validation|judge=16812833fcd2|slice=si-et-al|axis=originality|expert=overall_score`, with no `req=` segment. Rewriting it would break the very append-only invariant Appendix N item 8 identified as the real backstop.
+- **It is still reachable.** Everything that finds a validation record scans the prefix `judge-validation|judge=${judgeHash}|`, which matches both key shapes. `req=` was placed **between** `judge=` and `slice=` precisely because `sliceId` itself embeds `|` and must stay last.
+- **It reconciles as a MATCH against the current instrument.** A pre-#170 record carries `requestShape` and no `judgeRequestHash`, so it is reconciled on the shape. The stored shape is `{maxTokens: 256, thinking: {type: "disabled"}}` — identical, key-sorted, to the current `{maxTokens: MAX_JUDGE_TOKENS, ...JUDGE_REQUEST_SHAPE}`, and hashing to the same `d1554a8ca60c`. Verified by calling `attachIdeaLevelScores` against a copy of the real store at `7f3f359`: it returns the idea-level scores.
+- **Therefore idea-level metrics remain licensed under §5.4, and the §5.1 gate does not need re-running.** No re-run, no re-spend, no re-registration.
+
+**One precondition, registered because it is a real obligation on the analysis:** the reconciliation happens only when the caller passes **`requestShape` alongside `judgeRequestHash`**. A caller supplying the hash alone gets a **named refusal** — *"no current requestShape was supplied … Nothing has necessarily changed"* — distinct from the genuine changed-instrument diagnosis. That is a missing argument at a call site, **not** a stale verdict, and it must not be read as one.
+
+**And the forward-looking consequence:** a future re-run under the current instrument writes under the **`req=`** key, which is a *different* key from the stored record's. It therefore **adds a second record rather than colliding** with the first. That is the concrete sense in which the key now separates instruments in addition to the append-only guard — the failure mode Appendix N item 8 feared (a `drop` and a `pass` sharing one key) can no longer arise, and a re-run no longer fails with a collision instead of a diagnosis.
