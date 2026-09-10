@@ -62,7 +62,11 @@ const dryRun = process.argv.includes("--dry-run");
 const { axis, expertColumn: expertScoreField } = JUDGE_VALIDATION_MAPPING;
 const slice = readSiEtAlSlice({ scoreField: expertScoreField });
 const topics = new Set(slice.ideas.map((i) => i.topic));
-const judgeHash = computeJudgeHash({ judgeModels: JUDGE_MODELS });
+// The judgeHash the RECORD is keyed under -- computed the way
+// runJudgeValidation computes it, from the single model that actually runs,
+// not from the whole registered roster. Printing the roster hash here instead
+// would name a key the store does not contain.
+const judgeHash = computeJudgeHash({ judgeModels: { anthropic: [JUDGE_MODEL] } });
 
 console.log("judge validation -- docs/PREREGISTRATION.md §5.1, Appendix N");
 console.log(`  axis / column   : ${axis} <-> ${expertScoreField}   (Appendix A item 7)`);

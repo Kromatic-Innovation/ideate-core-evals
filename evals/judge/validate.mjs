@@ -302,6 +302,7 @@ export async function runJudgeValidation({
     judgeModel,
     axis,
     expertColumn: expertScoreField,
+    requestShape,
   });
 
   // spendByProvider/hasMissingRate/missingRateModels (issue #63): the same
