@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runJudgeValidation, judgeValidationSliceId } from "./validate.mjs";
-import { MockJudgeProvider, computeJudgeHash } from "./score.mjs";
+import { MockJudgeProvider, computeJudgeHash, computeJudgeRequestHash } from "./score.mjs";
 import { makeTempStore } from "../../lib/store.mjs";
 import { validationKey } from "./gate.mjs";
 import { JUDGE_VALIDATION_AXIS, SI_ET_AL_EXPERT_SCORE_FIELD } from "./config.mjs";
@@ -124,7 +124,11 @@ test("runJudgeValidation — end-to-end PASS: threads slice→pool→judge→axi
   const sliceId = judgeValidationSliceId({ axis: JUDGE_VALIDATION_AXIS, expertScoreField: SI_ET_AL_EXPERT_SCORE_FIELD });
   assert.equal(out.judgeHash, judgeHash);
   assert.equal(out.sliceId, sliceId);
-  const stored = store.get(validationKey({ judgeHash, sliceId }));
+  // #170: the record is keyed on BOTH judge hashes, and runJudgeValidation
+  // returns the request hash it wrote so a caller never has to re-derive it.
+  assert.equal(out.judgeRequestHash, computeJudgeRequestHash({ requestShape: out.requestShape }));
+  const stored = store.get(validationKey({ judgeHash, judgeRequestHash: out.judgeRequestHash, sliceId }));
+  assert.equal(stored.result.judgeRequestHash, out.judgeRequestHash);
   assert.equal(stored.result.kind, "judge-validation");
   assert.equal(stored.result.axis, "originality");
   assert.equal(stored.result.expertColumn, "overall_score");
@@ -211,7 +215,7 @@ test("runJudgeValidation — end-to-end DROP: an anti-aligned judge fails the fl
   assert.ok(out.accuracy < out.floor);
 
   const judgeHash = computeJudgeHash({ judgeModels: { anthropic: [JUDGE_MODEL] } });
-  const stored = store.get(validationKey({ judgeHash, sliceId: out.sliceId }));
+  const stored = store.get(validationKey({ judgeHash, judgeRequestHash: out.judgeRequestHash, sliceId: out.sliceId }));
   assert.equal(stored.result.verdict, "drop");
 });
 
@@ -235,7 +239,7 @@ test("runJudgeValidation — a non-default (axis, expert column) is threaded int
   assert.equal(out.sliceId, judgeValidationSliceId({ axis: "feasibility", expertScoreField: "overall_score" }));
 
   const judgeHash = computeJudgeHash({ judgeModels: { anthropic: [JUDGE_MODEL] } });
-  const stored = store.get(validationKey({ judgeHash, sliceId: out.sliceId }));
+  const stored = store.get(validationKey({ judgeHash, judgeRequestHash: out.judgeRequestHash, sliceId: out.sliceId }));
   assert.equal(stored.result.axis, "feasibility");
 });
 
