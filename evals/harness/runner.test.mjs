@@ -2454,10 +2454,29 @@ describe("issue #169: [balance] -- a ceiling above the funding is decorative, an
   test("the comparison is against HEADROOM, not the raw ceiling -- a resumed study must not cry wolf", async (t) => {
     // A store already holding real spend leaves less headroom than the
     // ceiling. Comparing the ceiling itself would warn on every resumed run
-    // whose ceiling happens to exceed a balance most of it is already paid for.
+    // whose ceiling happens to exceed a balance that most of the ceiling is
+    // already paid for.
+    //
+    // The balance is placed STRICTLY BETWEEN the two candidate comparands:
+    //
+    //   headroom (180 - spent)  <  balance (180 - spent/2)  <  ceiling (180)
+    //
+    // so "headroom > balance" is false (correct: no warning) while
+    // "ceiling > balance" is true (a mutant that compares the raw ceiling
+    // warns here and fails this test). A balance equal to the ceiling would
+    // discriminate nothing, since neither comparison would fire.
     const store = new ResultsStore(tempDir(t));
-    await runSpec(spec1, { store, armsConfig: soloArms, provider: new MockProvider(), log: silentLog });
-    const spent = 0; // the exact figure does not matter; only that it is > 0
+    const { summary: first } = await runSpec(spec1, {
+      store,
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: flatGrid,
+      maxSpendUsd: 180,
+      log: silentLog,
+    });
+    const spent = first.cumulativeSpendUsd;
+    assert.ok(spent > 0, "sanity: the store now holds real spend, so headroom is strictly below the ceiling");
+
     const logged = [];
     await runSpec(
       { ...spec1, briefs: [{ id: "b2" }] },
@@ -2467,13 +2486,12 @@ describe("issue #169: [balance] -- a ceiling above the funding is decorative, an
         provider: new MockProvider(),
         priceGrid: flatGrid,
         maxSpendUsd: 180,
-        accountBalanceUsd: 180,
+        accountBalanceUsd: 180 - spent / 2,
         log: (m) => logged.push(m),
       },
     );
     const line = logged.find((m) => m.startsWith("[balance]"));
-    assert.doesNotMatch(line, /WARNING/, "headroom is strictly below the ceiling, so a balance equal to the ceiling always fits");
-    assert.equal(spent, 0);
+    assert.doesNotMatch(line, /WARNING/, "the headroom fits inside the balance, even though the raw ceiling does not");
   });
 
   test("no ceiling at all: no [balance] line, because there is no ceiling to compare", async (t) => {

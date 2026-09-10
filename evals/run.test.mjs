@@ -1650,3 +1650,34 @@ test("issue #169: main() prints exactly helpLines() -- one source for the help t
   await main(["--help"], { log: (m) => lines.push(m) });
   assert.deepEqual(lines, helpLines());
 });
+
+test("issue #169: the calibration main() computes is HANDED TO the price grid, not merely logged", async () => {
+  // M30 in the mutation ledger. Logging the basis and actually pricing against
+  // it are two different wirings, and only one of them is the fix: the whole
+  // defect was a projection that ignored what the store already knew. So this
+  // reaches THROUGH main() to the priceGrid it built and prices a cell with it.
+  //
+  // Arm "A" is given absurd measured tokens, far above any structural
+  // estimate, so a grid that consulted the fit and one that did not cannot
+  // produce the same number by accident.
+  const key = "arm=A|brief=b1|rep=0|cfg=zzz";
+  const bodies = new Map();
+  const entries = [];
+  for (let i = 0; i < 5; i++) {
+    const k = `${key}-${i}`;
+    entries.push({ key: k, armId: "A", state: "completed" });
+    bodies.set(k, { costRows: [{ cellKey: k, tokens_by_model: { "claude-sonnet-5": { input_tokens: 1_000_000, output_tokens: 9_000_000 } } }] });
+  }
+  const storeWithHistory = { list: () => entries, get: (k) => bodies.get(k) };
+
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run", "--max-spend", "180"], { runSpecFn, store: storeWithHistory, getEngineVersion: STUB_ENGINE_VERSION, log: () => {} });
+
+  const { priceGrid } = runSpecFn.calls[0].opts;
+  const armsForPricing = { A: { mode: "solo", slots: [{ persona: "solo", model: "claude-sonnet-5" }] } };
+  const priced = priceGrid([{ key: "c1", armId: "A" }], armsForPricing);
+
+  assert.equal(priced.calibrated, true, "the grid knows arm A was fitted from the store");
+  assert.equal(priced.breakdown[0].calibrated, true);
+  assert.ok(priced.usd > 10, `9M output tokens must price far above the structural estimate, got $${priced.usd}`);
+});
