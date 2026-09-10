@@ -622,6 +622,24 @@ export function attachIdeaLevelScores({ store, judgeHash, judgeRequestHash, requ
     // A NAMED diagnosis, not a key collision. The records exist and are readable;
     // what changed is the instrument, and the message says so in those words.
     const stored = records.map((r) => `  • ${describeInstrument(r)}  (verdict ${r.result && r.result.verdict})`).join("\n");
+    // ...except when nothing changed and the CALLER is simply missing an
+    // argument. A pre-#170 record carries `requestShape` and no hash, so it can
+    // only be compared against a current `requestShape`; without one every such
+    // record is "unknown". Saying "the request shape changed" there would send a
+    // reader to re-run the §5.1 gate (~$0.58 and hours) to fix a missing
+    // parameter. Two situations, two fixes, two messages.
+    const bridgeable = records.filter((r) => r.result && r.result.judgeRequestHash === undefined && r.result.requestShape !== undefined);
+    if (requestShape === undefined && bridgeable.length === records.length) {
+      throw new Error(
+        `attachIdeaLevelScores: no current requestShape was supplied, so the pre-#170 validation record(s) for ` +
+          `judgeHash '${judgeHash}' cannot be compared against the current instrument. Nothing has necessarily ` +
+          `changed — a record written before #170 carries 'requestShape' and no 'judgeRequestHash', and the only ` +
+          `way to reconcile one is to pass the current shape alongside the hash.\n` +
+          `  current: judgeRequestHash=${judgeRequestHash} requestShape=(not supplied)\n` +
+          `  stored (${records.length} record${records.length === 1 ? "" : "s"}):\n${stored}\n` +
+          "Pass requestShape: { maxTokens: MAX_JUDGE_TOKENS, ...JUDGE_REQUEST_SHAPE } (evals/judge/score.mjs).",
+      );
+    }
     throw new Error(
       `attachIdeaLevelScores: the judge's request shape changed — no validation record for judgeHash ` +
         `'${judgeHash}' was produced under the current instrument.\n` +
