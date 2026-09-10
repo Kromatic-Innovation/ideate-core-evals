@@ -2129,3 +2129,40 @@ node evals/analysis/stage1c.mjs --results-dir results-study1c
 
 The arm override exists because a bare resume would re-collect the 288 physically-identical control cells. The analysis applies item 5's per-arm hash rule itself, so the reproduction command carries no hashes by hand.
 
+### Item 9 — Result of the corrected re-collect (added 2026-09-09, after the run)
+
+The re-collect completed **143 of 144** `S1C-RICH` cells against 5 of 144 before, at `configHash` **`9b17e4ba0734`**. One residual `parse_failure` / `cause=partial_truncated` remains (0.7% of cells), which is consistent with a ceiling set at 2.5× the top of a 12-sample distribution and is left standing as the measured residual rather than chased.
+
+**Registered family (Holm, m=2), rarefied `distinct_k`, floor 50 set by `arm=S1C-RICH|brief=sci-05|rep=2` — ≥ 48, so PRIMARY as registered:**
+
+| ID | Contrast | Estimate | SE | 95% CI | Holm p |
+|---|---|---|---|---|---|
+| S1c-1 | `S1C-RICH − S1C-SOLO60` | **+1.6728** | 0.6931 | [0.314, 3.031] | 0.0158 |
+| S1c-2 | `S1C-RICH − S1C-SOLO6X10` | **+30.2126** | 0.6931 | [28.854, 31.571] | <0.0001 |
+
+Rarefied means: RICH **46.025** (n=143), SOLO60 **44.369** (n=144), SOLO6X10 **15.829** (n=144). Full-pool: 54.161 / 53.160 / 17.201. Mean cost: **$0.6178** / $0.0430 / $0.0915.
+
+**The registered prediction resolves in the direction Appendix L registered as the alternative.** Stage 1b's thin-stance panel was **−2.1338** against the same reference; the richly differentiated panel is **+1.6728**. The sign reverses.
+
+**The SOLO60 bridge (Appendix L item 4) holds.** This run's `S1C-SOLO60` rarefied mean is 44.369 against Stage 1b's 44.570, a difference of −0.201, and both runs' rarefaction floors are 50. Both conditions registered for the bridge are met, so **RICH 46.025 vs Stage 1b's `S1B-PANEL` 42.495 is reportable as clearly-labelled SECONDARY.**
+
+**`S1C-SOLO6X10` is the study's cleanest single result.** Ten blind, identical, unshared agents produce a full 60-idea pool that clusters to ~15 distinct ideas — a 75% collapse, verified on a raw stored cell rather than inferred from the mean. Undifferentiated parallel sampling is worth less than a third of one solo call at matched pool size.
+
+#### What this result does NOT support
+
+1. **It is not attributable to personas.** Appendix L item 4 bundles three axes — stance text, strategy and effort — by design. `+1.6728` is the bundle's effect. No decomposition is available and none should be asserted.
+2. **It is not a quality claim.** `distinct_k` measures distinctness, not merit. Issue #16's judge gate has never been run, and it is now the binding constraint on every claim this study makes. The `weirdo` stance is explicitly prompted for strangeness and is the one slot that could buy distinctness with incoherence.
+3. **The effect is below the design's own MDE.** Appendix J registered MDE **1.89** at Holm m=2; the observed effect is **1.67**. It reached significance, but this design would miss an effect of this size a substantial fraction of the time — which argues for replication, not against the finding.
+4. **Holm applied no correction to S1c-1.** It is the larger of the two p-values, so `0.0158` is the raw p, not an adjusted one.
+5. **The economics are thin.** A **14.4×** cost increase ($0.6178 vs $0.0430) buys **+3.8%** rarefied distinct ideas. Statistical significance and practical value are different questions and this appendix asserts only the first.
+
+#### An unregistered robustness check, reported because it was run
+
+S1c-1's SE is estimated from a single-σ fit pooling all three arms, including `S1C-SOLO6X10` at a mean of 15.8. Refitting S1c-1 on `S1C-RICH + S1C-SOLO60` alone gives estimate **1.6713**, SE **0.5318**, CI [0.629, 2.714], p **0.0017**.
+
+The concern that motivated the check — that floor effects at 15.8 would compress that arm's variance and *deflate* the pooled SE — is **falsified**: per-arm variance is RICH 9.41, SOLO60 12.69, **SOLO6X10 32.91**, so pooling it *inflated* the SE by ~30%. **The registered three-arm figure is the conservative one**, and it remains the primary result; the two-arm fit was not pre-specified and is recorded here only so the check cannot be re-run selectively later.
+
+### Item 10 — The spend ceiling did not bind, again
+
+Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed rather than fixed here; no result in item 9 depends on it.
+
