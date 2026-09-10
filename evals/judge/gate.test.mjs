@@ -483,6 +483,15 @@ test("#170: the hash does not depend on key insertion order", () => {
   assert.equal(a, b);
   // ...and maxTokens may arrive either as its own argument or inside the shape.
   assert.equal(a, computeJudgeRequestHash({ maxTokens: 256, requestShape: { thinking: { type: "disabled" } } }));
+  // The pair above alone does NOT exercise the canonicalizer: rebuilding the
+  // payload as `{maxTokens, ...rest}` already normalizes maxTokens' position,
+  // and `rest` held one key. NESTED keys and top-level SIBLINGS are what the
+  // recursive key sort is actually for — a plain JSON.stringify survives the
+  // pair above and dies here. (Caught by mutation M5.)
+  assert.equal(
+    computeJudgeRequestHash({ requestShape: { maxTokens: 256, thinking: { type: "enabled", budget_tokens: 1024 }, temperature: 0 } }),
+    computeJudgeRequestHash({ requestShape: { temperature: 0, thinking: { budget_tokens: 1024, type: "enabled" }, maxTokens: 256 } }),
+  );
   assert.throws(
     () => computeJudgeRequestHash({ maxTokens: 512, requestShape: { maxTokens: 256, thinking: { type: "disabled" } } }),
     /contradicts requestShape.maxTokens/,
@@ -570,6 +579,35 @@ test("#170: the ONE pre-#170 record is still reachable and still licenses idea-l
     () => attachIdeaLevelScores({ store, judgeHash, judgeRequestHash: CURRENT_REQ_HASH, pools: [], ideaLevelScores }),
     /the judge's request shape changed/,
   );
+});
+
+test("#170: the legacy requestShape bridge compares shapes STRUCTURALLY, not by key order", () => {
+  // gate.mjs cannot import score.mjs (score.mjs -> gate.mjs already), so it
+  // reconciles a pre-#170 record by comparing shapes rather than hashing one.
+  // That comparison must be order-insensitive for the same reason the hash is.
+  //
+  // The asymmetry to test is the CALLER's side, not the store's: ResultsStore
+  // serializes bodies with sorted keys, so a stored shape always reads back
+  // canonical no matter how it was written. The in-memory shape a caller hands
+  // in is not canonicalized by anything, so that is where key order can differ.
+  const store = makeTempStore("judge-gate-test-");
+  store.put({
+    key: validationKey({ judgeHash: "jhReorder", sliceId: "s" }),
+    armId: "__judge-validation__", briefId: "s", replicate: 0, cfg: "jhReorder",
+    result: {
+      kind: "judge-validation", n: 98, accuracy: 0.62, floor: 0.561, verdict: "pass", rho: 0.2,
+      requestShape: { maxTokens: 256, thinking: { type: "enabled", budget_tokens: 1024 } },
+    },
+    resolvedModels: { judge: "mixed" }, accounting: { state: "completed" }, costRows: [],
+  });
+  const callerShape = { thinking: { budget_tokens: 1024, type: "enabled" }, maxTokens: 256 };
+  const out = attachIdeaLevelScores({
+    store, judgeHash: "jhReorder",
+    judgeRequestHash: computeJudgeRequestHash({ requestShape: callerShape }),
+    requestShape: callerShape,
+    pools: [], ideaLevelScores: [{ idea: "z" }],
+  });
+  assert.deepEqual(out.ideas, [{ idea: "z" }], "the same instrument written in a different key order is the SAME instrument");
 });
 
 test("#170: a same-key re-run still cannot overwrite a verdict — the store's append-only guard is the second backstop", () => {
