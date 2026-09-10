@@ -2230,6 +2230,61 @@ The question the study actually needs answered — whether the rich panel's extr
 
 Registering this in advance is what stops a `drop` verdict from silently deleting the user-facing answer, and stops a descriptive read from being promoted to a confirmatory one after the fact.
 
+### Item 7 — Instrument amendment: the judge was not the direct scorer §5 assumes
+
+**Registered after the first attempt failed and before any verdict existed**, which is the only ordering under which this amendment is legitimate.
+
+The first real run of the gate died on `parseAxisScores: empty judge reply`. It was not a refusal. Probing the failing call: `stop_reason: "max_tokens"`, `output_tokens: 256`, of which **`thinking_tokens: 255`** — the model spent the entire budget thinking and never emitted the JSON. `buildAnthropicMessageParams` never sets `thinking`, so every judge call this study has ever made inherited the API's **adaptive** default.
+
+`MAX_JUDGE_TOKENS`'s own doc comment already stated the intent this violates — 256 is *"small enough that a model tempted to 'explain' its score runs out of room rather than producing reasoning-then-score drift the §5 rubric forbids."* Adaptive thinking bypassed that ceiling's purpose: the model reasoned anyway, inside the budget meant to prevent it.
+
+**The load-bearing observation is not the crash.** In that topic group, **8 of 10** replies returned `thinking_tokens: 0` and **2** returned 255. Under adaptive thinking the instrument was **heterogeneous across ideas**, and the ideas it chose to think about are plausibly the ambiguous ones whose expert scores are hardest to predict — a bias surface in the gate itself, not merely a failure mode.
+
+**Registered change:** every judge call sets `thinking: {type: "disabled"}`. This restores the direct, score-only scorer item 3 registers and makes the instrument uniform across ideas. The ceiling is **not** raised; raising it would make this a reasoning judge, matching neither registered comparator.
+
+**Whether thinking shifts the scores is UNMEASURED.** Replaying one failing candidate gave `originality` 6 disabled, 4 at `max_tokens` 2048, 5 at 4096 — one candidate, one draw each, no temperature set. That is consistent with sampling noise and is **not** evidence of an instrument effect. It is recorded so the question stays visibly open.
+
+### Item 8 — A hash gap, and where the protection actually lives (#170)
+
+`judgeHash` folds the prompt hash and the model roster. It covers **neither** `MAX_JUDGE_TOKENS` **nor** the thinking mode. Since `validationKey` is exactly `{judgeHash, sliceId}`, a thinking judge and a direct judge collide on one key — and `attachIdeaLevelScores` licenses idea-level metrics off **any** record whose verdict is `pass`.
+
+**Not folded into the hash.** Doing so changes `judgeHash` → `configHash` → the `cellKey` of all **431 collected Stage 1c cells**, re-keying paid data over a constant that did not exist when it was collected. That trade is worse than the gap. Filed as **#170**.
+
+**Writing the test for the gap corrected the concern.** The feared path — a `drop` followed by a differently-shaped `pass` silently unlocking the confirmatory metrics — **is already closed**, by `ResultsStore.put`'s append-only guard, which refuses a second write under an existing key with different content. The backstop is the store's invariant, not the hash. Recorded because the protection lives somewhere no reader would look for it. `recordValidation` additionally stamps `requestShape` so a verdict names its own instrument.
+
+### Item 9 — Result: the §5.1 gate has run, and it PASSES
+
+First execution of the judge-validation gate in the study's history. Ran 2026-09-09 against the real slice; **$0.577**.
+
+| Field | Value |
+|---|---|
+| metric | `balanced-accuracy` |
+| construction | `si-et-al-2024/split-half-top-bottom-25pct-balanced-accuracy` |
+| axis ↔ column | `originality` ↔ `overall_score` |
+| n | **98** |
+| accuracy | **0.5833** |
+| floor | 0.561 |
+| **verdict** | **`pass`** |
+| rho (descriptive) | 0.2141 |
+| requestShape | `{maxTokens: 256, thinking: {type: "disabled"}}` |
+| judgeHash | `16812833fcd2` |
+
+**Per §5.4, idea-level metrics are therefore licensed** rather than dropped. That is the constraint Appendix L item 4 and Appendix M item 9 both named as binding on every claim this study makes.
+
+#### How far this verdict may be pushed — registered in item 2, before it was known
+
+1. **It is power-limited by the answer key, not only by the judge.** Human–human balanced accuracy on this same 98-idea slice is **0.5534, bootstrap 95% CI [0.4483, 0.6702]** — a CI that does not exclude chance. The judge's 0.5833 sits inside that interval. The honest statement is that **the judge is not distinguishable from the human reviewers on this metric at this n**, which is what clearing a human-agreement floor means; it is not evidence that the judge is *good*.
+2. **It clears both registered comparators** (item 3): 0.5833 > 0.533 pairwise and > 0.517 Claude-3.5 Direct, the shape-matched one. The construction difference registered in item 3 — Si et al. threshold LLM evaluators at their median, `balancedAccuracyTopBottom` splits top-k/bottom-k — applies to both comparisons and is not waived by the pass.
+3. **The margin is 2.2 points over the floor.** Nothing in this design distinguishes 0.5833 from 0.561.
+4. **`rho` is not stable across runs; the verdict is.** Two independent runs of the identical committed invocation returned accuracy **0.5833 both times** and rho **0.2291 then 0.2141**. The gate metric is robust to the judge's residual sampling variation; the retained descriptive statistic is not, and should not be quoted to three decimals.
+5. **The construct tension of item 5 is unresolved by a pass.** `originality` was validated against `overall_score`, not against `novelty_score`.
+
+#### Two defects in this appendix's own tooling, recorded rather than quietly fixed
+
+The **first** stored validation record carried `requestShape: null`. `runJudgeValidation` built the shape and never passed it to `recordValidation`; the unit test on `recordValidation` asserted the field is written *when supplied* and passed, so the mutation ledger was green while the wiring was dead. **A unit test on the callee is not a test of the wiring.** Fixed, a composition-level test added, and the defective record preserved outside the store before it was re-derived. The re-derivation reproduced accuracy, judgeHash and spend exactly.
+
+The **second**: the runner printed the full-roster `judgeHash` while `runJudgeValidation` keys the record by the single model that actually ran — so the operator was shown a key the store does not contain. Fixed.
+
 ### Item 10 — The spend ceiling did not bind, again
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.
