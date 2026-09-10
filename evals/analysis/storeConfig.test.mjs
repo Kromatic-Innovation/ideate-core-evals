@@ -311,6 +311,39 @@ test("#168: EVERY named hash is validated, so a typo in the second is caught too
   );
 });
 
+test("#168: NoCellsSelectedError names EVERY requested hash, not just the first", () => {
+  // Reported by review on this PR. `frame.configHash` is only the first of a
+  // pooled list, so an operator who named two hashes and matched neither was
+  // told only one was expected -- pointing them at a selection that never ran.
+  const store = makeTempStore("storeconfig-168-msg-");
+  putCell(store, { key: cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" }), armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" });
+  const frame = buildFrame(store, { configHash: ["dddddddddddd", "eeeeeeeeeeee"] });
+  assert.throws(
+    () => assertCellsSelected(frame),
+    (err) => {
+      assert.match(err.message, /any of 2 cfgs/);
+      assert.match(err.message, /dddddddddddd/);
+      assert.match(err.message, /eeeeeeeeeeee/, "the SECOND hash must appear -- that is the whole finding");
+      assert.deepEqual(err.configHashes, ["dddddddddddd", "eeeeeeeeeeee"]);
+      return true;
+    },
+  );
+});
+
+test("#168: a SINGLE requested hash still reads as before -- the common case is not made noisier", () => {
+  const store = makeTempStore("storeconfig-168-msg1-");
+  putCell(store, { key: cellKey({ armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" }), armId: "A", briefId: "b1", replicate: 0, cfg: "aaaaaaaaaaaa" });
+  const frame = buildFrame(store, { configHash: "dddddddddddd" });
+  assert.throws(
+    () => assertCellsSelected(frame),
+    (err) => {
+      assert.match(err.message, /expected cfg dddddddddddd/);
+      assert.doesNotMatch(err.message, /any of/);
+      return true;
+    },
+  );
+});
+
 test("#168: a hash named twice is de-duplicated — pooling must not double-count its cells", () => {
   const store = twoHashStore("storeconfig-168-dupe-");
   const r = resolveStoreConfigHash(store, { configHash: ["aaaaaaaaaaaa", "aaaaaaaaaaaa"] });
