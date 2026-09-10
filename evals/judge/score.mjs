@@ -114,6 +114,15 @@ export const MAX_JUDGE_TOKENS = 256;
  * sampling noise and is NOT evidence of an instrument effect. It is recorded so
  * the question is visibly open rather than silently settled.
  *
+ * SUPPORTED ON THE WHOLE REGISTERED ROSTER. `thinking: {type:"disabled"}` is
+ * applied unconditionally, so it must be accepted by every model in
+ * JUDGE_MODELS.anthropic, not just the one the §5.1 validation happened to run.
+ * Verified live against all four on 2026-09-09 -- claude-sonnet-5,
+ * claude-haiku-4-5, claude-opus-5 and claude-sonnet-4-6 each returned
+ * stop_reason "end_turn" with no error. Re-check this if the roster gains a
+ * model: an unsupported value here would 400 every judge call for that model,
+ * and the §5.1 run alone would not catch it.
+ *
  * NOT IN `judgeHash` -- see the warning on computeJudgeHash below.
  */
 export const JUDGE_REQUEST_SHAPE = Object.freeze({ thinking: Object.freeze({ type: "disabled" }) });
