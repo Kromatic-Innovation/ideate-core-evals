@@ -2516,3 +2516,122 @@ The two hashes together are the full instrument identity of the passing 0.5833 v
 **One precondition, registered because it is a real obligation on the analysis:** the reconciliation happens only when the caller passes **`requestShape` alongside `judgeRequestHash`**. A caller supplying the hash alone gets a **named refusal** — *"no current requestShape was supplied … Nothing has necessarily changed"* — distinct from the genuine changed-instrument diagnosis. That is a missing argument at a call site, **not** a stale verdict, and it must not be read as one.
 
 **And the forward-looking consequence:** a future re-run under the current instrument writes under the **`req=`** key, which is a *different* key from the stored record's. It therefore **adds a second record rather than colliding** with the first. That is the concrete sense in which the key now separates instruments in addition to the append-only guard — the failure mode Appendix N item 8 feared (a `drop` and a `pass` sharing one key) can no longer arise, and a re-run no longer fails with a collision instead of a diagnosis.
+
+---
+
+## Appendix P — Amendments (dated 2026-09-10)
+
+**`--max-spend` is now a limit rather than an estimate (#169, merged as `0c8b52f`, PR #174).** This appendix supersedes, by dated cross-reference, three registration statements the merge made false, and registers one thing that was never registered at all and matters more than the other three: **the ceiling is not exact, and its bound is now stated.**
+
+**Nothing here is edited in place.** [Appendix L](#appendix-l--amendments-dated-2026-09-09), [Appendix M](#appendix-m--amendments-dated-2026-09-09) and [Appendix N](#appendix-n--amendments-dated-2026-09-09) are left exactly as written, including one mis-citation and one misfiled heading, both disclosed below rather than corrected in the text they occur in.
+
+**No Stage 1a, Stage 1b or Stage 1c result depends on any of this**, and item 9 substantiates that against the merge diff rather than against the PR's description of itself.
+
+### Item 1 — §8: Appendix L item 7's "no model of `effort`" is SUPERSEDED
+
+[Appendix L](#appendix-l--amendments-dated-2026-09-09) **item 7** records that the projection `interimPriceGrid` "prices a plan from a flat assumed token shape and **has no model of `effort`**." That was true when written and is no longer true of the pricer a run actually uses. **Item 7 is not edited**; the statement is superseded here.
+
+**The live path is `runnerPriceGrid`, not `interimPriceGrid`.** `runnerPriceGrid` is imported in `evals/run.mjs` and injected into `runSpec` as `priceGrid`. `interimPriceGrid` — which still lives in `evals/harness/runner.mjs` and whose own header calls it the "INTERIM default pricer" awaiting the real one — is `runSpec`'s default only when nothing is injected, and nothing in production reaches it. It is genuinely unchanged by the merge. **Registered explicitly because #169 names `interimPriceGrid` by name**, and a reader who greps the function the issue names will find it untouched and conclude, wrongly, that nothing shipped.
+
+**The model is two-tier** (`lib/calibration.mjs`):
+
+- **Tier 1 — per-arm empirical tokens.** For any arm with at least three completed cells anywhere in the store, the mean measured input/output tokens per cell. **Deliberately across any `configHash`**: a hash gates whether two cells may be *pooled as data*, not what a cell *cost*, and the re-collect that caused this defect was a re-collect of arms the store had already priced exactly. Restricting the fit to the current hash would have blinded the module in precisely the case it exists for. This is exact for a re-collect.
+- **Tier 2 — per-slot `effort` output multipliers**, for arms the store has never run. Fitted from the store's **effort-homogeneous** arms where the store can support a fit, and otherwise from a static table derived from this study's own one-factor screening arms — same model, same N, 24 cells each:
+
+| arm | `effort` | mean output tokens/cell | multiplier |
+| --- | --- | --- | --- |
+| `S1-ELOW` | low | 1,307 | 0.55× |
+| `S1-C0` | high | 2,392 | 1.00× (baseline) |
+| `S1-EMAX` | max | 14,745 | **6.16×** |
+
+Only the **output** half scales; input held flat at ~362 tokens across all three levels, so a whole cell's ratio is below the multiplier (a solo cell prices `max` at roughly 4.9× `high`, not 6.16×). `S1C-RICH` is excluded from the effort *fit* because its slots are mixed (`max`/`max`/`high`/`high`/`low`) and stored cost rows are per **model**, not per slot — there is no honest attribution — while remaining eligible for a tier-1 fit, which needs none. A level the store cannot support keeps its **static** multiplier and says so, rather than falling through to 1.0, which is the original defect's exact shape.
+
+### Item 2 — What remains UNMODELED: N — disclosed, not fixed
+
+Registered because the honest treatment of an unmodeled term is disclosure, and because a silent fallback is what produced #169 in the first place.
+
+**N — an arm's requested idea count — is unmodeled at tier 2.** The store shows it matters at the same model and effort: `S1-N10` 979, `S1-C0` (N=30) 2,392, `S1-N60` 4,177 mean output tokens. **Three points from one arm family is a curve drawn through the only data there is, not a model**, and it is not fitted.
+
+The registered consequence: **a projection containing any tier-2 cell reports `usdHigh` and labels itself a FLOOR, not an estimate**, naming the arms it could not calibrate. `usdHigh` is the point estimate times `UNCALIBRATED_HIGH_FACTOR` = 2.5, the observed miss on the Stage 1c re-collect ($41.59 projected against $105.22 actual). Tier 1 subsumes N for any arm the store has seen. **Mid-flight admission compares against `usdHigh`, never the point estimate** — over-projection stops a run early and a `budget_exceeded` skip is store-absent and re-plans, whereas under-projection spends money that does not come back.
+
+### Item 3 — §8: Appendix L item 7's cumulative gap was DOCUMENTATION, not behaviour
+
+The second stale statement in [Appendix L](#appendix-l--amendments-dated-2026-09-09) **item 7** is what it does *not* say. Item 7 registers `--max-spend 180` (amended to 220 by [Appendix M](#appendix-m--amendments-dated-2026-09-09) item 5) without recording that the ceiling is **cumulative**: it counts every prior invocation and every `configHash` in the store, not just the current invocation.
+
+**That behaviour is correct, was correct then, and is unchanged.** The operator who filed #169 read it as per-invocation on the first Stage 1c run. What shipped is documentation of what already happened — a `--help` section headed `THE CEILING IS CUMULATIVE, NOT PER-INVOCATION` (there was no `--help` at all before; usage lived in a header comment no operator sees), a new `docs/spend-ceilings.md`, and a run-time log line naming `spent-to-date` as that history and printing the remaining headroom.
+
+**Registered plainly: the gap was in the documentation, not in the instrument.** No cell was priced differently before and after, and the escape hatch was always `--results-dir`.
+
+### Item 4 — **The ceiling is NOT exact.** The overshoot bound, registered
+
+**This is the most consequential item in this appendix, and it registers something no prior appendix stated.** [Appendix L](#appendix-l--amendments-dated-2026-09-09) item 7's language — "`--max-spend` refuses earlier than it needs to, never later" — implies an exact ceiling. **It is not one, and this is the bound.**
+
+**A cell already dispatched when the ceiling trips is allowed to COMPLETE. It is not aborted.** The money is spent the moment the provider accepts the request, so aborting discards work already paid for and buys nothing back; and a partial write into an append-only store whose `put()` contract is byte-identical-or-throw is a durable hazard, not a saving. The harness answers this the same way everywhere else it arises.
+
+**The guarantee `--max-spend` therefore makes:**
+
+> **ceiling + the actual cost of everything that was in flight when it tripped**, bounded by `--cell-concurrency` cells.
+
+At the default `--cell-concurrency 1` that is at most one cell. **`scripts/run-study1c.sh` runs at `CONCURRENCY=8`** ([Appendix I](#appendix-i--amendments-dated-2026-09-08) item 7's registered 4–8 band, at its top), **so for the registered Stage 1c run the bound is the ceiling plus up to eight cells' actual cost.** A reader who takes away "at most one cell" will size a ceiling wrong.
+
+**Every ceiling-gated run now prints that worst-case bound before it dispatches anything**, computed from the concurrency actually in force and the `cellConcurrency` **most expensive** planned cells — any subset of that size can be the one in flight — and priced at `usdHigh` wherever the projection is tier-2, because a bound built on a floor is not a bound:
+
+```
+[max-spend] worst-case stop=$224.9400 (ceiling $220.0000 + up to 8 in-flight
+            cell(s) at --cell-concurrency 8, worth $4.9400). A cell already
+            dispatched when the ceiling trips is allowed to COMPLETE rather
+            than be discarded, so this -- not the ceiling -- is the number to
+            size against.
+```
+
+**Registered as a design decision, not an implementation detail.** The alternative — strict abort — buys a hard ceiling at the price of discarded paid-for work and possibly half-written records. Complete-the-cell buys a deterministic, bounded, concurrency-proportional overshoot with a consistent store. That trade is made deliberately, and the reason it is *printed at plan time* rather than only documented is that #169's complaint is that `--max-spend` reads as absolute and is not: an overshoot discovered only afterwards reproduces the same complaint in a smaller form.
+
+### Item 5 — Two review findings fixed before merge, because both bear on how the number is read
+
+Registered rather than left in a merged PR's review thread, because each one changes what a printed figure means.
+
+**(a) The judge-leg check double-counted a settled cell against itself.** The mid-flight gate compares `spent-to-date + runningTotal + inFlightTotal + this leg`. A cell that had settled sat in `runningTotal` **and** still held its `inFlightTotal` reservation, so its cost was counted twice and the effective ceiling ratcheted downward for every remaining cell of the run. Fixed by releasing the reservation on settlement — after the actual cost is posted, so there is no window in which a cell's money is counted by neither term, and idempotently, so a cell that returned before ever being admitted (a payment abort, a budget skip) can be released unconditionally.
+
+**(b) The pre-flight verdict word disagreed with the gate.** The banner computed "within budget" / "over budget" on the **point estimate** while admission gated on **`usdHigh`**. A run could print "within budget" and then immediately start skipping cells. Fixed by computing the verdict word on the admission basis. The point estimate stays visible in the line as the honest centre of the range, with the upper bound named next to it; only the pass/fail word moved onto the binding arithmetic.
+
+**And the nuance that governs how the word should be read.** **"Over budget" means *"priced the way admission will price it, this plan crosses the ceiling."*** It is **not** a spend prediction. Where the projection is a floor, the verdict is deliberately computed on a bound that is expected to over-state, because the error direction is asymmetric: refusing early is recoverable and over-spending is not.
+
+### Item 6 — Appendix M item 10's two failures are CLOSED — and where that item actually is
+
+**A locating note first, because the heading is ambiguous in the rendered document.** The item superseded here is the one titled **"The spend ceiling did not bind, again"**. It belongs to [Appendix M](#appendix-m--amendments-dated-2026-09-09), and it is the item this document has cited as **Appendix M item 10**. It was appended at the **file tail** rather than into Appendix M's section, so it sits after [Appendix N](#appendix-n--amendments-dated-2026-09-09) item 12 and immediately before [Appendix O](#appendix-o--amendments-dated-2026-09-10), and therefore **renders under Appendix N's heading**. Appendix N has its own `### Item 10`, titled **"Judge refusals are MISSING scores, not low ones"**, which is a **different item and is not touched by this appendix.**
+
+**It is deliberately NOT moved.** Append-only discipline is the whole point of this document, and a reader diffing the file must never find historical registration text relocated — that is indistinguishable from tampering. Cite the two by title, never by "item 10" alone.
+
+**Both failures that item records as open are now addressed:**
+
+1. **Mid-flight enforcement, extended to judge legs.** Stated precisely so it is not read as more than it is: **mid-flight enforcement for generation cells already existed** — per-cell gating since #51/#62, against *actual* accumulated spend since PR #76. **Judge legs were entirely unguarded.** A leg was dispatched unconditionally and its cost recorded only afterwards, so a run could stop admitting generation cells at the ceiling and keep spending on judging indefinitely. That was the real gap, and judge spend is the dominant OpenAI cost driver. Legs are now gated in the same shape a generation cell is — actual-so-far + in-flight + this leg's projection — priced with the **real** candidate count rather than a plan-time estimate, and skipped as a classified `budget_exceeded`, store-absent so the leg re-plans.
+2. **The ceiling checked against funding.** [Appendix K](#appendix-k--amendments-dated-2026-09-09)'s finding was that the ceiling sat above the account balance. **No readable balance endpoint exists on either provider, and the absence is itself the registered finding.** Anthropic's public API exposes no remaining-balance or credit endpoint an API key can read — its Admin API covers members, workspaces, keys and *historical* cost reports, and requires an admin key the harness does not hold; OpenAI's dashboard billing figures come from session-authenticated endpoints, not API keys. So no balance is queried and none is faked. The nearest honest instrument is an **operator-asserted** `--account-balance USD` (or `IDEATE_ACCOUNT_BALANCE_USD`), compared at plan time against **headroom** (`ceiling − spent-to-date`), not against the raw ceiling — most of a cumulative ceiling may already be paid for, and comparing the ceiling itself would cry wolf on every resumed run. **Omitting it is announced out loud** rather than passing silently.
+
+### Item 7 — A citation correction, recorded and NOT applied in place
+
+**Every statement superseded by items 1 and 3 of this appendix lives in [Appendix L](#appendix-l--amendments-dated-2026-09-09) item 7, "§8: cost, and why the projection under-states it."** Appendix L **item 5** is "the prediction, registered in advance" — the arithmetic predicting `S1C-RICH` should clear `S1C-SOLO60`. It contains no pricing statement, **it is untouched by this appendix, and it stands.**
+
+This matters because the wrong citation propagated. The item titled "The spend ceiling did not bind, again" cites "(Appendix L item 5)" for the `effort` statement; so does #169, so does PR #174's own amendment note, and so does `lib/calibration.mjs`'s header comment. **None of those are edited** — the appendix text because this document is append-only, the code comment because this amendment touches `docs/PREREGISTRATION.md` and nothing else.
+
+**The hazard being closed is concrete:** a reader following that citation lands on a live, unsuperseded *prediction* and may read it as retracted. It is not. **Where any of those four places says "Appendix L item 5" in connection with pricing or `effort`, read "Appendix L item 7."**
+
+### Item 8 — [Appendix L](#appendix-l--amendments-dated-2026-09-09) item 9's reproduction command stands; its projected figure does not
+
+Registered because it is the one place a reader is most likely to try to reproduce a number and quietly fail to.
+
+The command is unchanged and still correct: `./scripts/run-study1c.sh --dry-run`. **What it prints has changed, for two independent reasons**, and neither is a regression:
+
+1. The `--dry-run` branch passed **neither `--results-dir` nor `--max-spend`**, so it priced against the **default** store — a different, near-empty ledger — reporting neither this study's spent-to-date nor the projection the real invocation is admission-controlled against. A dry run that prices the wrong store reads as a rehearsal and is not one. Fixed in the same merge; the script's real invocation was never affected.
+2. The pricer itself now carries item 1's calibration, and the dry run additionally prints a `[max-spend]` banner, a `[calibration]` basis, a `[balance]` line and item 4's worst-case bound.
+
+**Consequence, stated so it is not mistaken for a result changing:** Appendix L item 7's **$55.04 batched / $110.07 un-batched** projection for 432 cells is a **historical record of what the instrument said on 2026-09-09**, not a figure the current tree reproduces. Item 7's own reasoning about why that projection was too low is exactly what item 1 fixes. **No collected cell, no arm and no reported contrast is affected** — only the plan-time readout.
+
+### Item 9 — This retracts NO result, and no cell is re-keyed
+
+Stated last and explicitly, as [Appendix O](#appendix-o--amendments-dated-2026-09-10) item 5 does, so nothing above is read as a withdrawal.
+
+**Verified against the merge diff at `0c8b52f`, not against the PR's description of itself.** The commit touches thirteen files: `.gitignore`, `README.md`, `docs/spend-ceilings.md`, `evals/run.mjs`, `evals/harness/runner.mjs`, `lib/price.mjs`, `lib/calibration.mjs`, `scripts/run-study1c.sh` and five test files. **`arms.config.json`, `prompts.mjs`, the judge prompt and the corpus are absent from the diff**, and `harnessVersion` is unchanged.
+
+`configHash` covers `harnessVersion` / `engineSha` / `promptHash` / `judgeHash` / `embedderId` / `armsConfigHash` / `corpusHash` / `clusterDistanceThreshold`. **No hashed input moved. No stored cell is re-keyed. No Stage 1a, Stage 1b or Stage 1c result depends on anything in this appendix**, including the registered contrasts `S1b-1`, `S1c-1` and `S1c-2`, [Appendix M](#appendix-m--amendments-dated-2026-09-09) item 9's **+1.6728**, and [Appendix N](#appendix-n--amendments-dated-2026-09-09) item 9's passing §5.1 verdict.
+
+What changed is **how much a future run is permitted to spend and how honestly it says so beforehand** — an instrument-safety property, not a measurement.
