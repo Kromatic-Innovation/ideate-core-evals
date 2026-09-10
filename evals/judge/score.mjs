@@ -123,7 +123,8 @@ export const MAX_JUDGE_TOKENS = 256;
  * model: an unsupported value here would 400 every judge call for that model,
  * and the §5.1 run alone would not catch it.
  *
- * NOT IN `judgeHash` -- see the warning on computeJudgeHash below.
+ * NOT IN `judgeHash` -- it is covered by `computeJudgeRequestHash` instead.
+ * See the note above computeJudgeHash below for why the two are separate.
  */
 export const JUDGE_REQUEST_SHAPE = Object.freeze({ thinking: Object.freeze({ type: "disabled" }) });
 
@@ -874,29 +875,30 @@ export function judgeScoresForAxis(scores, axis) {
  * @returns {string} 12 hex chars
  */
 /*
- * KNOWN GAP -- judgeHash does NOT cover the judge's REQUEST SHAPE (#16, #170).
+ * TWO HASHES, TWO KEYS (#170, closed).
  *
- * The payload below is the prompt object's hash plus the model roster. It does
- * not include `MAX_JUDGE_TOKENS` or `JUDGE_REQUEST_SHAPE`, so two runs using
- * materially different instruments -- one with adaptive thinking eating the
- * whole 256-token budget, one with thinking disabled -- produce the SAME
- * judgeHash and are indistinguishable in the store.
+ * The judge is described by two independent hashes, deliberately kept apart:
  *
- * That is not cosmetic. `validationKey` is `{judgeHash, sliceId}`, and
- * `attachIdeaLevelScores` licenses idea-level metrics on `records.find(r =>
- * r.result.verdict === "pass")`. So a `drop` under one request shape followed by
- * a `pass` under another, at the same judgeHash and sliceId, silently unlocks
- * the study's confirmatory idea-level metrics with nothing in the store marking
- * that the instrument changed. This is exactly the tampering surface the hash
- * discipline exists to close.
+ *   computeJudgeHash        -> { prompt hash, judge model roster }
+ *     A CONFIG_FIELDS entry. Feeds `config.judgeHash` -> `configHash` ->
+ *     every cell's `cellKey`. It answers "could this judge have scored that
+ *     cell", which is a property of the GENERATION grid.
  *
- * WHY IT IS NOT SIMPLY FIXED HERE. Folding either constant into this payload
- * changes judgeHash -> configHash (judgeHash is a CONFIG_FIELDS entry) -> the
- * cellKey of every stored cell, re-keying all 431 collected Stage 1c cells over
- * a judge constant that did not exist when they were collected. That trade is
- * worse than the gap. The interim mitigation is `recordValidation` stamping the
- * request shape onto the validation record itself (see gate.mjs), so a reader
- * can at least tell which instrument produced a verdict. Filed as #170.
+ *   computeJudgeRequestHash -> { maxTokens, thinking mode }
+ *     NOT a CONFIG_FIELDS entry, and never folded into configHash. It feeds
+ *     `validationKey` and is stamped on the validation record. It answers
+ *     "which instrument produced this verdict", which is a property of the
+ *     JUDGE-VALIDATION record and of nothing else.
+ *
+ * WHY SEPARATE, AND NOT ONE HASH. `MAX_JUDGE_TOKENS` and `JUDGE_REQUEST_SHAPE`
+ * materially change what the instrument is -- 256 tokens with adaptive thinking
+ * enabled is a different judge from 256 tokens with thinking disabled (#16).
+ * But folding them into the payload below would change judgeHash -> configHash
+ * -> the cellKey of every stored cell, re-keying all 431 collected Stage 1c
+ * cells over a judge constant that did not exist when they were collected and
+ * that affects zero GENERATION calls. Two instruments therefore occupy two
+ * keys rather than one hash covering both. The request shape lives where it
+ * has teeth -- the validation key -- and configHash does not move.
  */
 export function computeJudgeHash({ judgeModels, promptObject } = {}) {
   if (!judgeModels || typeof judgeModels !== "object") {
@@ -908,6 +910,66 @@ export function computeJudgeHash({ judgeModels, promptObject } = {}) {
   }
   const canonical = JSON.stringify({ prompt: judgePromptHash(promptObject), models: [...new Set(models)].sort() });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
+}
+
+/**
+ * Stable JSON for hashing: object keys sorted at every depth, so a payload's
+ * hash cannot depend on the insertion order of a caller-supplied object.
+ * `JSON.stringify` alone preserves insertion order, which would make
+ * `{maxTokens, thinking}` and `{thinking, maxTokens}` two different hashes for
+ * one instrument. Arrays keep their order (order is meaningful in an array).
+ */
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+/**
+ * The judge's REQUEST SHAPE as a 12-hex hash (#170) — the second of the two
+ * judge hashes described above. Covers `MAX_JUDGE_TOKENS` and the thinking
+ * mode; covers NOTHING that `computeJudgeHash` covers, and is never folded
+ * into `configHash`.
+ *
+ * Both halves are here on purpose, because it was their INTERACTION that broke
+ * the first real §5.1 run: 256 tokens is a fine ceiling for a direct scorer and
+ * a fatal one for a thinking scorer, so a ceiling alone and a mode alone each
+ * name only half the instrument.
+ *
+ * Defaults to the CURRENT instrument, so `computeJudgeRequestHash()` is the
+ * hash a run happening now would write. Pass a stored record's `requestShape`
+ * to recover the hash of the instrument that produced an OLD verdict — that is
+ * exactly how a pre-#170 record (which carries `requestShape` but no
+ * `judgeRequestHash`) is reconciled against the current instrument.
+ *
+ * @param {object} [o]
+ *   @param {number} [o.maxTokens]  defaults to the shape's own `maxTokens`, else
+ *     MAX_JUDGE_TOKENS. Supplying a value that CONTRADICTS `requestShape.maxTokens`
+ *     throws rather than silently picking one.
+ *   @param {object} [o.requestShape]  defaults to the frozen JUDGE_REQUEST_SHAPE.
+ *     May itself carry `maxTokens` (the shape `recordValidation` stores).
+ * @returns {string} 12 hex chars
+ */
+export function computeJudgeRequestHash({ maxTokens, requestShape } = {}) {
+  const shape = requestShape === undefined ? JUDGE_REQUEST_SHAPE : requestShape;
+  if (shape === null || typeof shape !== "object" || Array.isArray(shape)) {
+    throw new Error(`computeJudgeRequestHash: requestShape must be an object, got ${JSON.stringify(requestShape)}`);
+  }
+  const { maxTokens: shapeMaxTokens, ...rest } = shape;
+  if (maxTokens !== undefined && shapeMaxTokens !== undefined && maxTokens !== shapeMaxTokens) {
+    throw new Error(
+      `computeJudgeRequestHash: maxTokens ${maxTokens} contradicts requestShape.maxTokens ${shapeMaxTokens} — ` +
+        "pass one or the other, never two different ceilings for one instrument",
+    );
+  }
+  const resolved = maxTokens !== undefined ? maxTokens : shapeMaxTokens !== undefined ? shapeMaxTokens : MAX_JUDGE_TOKENS;
+  if (typeof resolved !== "number" || !Number.isInteger(resolved) || resolved <= 0) {
+    throw new Error(`computeJudgeRequestHash: maxTokens must be a positive integer, got ${JSON.stringify(resolved)}`);
+  }
+  return createHash("sha256").update(stableStringify({ maxTokens: resolved, ...rest })).digest("hex").slice(0, 12);
 }
 
 // ── Judge-side payment abort (issue #106) ──────────────────────────────────

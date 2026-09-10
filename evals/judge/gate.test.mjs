@@ -19,6 +19,13 @@ import {
   MIN_IDEAS_N,
   CONSTRUCTION_ID,
 } from "./gate.mjs";
+import { computeJudgeHash, computeJudgeRequestHash, MAX_JUDGE_TOKENS, JUDGE_REQUEST_SHAPE } from "./score.mjs";
+
+// #170: the CURRENT instrument — the shape a run happening now writes, and the
+// hash of it. Derived from the constants rather than restated as literals, so
+// this file cannot drift from what score.mjs actually sends.
+const CURRENT_SHAPE = { maxTokens: MAX_JUDGE_TOKENS, ...JUDGE_REQUEST_SHAPE };
+const CURRENT_REQ_HASH = computeJudgeRequestHash({ requestShape: CURRENT_SHAPE });
 
 // ── spearmanRho (retained, descriptive) ──────────────────────────────────────
 
@@ -190,11 +197,11 @@ test("#24 — recordValidation stores the widened { metric, construction, n, acc
   const store = makeTempStore("judge-gate-test-");
   const judgeHash = "judgehashwide";
   recordValidation(store, {
-    judgeHash, sliceId: "sliceW",
+    judgeHash, judgeRequestHash: CURRENT_REQ_HASH, sliceId: "sliceW",
     metric: "balanced-accuracy", construction: CONSTRUCTION_ID,
     n: 147, accuracy: 0.62, floor: SI_ET_AL_BALANCED_ACCURACY_FLOOR, verdict: "pass", rho: 0.41,
   });
-  const stored = store.get(validationKey({ judgeHash, sliceId: "sliceW" }));
+  const stored = store.get(validationKey({ judgeHash, judgeRequestHash: CURRENT_REQ_HASH, sliceId: "sliceW" }));
   assert.deepEqual(stored.result, {
     kind: "judge-validation",
     metric: "balanced-accuracy",
@@ -204,13 +211,15 @@ test("#24 — recordValidation stores the widened { metric, construction, n, acc
     floor: 0.561,
     verdict: "pass",
     rho: 0.41,
+    judgeRequestHash: CURRENT_REQ_HASH,
   });
 });
 
 test("recordValidation requires a store, a valid verdict, a finite accuracy, and a positive-integer n", () => {
   const store = makeTempStore("judge-gate-test-");
-  const base = { judgeHash: "x", sliceId: "y", accuracy: 0.6, floor: 0.561, verdict: "pass", n: 30, rho: 0.3 };
+  const base = { judgeHash: "x", judgeRequestHash: CURRENT_REQ_HASH, sliceId: "y", accuracy: 0.6, floor: 0.561, verdict: "pass", n: 30, rho: 0.3 };
   assert.throws(() => recordValidation(undefined, base), /store is required/);
+  assert.throws(() => recordValidation(store, { ...base, judgeRequestHash: undefined }), /judgeRequestHash is required/);
   assert.throws(() => recordValidation(store, { ...base, verdict: "maybe" }), /verdict must be/);
   assert.throws(() => recordValidation(store, { ...base, accuracy: "high" }), /accuracy must be a finite number/);
   assert.throws(() => recordValidation(store, { ...base, n: 0 }), /n must be a positive integer/);
@@ -221,19 +230,33 @@ test("recordValidation requires a store, a valid verdict, a finite accuracy, and
 test("AC8 — attachIdeaLevelScores THROWS with no validation record at all", () => {
   const store = makeTempStore("judge-gate-test-");
   assert.throws(
-    () => attachIdeaLevelScores({ store, judgeHash: "nonexistent-hash", pools: [{ poolKey: "p1" }], ideaLevelScores: [{ idea: "x" }] }),
+    () => attachIdeaLevelScores({ store, judgeHash: "nonexistent-hash", judgeRequestHash: CURRENT_REQ_HASH, pools: [{ poolKey: "p1" }], ideaLevelScores: [{ idea: "x" }] }),
     /no validation record found/,
+  );
+});
+
+test("#170 — attachIdeaLevelScores REFUSES without a current judgeRequestHash", () => {
+  // The instrument's identity is required on the licensing path for the same
+  // reason judgeHash is: an optional gate on a function with no production
+  // caller is a gate nobody turns on. This repo already shipped `requestShape:
+  // null` under a green suite once.
+  const store = makeTempStore("judge-gate-test-");
+  recordValidation(store, { judgeHash: "jh-req", judgeRequestHash: CURRENT_REQ_HASH, sliceId: "s1", accuracy: 0.7, floor: 0.561, verdict: "pass", n: 98, rho: 0.4 });
+  assert.throws(
+    () => attachIdeaLevelScores({ store, judgeHash: "jh-req", pools: [], ideaLevelScores: [] }),
+    /judgeRequestHash is required/,
   );
 });
 
 test("AC8 — a recorded FAILING validation forces pool-level-only output", () => {
   const store = makeTempStore("judge-gate-test-");
   const judgeHash = "judgehashdrop";
-  recordValidation(store, { judgeHash, sliceId: "sliceB", accuracy: 0.5, floor: 0.561, verdict: "drop", n: 147, rho: -0.2 });
+  recordValidation(store, { judgeHash, judgeRequestHash: CURRENT_REQ_HASH, sliceId: "sliceB", accuracy: 0.5, floor: 0.561, verdict: "drop", n: 147, rho: -0.2 });
 
   const result = attachIdeaLevelScores({
     store,
     judgeHash,
+    judgeRequestHash: CURRENT_REQ_HASH,
     pools: [{ poolKey: "p1", diversity: 0.7 }],
     ideaLevelScores: [{ idea: "y", originality: 8 }],
   });
@@ -245,18 +268,18 @@ test("AC8 — a recorded FAILING validation forces pool-level-only output", () =
 test("AC8 — a recorded PASSING validation attaches idea-level scores", () => {
   const store = makeTempStore("judge-gate-test-");
   const judgeHash = "judgehashpass";
-  recordValidation(store, { judgeHash, sliceId: "sliceC", accuracy: 0.7, floor: 0.561, verdict: "pass", n: 147, rho: 0.5 });
+  recordValidation(store, { judgeHash, judgeRequestHash: CURRENT_REQ_HASH, sliceId: "sliceC", accuracy: 0.7, floor: 0.561, verdict: "pass", n: 147, rho: 0.5 });
 
   const ideaLevelScores = [{ idea: "z", originality: 9, feasibility: 3 }];
-  const result = attachIdeaLevelScores({ store, judgeHash, pools: [{ poolKey: "p1" }], ideaLevelScores });
+  const result = attachIdeaLevelScores({ store, judgeHash, judgeRequestHash: CURRENT_REQ_HASH, pools: [{ poolKey: "p1" }], ideaLevelScores });
   assert.deepEqual(result.pools, [{ poolKey: "p1" }]);
   assert.deepEqual(result.ideas, ideaLevelScores);
   assert.ok(!("idea_level_metrics" in result), "a passing judge must not carry a 'dropped' marker");
 });
 
 test("validationKey is reserved and cannot collide with a real cellKey shape", () => {
-  const key = validationKey({ judgeHash: "abc123", sliceId: "sliceA" });
-  assert.equal(key, "judge-validation|judge=abc123|slice=sliceA");
+  const key = validationKey({ judgeHash: "abc123", judgeRequestHash: "req456", sliceId: "sliceA" });
+  assert.equal(key, "judge-validation|judge=abc123|req=req456|slice=sliceA");
   assert.ok(!key.startsWith("arm="), "validation keys must never look like a real cell key");
 });
 
@@ -412,50 +435,261 @@ test("meterJudgeCall requires store, cellKey, and judgeModel", () => {
 });
 
 // ── #16/#170: the record must say WHICH instrument produced the verdict ──────
-// validationKey is {judgeHash, sliceId}, and judgeHash covers neither
-// max_tokens nor the thinking mode. attachIdeaLevelScores licenses idea-level
-// metrics off ANY record whose verdict is "pass", so without a stamp a "drop"
-// under one instrument followed by a "pass" under another silently unlocks the
-// study's confirmatory metrics. The stamp cannot close the hash gap; it makes it
-// auditable.
+// judgeHash covers the judge prompt and the model roster, and nothing else —
+// not max_tokens, not the thinking mode. #170 closes that with a SECOND hash,
+// computeJudgeRequestHash, carried in the record and in validationKey. The
+// tests below pin the three properties the fix rests on: two shapes give two
+// hashes and therefore two keys; a mismatched instrument is a NAMED diagnosis
+// rather than a collision; and the one pre-#170 record is still reachable and
+// still licenses idea-level metrics.
 
-test("#170: recordValidation stamps requestShape onto the record", () => {
+test("#170: recordValidation stamps BOTH judgeRequestHash and requestShape onto the record", () => {
   const store = makeTempStore("judge-gate-test-");
   const shape = { maxTokens: 256, thinking: { type: "disabled" } };
+  const reqHash = computeJudgeRequestHash({ requestShape: shape });
   recordValidation(store, {
-    judgeHash: "jh1", sliceId: "s1", accuracy: 0.6, floor: 0.561, verdict: "pass", n: 98, rho: 0.3,
+    judgeHash: "jh1", judgeRequestHash: reqHash, sliceId: "s1", accuracy: 0.6, floor: 0.561, verdict: "pass", n: 98, rho: 0.3,
     axis: "originality", expertColumn: "overall_score", requestShape: shape,
   });
   const entry = store.list().find((r) => r.armId === "__judge-validation__");
   assert.ok(entry, "a validation record was written");
+  assert.equal(entry.key, `judge-validation|judge=jh1|req=${reqHash}|slice=s1`);
   assert.deepEqual(store.get(entry.key).result.requestShape, shape);
+  assert.equal(store.get(entry.key).result.judgeRequestHash, reqHash);
+  // `cfg` stays judgeHash ALONE — it is read by the configHash tally paths, and
+  // widening it is exactly the re-key #170 chose not to do.
+  assert.equal(entry.cfg, "jh1");
 });
 
-test("#170: a re-run under a different instrument CANNOT overwrite a verdict -- the store's append-only guard is what closes the hash gap", () => {
-  // The hazard: judgeHash covers neither max_tokens nor the thinking mode, and
-  // validationKey is exactly {judgeHash, sliceId} -- so a thinking judge's
-  // "drop" and a direct judge's "pass" collide on ONE key. Since
-  // attachIdeaLevelScores licenses idea-level metrics off ANY record whose
-  // verdict is "pass", a silent overwrite would let a second, differently-shaped
-  // run unlock the study's confirmatory metrics with nothing marking the change.
-  //
-  // It does not, and this test records WHY: ResultsStore.put is append-only and
-  // REFUSES a second write under an existing key with different content. The
-  // backstop is the store's invariant, not the hash. That is worth pinning
-  // precisely because the protection lives somewhere other than where a reader
-  // would look for it.
+test("#170: two request shapes give two judgeRequestHashes and therefore two validation keys", () => {
+  const thinking = { maxTokens: 256, thinking: { type: "adaptive" } };
+  const direct = { maxTokens: 256, thinking: { type: "disabled" } };
+  const ceiling = { maxTokens: 2048, thinking: { type: "disabled" } };
+  const hThinking = computeJudgeRequestHash({ requestShape: thinking });
+  const hDirect = computeJudgeRequestHash({ requestShape: direct });
+  const hCeiling = computeJudgeRequestHash({ requestShape: ceiling });
+  assert.notEqual(hThinking, hDirect, "the thinking mode must move the hash");
+  assert.notEqual(hDirect, hCeiling, "max_tokens must move the hash");
+  assert.notEqual(
+    validationKey({ judgeHash: "jh", judgeRequestHash: hThinking, sliceId: "s" }),
+    validationKey({ judgeHash: "jh", judgeRequestHash: hDirect, sliceId: "s" }),
+    "two instruments must occupy two keys — that IS the fix",
+  );
+});
+
+test("#170: the hash does not depend on key insertion order", () => {
+  const a = computeJudgeRequestHash({ requestShape: { maxTokens: 256, thinking: { type: "disabled" } } });
+  const b = computeJudgeRequestHash({ requestShape: { thinking: { type: "disabled" }, maxTokens: 256 } });
+  assert.equal(a, b);
+  // ...and maxTokens may arrive either as its own argument or inside the shape.
+  assert.equal(a, computeJudgeRequestHash({ maxTokens: 256, requestShape: { thinking: { type: "disabled" } } }));
+  // The pair above alone does NOT exercise the canonicalizer: rebuilding the
+  // payload as `{maxTokens, ...rest}` already normalizes maxTokens' position,
+  // and `rest` held one key. NESTED keys and top-level SIBLINGS are what the
+  // recursive key sort is actually for — a plain JSON.stringify survives the
+  // pair above and dies here. (Caught by mutation M5.)
+  assert.equal(
+    computeJudgeRequestHash({ requestShape: { maxTokens: 256, thinking: { type: "enabled", budget_tokens: 1024 }, temperature: 0 } }),
+    computeJudgeRequestHash({ requestShape: { temperature: 0, thinking: { budget_tokens: 1024, type: "enabled" }, maxTokens: 256 } }),
+  );
+  assert.throws(
+    () => computeJudgeRequestHash({ maxTokens: 512, requestShape: { maxTokens: 256, thinking: { type: "disabled" } } }),
+    /contradicts requestShape.maxTokens/,
+  );
+});
+
+test("#170: a passing verdict under a DIFFERENT request shape does not license idea-level metrics — and says so by name", () => {
   const store = makeTempStore("judge-gate-test-");
-  const common = { judgeHash: "jh1", sliceId: "s1", floor: 0.561, n: 98, rho: 0.1, axis: "originality", expertColumn: "overall_score" };
-  recordValidation(store, { ...common, accuracy: 0.5, verdict: "drop", requestShape: { maxTokens: 256, thinking: { type: "adaptive" } } });
+  const thinking = { maxTokens: 256, thinking: { type: "adaptive" } };
+  const hThinking = computeJudgeRequestHash({ requestShape: thinking });
+  recordValidation(store, {
+    judgeHash: "jh1", judgeRequestHash: hThinking, sliceId: "s1", accuracy: 0.62, floor: 0.561, verdict: "pass",
+    n: 98, rho: 0.3, requestShape: thinking,
+  });
 
   assert.throws(
-    () => recordValidation(store, { ...common, accuracy: 0.62, verdict: "pass", requestShape: { maxTokens: 256, thinking: { type: "disabled" } } }),
+    () => attachIdeaLevelScores({
+      store, judgeHash: "jh1", judgeRequestHash: CURRENT_REQ_HASH, requestShape: CURRENT_SHAPE,
+      pools: [{ poolKey: "p1" }], ideaLevelScores: [{ idea: "z" }],
+    }),
+    (err) => {
+      assert.match(err.message, /the judge's request shape changed/);
+      assert.match(err.message, new RegExp(hThinking), "names the STORED instrument");
+      assert.match(err.message, new RegExp(CURRENT_REQ_HASH), "names the CURRENT instrument");
+      assert.doesNotMatch(err.message, /already exists under this exact key/, "a named diagnosis, never a key collision");
+      return true;
+    },
+  );
+});
+
+test("#170: a record naming NO instrument at all is non-licensing (fails closed)", () => {
+  // Pre-#16 records carry neither hash nor shape. An unidentified instrument is
+  // not an implicit match, for the same reason an absent record is not an
+  // implicit pass — the header block's own doctrine.
+  const store = makeTempStore("judge-gate-test-");
+  store.put({
+    key: validationKey({ judgeHash: "jhOld", sliceId: "sOld" }),
+    armId: "__judge-validation__", briefId: "sOld", replicate: 0, cfg: "jhOld",
+    result: { kind: "judge-validation", metric: "balanced-accuracy", n: 98, accuracy: 0.62, floor: 0.561, verdict: "pass", rho: 0.2 },
+    resolvedModels: { judge: "mixed" }, accounting: { state: "completed" }, costRows: [],
+  });
+  assert.throws(
+    () => attachIdeaLevelScores({
+      store, judgeHash: "jhOld", judgeRequestHash: CURRENT_REQ_HASH, requestShape: CURRENT_SHAPE,
+      pools: [], ideaLevelScores: [],
+    }),
+    /UNRECORDED \(the record names no request shape at all\)/,
+  );
+});
+
+test("#170: the ONE pre-#170 record is still reachable and still licenses idea-level metrics", () => {
+  // The real §5.1 gate result: judgeHash 16812833fcd2, accuracy 0.5833, keyed
+  // WITHOUT a `req=` segment because it predates this change, carrying only the
+  // `requestShape` #16 stamped on it. It must still be found by the prefix scan
+  // AND still reconcile against the current instrument — that verdict is what
+  // licenses the study's confirmatory idea-level metrics, and the append-only
+  // store makes migrating it impossible without breaking its own invariant.
+  const store = makeTempStore("judge-gate-test-");
+  const judgeHash = "16812833fcd2";
+  const sliceId = "si-et-al|axis=originality|expert=overall_score";
+  const legacyKey = validationKey({ judgeHash, sliceId });
+  assert.equal(legacyKey, `judge-validation|judge=${judgeHash}|slice=${sliceId}`, "omitting judgeRequestHash reproduces the OLD key exactly");
+  store.put({
+    key: legacyKey, armId: "__judge-validation__", briefId: sliceId, replicate: 0, cfg: judgeHash,
+    result: {
+      kind: "judge-validation", metric: "balanced-accuracy",
+      construction: CONSTRUCTION_ID, n: 98, accuracy: 0.5833333333333334, floor: 0.561,
+      verdict: "pass", rho: 0.2141178012495899, axis: "originality", expertColumn: "overall_score",
+      requestShape: { maxTokens: 256, thinking: { type: "disabled" } },
+    },
+    resolvedModels: { judge: "claude-sonnet-5" }, accounting: { state: "completed" }, costRows: [],
+  });
+
+  const ideaLevelScores = [{ idea: "z", originality: 9 }];
+  const out = attachIdeaLevelScores({
+    store, judgeHash, judgeRequestHash: CURRENT_REQ_HASH, requestShape: CURRENT_SHAPE,
+    pools: [{ poolKey: "p1" }], ideaLevelScores,
+  });
+  assert.deepEqual(out.ideas, ideaLevelScores, "the passing 0.5833 verdict still licenses idea-level metrics");
+  assert.ok(!("idea_level_metrics" in out));
+
+  // ...and it is reconciled by its stored shape, so a caller that supplies no
+  // current shape cannot accidentally launder it through. That refusal names
+  // the MISSING ARGUMENT, not a changed instrument — nothing changed, and
+  // saying it did would send a reader to re-run the §5.1 gate for $0.58.
+  assert.throws(
+    () => attachIdeaLevelScores({ store, judgeHash, judgeRequestHash: CURRENT_REQ_HASH, pools: [], ideaLevelScores }),
+    (err) => {
+      assert.match(err.message, /no current requestShape was supplied/);
+      assert.doesNotMatch(err.message, /the judge's request shape changed/);
+      return true;
+    },
+  );
+});
+
+test("#170: a MIXED record set diagnoses the changed shape, not the missing argument", () => {
+  // The boundary between the two refusals, and the reason the missing-argument
+  // branch is gated on `bridgeable.length === records.length` rather than
+  // `> 0`. Here one record is pre-#170 (reconcilable only via requestShape,
+  // which the caller omitted) and one is modern with a genuinely DIFFERENT
+  // judgeRequestHash. Some record really does name another instrument, so
+  // "the judge's request shape changed" is the TRUE diagnosis and "you forgot
+  // an argument" would be the false one — the exact mirror of the assertion
+  // pair in the reachability test above.
+  //
+  // Added because mutation M15 (=== records.length -> > 0) SURVIVED the suite:
+  // nothing built a mixed set, so both forms passed. The implementation was
+  // correct; the coverage was not.
+  const store = makeTempStore("judge-gate-test-");
+  const judgeHash = "jhMixed";
+  const adaptive = { maxTokens: 256, thinking: { type: "adaptive" } };
+  const otherHash = computeJudgeRequestHash({ requestShape: adaptive });
+
+  // (1) pre-#170: requestShape, no judgeRequestHash, legacy key shape.
+  store.put({
+    key: validationKey({ judgeHash, sliceId: "sliceLegacy" }),
+    armId: "__judge-validation__", briefId: "sliceLegacy", replicate: 0, cfg: judgeHash,
+    result: {
+      kind: "judge-validation", n: 98, accuracy: 0.62, floor: 0.561, verdict: "pass", rho: 0.2,
+      requestShape: CURRENT_SHAPE,
+    },
+    resolvedModels: { judge: "mixed" }, accounting: { state: "completed" }, costRows: [],
+  });
+  // (2) modern, and genuinely a different instrument.
+  recordValidation(store, {
+    judgeHash, judgeRequestHash: otherHash, sliceId: "sliceModern",
+    accuracy: 0.7, floor: 0.561, verdict: "pass", n: 98, rho: 0.4, requestShape: adaptive,
+  });
+
+  assert.throws(
+    // requestShape deliberately OMITTED.
+    () => attachIdeaLevelScores({ store, judgeHash, judgeRequestHash: CURRENT_REQ_HASH, pools: [], ideaLevelScores: [{ idea: "z" }] }),
+    (err) => {
+      assert.match(err.message, /the judge's request shape changed/);
+      assert.doesNotMatch(err.message, /no current requestShape was supplied/);
+      assert.match(err.message, new RegExp(otherHash), "names the record that really did change instrument");
+      return true;
+    },
+  );
+});
+
+test("#170: the legacy requestShape bridge compares shapes STRUCTURALLY, not by key order", () => {
+  // gate.mjs cannot import score.mjs (score.mjs -> gate.mjs already), so it
+  // reconciles a pre-#170 record by comparing shapes rather than hashing one.
+  // That comparison must be order-insensitive for the same reason the hash is.
+  //
+  // The asymmetry to test is the CALLER's side, not the store's: ResultsStore
+  // serializes bodies with sorted keys, so a stored shape always reads back
+  // canonical no matter how it was written. The in-memory shape a caller hands
+  // in is not canonicalized by anything, so that is where key order can differ.
+  const store = makeTempStore("judge-gate-test-");
+  store.put({
+    key: validationKey({ judgeHash: "jhReorder", sliceId: "s" }),
+    armId: "__judge-validation__", briefId: "s", replicate: 0, cfg: "jhReorder",
+    result: {
+      kind: "judge-validation", n: 98, accuracy: 0.62, floor: 0.561, verdict: "pass", rho: 0.2,
+      requestShape: { maxTokens: 256, thinking: { type: "enabled", budget_tokens: 1024 } },
+    },
+    resolvedModels: { judge: "mixed" }, accounting: { state: "completed" }, costRows: [],
+  });
+  const callerShape = { thinking: { budget_tokens: 1024, type: "enabled" }, maxTokens: 256 };
+  const out = attachIdeaLevelScores({
+    store, judgeHash: "jhReorder",
+    judgeRequestHash: computeJudgeRequestHash({ requestShape: callerShape }),
+    requestShape: callerShape,
+    pools: [], ideaLevelScores: [{ idea: "z" }],
+  });
+  assert.deepEqual(out.ideas, [{ idea: "z" }], "the same instrument written in a different key order is the SAME instrument");
+});
+
+test("#170: a same-key re-run still cannot overwrite a verdict — the store's append-only guard is the second backstop", () => {
+  // #170 gives two INSTRUMENTS two keys. Within one instrument the store's
+  // append-only invariant remains what stops a second run replacing a stored
+  // verdict, and that is worth pinning precisely because the protection lives
+  // somewhere other than where a reader would look for it.
+  const store = makeTempStore("judge-gate-test-");
+  const common = { judgeHash: "jh1", judgeRequestHash: CURRENT_REQ_HASH, sliceId: "s1", floor: 0.561, n: 98, rho: 0.1, axis: "originality", expertColumn: "overall_score", requestShape: CURRENT_SHAPE };
+  recordValidation(store, { ...common, accuracy: 0.5, verdict: "drop" });
+
+  assert.throws(
+    () => recordValidation(store, { ...common, accuracy: 0.62, verdict: "pass" }),
     /already exists under this exact key with DIFFERENT content/,
-    "a differently-shaped re-run must not be able to replace a stored verdict",
+    "a re-run under the SAME instrument must not be able to replace a stored verdict",
   );
 
-  const entry = store.list().find((r) => r.armId === "__judge-validation__");
-  const rec = store.get(entry.key);
+  const rec = store.get(validationKey(common));
   assert.equal(rec.result.verdict, "drop", "the ORIGINAL verdict survives");
-  assert.equal(rec.result.requestShape.thinking.type, "adaptive", "...and still names the instrument that produced it");
+});
+
+test("#170: computeJudgeHash is UNMOVED — configHash does not shift", () => {
+  // The entire point of a separate request hash: judgeHash is a CONFIG_FIELDS
+  // entry, so any change to its payload re-keys the cellKey of all 431
+  // collected Stage 1c cells. 16812833fcd2 is the value the real §5.1 record in
+  // results-judge-validation is stored under; a golden, not a re-derivation.
+  assert.equal(computeJudgeHash({ judgeModels: { anthropic: ["claude-sonnet-5"] } }), "16812833fcd2");
+  assert.notEqual(
+    computeJudgeHash({ judgeModels: { anthropic: ["claude-sonnet-5"] } }),
+    computeJudgeRequestHash(),
+    "the two hashes must be independent instruments, not one value under two names",
+  );
 });
