@@ -2302,6 +2302,58 @@ The abort was a second, distinct cause of `parse_failure: empty judge reply`, un
 
 The pilot is re-run from scratch under this rule rather than patched over the 10 stored cells, so every cell in the sidecar is produced by one instrument under one policy.
 
+### Item 11 — Result of the quality read: a sharp trade, not a free lunch
+
+**DESCRIPTIVE. No contrast, no p-value, no confirmatory claim.** 12 cells, 6 matched briefs, replicate 1, 729 candidates, **$0.98**. One refusal (0.14%), excluded and not imputed.
+
+| arm | n | scored | originality | feasibility | refused |
+|---|---|---|---|---|---|
+| `S1C-RICH` | 358 | 358 | **6.092** | 6.087 | 0 |
+| `S1C-SOLO60` | 371 | 370 | **2.803** | **8.214** | 1 |
+
+The originality gap holds in **all six briefs** with the same sign (RICH 5.63–6.48 vs SOLO60 1.89–3.57), so it is not a single-brief artefact. The distributions barely overlap: **no** `S1C-SOLO60` idea scored ≥ 8 on originality; 111 `S1C-RICH` ideas did.
+
+**The rich panel does not produce better ideas. It produces more original and less feasible ones**, and the solo call the reverse. Stage 1c's `distinct_k` finding sat on top of this trade without being able to see it.
+
+#### The `weirdo` question, answered — and the hypothesis half-corrected
+
+| persona | n | originality | feasibility |
+|---|---|---|---|
+| `weirdo` | 72 | **7.972** | **4.819** |
+| `philosopher` | 71 | 7.099 | 5.606 |
+| `poet` | 72 | 6.569 | 6.014 |
+| `product-manager` | 72 | 4.806 | 7.708 |
+| `mba` | 71 | 4.000 | 6.282 |
+
+`weirdo` is exactly what it was suspected of being on the numbers: **highest originality, lowest feasibility**, and the single largest contributor of high-originality ideas (59 of the 111 at ≥ 8). Removing it drops RICH's originality from 6.092 to 5.619 — still far above SOLO60's 2.803, so **the effect is not carried by `weirdo` alone.**
+
+**But low feasibility is not incoherence,** and the numeric judge cannot tell them apart. That is what the blind review below was for.
+
+#### The blind review — an independent reader who never saw the arms
+
+40 ideas (20 per arm, 2 briefs, deterministically shuffled, arm and persona stripped) were reviewed for substance / usefulness / **coherence** by a reader told only the brief. Joining its verdicts to the key it never saw:
+
+- **Every incoherence and vacuity flag it raised — all six — is `S1C-RICH`. Zero from `S1C-SOLO60`.**
+- **But `poet`, not `weirdo`, is the worse offender**: 4 of the 6 flags (`IDEA-14`, `-21`, `-22`, `-36`) are `poet`; 2 (`IDEA-16`, `-30`) are `weirdo`.
+- The clearest failure is `weirdo`'s: a subscription "tontine" whose stated mechanism is arithmetically self-refuting — fixed costs split among *fewer* payers were claimed to lower each share. It is wrong in a way a reader enjoying the prose does not notice.
+- **`weirdo` also produced one of the reviewer's five BEST ideas** (`IDEA-33`, a vacancy-chain scheduling analogy it called the strongest of the analogical items). The persona generates both tails.
+- Reviewing blind, it identified an "extended-metaphor" style cluster that is **100% `S1C-RICH`** (4 `poet`, 4 `weirdo`) and a "terse textbook one-liner" cluster that is **100% `S1C-SOLO60`** — perfect arm discrimination from style alone, with no labels.
+- Its five best split **3 `S1C-SOLO60` / 2 `S1C-RICH`**; its five worst split **4 `S1C-RICH` / 1 `S1C-SOLO60`**.
+
+#### The caveat that limits all of the above, raised by the reviewer itself
+
+> "a single-clause idea cannot contradict itself"
+
+**Coherence only bites on elaborated ideas.** `S1C-SOLO60` produces one-liners; `S1C-RICH` produces paragraphs. So RICH's monopoly on incoherence flags is **partly an artefact of having enough text to be wrong in**, not purely a quality difference — and any aggregate that pools one-liners with elaborated items washes out the very effect being looked for. This is the sharpest limitation on the section and it came from the instrument, not from us.
+
+#### A second instrument caveat: the two axes are not independent
+
+Per-idea correlation between `originality` and `feasibility` is **r = −0.61** within `S1C-RICH`, **−0.45** within `S1C-SOLO60`, **−0.72** pooled. `assertAxesNotCollapsed` enforces that the axes are separate *fields*; it cannot enforce that they are separate *constructs*. Some of the "originality up, feasibility down" pattern is therefore built into the instrument, and the pooled figure is further inflated by the arm separation itself. The per-arm figures are the ones to read.
+
+#### What this licenses
+
+A reader may now say that the rich panel trades feasibility for originality, that the trade is large and consistent across briefs, and that its ideas fail coherence in a way the solo call's do not — with the length confound stated. A reader may **not** yet say the rich panel is better or worse overall: that is 12 cells, one replicate, two briefs for the blind read, and no contrast was computed.
+
 ### Item 10 — The spend ceiling did not bind, again
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.
