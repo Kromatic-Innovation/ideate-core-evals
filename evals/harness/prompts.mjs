@@ -368,6 +368,67 @@ export const LEGACY_MAX_TOKENS = 2048;
  *  distribution times MAX_TOKENS_HEADROOM (issue #160). See above. */
 export const MIN_REQUEST_MAX_TOKENS = 6873;
 
+// -- issue #168: the per-request floor is itself a function of EFFORT --------
+// #160 above is right that a reply carries a FIXED cost -- framing, reasoning,
+// the JSON scaffold -- that does not shrink with the ideas asked for, and that
+// a per-idea RATE therefore cannot size a small request. What it did not say is
+// that the fixed cost is itself a function of `effort`, because its probe ran
+// entirely at effort `high`. MIN_REQUEST_MAX_TOKENS is a `high` measurement
+// wearing a flat name.
+//
+// Stage 1c found the gap the expensive way. S1C-RICH carries two `effort: max`
+// slots; `maxTokensForIdeas` IS effort-aware (TOKENS_PER_IDEA_BY_MODEL's `max`
+// bucket, 776), so those replies were sized at 6 * 776 * 2.5 = 11640 -- above
+// the 6873 floor, and still far too low. 139 of 144 S1C-RICH cells failed
+// `parse_failure` / `cause=partial_truncated`, every one of them with all five
+// agents replying and a HEALTHY pool (median 48 candidates) that
+// classifyUndersizedPool then discarded, because a pool assembled from fewer
+// agents than the arm specifies must not be silently under-reported (#102).
+//
+// A 30-reply probe of the exact S1C-RICH shape (3 briefs x 5 slots x 2 rounds,
+// claude-sonnet-5, ideasPerAgent 6, max_tokens 60000 so nothing truncated,
+// every reply stop_reason `end_turn` so the top is observed and not censored,
+// 2026-09-09) measured the fixed cost per effort bucket:
+//
+//   low   n=6   454-814      median 667     0/6  over the 6873 floor
+//   high  n=12  771-2980     median 1782    0/12 over the 6873 floor
+//   max   n=12  6586-18209   median 12917   6/12 over the 11640 cap
+//
+// Two things fall out of that table. `high` and `low` are FINE -- #160's floor
+// clears both outright, so this issue changes nothing for them, and the two
+// solo control arms (which run entirely at `high`) send byte-identical requests
+// before and after. And `max` is not marginally short but ~2x short at the top,
+// at a 50% per-REPLY rate -- which across the 4 max-effort replies a two-round
+// 2-max-slot panel makes predicts 0.5^4 = 6.25% cell survival against the 3.5%
+// actually observed. The arithmetic closes.
+//
+// Set by the SAME convention every other number in this file uses: the TOP of
+// the observed distribution times MAX_TOKENS_HEADROOM. 18209 * 2.5 = 45523.
+// No new multiplier, and no new mechanism -- this is #160's floor, keyed.
+//
+// Why a floor keyed by effort rather than a bigger `max` RATE: the cost is
+// fixed per reply, not per idea. Lifting the rate to cover it would inflate a
+// 60-idea max-effort solo call by the same multiple, where the per-idea unit is
+// sound -- the exact error #160 identified, reintroduced one level up.
+//
+// `max_tokens` is a CEILING billed as generated, so the unused headroom is
+// free; 45523 is well inside the model's accepted range (the probe itself sent
+// 60000 without complaint).
+export const MIN_REQUEST_MAX_TOKENS_BY_EFFORT = Object.freeze({ max: 45523 });
+
+/** The per-request floor for `effort`, never below the flat
+ *  MIN_REQUEST_MAX_TOKENS. `undefined` resolves to `high` for the same
+ *  documented reason tokensPerIdeaFor does it (omitting `effort` is exactly
+ *  the `high` behaviour), so the two halves of the sizing calculation cannot
+ *  disagree about what an absent `effort` means. */
+function minRequestMaxTokensFor(effort) {
+  const key = effort === undefined ? "high" : effort;
+  const keyed = Object.prototype.hasOwnProperty.call(MIN_REQUEST_MAX_TOKENS_BY_EFFORT, key)
+    ? MIN_REQUEST_MAX_TOKENS_BY_EFFORT[key]
+    : 0;
+  return Math.max(MIN_REQUEST_MAX_TOKENS, keyed);
+}
+
 /** Fallback ideas-per-agent when a caller supplies nothing usable -- matches
  *  the same fallback the prompt builders above apply to `ideasPerAgent`. */
 export const DEFAULT_IDEAS_PER_AGENT = 6;
@@ -428,7 +489,7 @@ function tokensPerIdeaFor(model, effort) {
 export function maxTokensForIdeas(ideas, model, effort) {
   const n = Number.isFinite(ideas) && ideas > 0 ? ideas : DEFAULT_IDEAS_PER_AGENT;
   const rate = tokensPerIdeaFor(model, effort);
-  return Math.max(LEGACY_MAX_TOKENS, MIN_REQUEST_MAX_TOKENS, Math.ceil(n * rate * MAX_TOKENS_HEADROOM));
+  return Math.max(LEGACY_MAX_TOKENS, minRequestMaxTokensFor(effort), Math.ceil(n * rate * MAX_TOKENS_HEADROOM));
 }
 
 // ── Salvage (issue #93, cause 2) ────────────────────────────────────
@@ -653,6 +714,7 @@ export function promptTemplateHash() {
     defaultTokensPerIdea: DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: MAX_TOKENS_HEADROOM,
     legacyMaxTokens: LEGACY_MAX_TOKENS,
+    minRequestMaxTokensByEffort: MIN_REQUEST_MAX_TOKENS_BY_EFFORT,
     // issue #160: a second floor, and a change to it is a change to what was
     // requested -- it must move the hash exactly as a rate change does.
     minRequestMaxTokens: MIN_REQUEST_MAX_TOKENS,

@@ -51,6 +51,94 @@ export const S1C_PANEL_ARM = "S1C-RICH";
  *  a persona ablation. Named for what it is. */
 export const S1C_CONTROL_ARM = "S1C-SOLO6X10";
 
+// ── Appendix M item 5: each arm comes from exactly ONE configHash ───────────
+//
+// #168 keyed the per-request output floor by effort, which moved promptHash and
+// therefore configHash. The two SOLO control arms run entirely at `high`, which
+// #168 does not touch, so their requests are byte-identical across the move
+// (26250 and 6873 on both sides -- asserted in prompts.test.mjs against
+// hard-coded pre-#168 literals). They are REUSED rather than re-collected.
+//
+// S1C-RICH is re-collected, and the old-hash S1C-RICH cells must NOT come with
+// it. Only 5 of 144 survived the truncation defect, and they are exactly the
+// cells in which none of the four max-effort replies truncated -- the most
+// outcome-selected subset in the store. Pooling the two hashes wholesale would
+// fold that censored subsample into the corrected treatment arm and bias the
+// contrast the study exists to estimate.
+//
+// So the rule is per ARM, not per store, and it is applied BEFORE rarefaction:
+// buildRarefiedFrame rarefies to the minimum pool size present, so a
+// contaminated row left in the frame would move the floor for every arm.
+
+/** The configHash Stage 1c's first run wrote, under which both control arms
+ *  (and the 5 discarded S1C-RICH survivors) are stored. A literal, because it
+ *  is a fact about an existing store rather than something to re-derive. */
+export const PRE_168_CONFIG_HASH = "fb16a8434518";
+
+/**
+ * Resolve which configHash each registered arm is taken from.
+ *
+ * The pre-#168 hash is pinned; the post-#168 hash is whatever the corrected
+ * run wrote, validated to be exactly one OTHER hash rather than guessed. The
+ * assertion that matters is that the treatment arm's hash is NOT the pre-#168
+ * one -- that is what guarantees the 5 contaminated cells are excluded.
+ *
+ * A store still holding only the pre-#168 hash (the re-collect has not run)
+ * returns null, and the caller reports that rather than analysing controls
+ * against a treatment arm that is 96% missing.
+ *
+ * @param {ReturnType<typeof import("./storeConfig.mjs").tallyStoredConfigs>} tally
+ * @returns {{armHashes: Record<string,string>, post: string}|null}
+ */
+export function resolveS1cArmHashes(tally) {
+  const hashes = tally.map((t) => t.cfg);
+  if (!hashes.includes(PRE_168_CONFIG_HASH)) {
+    throw new Error(
+      `stage1c: store does not hold the pre-#168 configHash ${PRE_168_CONFIG_HASH}, which both control arms are stored under. ` +
+        `Holds: ${hashes.join(", ") || "nothing"}. This analysis is specific to the Stage 1c store (Appendix M item 5).`,
+    );
+  }
+  const others = hashes.filter((h) => h !== PRE_168_CONFIG_HASH);
+  if (others.length === 0) return null;
+  if (others.length > 1) {
+    throw new Error(
+      `stage1c: store holds ${others.length} post-#168 configHashes (${others.join(", ")}); ` +
+        `Appendix M item 5 assigns S1C-RICH to exactly one and this tool will not choose between them.`,
+    );
+  }
+  const post = others[0];
+  return {
+    post,
+    armHashes: {
+      [S1C_REFERENCE_ARM]: PRE_168_CONFIG_HASH,
+      [S1C_CONTROL_ARM]: PRE_168_CONFIG_HASH,
+      [S1C_PANEL_ARM]: post,
+    },
+  };
+}
+
+/**
+ * Drop every row whose arm did not come from that arm's assigned configHash.
+ *
+ * Returns a NEW frame; the input is not mutated. `armLevels` is rebuilt from
+ * the surviving rows, so an arm left with nothing disappears rather than
+ * lingering as an empty level that downstream fitting would trip over.
+ *
+ * @param {ReturnType<typeof buildFrame>} frame
+ * @param {Record<string,string>} armHashes
+ */
+export function applyArmHashRule(frame, armHashes) {
+  const kept = [];
+  const dropped = [];
+  for (const row of frame.rows) {
+    const want = armHashes[row.armId];
+    if (want === undefined || row.cfg === want) kept.push(row);
+    else dropped.push(row);
+  }
+  const armLevels = frame.armLevels.filter((a) => kept.some((r) => r.armId === a));
+  return { ...frame, rows: kept, armLevels, droppedByArmHashRule: dropped };
+}
+
 /** Appendix J item 8: at or above this rarefaction floor the contrast is
  *  primary as registered; below it the contrast is still REPORTED, flagged as
  *  not comparable to the registered target, and the cell that set the floor is
@@ -80,18 +168,50 @@ async function main(argv) {
   }
 
   const store = new ResultsStore(resultsDir);
-  // resolveStoreConfigHash returns { configHash, tally } and refuses to choose
-  // when a store holds several incomparable experiments -- exactly the state
-  // that used to surface downstream as an empty `armLevels`.
-  const { configHash: cfg } = resolveStoreConfigHash(store, {});
+  // Appendix M item 5: the two hashes are named here rather than resolved by
+  // resolveStoreConfigHash's single-hash path, because this store deliberately
+  // holds two and each ARM is assigned to one of them.
+  const { tally } = (() => {
+    try {
+      return resolveStoreConfigHash(store, { configHash: PRE_168_CONFIG_HASH, resultsDir });
+    } catch (e) {
+      if (e.name === "UnknownStoredConfigError") return { tally: e.tally };
+      throw e;
+    }
+  })();
+
+  const assignment = resolveS1cArmHashes(tally);
+  if (assignment === null) {
+    console.error(
+      `stage1c: the store holds ONLY the pre-#168 configHash ${PRE_168_CONFIG_HASH}. The corrected S1C-RICH\n` +
+        `re-collect has not run, so the treatment arm is 139/144 missing and no contrast is computable.\n` +
+        `Run:  ./scripts/run-study1c.sh S1C-RICH`,
+    );
+    process.exit(1);
+  }
+  const { armHashes, post } = assignment;
+
   // `poolField` is what makes the rarefied lane possible at all: without it a
   // frame carries only the scalar distinct_k, and Appendix C's estimand cannot
   // be computed. "pool" matches analysis.mjs's own default.
-  const frame = buildFrame(store, { configHash: cfg, responseField: "distinct_k", poolField: "pool" });
+  const pooled = buildFrame(store, {
+    configHash: [PRE_168_CONFIG_HASH, post],
+    responseField: "distinct_k",
+    poolField: "pool",
+  });
+  // BEFORE rarefaction, on purpose -- see the Appendix M item 5 block above.
+  const frame = applyArmHashRule(pooled, armHashes);
 
-  console.log(`store: ${resultsDir}   configHash: ${cfg}`);
+  console.log(`store: ${resultsDir}`);
+  console.log(`configHash (controls, pre-#168): ${PRE_168_CONFIG_HASH}`);
+  console.log(`configHash (S1C-RICH, post-#168): ${post}`);
   console.log(`arms in frame: ${frame.armLevels.join(", ")}`);
   console.log(`rows: ${frame.rows.length}`);
+  const droppedRich = frame.droppedByArmHashRule.filter((r) => r.armId === S1C_PANEL_ARM).length;
+  console.log(
+    `dropped by the per-arm hash rule: ${frame.droppedByArmHashRule.length}` +
+      ` (of which ${droppedRich} are the outcome-selected old-hash ${S1C_PANEL_ARM} survivors -- Appendix M item 5)`,
+  );
 
   console.log("\n=== full-pool distinct_k by arm (secondary descriptive, Appendix C item 5) ===");
   for (const s of summarizeByArm(frame)) {

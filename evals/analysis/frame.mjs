@@ -148,6 +148,10 @@ function getPath(obj, path) {
  *   responseField: string,
  *   poolField: string|undefined,
  *   configHash: string,
+ *   configHashes: string[],   // the WHOLE selected set (issue #168). With one
+ *                             // hash this is [configHash]; with a pooled list
+ *                             // `configHash` is only its first element, so any
+ *                             // reporting of what was selected must use this.
  *   excluded: {
  *     failed: Array<{key: string, armId: string, briefId: string, kind: string}>,
  *     skipped: Array<{key: string, armId: string, briefId: string, detail: string}>,
@@ -169,7 +173,17 @@ export function buildFrame(store, opts = {}) {
         "store by evals/analysis/storeConfig.mjs) — never both, since the two could disagree and only one can win",
     );
   }
-  const cfg = opts.configHash !== undefined ? opts.configHash : computeConfigHash(opts.config || {});
+  // `opts.configHash` may be a single hash or a LIST (issue #168 -- see
+  // storeConfig.mjs's "Naming SEVERAL is allowed" for why a list is the
+  // operator choosing out loud rather than this module guessing). Normalized
+  // to a Set here so the per-entry test below stays one comparison either way.
+  const cfgList =
+    opts.configHash !== undefined ? [].concat(opts.configHash) : [computeConfigHash(opts.config || {})];
+  const cfgSet = new Set(cfgList);
+  // The single-hash face of the selection, for `frame.configHash` and every
+  // message built from it. With a pooled list this understates the selection,
+  // which is why `frame.configHashes` carries the whole set.
+  const cfg = cfgList[0];
 
   const rows = [];
   const excluded = { failed: [], skipped: [], stale: [] };
@@ -220,7 +234,7 @@ export function buildFrame(store, opts = {}) {
     // batch-replay record fails the key shape, so it lands in NO bucket,
     // which is right: it is not a study cell in any config, and it is not
     // recoverable by passing --config-hash.
-    if (entry.cfg !== cfg) {
+    if (!cfgSet.has(entry.cfg)) {
       excluded.stale.push({ key: entry.key, armId: entry.armId, briefId: entry.briefId, cfg: entry.cfg });
       continue;
     }
@@ -317,6 +331,7 @@ export function buildFrame(store, opts = {}) {
     responseField,
     poolField,
     configHash: cfg,
+    configHashes: cfgList,
     excluded,
     failuresByArm,
     skippedByArm,
@@ -361,13 +376,20 @@ export class NoCellsSelectedError extends Error {
     const stale = frame.excluded.stale.length;
     const failed = frame.excluded.failed.length;
     const skipped = frame.excluded.skipped.length;
+    // Report EVERY requested hash (issue #168). `frame.configHash` is only the
+    // first of a pooled list, and naming just that one tells an operator who
+    // asked for two that only one was considered -- sending them to debug a
+    // selection that never happened.
+    const requested = frame.configHashes || [frame.configHash];
+    const expected = requested.length === 1 ? `cfg ${requested[0]}` : `any of ${requested.length} cfgs (${requested.join(", ")})`;
     super(
       `buildFrame selected 0 cells: ${stale} excluded as stale, ${failed} as failed, ${skipped} as skipped; ` +
-        `expected cfg ${frame.configHash}, store holds ${held}. ` +
+        `expected ${expected}, store holds ${held}. ` +
         `This is an EXCLUSION outcome, not a modelling one — nothing downstream was ever given data to fit.`,
     );
     this.name = "NoCellsSelectedError";
     this.configHash = frame.configHash;
+    this.configHashes = requested;
   }
 }
 

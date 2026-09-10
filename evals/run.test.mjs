@@ -364,6 +364,9 @@ test("issue #99: editing a generation prompt template moves the configHash of th
     defaultTokensPerIdea: prompts.DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: prompts.MAX_TOKENS_HEADROOM,
     legacyMaxTokens: prompts.LEGACY_MAX_TOKENS,
+    // issue #168: and it is keyed by effort, because the fixed per-reply cost
+    // the floor exists to cover is itself a function of effort.
+    minRequestMaxTokensByEffort: prompts.MIN_REQUEST_MAX_TOKENS_BY_EFFORT,
     // issue #160: the per-request floor is a sizing constant too.
     minRequestMaxTokens: prompts.MIN_REQUEST_MAX_TOKENS,
     salvageVersion: prompts.SALVAGE_VERSION,

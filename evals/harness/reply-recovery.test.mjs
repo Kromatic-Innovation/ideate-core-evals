@@ -773,6 +773,9 @@ test("#93 comparability: promptTemplateHash covers prompt TEXT, the sizing const
     defaultTokensPerIdea: prompts.DEFAULT_TOKENS_PER_IDEA,
     maxTokensHeadroom: prompts.MAX_TOKENS_HEADROOM,
     legacyMaxTokens: prompts.LEGACY_MAX_TOKENS,
+    // issue #168: the per-request floor is keyed by effort, and the keyed table
+    // is a sizing constant on exactly the same footing as the flat one.
+    minRequestMaxTokensByEffort: prompts.MIN_REQUEST_MAX_TOKENS_BY_EFFORT,
     minRequestMaxTokens: prompts.MIN_REQUEST_MAX_TOKENS,
     salvageVersion: prompts.SALVAGE_VERSION,
   };
