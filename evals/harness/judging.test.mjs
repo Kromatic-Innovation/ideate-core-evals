@@ -481,6 +481,14 @@ test("judge cost rows reach recordActualSpend -- real judge spend (not generatio
     // ceiling trip to the ANTHROPIC judge leg's real spend specifically.
     judgeProviders: { anthropic: anthropicJudge },
     corpus: CORPUS,
+    // issue #169 added a mid-flight ceiling gate on JUDGE LEGS too. This test
+    // is about something else -- that a judge leg's ACTUAL spend, once it has
+    // run, counts toward a LATER cell's admission -- so the leg has to be
+    // admitted for the test to say anything. Pricing the gate at $0 disables
+    // it for this fixture only, keeping the pre-#169 arithmetic below exactly
+    // as written. The gate itself has its own dedicated tests further down;
+    // one test, one behaviour.
+    judgeLegPrice: () => ({ usd: 0, byProvider: {} }),
     maxSpendByProviderUsd: { anthropic: ceiling },
     log: silentLog,
   });
@@ -589,6 +597,14 @@ test("Sentry HIGH finding (PR #76 fix round): judge spend also trips the GLOBAL 
     judgeModels: JUDGE_MODELS,
     judgeProviders: { anthropic: anthropicJudge }, // openai deferred, $0 -- isolates the trip to anthropic judge spend
     corpus: corpus3,
+    // issue #169 added a mid-flight ceiling gate on JUDGE LEGS too. This test
+    // is about something else -- that a judge leg's ACTUAL spend, once it has
+    // run, counts toward a LATER cell's admission -- so the leg has to be
+    // admitted for the test to say anything. Pricing the gate at $0 disables
+    // it for this fixture only, keeping the pre-#169 arithmetic below exactly
+    // as written. The gate itself has its own dedicated tests further down;
+    // one test, one behaviour.
+    judgeLegPrice: () => ({ usd: 0, byProvider: {} }),
     maxSpendUsd: ceiling, // GLOBAL ceiling this time, not per-provider
     log: silentLog,
   });

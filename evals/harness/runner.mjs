@@ -78,7 +78,11 @@ import { assertValidProviderResponse, realizedAgents } from "./provider.mjs";
 // same read-time pricer the ledger already uses for a report, now used to
 // reconstruct spend-to-date from the store's own cost rows before this
 // invocation's admission control runs -- see `spendToDate` below.
-import { providerOf, priceRowByProvider, priceRows, priceRowsByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
+// priceJudgeLeg (issue #169): the mid-flight ceiling has to price a JUDGE LEG
+// before dispatching it, and it must price it by the same rule the pre-flight
+// projection used -- two copies of that arithmetic is how a ceiling silently
+// stops binding. Imported rather than reimplemented for exactly that reason.
+import { providerOf, priceRowByProvider, priceRows, priceRowsByProvider, priceJudgeLeg, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
 // runJudgeMatrix/judgeScoresKey (issue #68): judging has a non-test caller
 // here -- runSpec() invokes runJudgeMatrix per completed pool (one generation
 // cell IS a pool -- poolKey === cell.key, see evals/judge/matrix.mjs's own
@@ -1731,6 +1735,16 @@ export async function runSpec(spec, opts) {
     judgeProviders,
     corpus,
     judgeSeed = 1,
+    // judgeLegPrice (issue #169): the injectable seam the mid-flight judge-leg
+    // ceiling prices against, exactly mirroring the `priceGrid` seam the
+    // generation ceiling already uses. Defaults to lib/price.mjs's
+    // `priceJudgeLeg`, the SAME function the pre-flight projection uses, so
+    // production admits and projects a leg at one price. A test injects an
+    // exact pricer for the same reason it injects an exact `priceGrid`: the
+    // MockProvider's token volumes and the real API's differ by construction,
+    // so a ceiling that must land between two known amounts cannot be pinned
+    // against a real-API estimate.
+    judgeLegPrice = (leg) => priceJudgeLeg(leg, rateTable, { batch }),
     embedder,
     clusterDistanceThreshold,
   } = opts || {};
@@ -1830,11 +1844,35 @@ export async function runSpec(spec, opts) {
   // spend-to-date alone already meets or exceeds the ceiling, the whole
   // grid is skipped immediately (see the per-cell loop, which folds
   // `priorSpend.totalUsd` into every comparison).
+  //
+  // The pre-flight is an EARLY WARNING, not the guard (issue #169). The guard
+  // is the per-cell admission check below, which compares ACTUAL accumulated
+  // spend against the ceiling as cells settle. This banner exists so an
+  // operator learns at plan time that a run is going to hit the wall -- which
+  // is why it now prints the projection's upper bound and says out loud when
+  // the point estimate is a FLOOR rather than an estimate. `$41.59` against an
+  // actual `$105.22` was read as precise because nothing said otherwise.
   const overBudget = maxSpendUsd !== undefined && priorSpend.totalUsd + projection.usd > maxSpendUsd;
   if (maxSpendUsd !== undefined) {
+    const highUsd = projection.usdHigh ?? projection.usd;
+    const uncal = projection.uncalibratedArmIds || [];
+    const rangeNote =
+      highUsd > projection.usd
+        ? ` (a FLOOR, not an estimate -- upper bound $${highUsd.toFixed(4)}` +
+          (uncal.length ? `; the store holds too few completed cells to calibrate ${uncal.join(", ")}` : "") +
+          ")"
+        : "";
     log(
-      `[max-spend] ceiling=$${maxSpendUsd} spent-to-date=$${priorSpend.totalUsd.toFixed(4)} projected=$${projection.usd.toFixed(4)} ` +
+      `[max-spend] ceiling=$${maxSpendUsd} spent-to-date=$${priorSpend.totalUsd.toFixed(4)} projected=$${projection.usd.toFixed(4)}${rangeNote} ` +
         `${overBudget ? "(over budget -- admission-controlling cells)" : "(within budget)"}`,
+    );
+    // The ceiling is CUMULATIVE across every prior invocation and configHash
+    // in this store, not per-invocation (issue #64). The operator who filed
+    // #169 read it as per-invocation on the first Stage 1c run. `spent-to-date`
+    // above is that history; this line names what it is.
+    log(
+      `[max-spend] the ceiling is CUMULATIVE: spent-to-date is every prior invocation and every configHash in this store, ` +
+        `not just this invocation. Headroom left: $${(maxSpendUsd - priorSpend.totalUsd).toFixed(4)}.`,
     );
   }
 
@@ -2147,6 +2185,74 @@ export async function runSpec(spec, opts) {
     }
     if (alreadyJudged.size === rows.length) return; // every leg already scored in a prior session
 
+    // ── Mid-flight ceiling for JUDGE LEGS (issue #169) ─────────────────────
+    // Until this block, judging was the one spend path with NO admission
+    // control at all. Generation cells have been gated per-cell since #51/#62
+    // and gated against ACTUAL accumulated spend since PR #76 -- but a judge
+    // leg was dispatched here unconditionally and only recorded afterwards,
+    // through the same `recordActualSpend` the ceiling reads. A run could
+    // therefore stop admitting generation cells at the ceiling and keep
+    // spending on judging past it, indefinitely. Judge spend is also the
+    // dominant OpenAI cost driver (docs/PREREGISTRATION.md §12), so this was
+    // the largest unguarded surface in the harness.
+    //
+    // Priced with the REAL candidate count (`candidates.length`), not the
+    // plan-time estimate -- the pool is in hand by the time this runs, so the
+    // gate uses a fact where the projection could only use a guess.
+    //
+    // Shape matches the generation check exactly: everything ACTUALLY spent
+    // (prior invocations + this run) plus everything reserved in flight, plus
+    // THIS leg's projection. A leg that would cross the ceiling is recorded as
+    // a classified `budget_exceeded` skip on `judgeAccount` and never sent --
+    // store-absent, so the next invocation re-plans it, exactly like a
+    // budget-skipped generation cell.
+    // `budgetSkipped` mirrors `alreadyJudged`: a provider whose leg reached a
+    // terminal state HERE must be excluded from every accounting loop after
+    // `runJudgeMatrix` below, or `judgeAccount.skip`/`.complete`/`.fail` lands
+    // on an already-terminal leg and throws "already terminal; refusing to
+    // overwrite". Same one-terminal-state-per-leg gate the paymentSkipped
+    // partition documents further down.
+    const budgetSkipped = new Set();
+    if (anyCeilingActive) {
+      for (const row of rows) {
+        const providerName = row.judge_provider;
+        if (!providersToCall[providerName]) continue;
+        const { usd: legUsd, byProvider: legByProvider } = judgeLegPrice({
+          model: row.judge_model,
+          provider: providerName,
+          candidateCount: candidates.length,
+          poolKey: cell.key,
+        });
+        let tripped = null;
+        if (maxSpendByProviderUsd) {
+          for (const [provider, projected] of Object.entries(legByProvider)) {
+            if (!(provider in maxSpendByProviderUsd) || !(projected > 0)) continue;
+            const already = (priorSpend.byProvider[provider] || 0) + (runningTotalByProvider[provider] || 0) + (inFlightByProvider[provider] || 0);
+            if (already + projected > maxSpendByProviderUsd[provider]) {
+              tripped = provider;
+              break;
+            }
+          }
+        }
+        if (tripped || (maxSpendUsd !== undefined && priorSpend.totalUsd + runningTotal + inFlightTotal + legUsd > maxSpendUsd)) {
+          delete providersToCall[providerName];
+          budgetSkipped.add(providerName);
+          judgeAccount.skip(judgeLegKey(cell.key, providerName), tripped ? `budget_exceeded:${tripped}` : "budget_exceeded");
+          log(
+            `[max-spend] judge leg SKIPPED (budget_exceeded${tripped ? `:${tripped}` : ""}): pool '${cell.key}' ` +
+              `judge=${row.judge_model} projected=$${legUsd.toFixed(4)} ` +
+              `spent-so-far=$${(priorSpend.totalUsd + runningTotal).toFixed(4)}` +
+              (maxSpendUsd !== undefined ? ` ceiling=$${maxSpendUsd}` : ""),
+          );
+        }
+      }
+      // Every leg of this pool is now terminal (already scored, or budget
+      // skipped) -- there is nothing left for runJudgeMatrix to do, and
+      // calling it would only re-derive `deferred` rows the loops below would
+      // then have to filter back out again.
+      if (rows.every((r) => alreadyJudged.has(r.judge_provider) || budgetSkipped.has(r.judge_provider))) return;
+    }
+
     const timestamp = new Date().toISOString();
     // providersToCall omits any provider not wired (opts.judgeProviders) --
     // runJudgeMatrix records that leg as `deferred`, never throws for it
@@ -2189,11 +2295,11 @@ export async function runSpec(spec, opts) {
     // the array) dedupes for free, so a duplicated entry cannot double-skip.
     const paymentSkippedLegs = new Map();
     for (const p of paymentSkipped || []) {
-      if (alreadyJudged.has(p.judge_provider)) continue;
+      if (alreadyJudged.has(p.judge_provider) || budgetSkipped.has(p.judge_provider)) continue;
       paymentSkippedLegs.set(judgeLegKey(p.poolKey, p.judge_provider), p.reason);
     }
     for (const r of results) {
-      if (alreadyJudged.has(r.judge_provider)) continue;
+      if (alreadyJudged.has(r.judge_provider) || budgetSkipped.has(r.judge_provider)) continue;
       const legKey = judgeLegKey(r.poolKey, r.judge_provider);
       if (paymentSkippedLegs.has(legKey)) continue; // terminal below, as a skip
       if (r.state === "completed") judgeAccount.complete(legKey, { scores: r.scores });
@@ -2209,7 +2315,7 @@ export async function runSpec(spec, opts) {
       judgeAccount.skip(legKey, reason);
     }
     for (const d of deferred) {
-      if (alreadyJudged.has(d.judge_provider)) continue;
+      if (alreadyJudged.has(d.judge_provider) || budgetSkipped.has(d.judge_provider)) continue;
       const legKey = judgeLegKey(d.poolKey, d.judge_provider);
       // A deferred leg (no provider wired for it) is a legitimate, terminal
       // outcome -- `skip()`, never `fail()`: FAILURE_KINDS has no entry that
@@ -2339,11 +2445,39 @@ export async function runSpec(spec, opts) {
   // `budget_exceeded` skip below already uses, for the same reason.
   let paymentAborted = null;
 
-  const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usd]));
+  // ── What the mid-flight ceiling admits against (issue #169) ───────────────
+  // `usdHigh`, not `usd`. A cell priced from the STRUCTURAL estimate (no
+  // stored cells for its arm) carries a projection its own pricer declares to
+  // be a floor -- lib/price.mjs's UNCALIBRATED_HIGH_FACTOR, set to the 2.53x
+  // miss actually observed on the Stage 1c re-collect. Admitting against a
+  // known floor is exactly how a $220 ceiling settled at $222.7198. A cell
+  // priced from real stored cells for its own arm has `usdHigh === usd`, so a
+  // resumed study -- the common case -- admits against the measurement, not
+  // against a 2.5x pad.
+  //
+  // `?? b.usd` keeps every pricer that predates this field (interimPriceGrid,
+  // and any injected test pricer) admitting exactly as it did before.
+  //
+  // The direction of the remaining error is deliberate: over-projecting stops
+  // the run EARLY, and a `budget_exceeded` skip is store-absent and re-plans
+  // as `todo` on the next invocation (see the skip below). Under-projecting
+  // spends money that cannot be un-spent. Only one of those is recoverable.
+  const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usdHigh ?? b.usd]));
   // Projected per-provider cost for each todo cell, split slot-by-slot (see
   // the pre-flight block above) -- used to decide, BEFORE a cell runs,
   // whether admitting it would cross a provider's ceiling.
-  const providerByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.byProvider || {}]));
+  // Scaled by the SAME usdHigh/usd ratio the global check uses (issue #169) --
+  // otherwise the global ceiling would admit against the upper bound while
+  // every per-provider ceiling admitted against the point estimate, and the
+  // two guards would disagree about what this cell is about to cost.
+  const providerByKey = new Map(
+    projection.breakdown.map((b) => {
+      const byProvider = b.byProvider || {};
+      const ratio = b.usdHigh !== undefined && b.usd > 0 ? b.usdHigh / b.usd : 1;
+      if (ratio === 1) return [b.cellKey, byProvider];
+      return [b.cellKey, Object.fromEntries(Object.entries(byProvider).map(([p, usd]) => [p, usd * ratio]))];
+    }),
+  );
 
   // ── In-flight reservations (issue #148) ────────────────────────────────────
   // The admission check below is "everything ACTUALLY spent so far, plus this
