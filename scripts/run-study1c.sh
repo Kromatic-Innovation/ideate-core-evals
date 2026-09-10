@@ -69,7 +69,7 @@ STORE="results-study1c"
 # Raised to $220 = $117.49 spent + ~$85 for S1C-RICH's 144 cells + headroom,
 # because a max-effort reply now runs to completion (~18k tokens) instead of
 # being truncated at 11640, so the corrected arm costs MORE per cell, not less.
-MAX_SPEND=220          # Appendix L item 7, amended by Appendix M item 5
+MAX_SPEND=220          # Appendix L item 7, amended by Appendix M item 6
 CONCURRENCY=8          # top of Appendix I item 7's registered 4-8 band
 LOG=".tmp/stage1c-run.log"
 
