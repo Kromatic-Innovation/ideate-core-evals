@@ -2354,6 +2354,66 @@ Per-idea correlation between `originality` and `feasibility` is **r = −0.61** 
 
 A reader may now say that the rich panel trades feasibility for originality, that the trade is large and consistent across briefs, and that its ideas fail coherence in a way the solo call's do not — with the length confound stated. A reader may **not** yet say the rich panel is better or worse overall: that is 12 cells, one replicate, two briefs for the blind read, and no contrast was computed.
 
+### Item 12 — The operator's own blind read, and what it found that the metrics could not
+
+The operator read the same 40-idea blind packet (arm and persona stripped) and left free-text notes rather than ratings. Deliberately not a scale: two numeric instruments already scored these ideas, and what neither can supply is the reasoning behind a verdict. The notes were written before the key was seen.
+
+#### A third independent instrument, agreeing
+
+Classifying the operator's notes and joining them to the key:
+
+| operator verdict | `S1C-RICH` | `S1C-SOLO60` |
+|---|---|---|
+| "unique" / "novel" | **5** | **0** |
+| "nonsense" / "doesn't make sense" | **4** | **0** |
+| "good, standard" | 4 | **12** |
+
+**Perfect separation on both tails, from a reader who saw no labels.** The LLM judge, the blind reviewer and the operator are three instruments of different kinds, and all three independently reproduce the same structure — including the double tail: the rich panel owns the uniques *and* the incoherence. The operator's four flags were 2 `poet`, 1 `philosopher`, 1 `weirdo`, again pointing away from the registered `weirdo` suspicion and toward `poet` (item 11).
+
+#### The finding that bears on METHOD, not on the arms
+
+**The operator rated the tontine (`IDEA-16`, `weirdo`) "Unique idea" and did not catch its defect.** Its stated mechanism is arithmetically self-refuting — fixed costs split among *fewer* survivors raise each share, so the claimed cause produces the opposite of the claimed effect. The blind reviewer caught it; a careful human reader who was *specifically looking for this failure mode* did not.
+
+This is registered as a first-class result: **vivid framing buys a pass on incoherence from human spot-check.** It is the precise hazard §5 exists to guard against, observed happening to the study's own operator. Human review alone is therefore **not** a sufficient control for this class, and any future design that leans on operator spot-check as the coherence check should be considered unsound on this evidence.
+
+#### A limit on human spot-check, from the same source
+
+**9 of the operator's 20 `sci-05` notes are "can't evaluate this but sounds cool."** That is the correct answer for domain-technical research proposals, and it bounds what operator review can contribute: on the technical brief its discriminating power is near zero, while on `biz-02` — the brief the operator judged the *weaker* test — the notes are decisive. Human spot-check is domain-bounded and should be deployed where the operator has standing, not uniformly.
+
+#### Brief genericness is real and measurable
+
+The operator's first observation was that `biz-02` is generic and has a bounded answer space. The store confirms it directly, and it had not been looked at before the claim was made:
+
+| brief | `S1C-RICH` collapse | `S1C-SOLO60` collapse |
+|---|---|---|
+| `biz-02` | **13.3%** | **16.7%** |
+| `sci-05` | 3.3% | 1.6% |
+
+`biz-02` collapses **4–10× harder**. Brief genericness is a measurable property of a cell, it varies enormously across the corpus, and nothing in the study currently models it.
+
+#### The dissociation: `distinct_k` and quality are near-orthogonal at the cell level
+
+Comparing the two metrics on the **same twelve cells**:
+
+| brief | `distinct_k` gap (RICH − SOLO60) | originality gap |
+|---|---|---|
+| `biz-02` | **+2** | +3.83 |
+| `biz-07` | **+1** | +3.06 |
+| `prod-03` | **−3** | +3.75 |
+| `prod-07` | **+8** | +3.73 |
+| `sci-05` | **−2** | +2.68 |
+| `sci-08` | **−5** | +2.78 |
+
+**The `distinct_k` gap changes sign three times and averages roughly zero. The originality gap is positive in all six briefs, between +2.68 and +3.83.** On `biz-02` the two arms are nearly identical on `distinct_k` (52 vs 50) and three points apart on originality; on `sci-08` `S1C-SOLO60` *wins* `distinct_k` (61 vs 56) while losing originality by 2.78.
+
+**Twelve competent one-liners and twelve genuinely varied approaches both count as ~50 distinct ideas, because they are ~50 distinct ideas.** `distinct_k` measures how many different things were said, and is constitutionally unable to see how good they were. This is the clearest available evidence that the study's headline metric and the thing the product actually claims are not the same quantity.
+
+**What this does NOT do is revise Appendix M item 9.** These `distinct_k` values are **raw, unrarefied, single-replicate** figures from 6 of 48 briefs; the registered **+1.6728** is a rarefied estimate over 48 briefs × 3 replicates and stands unchanged. The claim here is narrower and about *dissociation*, not magnitude: on the very same cells, the two metrics rank the arms differently, so a `distinct_k` result cannot be read as a quality result in either direction.
+
+#### Provenance
+
+Every observation in this item originated with the operator's read of the packet, not with the analysis. The measurements were run afterwards to test claims the operator had already made — which is the ordering that makes them tests rather than illustrations.
+
 ### Item 10 — The spend ceiling did not bind, again
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.
