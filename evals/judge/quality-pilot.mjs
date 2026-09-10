@@ -112,25 +112,37 @@ for (const t of targets) {
   const brief = briefText.get(t.briefId);
   if (!brief) throw new Error(`quality-pilot: no brief text for '${t.briefId}'`);
 
-  // TEXT ONLY over the wire. persona stays here.
-  const resp = await provider.score(
-    { briefText: brief, candidates: candidates.map((c) => ({ text: c.text })) },
-    { judgeModel: JUDGE_MODEL, mode: MODE, seed: 1, timestamp },
-  );
-  if (resp.terminalState !== "completed") {
-    throw new Error(`quality-pilot: judge failed on ${t.key}: ${resp.detail || resp.failureKind}`);
+  // ONE candidate per score() call -- Appendix N item 10.
+  //
+  // The first run scored a whole cell in one call and a SINGLE refusal aborted
+  // all 61 candidates. That is the classifyUndersizedPool trap (Appendix M item
+  // 4) reappearing on the judge leg, and worse here: the judge refuses on
+  // CONTENT, so letting a refusal take the cell would condition the quality
+  // means on what the judge was willing to read.
+  //
+  // In `single` mode the provider already issues one POST per candidate, and
+  // buildJudgeScoringPrompt renders one candidate against the brief, so
+  // splitting the loop changes no prompt the model sees -- with a pool of one
+  // there is simply no presentation position for order randomization (§5.3) to
+  // neutralize. What it changes is the blast radius of a single refusal.
+  const ideas = [];
+  for (const c of candidates) {
+    const resp = await provider.score(
+      { briefText: brief, candidates: [{ text: c.text }] }, // TEXT ONLY over the wire; persona stays here
+      { judgeModel: JUDGE_MODEL, mode: MODE, seed: 1, timestamp },
+    );
+    const ok = resp.terminalState === "completed" && Array.isArray(resp.scores) && resp.scores.length === 1;
+    ideas.push({
+      id: c.id,
+      persona: c.persona ?? null,
+      round: c.round ?? null,
+      // null, never 0 and never an imputed mean: a refusal is MISSING data.
+      originality: ok ? resp.scores[0].originality : null,
+      feasibility: ok ? resp.scores[0].feasibility : null,
+      refused: !ok,
+      refusalDetail: ok ? undefined : String(resp.detail || resp.failureKind || resp.terminalState),
+    });
   }
-  if (resp.scores.length !== candidates.length) {
-    throw new Error(`quality-pilot: ${resp.scores.length} scores for ${candidates.length} candidates on ${t.key}`);
-  }
-
-  const ideas = candidates.map((c, i) => ({
-    id: c.id,
-    persona: c.persona ?? null,
-    round: c.round ?? null,
-    originality: resp.scores[i].originality,
-    feasibility: resp.scores[i].feasibility,
-  }));
   scored.push({ key: t.key, armId: t.armId, briefId: t.briefId, ideas });
 
   out.put({
@@ -144,25 +156,45 @@ for (const t of targets) {
     accounting: { state: "completed" },
     costRows: [],
   });
-  console.error(`  scored ${t.key} (${candidates.length})`);
+  const refused = ideas.filter((i) => i.refused).length;
+  console.error(`  scored ${t.key} (${candidates.length}${refused ? `, ${refused} REFUSED` : ""})`);
 }
 
+// Means are taken over SCORED candidates only. Refusals are excluded and never
+// imputed, and the refusal count rides alongside every mean (Appendix N item
+// 10) -- a quality figure over a pool the judge partly declined to read must
+// carry that fact next to it, not in a footnote.
 const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN);
 const fmt = (x) => (Number.isFinite(x) ? x.toFixed(3) : "n/a");
+const scoredOf = (ideas, axis) => ideas.filter((i) => !i.refused && Number.isFinite(i[axis])).map((i) => i[axis]);
 
-console.log("\n=== by arm (descriptive; no contrast, no p-value) ===");
-console.log("arm            n     originality  feasibility");
-for (const arm of ARMS) {
-  const ideas = scored.filter((s) => s.armId === arm).flatMap((s) => s.ideas);
-  console.log(`${arm.padEnd(14)} ${String(ideas.length).padEnd(5)} ${fmt(mean(ideas.map((i) => i.originality))).padEnd(12)} ${fmt(mean(ideas.map((i) => i.feasibility)))}`);
+function reportRow(label, ideas) {
+  const orig = scoredOf(ideas, "originality");
+  const feas = scoredOf(ideas, "feasibility");
+  const refused = ideas.filter((i) => i.refused).length;
+  const pct = ideas.length ? ((refused / ideas.length) * 100).toFixed(1) : "0.0";
+  console.log(
+    `${label.padEnd(18)} ${String(ideas.length).padEnd(6)} ${String(orig.length).padEnd(7)} ${fmt(mean(orig)).padEnd(13)} ${fmt(mean(feas)).padEnd(13)} ${refused} (${pct}%)`,
+  );
 }
 
+const HEAD = `${"".padEnd(18)} ${"n".padEnd(6)} ${"scored".padEnd(7)} ${"originality".padEnd(13)} ${"feasibility".padEnd(13)} refused`;
+
+console.log("\n=== by arm (DESCRIPTIVE; no contrast, no p-value) ===");
+console.log(HEAD);
+for (const arm of ARMS) reportRow(arm, scored.filter((s) => s.armId === arm).flatMap((s) => s.ideas));
+
 console.log("\n=== S1C-RICH by persona -- the `weirdo` question ===");
-console.log("persona            n     originality  feasibility");
+console.log(HEAD);
 const rich = scored.filter((s) => s.armId === "S1C-RICH").flatMap((s) => s.ideas);
 for (const persona of [...new Set(rich.map((i) => i.persona))].sort()) {
-  const ideas = rich.filter((i) => i.persona === persona);
-  console.log(`${String(persona).padEnd(18)} ${String(ideas.length).padEnd(5)} ${fmt(mean(ideas.map((i) => i.originality))).padEnd(12)} ${fmt(mean(ideas.map((i) => i.feasibility)))}`);
+  reportRow(String(persona), rich.filter((i) => i.persona === persona));
+}
+
+const allRefused = scored.flatMap((s) => s.ideas).filter((i) => i.refused);
+if (allRefused.length) {
+  console.log(`\n=== refusals (${allRefused.length}) -- reported, never imputed ===`);
+  for (const r of allRefused) console.log(`  ${r.id}  persona=${r.persona}  ${r.refusalDetail}`);
 }
 
 console.log(`\nStored ${scored.length} cells in ${OUT_STORE}. Descriptive only -- Appendix N item 6.`);

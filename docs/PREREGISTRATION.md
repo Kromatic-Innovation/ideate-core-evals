@@ -2285,6 +2285,23 @@ The **first** stored validation record carried `requestShape: null`. `runJudgeVa
 
 The **second**: the runner printed the full-roster `judgeHash` while `runJudgeValidation` keys the record by the single model that actually ran — so the operator was shown a key the store does not contain. Fixed.
 
+### Item 10 — Judge refusals are MISSING scores, not low ones
+
+**Registered before any quality mean was computed or inspected.** The first quality-read run scored 10 of 12 cells and then aborted; the abort happened before any summary was produced, and no per-arm or per-persona figure had been looked at when this rule was written. That ordering is the only thing that makes it a rule rather than a rationalisation.
+
+The abort was a second, distinct cause of `parse_failure: empty judge reply`, unrelated to item 7's thinking defect — which had already been fixed and held for 600 consecutive candidates. This one is **`stop_reason: "refusal"`**: the judge declined to score a candidate. The candidate was `"Build agent-based immune system simulations capturing T-cell and pathogen co-evolution to explore vaccination strategies that minimize resistance emergence"` — an unremarkable computational-biology proposal.
+
+**The hazard.** As written, one refusal aborted an entire 61-candidate cell. That is precisely the shape of the `classifyUndersizedPool` trap Appendix M item 4 refused to loosen — a per-reply failure escalating to destroy a whole cell — reappearing on the judge leg. And it is worse here, because refusals are **not** independent of the outcome: the judge refuses on content, so discarding refused candidates silently conditions the quality means on what the judge was willing to look at.
+
+**Registered handling:**
+
+1. A refusal records `originality: null, feasibility: null` for **that candidate only**. The cell is kept.
+2. Refused candidates are **excluded from means and never imputed** — not as zero, not as the cell mean. A refusal is missing data.
+3. **The refusal count is reported as a first-class number**, per arm and per persona, alongside every mean. A quality figure computed over a pool the judge partly declined to read must carry that fact next to it.
+4. If refusals are **unevenly distributed across arms or personas**, that asymmetry is reported as a finding in its own right — it is a measurement of what the instrument will not measure, and it bears directly on the `weirdo` question, since a persona prompted for strangeness is the one most likely to trip a refusal.
+
+The pilot is re-run from scratch under this rule rather than patched over the 10 stored cells, so every cell in the sidecar is produced by one instrument under one policy.
+
 ### Item 10 — The spend ceiling did not bind, again
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.
