@@ -1,3 +1,18 @@
+# BOTH forms, deliberately. `node_modules/` (trailing slash) matches a
+# DIRECTORY only -- and in a git worktree the natural thing to do is symlink
+# node_modules at the worktree root rather than reinstall it. A symlink is not
+# a directory, so the trailing-slash pattern never matched it, `git add -A`
+# happily took it, and PR #174 shipped a committed symlink pointing at an
+# absolute /Users/<name>/... path in a PUBLIC repo -- which also killed CI,
+# since the runner resolved it to a path that does not exist there and every
+# test job died before running a single test.
+#
+# The bare line below matches a file, a symlink, or a directory of that name.
+# Keep both: the trailing-slash form still usefully documents the common case.
+# Same defect class as ideate-core#164 (`--exclude-dir=.git`, which misses a
+# worktree's `.git` because there it is a FILE, not a directory). Whenever a
+# rule is written against a path SHAPE, check the worktree case.
+node_modules
 node_modules/
 *.log
 .DS_Store
