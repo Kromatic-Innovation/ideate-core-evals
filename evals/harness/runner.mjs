@@ -1859,9 +1859,29 @@ export async function runSpec(spec, opts) {
   // is why it now prints the projection's upper bound and says out loud when
   // the point estimate is a FLOOR rather than an estimate. `$41.59` against an
   // actual `$105.22` was read as precise because nothing said otherwise.
-  const overBudget = maxSpendUsd !== undefined && priorSpend.totalUsd + projection.usd > maxSpendUsd;
+  //
+  // ── The verdict word is computed on the ADMISSION basis (issue #169, ─────
+  // ── Sentry LOW on PR #174) ──────────────────────────────────────────────
+  // This used to read `priorSpend.totalUsd + projection.usd`, the POINT
+  // estimate, while admission builds `priceByKey` from `usdHigh ?? usd`. So
+  // the banner could print "(within budget)" and the run would then skip
+  // cells the moment `usdHigh` pricing applied.
+  //
+  // Rated LOW as messaging, and taken as a must anyway: a ceiling readout
+  // that tells the operator one thing while the run does another IS #169 --
+  // the issue's own words are that `--max-spend` "reads as absolute" and is
+  // not. Fixing the gate and leaving the banner disagreeing with the gate
+  // closes the defect in code and leaves it open in the operator's
+  // experience. The `rangeNote` below mitigates it; it does not make a wrong
+  // verdict word right.
+  //
+  // The point estimate stays VISIBLE in the line -- it is the honest centre
+  // of the range, and `rangeNote` names the upper bound next to it. Only the
+  // pass/fail word moved onto the binding arithmetic.
+  const admissionBasisUsd = projection.usdHigh ?? projection.usd;
+  const overBudget = maxSpendUsd !== undefined && priorSpend.totalUsd + admissionBasisUsd > maxSpendUsd;
   if (maxSpendUsd !== undefined) {
-    const highUsd = projection.usdHigh ?? projection.usd;
+    const highUsd = admissionBasisUsd;
     const uncal = projection.uncalibratedArmIds || [];
     const rangeNote =
       highUsd > projection.usd
@@ -2051,7 +2071,41 @@ export async function runSpec(spec, opts) {
   // computed, above) so it fires whenever EITHER ceiling depends on
   // per-row pricing. A run with NO ceiling at all has nothing to gate, and
   // priceRowByProvider's $0-and-continue default remains correct for it.
-  function recordActualSpend(costRows) {
+  //
+  // ── `settledCellKey` (issue #169, Sentry MEDIUM on PR #174) ──────────────
+  // An in-flight RESERVATION exists for exactly one reason: this cell's cost
+  // is not yet known, so the ceiling holds its PROJECTION against the budget
+  // in the meantime. The moment `recordActualSpend` posts the cell's real
+  // cost into `runningTotal`, that projection is superseded by a fact -- and
+  // holding both counts the cell twice against its own ceiling.
+  //
+  // That double-count was live, at concurrency 1, on exactly one path:
+  // `recordActualSpend(costRows)` for a completed cell runs INSIDE
+  // `runOneCell`, and `judgePoolIfEnabled` is called immediately after it --
+  // while the driver's `finally` (which is what used to do the releasing)
+  // has not run, because `runOneCell` has not returned. So the judge-leg
+  // ceiling check saw this cell's generation cost in `runningTotal` AND its
+  // projection in `inFlightTotal`, and gated legs it should have admitted.
+  //
+  // Over-restrictive, so it could never overspend -- but judge legs are the
+  // gap this whole change exists to close, and a gate that trips early means
+  // pools the operator expected to be judged silently are not. It also made
+  // the plan-time `worst-case stop` line wrong, since the bound and the gate
+  // stopped describing the same arithmetic.
+  //
+  // Fixed HERE rather than by moving `judgePoolIfEnabled` after the driver's
+  // release, deliberately. Moving the call would change WHEN a pool is judged
+  // relative to the next cell's admission -- judging is per-cell precisely so
+  // a per-provider ceiling stays responsive to judge spend for the NEXT cell
+  // (issue #68) -- and would leave the invariant itself ("a reservation may
+  // outlive the fact that replaces it") intact for the next caller to trip
+  // over. Releasing on settlement states the invariant instead: a reservation
+  // lives exactly as long as the cost is unknown.
+  //
+  // `releaseInFlight` is idempotent, so the driver's `finally` remains the
+  // correct catch-all for every path that never settles (a throw, a payment
+  // abort, a budget skip) and simply no-ops for a cell released here.
+  function recordActualSpend(costRows, settledCellKey) {
     for (const row of costRows) {
       const { byProvider, hasMissingRate, missingRateModels, excludedNonProviderUsd } = priceRowByProvider(row, rateTable, { batch });
       if (anyCeilingActive && hasMissingRate) {
@@ -2085,6 +2139,10 @@ export async function runSpec(spec, opts) {
       // total-dollars backstop, not scoped to any one provider.
       runningTotal += rowTotalUsd;
     }
+    // The projection this cell was admitted on is now superseded by the fact
+    // just posted above. Release it, or the cell is counted twice against its
+    // own ceiling for the rest of `runOneCell` -- see this function's header.
+    if (settledCellKey !== undefined) releaseInFlight(settledCellKey);
   }
 
   // ── Judging (issue #68) ──────────────────────────────────────────────────
@@ -2829,7 +2887,7 @@ export async function runSpec(spec, opts) {
         // for, and this cell is still being re-planned, so its replies must
         // survive or the next invocation buys them again.
         if (resumeEnabled) persistBatchResumeState(store, cell, response.resume, pricingLever, log);
-        recordActualSpend(genCostRows);
+        recordActualSpend(genCostRows, cell.key);
         return; // no metrics, no store.put, no judging -- this pool is discarded
       }
 
@@ -2882,7 +2940,7 @@ export async function runSpec(spec, opts) {
         // never lost and never double-counted against a later successful
         // retry (each attempt gets a new, non-colliding key).
         recordMetricsAttemptFailure(store, { cell, costRows, detail: metrics.detail, timestamp });
-        recordActualSpend(costRows);
+        recordActualSpend(costRows, cell.key);
         // Skipped, not failed: RunAccount.skip() is a legitimate terminal
         // state for THIS invocation's reconcile() (every planned cell must
         // still reach exactly one terminal state -- this cell is not
@@ -2934,7 +2992,7 @@ export async function runSpec(spec, opts) {
         accounting: { state: "completed" },
         costRows,
       });
-      recordActualSpend(costRows);
+      recordActualSpend(costRows, cell.key);
       // issue #68 -- judge this pool now, per cell, so a per-provider
       // ceiling stays responsive to judge spend for the NEXT cell's
       // admission decision (see the per-cell loop's projected-vs-actual
@@ -3044,7 +3102,7 @@ export async function runSpec(spec, opts) {
           costRows,
         });
       }
-      recordActualSpend(costRows);
+      recordActualSpend(costRows, cell.key);
       // No candidates on a failed generation cell -- nothing to judge.
     }
   };
