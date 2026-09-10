@@ -574,10 +574,16 @@ test("#170: the ONE pre-#170 record is still reachable and still licenses idea-l
   assert.ok(!("idea_level_metrics" in out));
 
   // ...and it is reconciled by its stored shape, so a caller that supplies no
-  // current shape cannot accidentally launder it through.
+  // current shape cannot accidentally launder it through. That refusal names
+  // the MISSING ARGUMENT, not a changed instrument — nothing changed, and
+  // saying it did would send a reader to re-run the §5.1 gate for $0.58.
   assert.throws(
     () => attachIdeaLevelScores({ store, judgeHash, judgeRequestHash: CURRENT_REQ_HASH, pools: [], ideaLevelScores }),
-    /the judge's request shape changed/,
+    (err) => {
+      assert.match(err.message, /no current requestShape was supplied/);
+      assert.doesNotMatch(err.message, /the judge's request shape changed/);
+      return true;
+    },
   );
 });
 
