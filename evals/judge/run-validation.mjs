@@ -27,9 +27,9 @@
 // Stage 1c analysis merged as #168. It goes in its own store and always has.
 import { ResultsStore } from "../../lib/store.mjs";
 import { AnthropicJudgeProvider } from "./score.mjs";
-import { computeJudgeHash } from "./score.mjs";
+import { computeJudgeHash, computeJudgeRequestHash, MAX_JUDGE_TOKENS, JUDGE_REQUEST_SHAPE } from "./score.mjs";
 import { JUDGE_MODELS, JUDGE_VALIDATION_MAPPING } from "./config.mjs";
-import { SI_ET_AL_BALANCED_ACCURACY_FLOOR } from "./gate.mjs";
+import { SI_ET_AL_BALANCED_ACCURACY_FLOOR, validationKey } from "./gate.mjs";
 import { readSiEtAlSlice } from "./slice.mjs";
 import { runJudgeValidation, judgeValidationSliceId } from "./validate.mjs";
 
@@ -67,6 +67,13 @@ const topics = new Set(slice.ideas.map((i) => i.topic));
 // not from the whole registered roster. Printing the roster hash here instead
 // would name a key the store does not contain.
 const judgeHash = computeJudgeHash({ judgeModels: { anthropic: [JUDGE_MODEL] } });
+// The SECOND half of the record's key (#170). judgeHash covers the prompt and
+// the model roster; this covers max_tokens and the thinking mode -- the two
+// things that made the first real run of this gate a different instrument from
+// the one §5.1 registered. Built from the same constants runJudgeValidation
+// uses, so the key printed here is the key the run writes.
+const requestShape = { maxTokens: MAX_JUDGE_TOKENS, ...JUDGE_REQUEST_SHAPE };
+const judgeRequestHash = computeJudgeRequestHash({ requestShape });
 
 console.log("judge validation -- docs/PREREGISTRATION.md §5.1, Appendix N");
 console.log(`  axis / column   : ${axis} <-> ${expertScoreField}   (Appendix A item 7)`);
@@ -76,8 +83,10 @@ for (const x of slice.exclusions) console.log(`  excluded        : ${x.condition
 console.log(`  judge model     : ${JUDGE_MODEL}  mode=${MODE}  seed=${SEED}`);
 console.log(`  judge calls     : ${topics.size} (one per topic group)`);
 console.log(`  judgeHash       : ${judgeHash}`);
+console.log(`  judgeRequestHash: ${judgeRequestHash}   (#170; ${JSON.stringify(requestShape)})`);
 console.log(`  store           : ${STORE_DIR}`);
 console.log(`  sliceId         : ${judgeValidationSliceId({ axis, expertScoreField })}`);
+console.log(`  record key      : ${validationKey({ judgeHash, judgeRequestHash, sliceId: judgeValidationSliceId({ axis, expertScoreField }) })}`);
 console.log();
 
 // The answer key's own precision, printed BESIDE the verdict rather than after
