@@ -1745,6 +1745,13 @@ export async function runSpec(spec, opts) {
     // so a ceiling that must land between two known amounts cannot be pinned
     // against a real-API estimate.
     judgeLegPrice = (leg) => priceJudgeLeg(leg, rateTable, { batch }),
+    // accountBalanceUsd (issue #169): what the funding account can actually
+    // pay, ASSERTED BY THE OPERATOR. Neither provider exposes a balance an
+    // API key can read -- see evals/run.mjs's --account-balance for the search
+    // that establishes it -- so this is not queried, it is declared. Undefined
+    // means "not asserted", which produces a plain statement to that effect
+    // rather than a silent pass; it never blocks a run.
+    accountBalanceUsd,
     embedder,
     clusterDistanceThreshold,
   } = opts || {};
@@ -1874,6 +1881,39 @@ export async function runSpec(spec, opts) {
       `[max-spend] the ceiling is CUMULATIVE: spent-to-date is every prior invocation and every configHash in this store, ` +
         `not just this invocation. Headroom left: $${(maxSpendUsd - priorSpend.totalUsd).toFixed(4)}.`,
     );
+
+    // ── Ceiling vs funding (issue #169, failure 1) ────────────────────────
+    // The first Stage 1c run aborted at $39.4965 against a --max-spend of
+    // $180, on an Anthropic billing refusal. The ceiling was never
+    // approached. A ceiling above the money available is decorative, and the
+    // operator learned it mid-run instead of at plan time.
+    //
+    // The number that has to fit inside the balance is the HEADROOM
+    // (ceiling - spent-to-date), not the ceiling: the ceiling is cumulative
+    // and most of it may already be paid for. Comparing the raw ceiling would
+    // cry wolf on every resumed run.
+    const headroomUsd = maxSpendUsd - priorSpend.totalUsd;
+    if (accountBalanceUsd === undefined) {
+      log(
+        "[balance] account balance NOT CHECKED -- neither Anthropic nor OpenAI exposes a balance an API key can read, " +
+          "so the harness cannot query one and does not pretend to. Pass --account-balance <usd> (or set " +
+          "IDEATE_ACCOUNT_BALANCE_USD) to have this ceiling checked against your funding at plan time instead of " +
+          "discovering the gap as a mid-run billing refusal.",
+      );
+    } else if (headroomUsd > accountBalanceUsd) {
+      log(
+        `[balance] WARNING: this ceiling's remaining headroom ($${headroomUsd.toFixed(4)}) exceeds the asserted account ` +
+          `balance ($${Number(accountBalanceUsd).toFixed(4)}). The ceiling is decorative above $${Number(accountBalanceUsd).toFixed(4)}: ` +
+          `the real limit is the balance, and the run will stop on a provider billing refusal rather than on --max-spend. ` +
+          `Balance is operator-asserted, not queried.`,
+      );
+    } else {
+      log(
+        `[balance] ceiling headroom $${headroomUsd.toFixed(4)} fits inside the asserted account balance ` +
+          `$${Number(accountBalanceUsd).toFixed(4)} -- --max-spend, not the balance, is the binding limit. ` +
+          `Balance is operator-asserted, not queried.`,
+      );
+    }
   }
 
   // ── --max-spend-<provider>: the SAME fail-closed pre-flight, priced PER

@@ -46,6 +46,7 @@ import {
   PAYMENT_FAILURE_KINDS,
 } from "../lib/accounting.mjs";
 import { runnerPriceGrid } from "../lib/price.mjs";
+import { calibrateFromStore, formatCalibration } from "../lib/calibration.mjs";
 import { AnthropicBatchProvider } from "./harness/provider.mjs";
 import { promptTemplateHash } from "./harness/prompts.mjs";
 import { voyageEmbedder } from "./metrics/embedder.mjs";
@@ -319,6 +320,26 @@ export function formatPrunePlan(plan, { applied = false } = {}) {
   return lines;
 }
 
+/**
+ * IDEATE_ACCOUNT_BALANCE_USD -> a number, or undefined (issue #169).
+ *
+ * Deliberately NOT tolerant: an unset/blank variable is "not asserted", but a
+ * SET-BUT-UNPARSEABLE one throws. Coercing `"180 USD"` to NaN would silently
+ * disable the balance warning, which is the same class of bug as the NaN
+ * `--max-spend` this file's own header comment calls out.
+ *
+ * @param {string|undefined} raw
+ * @returns {number|undefined}
+ */
+export function parseEnvBalance(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new Error(`run.mjs: IDEATE_ACCOUNT_BALANCE_USD must be a finite number, got '${raw}'`);
+  }
+  return n;
+}
+
 export function parseArgs(argv) {
   const args = { dryRun: false };
   for (let i = 0; i < argv.length; i++) {
@@ -342,6 +363,25 @@ export function parseArgs(argv) {
         break;
       case "--max-spend-openai":
         args.maxSpendByProviderUsd = { ...args.maxSpendByProviderUsd, openai: parseRequiredNumber(argv, ++i, "--max-spend-openai") };
+        break;
+      case "--account-balance":
+        // Issue #169, failure 1: the first Stage 1c run aborted at $39.4965
+        // against a --max-spend of $180, on a billing refusal. The ceiling was
+        // never approached, because the ACCOUNT BALANCE was the real limit.
+        //
+        // This is ASSERTED, not queried. Anthropic's public API exposes no
+        // balance/credit endpoint (the Admin API covers organization members,
+        // workspaces, API keys and the usage/cost reports -- cost reports are
+        // historical spend, not remaining funds, and need an admin key the
+        // harness does not hold). OpenAI's dashboard billing figures come from
+        // session-authenticated endpoints, not from an API key. So there is
+        // nothing honest to call, and the harness says so in `[balance]`
+        // rather than inventing a probe. See runner.mjs's accountBalanceUsd.
+        args.accountBalanceUsd = parseRequiredNumber(argv, ++i, "--account-balance");
+        break;
+      case "--help":
+      case "-h":
+        args.help = true;
         break;
       case "--arms":
         args.arms = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
@@ -516,6 +556,85 @@ export function parseArgs(argv) {
   return args;
 }
 
+/**
+ * `--help` (issue #169 item 4).
+ *
+ * Until #169 this CLI had no `--help` at all -- the usage block lived only in
+ * this file's header comment, where an operator running the tool never saw it.
+ * The SPEND CEILING section exists because the ceiling's cumulative semantics
+ * were correct, load-bearing, and undocumented: the operator who filed #169
+ * read `--max-spend 180` as "spend at most $180 on THIS run" and was surprised
+ * by admission control that had already counted $117 of prior spend. Nothing
+ * about the behaviour changes here. It is only now written down where it is
+ * read.
+ *
+ * @returns {string[]} lines, one per log() call
+ */
+export function helpLines() {
+  return [
+    "usage: node evals/run.mjs [flags]",
+    "",
+    "  --dry-run                   plan and price only; no provider calls, no store writes",
+    "  --phase N                   run study phase N (0 = embedder calibration)",
+    "  --arms A,B                  restrict to these arm ids",
+    "  --briefs biz-01,biz-02      restrict to these brief ids",
+    "  --replicates N              replicates per (arm, brief)",
+    "  --results-dir DIR           use a SEPARATE store rooted at DIR",
+    "  --no-batch                  submit single requests instead of Batch API (full price)",
+    "  --cell-concurrency N        cells in flight at once (default 1)",
+    "  --max-poll-minutes N        batch poll ceiling",
+    "  --no-resume                 do NOT re-poll/replay a batch already paid for",
+    "  --no-cancel-on-abandon      leave an abandoned batch running",
+    "  --prune [--apply ...]       store maintenance; see docs/resuming-batches.md",
+    "  --help, -h                  this message",
+    "",
+    "SPEND CEILINGS",
+    "",
+    "  --max-spend USD             global ceiling (provider spend PLUS non-provider spend)",
+    "  --max-spend-anthropic USD   per-provider ceiling",
+    "  --max-spend-openai USD      per-provider ceiling",
+    "  --account-balance USD       what the funding account can pay (see BALANCE below)",
+    "",
+    "  THE CEILING IS CUMULATIVE, NOT PER-INVOCATION.",
+    "",
+    "  --max-spend 220 does NOT mean 'spend at most $220 on this run'. It means",
+    "  'stop when this STORE's total recorded spend reaches $220' -- summed across",
+    "  every prior invocation and every configHash in the store the run is using.",
+    "  A store already holding $117 of spend has $103 of headroom under a $220",
+    "  ceiling, and the run stops there. The [max-spend] line prints spent-to-date",
+    "  and the remaining headroom on every ceiling-gated invocation.",
+    "",
+    "  This is deliberate and load-bearing: it is what makes a ceiling meaningful",
+    "  across a study collected over many resumed sessions. To budget one",
+    "  invocation in isolation, give it its own store with --results-dir, or add",
+    "  the intended new spend to the spent-to-date figure the last run printed.",
+    "",
+    "  ENFORCEMENT. The ceiling is checked twice. Pre-flight it prices the whole",
+    "  planned grid and warns -- that is an early warning, and when the pricer has",
+    "  no stored cells to calibrate an arm it says the number is a FLOOR, not an",
+    "  estimate. The guard proper runs mid-flight: between cell dispatches, and",
+    "  before every judge leg, against spend that has ACTUALLY been recorded. A",
+    "  cell or leg that would cross the ceiling is skipped as `budget_exceeded`,",
+    "  never written to the store, and re-plans as `todo` on the next invocation.",
+    "",
+    "  A cell already in flight when the ceiling trips is allowed to COMPLETE.",
+    "  Aborting it would discard provider work already paid for and risk a",
+    "  half-written record. So the true bound is the ceiling plus the actual cost",
+    "  of whatever was in flight -- at the default --cell-concurrency 1, at most",
+    "  one cell's worth.",
+    "",
+    "BALANCE",
+    "",
+    "  --account-balance is ASSERTED BY YOU, not queried. Neither Anthropic nor",
+    "  OpenAI exposes a remaining-balance endpoint an API key can read, so the",
+    "  harness does not pretend to check one. Pass it and the run warns at PLAN",
+    "  time when the ceiling's headroom exceeds your funding; omit it and the run",
+    "  says plainly that the ceiling is unverified against funding. Either way a",
+    "  ceiling above the balance is decorative -- the balance is the real limit,",
+    "  and it announces itself as a mid-run billing refusal.",
+  ];
+}
+
 // argv/deps are injectable (issue #62 BLOCKER 2): main() previously always
 // read process.argv and always constructed the real runSpec/ResultsStore,
 // so nothing outside a real CLI invocation could exercise its WIRING --
@@ -688,6 +807,14 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     runPhase0Fn = runPhase0,
   } = deps;
   const args = parseArgs(argv);
+
+  // --help before ANY other work: it must not need a store, a corpus, an
+  // engine version, or a network. Returns rather than exiting so a test can
+  // call main(["--help"]) and read the lines back.
+  if (args.help) {
+    for (const line of helpLines()) log(line);
+    return { help: true };
+  }
 
   // ── Which store (issue #120) ──────────────────────────────────────────
   // Resolved ONCE, before any mode branches, and used by all four of them
@@ -1148,6 +1275,19 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     embedder = voyageEmbedder({ apiKey: voyageApiKey });
   }
 
+  // ── Fit the projection to this store (issue #169) ─────────────────────────
+  // Only when a ceiling is active: `calibrateFromStore` reads and JSON-parses
+  // every stored body, the same whole-store read `spendToDate` performs, and a
+  // run with no ceiling has nothing to project against. Undefined calibration
+  // leaves `runnerPriceGrid` on its documented static effort table, which is
+  // still strictly better than the pre-#169 effort blindness.
+  const ceilingActive = args.maxSpendUsd !== undefined || args.maxSpendByProviderUsd !== undefined;
+  let calibration;
+  if (ceilingActive) {
+    calibration = calibrateFromStore(store, armsConfig);
+    for (const line of formatCalibration(calibration)) log(line);
+  }
+
   const runSpecOpts = {
     store,
     armsConfig,
@@ -1194,9 +1334,23 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     // plus arms.config.json's own panel shape, so each planned cell's judge
     // legs are priced per-model, batch-aware, and fail loud on a missing
     // rate -- not a flat per-pool guess.
-    priceGrid: runnerPriceGrid(undefined, { judgeLegsFor: judgeLegsFor({ judgeModels: JUDGE_MODELS, panelConfig: armsConfig.panel }) }),
+    //
+    // calibration (issue #169) -- the projection is fitted to THIS store
+    // before it is used. `runnerPriceGrid` alone is still a constant table
+    // keyed on arm.mode; the Stage 1c re-collect projected $41.59 against an
+    // actual $105.22 because that table had no model of `effort` and no memory
+    // of what these very arms had already cost, in this very store, under a
+    // prior configHash. `calibrateFromStore` supplies both. Computed only when
+    // a ceiling is active (it reads every stored body, the same whole-store
+    // read spendToDate performs) and logged with its basis, so the projection
+    // is an auditable number rather than an authoritative-looking constant.
+    priceGrid: runnerPriceGrid(undefined, {
+      judgeLegsFor: judgeLegsFor({ judgeModels: JUDGE_MODELS, panelConfig: armsConfig.panel }),
+      calibration,
+    }),
     maxSpendUsd: args.maxSpendUsd,
     maxSpendByProviderUsd: args.maxSpendByProviderUsd,
+    accountBalanceUsd: args.accountBalanceUsd ?? parseEnvBalance(process.env.IDEATE_ACCOUNT_BALANCE_USD),
     armIds: args.arms,
     briefIds: args.briefs,
     replicates: args.replicates,
