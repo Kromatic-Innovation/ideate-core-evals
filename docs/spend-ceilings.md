@@ -92,8 +92,25 @@ So the true bound is:
 > **ceiling + the actual cost of whatever was in flight when it tripped.**
 
 At the default `--cell-concurrency 1` that is at most one cell. At
-`--cell-concurrency 8` it is at most eight. Size the ceiling with that headroom
-in mind, or lower the concurrency when the margin matters more than throughput.
+`--cell-concurrency 8` — what `scripts/run-study1c.sh` uses — it is up to eight.
+
+**You do not have to work that out.** Every ceiling-gated run prints the bound
+*before* it starts, computed from the concurrency actually in force and the
+`--cell-concurrency` most expensive planned cells (any of them could be the ones
+in flight when it trips), priced at `usdHigh` wherever the projection is a floor:
+
+```
+[max-spend] worst-case stop=$224.9400 (ceiling $220.0000 + up to 8 in-flight
+            cell(s) at --cell-concurrency 8, worth $4.9400). A cell already
+            dispatched when the ceiling trips is allowed to COMPLETE rather
+            than be discarded, so this -- not the ceiling -- is the number to
+            size against.
+```
+
+Size against that number. The issue this page exists for (#169) is fundamentally
+that `--max-spend` *reads* as absolute and is not; an overshoot an operator can
+only discover afterwards would reproduce that complaint in a smaller form, so
+the bound is stated up front rather than left to be inferred from this page.
 
 ---
 

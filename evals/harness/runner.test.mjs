@@ -2505,3 +2505,80 @@ describe("issue #169: [balance] -- a ceiling above the funding is decorative, an
     assert.equal(logged.filter((m) => m.startsWith("[balance]")).length, 0);
   });
 });
+
+// ── issue #169: the worst-case stop is printed at PLAN time ──────────────────
+//
+// The in-flight cell completes rather than being aborted, so the real bound is
+// ceiling + whatever was in flight. #169's complaint is that --max-spend
+// "reads as absolute" and is not; an overshoot discovered only afterwards
+// reproduces that complaint in a new form. The bound is therefore stated
+// before the run, derived from the concurrency in force and the actual cells.
+
+describe("issue #169: [max-spend] worst-case stop", () => {
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const spec4 = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }, { id: "b3" }, { id: "b4" }], replicates: 1, config: CFG };
+  // Deliberately UNEQUAL per-cell prices so "the N most expensive" is
+  // distinguishable from "the first N" or "N x the mean".
+  const laddered = (cells) => {
+    const priceOf = (i) => (i + 1) * 2; // 2, 4, 6, 8
+    return {
+      usd: cells.reduce((a, _c, i) => a + priceOf(i), 0),
+      breakdown: cells.map((c, i) => ({ cellKey: c.key, usd: priceOf(i), byProvider: { anthropic: priceOf(i) } })),
+    };
+  };
+
+  const bannerFrom = async (t, opts) => {
+    const logged = [];
+    await runSpec(spec4, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: laddered,
+      maxSpendUsd: 1000,
+      log: (m) => logged.push(m),
+      ...opts,
+    });
+    return logged.find((m) => m.includes("worst-case stop="));
+  };
+
+  test("at the default concurrency 1 the bound is the ceiling plus the single most expensive planned cell", async (t) => {
+    const line = await bannerFrom(t, {});
+    assert.match(line, /worst-case stop=\$1008\.0000/, "1000 + the $8 cell, not + $2 (the first) and not + $5 (the mean)");
+    assert.match(line, /up to 1 in-flight cell\(s\)/);
+  });
+
+  test("the bound scales with --cell-concurrency, because that many cells can be in flight at once", async (t) => {
+    const line = await bannerFrom(t, { cellConcurrency: 3 });
+    assert.match(line, /worst-case stop=\$1018\.0000/, "1000 + 8 + 6 + 4 -- the THREE most expensive");
+    assert.match(line, /up to 3 in-flight cell\(s\)/);
+  });
+
+  test("the bound is built on usdHigh where the pricer reports one -- a bound built on a floor is not a bound", async (t) => {
+    const withHigh = (cells) => ({
+      usd: cells.length,
+      usdHigh: cells.length * 5,
+      calibrated: false,
+      uncalibratedArmIds: ["A"],
+      breakdown: cells.map((c) => ({ cellKey: c.key, usd: 1, usdHigh: 5, calibrated: false, byProvider: { anthropic: 1 } })),
+    });
+    const line = await bannerFrom(t, { priceGrid: withHigh, cellConcurrency: 2 });
+    assert.match(line, /worst-case stop=\$1010\.0000/, "2 x $5 (usdHigh), never 2 x $1 (the point estimate)");
+  });
+
+  test("the line says WHY the bound exists -- the in-flight cell completes rather than being discarded", async (t) => {
+    const line = await bannerFrom(t, {});
+    assert.match(line, /allowed to COMPLETE/);
+    assert.match(line, /this -- not the ceiling -- is the number to size against/);
+  });
+
+  test("no ceiling means no bound line, since there is nothing to overshoot", async (t) => {
+    const logged = [];
+    await runSpec(spec4, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      log: (m) => logged.push(m),
+    });
+    assert.equal(logged.filter((m) => m.includes("worst-case stop=")).length, 0);
+  });
+});

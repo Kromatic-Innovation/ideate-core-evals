@@ -1882,6 +1882,38 @@ export async function runSpec(spec, opts) {
         `not just this invocation. Headroom left: $${(maxSpendUsd - priorSpend.totalUsd).toFixed(4)}.`,
     );
 
+    // ── The worst-case stop, printed BEFORE the run (issue #169) ──────────
+    // A cell already in flight when the ceiling trips is allowed to complete
+    // (see the admission check below for why: aborting discards work already
+    // paid for and risks a half-written record in an append-only store). So
+    // the real bound is `ceiling + the actual cost of everything in flight`,
+    // not the ceiling exactly.
+    //
+    // #169's whole complaint is that --max-spend "reads as absolute" and is
+    // not. An overshoot the operator can only discover afterwards reproduces
+    // that complaint in a new form, however small and however well documented
+    // elsewhere. So the bound is stated here, at plan time, derived from the
+    // concurrency actually in force and the actual planned cells -- never
+    // left to be inferred from a doc.
+    //
+    // Worst case is the `cellConcurrency` MOST EXPENSIVE planned cells, since
+    // any subset of that size can be the one in flight when the ceiling
+    // trips. Priced at `usdHigh` wherever the pricer reports one, for the
+    // same reason admission uses it: a tier-2 cell's point estimate is a
+    // floor, and a bound built on a floor is not a bound.
+    const inFlightWorstCase = projection.breakdown
+      .map((b) => b.usdHigh ?? b.usd)
+      .sort((a, b) => b - a)
+      .slice(0, Math.max(cellConcurrency, 1))
+      .reduce((a, b) => a + b, 0);
+    log(
+      `[max-spend] worst-case stop=$${(maxSpendUsd + inFlightWorstCase).toFixed(4)} ` +
+        `(ceiling $${Number(maxSpendUsd).toFixed(4)} + up to ${Math.max(cellConcurrency, 1)} in-flight cell(s) at ` +
+        `--cell-concurrency ${Math.max(cellConcurrency, 1)}, worth $${inFlightWorstCase.toFixed(4)}). ` +
+        `A cell already dispatched when the ceiling trips is allowed to COMPLETE rather than be discarded, ` +
+        `so this -- not the ceiling -- is the number to size against.`,
+    );
+
     // ── Ceiling vs funding (issue #169, failure 1) ────────────────────────
     // The first Stage 1c run aborted at $39.4965 against a --max-spend of
     // $180, on an Anthropic billing refusal. The ceiling was never

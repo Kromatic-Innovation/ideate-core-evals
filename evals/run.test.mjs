@@ -1681,3 +1681,11 @@ test("issue #169: the calibration main() computes is HANDED TO the price grid, n
   assert.equal(priced.breakdown[0].calibrated, true);
   assert.ok(priced.usd > 10, `9M output tokens must price far above the structural estimate, got $${priced.usd}`);
 });
+
+test("issue #169: --help points the operator at the printed worst-case bound, not just at the concept", async () => {
+  const lines = [];
+  await main(["--help"], { log: (m) => lines.push(m) });
+  const text = lines.join("\n");
+  assert.match(text, /worst-case stop=/, "the help shows the actual line the run prints");
+  assert.match(text, /Size against THAT number, not against the ceiling\./);
+});
