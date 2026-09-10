@@ -33,11 +33,19 @@
 // genuine top/bottom-quartile balanced-accuracy metric.
 //
 // ── The validation record's key and shape ───────────────────────────────────
-// Key: `judge-validation|judge=${judgeHash}|slice=${sliceId}` — reserved,
-// namespaced so it can never collide with a real cell's `arm=...|brief=...`
-// key shape (lib/manifest.mjs's cellKey), and scoped per judge-prompt-version
-// (judgeHash) and per validation slice (sliceId identifies WHICH held-out
-// expert-scored slice validated this judge — e.g. a Si et al. subset id).
+// Key: `judge-validation|judge=${judgeHash}|req=${judgeRequestHash}|slice=${sliceId}`
+// — reserved, namespaced so it can never collide with a real cell's
+// `arm=...|brief=...` key shape (lib/manifest.mjs's cellKey), and scoped per
+// judge-prompt-version (judgeHash), per judge REQUEST SHAPE (judgeRequestHash,
+// #170 — max_tokens and the thinking mode, which judgeHash does not cover) and
+// per validation slice (sliceId identifies WHICH held-out expert-scored slice
+// validated this judge — e.g. a Si et al. subset id).
+//
+// `req=` sits BETWEEN `judge=` and `slice=` because sliceId itself embeds `|`
+// (`si-et-al|axis=originality|expert=overall_score`) and must stay last, and
+// because everything that finds a record scans the prefix
+// `judge-validation|judge=${judgeHash}|` — which matches both the current key
+// shape and the one pre-#170 record written without a `req=` segment.
 // Record shape (#24 widened it from `{ rho, floor, verdict }` so a reader can
 // confirm WHICH computation produced the verdict):
 //   result = { kind: "judge-validation", metric, construction, n, accuracy,
@@ -62,6 +70,12 @@
 // "Fails closed" means the ABSENCE of a record is treated exactly like a
 // KNOWN failure for the purpose of withholding idea-level scores — never
 // like an implicit pass.
+//
+// #170 adds a fourth disposition ahead of the other three: a passing record
+// exists but was produced under a DIFFERENT request shape than the caller's
+// current instrument -> THROW with a named diagnosis. The absence of an
+// instrument identity is treated the same way, for the same reason absence of
+// a record is — an unidentified instrument is not an implicit match.
 
 import { costRow } from "../../lib/accounting.mjs";
 // Shared attempt-record key grammar (issues #98, #108). Imported from the
@@ -387,13 +401,53 @@ export function resolveAccuracyFloor(config) {
   return override;
 }
 
-/** Reserved, namespaced key for a judge-validation record — never collides
- *  with a real cell key (lib/manifest.mjs's cellKey always starts `arm=`). */
-export function validationKey({ judgeHash, sliceId }) {
+/**
+ * Reserved, namespaced key for a judge-validation record — never collides
+ * with a real cell key (lib/manifest.mjs's cellKey always starts `arm=`).
+ *
+ * `judgeRequestHash` (#170) is OPTIONAL, and omitting it reproduces the
+ * pre-#170 key EXACTLY. That is the whole back-compat posture, and it is a
+ * read-path affordance rather than a write-path one: exactly one pre-#170
+ * record exists (`judge=16812833fcd2`, the passing 0.5833 §5.1 gate), and
+ * `ResultsStore.put` is append-only — it refuses a differing write under an
+ * existing key. Migrating that record would mean deleting or rewriting it,
+ * i.e. breaking the very store invariant that is the actual backstop against
+ * a silently-swapped verdict. So the old key stays addressable, the record is
+ * reconciled by its stored `requestShape` (see attachIdeaLevelScores), and
+ * every NEW record names its instrument in its own key.
+ *
+ * @param {object} o
+ *   @param {string} o.judgeHash
+ *   @param {string} o.sliceId
+ *   @param {string} [o.judgeRequestHash]  omit ONLY to address a pre-#170 record.
+ */
+export function validationKey({ judgeHash, judgeRequestHash, sliceId }) {
   if (!judgeHash || !sliceId) {
     throw new Error("validationKey: judgeHash and sliceId are both required");
   }
-  return `judge-validation|judge=${judgeHash}|slice=${sliceId}`;
+  if (judgeRequestHash === undefined || judgeRequestHash === null) {
+    return `judge-validation|judge=${judgeHash}|slice=${sliceId}`;
+  }
+  if (typeof judgeRequestHash !== "string" || judgeRequestHash === "") {
+    throw new Error(`validationKey: judgeRequestHash must be a non-empty string when supplied, got ${JSON.stringify(judgeRequestHash)}`);
+  }
+  return `judge-validation|judge=${judgeHash}|req=${judgeRequestHash}|slice=${sliceId}`;
+}
+
+/**
+ * Stable JSON for comparing two request shapes, key-sorted at every depth.
+ *
+ * Duplicated from score.mjs's `stableStringify` on purpose. score.mjs imports
+ * THIS module (score.mjs -> gate.mjs, for meterJudgeCall); importing back would
+ * close a cycle this file's header block already refuses for the same reason.
+ * Six lines beats an import cycle.
+ */
+function stableShape(value) {
+  if (Array.isArray(value)) return `[${value.map(stableShape).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableShape(value[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
 }
 
 /**
@@ -405,6 +459,10 @@ export function validationKey({ judgeHash, sliceId }) {
  * @param {object} store  a lib/store.mjs ResultsStore
  * @param {object} o
  *   @param {string} o.judgeHash
+ *   @param {string} o.judgeRequestHash  REQUIRED (#170) — evals/judge/score.mjs's
+ *     computeJudgeRequestHash over the shape these scores were produced under.
+ *     A stored verdict that does not name its instrument in its own key is the
+ *     defect #170 exists to close, so this is not optional on the write path.
  *   @param {string} o.sliceId
  *   @param {number} o.accuracy   the balanced accuracy the gate read
  *   @param {number} o.floor
@@ -419,8 +477,16 @@ export function validationKey({ judgeHash, sliceId }) {
  *   @param {string} [o.expertColumn]  the Si et al. expert column the axis was
  *     validated against (issue #36) — stored when supplied.
  */
-export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, verdict, n, rho, metric = "balanced-accuracy", construction = CONSTRUCTION_ID, judgeModel = "mixed", axis, expertColumn, requestShape }) {
+export function recordValidation(store, { judgeHash, judgeRequestHash, sliceId, accuracy, floor, verdict, n, rho, metric = "balanced-accuracy", construction = CONSTRUCTION_ID, judgeModel = "mixed", axis, expertColumn, requestShape }) {
   if (!store) throw new Error("recordValidation: store is required");
+  if (typeof judgeRequestHash !== "string" || judgeRequestHash === "") {
+    throw new Error(
+      "recordValidation: judgeRequestHash is required (#170) — compute it with " +
+        "computeJudgeRequestHash({ maxTokens, requestShape }) from evals/judge/score.mjs. " +
+        "judgeHash covers the prompt and the model roster but NOT max_tokens or the thinking mode, " +
+        "so a verdict keyed on judgeHash alone does not name the instrument that produced it.",
+    );
+  }
   if (verdict !== "pass" && verdict !== "drop") {
     throw new Error(`recordValidation: verdict must be "pass" or "drop", got ${JSON.stringify(verdict)}`);
   }
@@ -430,21 +496,19 @@ export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, v
   if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
     throw new Error("recordValidation: n must be a positive integer (the idea count the accuracy was computed over)");
   }
-  const key = validationKey({ judgeHash, sliceId });
+  const key = validationKey({ judgeHash, judgeRequestHash, sliceId });
   // axis/expertColumn are added ONLY when supplied, so a record written without
   // them (pre-#36 callers) keeps its exact prior shape.
   const result = { kind: "judge-validation", metric, construction, n, accuracy, floor, verdict, rho };
   if (axis !== undefined) result.axis = axis;
   if (expertColumn !== undefined) result.expertColumn = expertColumn;
-  // requestShape (#16, #170): judgeHash covers the prompt and the model roster
-  // but NOT max_tokens or the thinking mode, so two materially different judges
-  // share a judgeHash -- and therefore share a validationKey, which is exactly
-  // {judgeHash, sliceId}. Because attachIdeaLevelScores licenses idea-level
-  // metrics off ANY record whose verdict is "pass", an unstamped record lets a
-  // re-run under a different instrument unlock the study's confirmatory metrics
-  // invisibly. Stamping the shape here does not close the hash gap; it makes the
-  // gap AUDITABLE, which is the most a record can do about a field its own key
-  // does not cover.
+  // judgeRequestHash + requestShape (#16, #170). judgeHash covers the prompt and
+  // the model roster but NOT max_tokens or the thinking mode. The HASH is what
+  // separates two instruments into two keys (see validationKey above); the SHAPE
+  // is the human-readable statement of what that hash is a hash OF, so a reader
+  // opening the record does not have to reverse a 12-hex digest to learn which
+  // judge produced the verdict. Both, always — neither substitutes for the other.
+  result.judgeRequestHash = judgeRequestHash;
   if (requestShape !== undefined) result.requestShape = requestShape;
   return store.put({
     key,
@@ -473,25 +537,76 @@ function findValidationRecords(store, judgeHash) {
 }
 
 /**
- * Attach idea-level judge scores to study pools — but FAILS CLOSED (AC8):
+ * How a stored record's instrument compares to the caller's current one (#170).
+ *
+ *   "match"    the record's judgeRequestHash equals the current one, OR the
+ *              record predates judgeRequestHash but its stored `requestShape`
+ *              is deep-equal to the current shape.
+ *   "mismatch" the record names an instrument, and it is a different one.
+ *   "unknown"  the record names no instrument this call can compare. Treated
+ *              exactly like a mismatch — an unidentified instrument is not an
+ *              implicit match — but diagnosed differently, because the fix is
+ *              different (re-run the gate vs. supply `requestShape`).
+ */
+function instrumentDisposition(record, { judgeRequestHash, requestShape }) {
+  const r = (record && record.result) || {};
+  if (typeof r.judgeRequestHash === "string" && r.judgeRequestHash !== "") {
+    return r.judgeRequestHash === judgeRequestHash ? "match" : "mismatch";
+  }
+  if (r.requestShape !== undefined && requestShape !== undefined) {
+    return stableShape(r.requestShape) === stableShape(requestShape) ? "match" : "mismatch";
+  }
+  return "unknown";
+}
+
+/** Human-readable name for the instrument a record was produced under. */
+function describeInstrument(record) {
+  const r = (record && record.result) || {};
+  const parts = [];
+  if (r.judgeRequestHash) parts.push(`judgeRequestHash=${r.judgeRequestHash}`);
+  if (r.requestShape !== undefined) parts.push(`requestShape=${stableShape(r.requestShape)}`);
+  return parts.length ? parts.join(" ") : "UNRECORDED (the record names no request shape at all)";
+}
+
+/**
+ * Attach idea-level judge scores to study pools — but FAILS CLOSED (AC8, #170):
  *   - no validation record for judgeHash at all           -> throws
- *   - a record exists with verdict "drop"                 -> pool-level only
- *   - a record exists with verdict "pass"                 -> idea-level attached
+ *   - no record produced under the CURRENT request shape  -> throws (#170)
+ *   - a matching record exists with verdict "drop"        -> pool-level only
+ *   - a matching record exists with verdict "pass"        -> idea-level attached
  * If multiple validation records exist for this judgeHash (e.g. across multiple
  * slices), ANY passing record is sufficient to attach — the study only needs one
  * confirmed calibration to trust the instrument; a dropped record from a
- * DIFFERENT slice does not retroactively invalidate a pass.
+ * DIFFERENT slice does not retroactively invalidate a pass. That indifference is
+ * scoped to the SLICE, never to the instrument: records produced under a
+ * different request shape are excluded from the disposition entirely, so a pass
+ * under a thinking judge cannot license metrics computed with a direct one.
  *
  * @param {object} o
  *   @param {object} o.store         lib/store.mjs ResultsStore
  *   @param {string} o.judgeHash
+ *   @param {string} o.judgeRequestHash  REQUIRED (#170) — the CURRENT instrument's
+ *     computeJudgeRequestHash (evals/judge/score.mjs). Required rather than
+ *     optional for the same reason `judgeHash` is: an optional gate on a
+ *     licensing function is a gate nobody turns on.
+ *   @param {object} [o.requestShape]  the current instrument's request shape.
+ *     Used ONLY to reconcile a pre-#170 record, which carries `requestShape` but
+ *     no `judgeRequestHash` (exactly one such record exists — the passing 0.5833
+ *     §5.1 gate). Omitting it makes such a record "unknown", i.e. non-licensing.
  *   @param {Array}  o.pools         pool-level rows/metrics (opaque to this fn)
  *   @param {Array}  o.ideaLevelScores  idea-level judge scores to attach
  * @returns {{ pools: Array, ideas?: Array, idea_level_metrics?: "dropped" }}
  */
-export function attachIdeaLevelScores({ store, judgeHash, pools, ideaLevelScores }) {
+export function attachIdeaLevelScores({ store, judgeHash, judgeRequestHash, requestShape, pools, ideaLevelScores }) {
   if (!store) throw new Error("attachIdeaLevelScores: store is required");
   if (!judgeHash) throw new Error("attachIdeaLevelScores: judgeHash is required");
+  if (typeof judgeRequestHash !== "string" || judgeRequestHash === "") {
+    throw new Error(
+      "attachIdeaLevelScores: judgeRequestHash is required (#170) — compute it with " +
+        "computeJudgeRequestHash({ maxTokens, requestShape }) from evals/judge/score.mjs. " +
+        "Licensing idea-level metrics without naming the current instrument is the defect #170 closes.",
+    );
+  }
 
   const records = findValidationRecords(store, judgeHash);
   if (records.length === 0) {
@@ -502,9 +617,26 @@ export function attachIdeaLevelScores({ store, judgeHash, pools, ideaLevelScores
     );
   }
 
-  const passing = records.find((r) => r.result && r.result.verdict === "pass");
+  const usable = records.filter((r) => instrumentDisposition(r, { judgeRequestHash, requestShape }) === "match");
+  if (usable.length === 0) {
+    // A NAMED diagnosis, not a key collision. The records exist and are readable;
+    // what changed is the instrument, and the message says so in those words.
+    const stored = records.map((r) => `  • ${describeInstrument(r)}  (verdict ${r.result && r.result.verdict})`).join("\n");
+    throw new Error(
+      `attachIdeaLevelScores: the judge's request shape changed — no validation record for judgeHash ` +
+        `'${judgeHash}' was produced under the current instrument.\n` +
+        `  current: judgeRequestHash=${judgeRequestHash}` +
+        (requestShape === undefined ? "" : ` requestShape=${stableShape(requestShape)}`) +
+        `\n  stored (${records.length} record${records.length === 1 ? "" : "s"}):\n${stored}\n` +
+        "A verdict earned under one request shape (max_tokens + thinking mode) does not license idea-level " +
+        "metrics computed under another (#170; docs/PREREGISTRATION.md §5). Re-run the §5.1 gate under the " +
+        "current shape, or analyse under the shape the stored verdict was earned with.",
+    );
+  }
+
+  const passing = usable.find((r) => r.result && r.result.verdict === "pass");
   if (!passing) {
-    // Every record on file for this judge is a "drop" — pool-level-only output,
+    // Every record on file for this judge UNDER THIS INSTRUMENT is a "drop" — pool-level-only output,
     // idea-level metrics explicitly marked dropped rather than just omitted (so
     // a downstream report can distinguish "we chose not to compute this" from
     // "this field is simply absent").

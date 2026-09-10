@@ -67,7 +67,7 @@
 
 import { readSiEtAlSlice, sliceToJudgePool } from "./slice.mjs";
 import { validateJudge, recordValidation, meterJudgeCall } from "./gate.mjs";
-import { judgeScoresForAxis, computeJudgeHash, MAX_JUDGE_TOKENS, JUDGE_REQUEST_SHAPE } from "./score.mjs";
+import { judgeScoresForAxis, computeJudgeHash, computeJudgeRequestHash, MAX_JUDGE_TOKENS, JUDGE_REQUEST_SHAPE } from "./score.mjs";
 import { assertAxesNotCollapsed } from "./prompt.mjs";
 import { providerOf } from "./matrix.mjs";
 import { JUDGE_VALIDATION_AXIS, SI_ET_AL_EXPERT_SCORE_FIELD } from "./config.mjs";
@@ -137,8 +137,8 @@ export function judgeValidationSliceId({ axis, expertScoreField }) {
  *     compute `spendByProvider` from this run's own costRows (issue #63) — never
  *     affects what is stored (store rows are always token counts, priced at READ time)
  * @returns {Promise<{ metric, construction, n, accuracy, floor, verdict, rho,
- *   axis, expertColumn, judgeHash, sliceId, exclusions, costRows,
- *   spendByProvider, hasMissingRate, missingRateModels }>}
+ *   axis, expertColumn, judgeHash, judgeRequestHash, requestShape, sliceId,
+ *   exclusions, costRows, spendByProvider, hasMissingRate, missingRateModels }>}
  */
 export async function runJudgeValidation({
   store,
@@ -292,11 +292,16 @@ export async function runJudgeValidation({
   // the thinking mode: the two interact, and it was the interaction -- 256
   // tokens, all of them spent thinking -- that broke the first real run.
   const requestShape = { maxTokens: MAX_JUDGE_TOKENS, ...JUDGE_REQUEST_SHAPE };
+  // ...and hashed, so it lands in the record's KEY and not merely in its body
+  // (#170). The shape alone made the gap auditable; the hash is what makes two
+  // instruments occupy two keys.
+  const judgeRequestHash = computeJudgeRequestHash({ requestShape });
 
   // 6. Record — self-describing: the axis + expert column actually used.
   const judgeHash = computeJudgeHash({ judgeModels: { [providerOf(judgeModel)]: [judgeModel] } });
   recordValidation(store, {
     judgeHash,
+    judgeRequestHash,
     sliceId,
     ...result,
     judgeModel,
@@ -311,5 +316,5 @@ export async function runJudgeValidation({
   // providerOf(judgeModel) regardless of which topic group produced it.
   const { byProvider: spendByProvider, hasMissingRate, missingRateModels } = priceRowsByProvider(costRows, rateTable, { batch: mode === "batch" });
 
-  return { ...result, axis, expertColumn: expertScoreField, judgeHash, sliceId, exclusions: slice.exclusions, costRows, spendByProvider, hasMissingRate, missingRateModels };
+  return { ...result, axis, expertColumn: expertScoreField, judgeHash, judgeRequestHash, requestShape, sliceId, exclusions: slice.exclusions, costRows, spendByProvider, hasMissingRate, missingRateModels };
 }
