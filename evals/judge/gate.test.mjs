@@ -410,3 +410,52 @@ test("meterJudgeCall requires store, cellKey, and judgeModel", () => {
   assert.throws(() => meterJudgeCall({ store, judgeModel: "y", tokens: {}, timestamp: "t" }), /cellKey is required/);
   assert.throws(() => meterJudgeCall({ store, cellKey: "x", tokens: {}, timestamp: "t" }), /judgeModel is required/);
 });
+
+// ── #16/#170: the record must say WHICH instrument produced the verdict ──────
+// validationKey is {judgeHash, sliceId}, and judgeHash covers neither
+// max_tokens nor the thinking mode. attachIdeaLevelScores licenses idea-level
+// metrics off ANY record whose verdict is "pass", so without a stamp a "drop"
+// under one instrument followed by a "pass" under another silently unlocks the
+// study's confirmatory metrics. The stamp cannot close the hash gap; it makes it
+// auditable.
+
+test("#170: recordValidation stamps requestShape onto the record", () => {
+  const store = makeTempStore("judge-gate-test-");
+  const shape = { maxTokens: 256, thinking: { type: "disabled" } };
+  recordValidation(store, {
+    judgeHash: "jh1", sliceId: "s1", accuracy: 0.6, floor: 0.561, verdict: "pass", n: 98, rho: 0.3,
+    axis: "originality", expertColumn: "overall_score", requestShape: shape,
+  });
+  const entry = store.list().find((r) => r.armId === "__judge-validation__");
+  assert.ok(entry, "a validation record was written");
+  assert.deepEqual(store.get(entry.key).result.requestShape, shape);
+});
+
+test("#170: a re-run under a different instrument CANNOT overwrite a verdict -- the store's append-only guard is what closes the hash gap", () => {
+  // The hazard: judgeHash covers neither max_tokens nor the thinking mode, and
+  // validationKey is exactly {judgeHash, sliceId} -- so a thinking judge's
+  // "drop" and a direct judge's "pass" collide on ONE key. Since
+  // attachIdeaLevelScores licenses idea-level metrics off ANY record whose
+  // verdict is "pass", a silent overwrite would let a second, differently-shaped
+  // run unlock the study's confirmatory metrics with nothing marking the change.
+  //
+  // It does not, and this test records WHY: ResultsStore.put is append-only and
+  // REFUSES a second write under an existing key with different content. The
+  // backstop is the store's invariant, not the hash. That is worth pinning
+  // precisely because the protection lives somewhere other than where a reader
+  // would look for it.
+  const store = makeTempStore("judge-gate-test-");
+  const common = { judgeHash: "jh1", sliceId: "s1", floor: 0.561, n: 98, rho: 0.1, axis: "originality", expertColumn: "overall_score" };
+  recordValidation(store, { ...common, accuracy: 0.5, verdict: "drop", requestShape: { maxTokens: 256, thinking: { type: "adaptive" } } });
+
+  assert.throws(
+    () => recordValidation(store, { ...common, accuracy: 0.62, verdict: "pass", requestShape: { maxTokens: 256, thinking: { type: "disabled" } } }),
+    /already exists under this exact key with DIFFERENT content/,
+    "a differently-shaped re-run must not be able to replace a stored verdict",
+  );
+
+  const entry = store.list().find((r) => r.armId === "__judge-validation__");
+  const rec = store.get(entry.key);
+  assert.equal(rec.result.verdict, "drop", "the ORIGINAL verdict survives");
+  assert.equal(rec.result.requestShape.thinking.type, "adaptive", "...and still names the instrument that produced it");
+});

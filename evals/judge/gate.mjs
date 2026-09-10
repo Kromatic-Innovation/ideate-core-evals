@@ -419,7 +419,7 @@ export function validationKey({ judgeHash, sliceId }) {
  *   @param {string} [o.expertColumn]  the Si et al. expert column the axis was
  *     validated against (issue #36) — stored when supplied.
  */
-export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, verdict, n, rho, metric = "balanced-accuracy", construction = CONSTRUCTION_ID, judgeModel = "mixed", axis, expertColumn }) {
+export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, verdict, n, rho, metric = "balanced-accuracy", construction = CONSTRUCTION_ID, judgeModel = "mixed", axis, expertColumn, requestShape }) {
   if (!store) throw new Error("recordValidation: store is required");
   if (verdict !== "pass" && verdict !== "drop") {
     throw new Error(`recordValidation: verdict must be "pass" or "drop", got ${JSON.stringify(verdict)}`);
@@ -436,6 +436,16 @@ export function recordValidation(store, { judgeHash, sliceId, accuracy, floor, v
   const result = { kind: "judge-validation", metric, construction, n, accuracy, floor, verdict, rho };
   if (axis !== undefined) result.axis = axis;
   if (expertColumn !== undefined) result.expertColumn = expertColumn;
+  // requestShape (#16, #170): judgeHash covers the prompt and the model roster
+  // but NOT max_tokens or the thinking mode, so two materially different judges
+  // share a judgeHash -- and therefore share a validationKey, which is exactly
+  // {judgeHash, sliceId}. Because attachIdeaLevelScores licenses idea-level
+  // metrics off ANY record whose verdict is "pass", an unstamped record lets a
+  // re-run under a different instrument unlock the study's confirmatory metrics
+  // invisibly. Stamping the shape here does not close the hash gap; it makes the
+  // gap AUDITABLE, which is the most a record can do about a field its own key
+  // does not cover.
+  if (requestShape !== undefined) result.requestShape = requestShape;
   return store.put({
     key,
     armId: "__judge-validation__",

@@ -84,6 +84,51 @@ import {
  *  §5 rubric forbids. */
 export const MAX_JUDGE_TOKENS = 256;
 
+/**
+ * The judge's request shape, applied to EVERY judge call in both modes.
+ *
+ * WHY `thinking: disabled` (#16, Appendix N item 7). The first real run of the
+ * §5.1 validation gate died on `parseAxisScores: empty judge reply`. It was not
+ * a refusal. Probing the failing call showed `stop_reason: "max_tokens"` with
+ * `output_tokens: 256` of which `thinking_tokens: 255` -- the model spent the
+ * whole budget thinking and never emitted the JSON. `buildAnthropicMessageParams`
+ * never sets `thinking`, so these calls inherited the API's ADAPTIVE default and
+ * the model decided per idea whether to think.
+ *
+ * The load-bearing observation is not that the run crashed. It is that 8 of the
+ * 10 replies in that topic group returned `thinking_tokens: 0` and two returned
+ * 255. Under adaptive thinking the instrument was HETEROGENEOUS ACROSS IDEAS,
+ * and the ideas it chose to think about are plausibly the ambiguous ones whose
+ * expert scores are hardest to predict -- a bias surface in the gate itself, not
+ * merely a crash. Disabling thinking makes the instrument uniform across ideas,
+ * which §5.1 assumed and the observed data shows it was not.
+ *
+ * It also restores the shape Appendix N item 3 registers: a DIRECT, score-only
+ * scorer, whose shape-matched Si et al. comparator is Claude-3.5 Direct (51.7%).
+ * Raising the ceiling instead would make this a reasoning judge, matching
+ * neither registered comparator.
+ *
+ * WHETHER THINKING SHIFTS THE SCORES IS UNMEASURED. Replaying one failing
+ * candidate returned originality 6 disabled, 4 at max_tokens 2048, 5 at 4096 --
+ * one candidate, one draw each, no temperature set. That is consistent with
+ * sampling noise and is NOT evidence of an instrument effect. It is recorded so
+ * the question is visibly open rather than silently settled.
+ *
+ * NOT IN `judgeHash` -- see the warning on computeJudgeHash below.
+ */
+export const JUDGE_REQUEST_SHAPE = Object.freeze({ thinking: Object.freeze({ type: "disabled" }) });
+
+/**
+ * The judge request params, built once so the two modes cannot drift apart.
+ * Both `#scoreSingle` and `#scoreBatched` go through here.
+ */
+export function judgeMessageParams({ judgeModel, prompt }) {
+  return {
+    ...buildAnthropicMessageParams({ model: judgeModel, prompt, maxTokens: MAX_JUDGE_TOKENS }),
+    ...JUDGE_REQUEST_SHAPE,
+  };
+}
+
 /** Judge scores are on the rubric's 1-10 scale (prompt.mjs JUDGE_PROMPT). */
 const AXIS_MIN = 1;
 const AXIS_MAX = 10;
@@ -325,7 +370,7 @@ export class AnthropicJudgeProvider {
   async #scoreSingle(requests, judgeModel, { tokens, classification, replies }) {
     await Promise.all(
       requests.map(async (req) => {
-        const params = buildAnthropicMessageParams({ model: judgeModel, prompt: req.prompt, maxTokens: MAX_JUDGE_TOKENS });
+        const params = judgeMessageParams({ judgeModel, prompt: req.prompt });
         const { ok, status, json, error, errorBody } = await anthropicFetchWithRetry(
           this.fetchImpl,
           "https://api.anthropic.com/v1/messages",
@@ -355,7 +400,7 @@ export class AnthropicJudgeProvider {
   async #scoreBatched(requests, judgeModel, { tokens, classification, replies }) {
     const batchRequests = requests.map((req) => ({
       custom_id: req.customId,
-      params: buildAnthropicMessageParams({ model: judgeModel, prompt: req.prompt, maxTokens: MAX_JUDGE_TOKENS }),
+      params: judgeMessageParams({ judgeModel, prompt: req.prompt }),
     }));
     const byCustomId = new Map(requests.map((req) => [req.customId, req]));
 
@@ -818,6 +863,31 @@ export function judgeScoresForAxis(scores, axis) {
  *     model ids per provider (the matrix's judgeModels shape). Order-insensitive.
  *   @param {object} [o.promptObject]  defaults to the frozen JUDGE_PROMPT.
  * @returns {string} 12 hex chars
+ */
+/*
+ * KNOWN GAP -- judgeHash does NOT cover the judge's REQUEST SHAPE (#16, #170).
+ *
+ * The payload below is the prompt object's hash plus the model roster. It does
+ * not include `MAX_JUDGE_TOKENS` or `JUDGE_REQUEST_SHAPE`, so two runs using
+ * materially different instruments -- one with adaptive thinking eating the
+ * whole 256-token budget, one with thinking disabled -- produce the SAME
+ * judgeHash and are indistinguishable in the store.
+ *
+ * That is not cosmetic. `validationKey` is `{judgeHash, sliceId}`, and
+ * `attachIdeaLevelScores` licenses idea-level metrics on `records.find(r =>
+ * r.result.verdict === "pass")`. So a `drop` under one request shape followed by
+ * a `pass` under another, at the same judgeHash and sliceId, silently unlocks
+ * the study's confirmatory idea-level metrics with nothing in the store marking
+ * that the instrument changed. This is exactly the tampering surface the hash
+ * discipline exists to close.
+ *
+ * WHY IT IS NOT SIMPLY FIXED HERE. Folding either constant into this payload
+ * changes judgeHash -> configHash (judgeHash is a CONFIG_FIELDS entry) -> the
+ * cellKey of every stored cell, re-keying all 431 collected Stage 1c cells over
+ * a judge constant that did not exist when they were collected. That trade is
+ * worse than the gap. The interim mitigation is `recordValidation` stamping the
+ * request shape onto the validation record itself (see gate.mjs), so a reader
+ * can at least tell which instrument produced a verdict. Filed as #170.
  */
 export function computeJudgeHash({ judgeModels, promptObject } = {}) {
   if (!judgeModels || typeof judgeModels !== "object") {
