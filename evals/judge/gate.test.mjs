@@ -587,6 +587,52 @@ test("#170: the ONE pre-#170 record is still reachable and still licenses idea-l
   );
 });
 
+test("#170: a MIXED record set diagnoses the changed shape, not the missing argument", () => {
+  // The boundary between the two refusals, and the reason the missing-argument
+  // branch is gated on `bridgeable.length === records.length` rather than
+  // `> 0`. Here one record is pre-#170 (reconcilable only via requestShape,
+  // which the caller omitted) and one is modern with a genuinely DIFFERENT
+  // judgeRequestHash. Some record really does name another instrument, so
+  // "the judge's request shape changed" is the TRUE diagnosis and "you forgot
+  // an argument" would be the false one — the exact mirror of the assertion
+  // pair in the reachability test above.
+  //
+  // Added because mutation M15 (=== records.length -> > 0) SURVIVED the suite:
+  // nothing built a mixed set, so both forms passed. The implementation was
+  // correct; the coverage was not.
+  const store = makeTempStore("judge-gate-test-");
+  const judgeHash = "jhMixed";
+  const adaptive = { maxTokens: 256, thinking: { type: "adaptive" } };
+  const otherHash = computeJudgeRequestHash({ requestShape: adaptive });
+
+  // (1) pre-#170: requestShape, no judgeRequestHash, legacy key shape.
+  store.put({
+    key: validationKey({ judgeHash, sliceId: "sliceLegacy" }),
+    armId: "__judge-validation__", briefId: "sliceLegacy", replicate: 0, cfg: judgeHash,
+    result: {
+      kind: "judge-validation", n: 98, accuracy: 0.62, floor: 0.561, verdict: "pass", rho: 0.2,
+      requestShape: CURRENT_SHAPE,
+    },
+    resolvedModels: { judge: "mixed" }, accounting: { state: "completed" }, costRows: [],
+  });
+  // (2) modern, and genuinely a different instrument.
+  recordValidation(store, {
+    judgeHash, judgeRequestHash: otherHash, sliceId: "sliceModern",
+    accuracy: 0.7, floor: 0.561, verdict: "pass", n: 98, rho: 0.4, requestShape: adaptive,
+  });
+
+  assert.throws(
+    // requestShape deliberately OMITTED.
+    () => attachIdeaLevelScores({ store, judgeHash, judgeRequestHash: CURRENT_REQ_HASH, pools: [], ideaLevelScores: [{ idea: "z" }] }),
+    (err) => {
+      assert.match(err.message, /the judge's request shape changed/);
+      assert.doesNotMatch(err.message, /no current requestShape was supplied/);
+      assert.match(err.message, new RegExp(otherHash), "names the record that really did change instrument");
+      return true;
+    },
+  );
+});
+
 test("#170: the legacy requestShape bridge compares shapes STRUCTURALLY, not by key order", () => {
   // gate.mjs cannot import score.mjs (score.mjs -> gate.mjs already), so it
   // reconciles a pre-#170 record by comparing shapes rather than hashing one.
