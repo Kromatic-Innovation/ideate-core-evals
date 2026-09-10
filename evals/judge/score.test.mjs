@@ -18,6 +18,8 @@ import {
   recordJudgeScores,
   judgeScoresKey,
   judgeScoresForAxis,
+  judgeMessageParams,
+  JUDGE_REQUEST_SHAPE,
   computeJudgeHash,
   MAX_JUDGE_TOKENS,
 } from "./score.mjs";
@@ -1396,4 +1398,99 @@ test("issue #106: a REAL OpenAIJudgeProvider quota refusal sets the abort and sh
   assert.equal(second.failureKind, "payment_required");
   assert.equal(second.attempted, false);
   assert.equal(runs[1].results.find((r) => r.judge_provider === "anthropic").state, "completed", "the anthropic leg of the same pool still judged");
+});
+
+// ── #16: the judge is a DIRECT scorer, and both modes must agree on that ─────
+// The first real run of the §5.1 gate died on `parseAxisScores: empty judge
+// reply`. Not a refusal: stop_reason "max_tokens", output_tokens 256, of which
+// thinking_tokens 255. buildAnthropicMessageParams never sets `thinking`, so the
+// call inherited the API's ADAPTIVE default -- and 8 of 10 replies in that topic
+// group thought not at all while 2 spent the entire budget thinking, making the
+// instrument heterogeneous across ideas. These tests pin the fix.
+
+test("#16: judgeMessageParams disables thinking -- the 256-token cap only forbids reasoning if reasoning is off", () => {
+  const params = judgeMessageParams({ judgeModel: "claude-sonnet-5", prompt: "p" });
+  assert.deepEqual(params.thinking, { type: "disabled" });
+  assert.equal(params.max_tokens, MAX_JUDGE_TOKENS);
+});
+
+test("#16: the SINGLE-mode judge call actually carries thinking:disabled on the wire", async () => {
+  const sent = [];
+  const fetchImpl = async (_url, opts) => {
+    sent.push(JSON.parse(opts.body));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        content: [{ type: "text", text: '{"originality": 5, "feasibility": 5}' }],
+        usage: { input_tokens: 10, output_tokens: 19 },
+      }),
+    };
+  };
+  const p = new AnthropicJudgeProvider({ apiKey: "k", fetchImpl });
+  const out = await p.score(
+    { briefText: "b", candidates: [{ text: "one" }, { text: "two" }] },
+    { judgeModel: "claude-sonnet-5", mode: "single", seed: 1, timestamp: "2026-09-09T00:00:00.000Z" },
+  );
+  assert.equal(out.terminalState, "completed");
+  assert.equal(sent.length, 2, "one POST per candidate");
+  for (const body of sent) {
+    assert.deepEqual(body.thinking, { type: "disabled" }, "every single-mode judge call disables thinking");
+  }
+});
+
+test("#16: the BATCH-mode judge call carries it too -- the two modes cannot drift apart", async () => {
+  // Only the SUBMIT body matters here: it is the one that carries params.
+  let submitted = null;
+  const fetchImpl = async (url, opts) => {
+    if (opts && opts.method === "POST" && String(url).endsWith("/v1/messages/batches")) {
+      submitted = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ id: "b1", processing_status: "in_progress" }) };
+    }
+    if (String(url).includes("/results")) {
+      const lines = submitted.requests.map((r) =>
+        JSON.stringify({
+          custom_id: r.custom_id,
+          result: {
+            type: "succeeded",
+            message: {
+              content: [{ type: "text", text: '{"originality": 5, "feasibility": 5}' }],
+              usage: { input_tokens: 10, output_tokens: 19 },
+            },
+          },
+        }),
+      );
+      return { ok: true, status: 200, text: async () => lines.join("\n") };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "b1", processing_status: "ended", results_url: "https://api.anthropic.com/v1/messages/batches/b1/results" }),
+    };
+  };
+  const p = new AnthropicJudgeProvider({ apiKey: "k", fetchImpl, sleep: async () => {}, pollIntervalMs: 0 });
+  const out = await p.score(
+    { briefText: "b", candidates: [{ text: "one" }, { text: "two" }] },
+    { judgeModel: "claude-sonnet-5", mode: "batch", seed: 1, timestamp: "2026-09-09T00:00:00.000Z" },
+  );
+  assert.equal(out.terminalState, "completed");
+  assert.ok(submitted && Array.isArray(submitted.requests) && submitted.requests.length === 2);
+  for (const r of submitted.requests) {
+    assert.deepEqual(r.params.thinking, { type: "disabled" }, "every batched judge request disables thinking");
+  }
+});
+
+test("#16/#170: judgeHash does NOT cover the request shape -- the gap is real, and pinned so it cannot be forgotten", () => {
+  // This test asserts a DEFECT, deliberately. Folding MAX_JUDGE_TOKENS or
+  // JUDGE_REQUEST_SHAPE into computeJudgeHash would change judgeHash ->
+  // configHash -> the cellKey of all 431 collected Stage 1c cells, so the gap is
+  // accepted and mitigated by stamping requestShape onto the validation record
+  // instead. If someone later closes the gap properly, this test SHOULD fail --
+  // that is the signal to re-key deliberately rather than by accident.
+  const before = computeJudgeHash({ judgeModels: { anthropic: ["claude-sonnet-5"] } });
+  const after = computeJudgeHash({ judgeModels: { anthropic: ["claude-sonnet-5"] } });
+  assert.equal(before, after);
+  const canonical = JSON.stringify({ prompt: judgePromptHash(), models: ["claude-sonnet-5"] });
+  assert.ok(!canonical.includes(String(MAX_JUDGE_TOKENS)), "max_tokens is not in the judgeHash payload");
+  assert.ok(!canonical.includes("thinking"), "the thinking mode is not in the judgeHash payload");
 });

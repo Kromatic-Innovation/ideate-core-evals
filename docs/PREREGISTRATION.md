@@ -2162,6 +2162,258 @@ S1c-1's SE is estimated from a single-σ fit pooling all three arms, including `
 
 The concern that motivated the check — that floor effects at 15.8 would compress that arm's variance and *deflate* the pooled SE — is **falsified**: per-arm variance is RICH 9.41, SOLO60 12.69, **SOLO6X10 32.91**, so pooling it *inflated* the SE by ~30%. **The registered three-arm figure is the conservative one**, and it remains the primary result; the two-arm fit was not pre-specified and is recorded here only so the check cannot be re-run selectively later.
 
+---
+
+## Appendix N — Amendments (dated 2026-09-09)
+
+Registers the §5.1 judge-validation run (#16) **before it is run**, and registers a separate, explicitly non-confirmatory quality read of the Stage 1c pools. Appendix L item 4 and Appendix M item 9 both name the unrun judge gate as the binding constraint on every claim this study makes; this appendix is the attempt to unbind it, and it registers in advance what happens in both branches.
+
+### Item 1 — What was already settled, and what is actually left
+
+Issue #16's own history records two blockers that are **no longer live**, and this item states that plainly so the run is not re-litigated against a stale reading of the issue:
+
+1. **The axis↔column mapping is registered.** Appendix A item 7 registers the judge's **`originality`** axis against the Si et al. **`overall_score`** column. The 2026-08-02 kickback described this as an unregistered methodology decision; it was registered afterwards. That kickback also described the judge as emitting *four* axes — it emits **two**, `originality` and `feasibility` (`prompt.mjs` `JUDGE_AXES`). Both statements in that comment are stale.
+2. **The slice join is repaired.** The kickback recorded `readSiEtAlSlice()` failing closed with *"99 idea file(s) did not resolve to an idea_id"*. Verified on `develop` at `cbb74a7`: the join is total — **98 ideas, 228 reviews**, `nearMisses: 0`, with `AI_Rerank` carried as a named exclusion (49 files, issue #35).
+
+The remaining scope of #16 is therefore exactly its fourth checklist item: **run the validation and record the record.** Nothing about the instrument is changed by this appendix.
+
+### Item 2 — The answer key is under-powered, and this is registered before the verdict
+
+`evals/judge/reproduce-si-et-al.mjs` was run against the real slice. It reproduces the committed #47 figure **bit-for-bit** (only the timestamp differs), so this is a verification, not a new measurement — but the figure has never been carried into the gate's own registration, and it governs how the verdict may be read:
+
+| Quantity | Value |
+|---|---|
+| Human–human balanced accuracy, our 98-idea slice | **0.5534** |
+| Bootstrap 95% CI (2000 draws, resampling ideas) | **[0.4483, 0.6702]** |
+| Registered floor (Appendix A item 4) | 0.561 |
+| Chance | 0.500 |
+
+**The CI does not exclude chance.** The expert answer key, measured against itself at n=98, cannot be distinguished from a coin flip. The registered 0.561 floor sits inside the CI and is therefore not contradicted — but a `pass`/`drop` verdict computed at n=98 carries roughly ±0.11 of bootstrap uncertainty, so a judge at 0.60 and a judge at 0.50 land in the same interval.
+
+**Registered consequence:** the verdict is reported **with this CI beside it**, and is described as **power-limited by the answer key, not only by the judge**. This is registered now, before the verdict is known, precisely so it cannot be deployed selectively as an excuse for a `drop` or waved away on a `pass`.
+
+### Item 3 — Comparators, registered before the run
+
+Appendix A item 4 registers **53.3%** as the "best LLM evaluator" comparator. That figure is Si et al.'s Claude-3.5 **Pairwise** ranker. This study's judge is a **direct, score-only** scorer, whose shape-matched comparator is Claude-3.5 **Direct** at **51.7%**. Registering only the pairwise figure invites a comparison against a differently-shaped evaluator.
+
+**Both are registered as comparators**, with 51.7% named as the shape-matched one. Neither is a floor; the floor remains 56.1%.
+
+**A construction difference is registered alongside them:** Si et al. threshold LLM evaluators at their **median** score, whereas `balancedAccuracyTopBottom` ranks the labelled set and splits top-k/bottom-k. These are not the same computation, and any comparison drawn against 51.7% or 53.3% must say so.
+
+### Item 4 — Run parameters, fixed before the first judge call
+
+- **Axis:** `originality` (Appendix A item 7)
+- **Expert column:** `overall_score` (Appendix A item 7)
+- **Metric / construction:** `balanced-accuracy` / `si-et-al-2024/split-half-top-bottom-25pct-balanced-accuracy` (Appendix A item 4)
+- **Floor:** `0.561`
+- **Slice:** Human + AI, n = 98; `AI_Rerank` excluded and carried in the record's `exclusions`
+- **Store:** a **dedicated** store, not `results-study1c`
+
+The store choice is load-bearing rather than cosmetic. `recordValidation` writes its record under `cfg: <judgeHash>`. `results-study1c`'s configHash tally is what `resolveS1cArmHashes` reads, and it throws when it finds more than one non-pre-#168 hash — so writing the validation record into that store would **break the Stage 1c analysis merged as #168**. The validation record goes elsewhere.
+
+**No sweep.** The judge is run at the registered mapping only. A judge-vs-column or judge-vs-axis sweep would select the gate on its own outcome; Appendix A item 7 closed the question and this appendix does not reopen it.
+
+### Item 5 — A construct tension, disclosed and NOT acted on
+
+The Si et al. release carries a **`novelty_score`** column. On construct grounds it is a closer match to the judge's `originality` axis than `overall_score` is.
+
+**The registered mapping stands.** The 56.1% floor is human–human agreement on `overall_score` and on no other column; validating against `novelty_score` would require a second floor and a second amendment. This is recorded as a **limitation of the registered gate**, not as a proposed change — and it is recorded *after* item 2's 0.5534 was already known, which is exactly the circumstance in which switching columns would be selecting on the outcome.
+
+### Item 6 — The Stage 1c quality read is DESCRIPTIVE and non-confirmatory
+
+The question the study actually needs answered — whether the rich panel's extra distinct ideas are *better* ideas, and whether `weirdo` buys distinctness with incoherence — is registered here as a **separate, explicitly non-confirmatory** exercise, run **outside** the §5.1 gate.
+
+- It scores already-stored Stage 1c candidate texts. No cells are re-collected.
+- Scores are written to a **sidecar keyed by cellKey**, never back into `results-study1c` under a new `configHash`. `judgeHash` is a `CONFIG_FIELDS` entry, so writing judge output in-store would restate every cell's identity and strand the 431 cells already collected.
+- It is run **regardless of the gate's verdict**, and every artifact it produces is labelled descriptive. Per §5.4 a `drop` verdict removes idea-level metrics from *the study's confirmatory claims*; it does not forbid looking at the ideas and saying what is there.
+- **It is a look, not a test.** A small stratified pilot has no power for an arm contrast, and no p-value is computed from it.
+
+Registering this in advance is what stops a `drop` verdict from silently deleting the user-facing answer, and stops a descriptive read from being promoted to a confirmatory one after the fact.
+
+### Item 7 — Instrument amendment: the judge was not the direct scorer §5 assumes
+
+**Registered after the first attempt failed and before any verdict existed**, which is the only ordering under which this amendment is legitimate.
+
+The first real run of the gate died on `parseAxisScores: empty judge reply`. It was not a refusal. Probing the failing call: `stop_reason: "max_tokens"`, `output_tokens: 256`, of which **`thinking_tokens: 255`** — the model spent the entire budget thinking and never emitted the JSON. `buildAnthropicMessageParams` never sets `thinking`, so every judge call this study has ever made inherited the API's **adaptive** default.
+
+`MAX_JUDGE_TOKENS`'s own doc comment already stated the intent this violates — 256 is *"small enough that a model tempted to 'explain' its score runs out of room rather than producing reasoning-then-score drift the §5 rubric forbids."* Adaptive thinking bypassed that ceiling's purpose: the model reasoned anyway, inside the budget meant to prevent it.
+
+**The load-bearing observation is not the crash.** In that topic group, **8 of 10** replies returned `thinking_tokens: 0` and **2** returned 255. Under adaptive thinking the instrument was **heterogeneous across ideas**, and the ideas it chose to think about are plausibly the ambiguous ones whose expert scores are hardest to predict — a bias surface in the gate itself, not merely a failure mode.
+
+**Registered change:** every judge call sets `thinking: {type: "disabled"}`. This restores the direct, score-only scorer item 3 registers and makes the instrument uniform across ideas. The ceiling is **not** raised; raising it would make this a reasoning judge, matching neither registered comparator.
+
+**Whether thinking shifts the scores is UNMEASURED.** Replaying one failing candidate gave `originality` 6 disabled, 4 at `max_tokens` 2048, 5 at 4096 — one candidate, one draw each, no temperature set. That is consistent with sampling noise and is **not** evidence of an instrument effect. It is recorded so the question stays visibly open.
+
+### Item 8 — A hash gap, and where the protection actually lives (#170)
+
+`judgeHash` folds the prompt hash and the model roster. It covers **neither** `MAX_JUDGE_TOKENS` **nor** the thinking mode. Since `validationKey` is exactly `{judgeHash, sliceId}`, a thinking judge and a direct judge collide on one key — and `attachIdeaLevelScores` licenses idea-level metrics off **any** record whose verdict is `pass`.
+
+**Not folded into the hash.** Doing so changes `judgeHash` → `configHash` → the `cellKey` of all **431 collected Stage 1c cells**, re-keying paid data over a constant that did not exist when it was collected. That trade is worse than the gap. Filed as **#170**.
+
+**Writing the test for the gap corrected the concern.** The feared path — a `drop` followed by a differently-shaped `pass` silently unlocking the confirmatory metrics — **is already closed**, by `ResultsStore.put`'s append-only guard, which refuses a second write under an existing key with different content. The backstop is the store's invariant, not the hash. Recorded because the protection lives somewhere no reader would look for it. `recordValidation` additionally stamps `requestShape` so a verdict names its own instrument.
+
+### Item 9 — Result: the §5.1 gate has run, and it PASSES
+
+First execution of the judge-validation gate in the study's history. Ran 2026-09-09 against the real slice; **$0.577**.
+
+| Field | Value |
+|---|---|
+| metric | `balanced-accuracy` |
+| construction | `si-et-al-2024/split-half-top-bottom-25pct-balanced-accuracy` |
+| axis ↔ column | `originality` ↔ `overall_score` |
+| n | **98** |
+| accuracy | **0.5833** |
+| floor | 0.561 |
+| **verdict** | **`pass`** |
+| rho (descriptive) | 0.2141 |
+| requestShape | `{maxTokens: 256, thinking: {type: "disabled"}}` |
+| judgeHash | `16812833fcd2` |
+
+**Per §5.4, idea-level metrics are therefore licensed** rather than dropped. That is the constraint Appendix L item 4 and Appendix M item 9 both named as binding on every claim this study makes.
+
+#### How far this verdict may be pushed — registered in item 2, before it was known
+
+1. **It is power-limited by the answer key, not only by the judge.** Human–human balanced accuracy on this same 98-idea slice is **0.5534, bootstrap 95% CI [0.4483, 0.6702]** — a CI that does not exclude chance. The judge's 0.5833 sits inside that interval. The honest statement is that **the judge is not distinguishable from the human reviewers on this metric at this n**, which is what clearing a human-agreement floor means; it is not evidence that the judge is *good*.
+2. **It clears both registered comparators** (item 3): 0.5833 > 0.533 pairwise and > 0.517 Claude-3.5 Direct, the shape-matched one. The construction difference registered in item 3 — Si et al. threshold LLM evaluators at their median, `balancedAccuracyTopBottom` splits top-k/bottom-k — applies to both comparisons and is not waived by the pass.
+3. **The margin is 2.2 points over the floor.** Nothing in this design distinguishes 0.5833 from 0.561.
+4. **`rho` is not stable across runs; the verdict is.** Two independent runs of the identical committed invocation returned accuracy **0.5833 both times** and rho **0.2291 then 0.2141**. The gate metric is robust to the judge's residual sampling variation; the retained descriptive statistic is not, and should not be quoted to three decimals.
+5. **The construct tension of item 5 is unresolved by a pass.** `originality` was validated against `overall_score`, not against `novelty_score`.
+
+#### Two defects in this appendix's own tooling, recorded rather than quietly fixed
+
+The **first** stored validation record carried `requestShape: null`. `runJudgeValidation` built the shape and never passed it to `recordValidation`; the unit test on `recordValidation` asserted the field is written *when supplied* and passed, so the mutation ledger was green while the wiring was dead. **A unit test on the callee is not a test of the wiring.** Fixed, a composition-level test added, and the defective record preserved outside the store before it was re-derived. The re-derivation reproduced accuracy, judgeHash and spend exactly.
+
+The **second**: the runner printed the full-roster `judgeHash` while `runJudgeValidation` keys the record by the single model that actually ran — so the operator was shown a key the store does not contain. Fixed.
+
+### Item 10 — Judge refusals are MISSING scores, not low ones
+
+**Registered before any quality mean was computed or inspected.** The first quality-read run scored 10 of 12 cells and then aborted; the abort happened before any summary was produced, and no per-arm or per-persona figure had been looked at when this rule was written. That ordering is the only thing that makes it a rule rather than a rationalisation.
+
+The abort was a second, distinct cause of `parse_failure: empty judge reply`, unrelated to item 7's thinking defect — which had already been fixed and held for 600 consecutive candidates. This one is **`stop_reason: "refusal"`**: the judge declined to score a candidate. The candidate was `"Build agent-based immune system simulations capturing T-cell and pathogen co-evolution to explore vaccination strategies that minimize resistance emergence"` — an unremarkable computational-biology proposal.
+
+**The hazard.** As written, one refusal aborted an entire 61-candidate cell. That is precisely the shape of the `classifyUndersizedPool` trap Appendix M item 4 refused to loosen — a per-reply failure escalating to destroy a whole cell — reappearing on the judge leg. And it is worse here, because refusals are **not** independent of the outcome: the judge refuses on content, so discarding refused candidates silently conditions the quality means on what the judge was willing to look at.
+
+**Registered handling:**
+
+1. A refusal records `originality: null, feasibility: null` for **that candidate only**. The cell is kept.
+2. Refused candidates are **excluded from means and never imputed** — not as zero, not as the cell mean. A refusal is missing data.
+3. **The refusal count is reported as a first-class number**, per arm and per persona, alongside every mean. A quality figure computed over a pool the judge partly declined to read must carry that fact next to it.
+4. If refusals are **unevenly distributed across arms or personas**, that asymmetry is reported as a finding in its own right — it is a measurement of what the instrument will not measure, and it bears directly on the `weirdo` question, since a persona prompted for strangeness is the one most likely to trip a refusal.
+
+The pilot is re-run from scratch under this rule rather than patched over the 10 stored cells, so every cell in the sidecar is produced by one instrument under one policy.
+
+### Item 11 — Result of the quality read: a sharp trade, not a free lunch
+
+**DESCRIPTIVE. No contrast, no p-value, no confirmatory claim.** 12 cells, 6 matched briefs, replicate 1, 729 candidates, **$0.98**. One refusal (0.14%), excluded and not imputed.
+
+| arm | n | scored | originality | feasibility | refused |
+|---|---|---|---|---|---|
+| `S1C-RICH` | 358 | 358 | **6.092** | 6.087 | 0 |
+| `S1C-SOLO60` | 371 | 370 | **2.803** | **8.214** | 1 |
+
+The originality gap holds in **all six briefs** with the same sign (RICH 5.63–6.48 vs SOLO60 1.89–3.57), so it is not a single-brief artefact. The distributions barely overlap: **no** `S1C-SOLO60` idea scored ≥ 8 on originality; 111 `S1C-RICH` ideas did.
+
+**The rich panel does not produce better ideas. It produces more original and less feasible ones**, and the solo call the reverse. Stage 1c's `distinct_k` finding sat on top of this trade without being able to see it.
+
+#### The `weirdo` question, answered — and the hypothesis half-corrected
+
+| persona | n | originality | feasibility |
+|---|---|---|---|
+| `weirdo` | 72 | **7.972** | **4.819** |
+| `philosopher` | 71 | 7.099 | 5.606 |
+| `poet` | 72 | 6.569 | 6.014 |
+| `product-manager` | 72 | 4.806 | 7.708 |
+| `mba` | 71 | 4.000 | 6.282 |
+
+`weirdo` is exactly what it was suspected of being on the numbers: **highest originality, lowest feasibility**, and the single largest contributor of high-originality ideas (59 of the 111 at ≥ 8). Removing it drops RICH's originality from 6.092 to 5.619 — still far above SOLO60's 2.803, so **the effect is not carried by `weirdo` alone.**
+
+**But low feasibility is not incoherence,** and the numeric judge cannot tell them apart. That is what the blind review below was for.
+
+#### The blind review — an independent reader who never saw the arms
+
+40 ideas (20 per arm, 2 briefs, deterministically shuffled, arm and persona stripped) were reviewed for substance / usefulness / **coherence** by a reader told only the brief. Joining its verdicts to the key it never saw:
+
+- **Every incoherence and vacuity flag it raised — all six — is `S1C-RICH`. Zero from `S1C-SOLO60`.**
+- **But `poet`, not `weirdo`, is the worse offender**: 4 of the 6 flags (`IDEA-14`, `-21`, `-22`, `-36`) are `poet`; 2 (`IDEA-16`, `-30`) are `weirdo`.
+- The clearest failure is `weirdo`'s: a subscription "tontine" whose stated mechanism is arithmetically self-refuting — fixed costs split among *fewer* payers were claimed to lower each share. It is wrong in a way a reader enjoying the prose does not notice.
+- **`weirdo` also produced one of the reviewer's five BEST ideas** (`IDEA-33`, a vacancy-chain scheduling analogy it called the strongest of the analogical items). The persona generates both tails.
+- Reviewing blind, it identified an "extended-metaphor" style cluster that is **100% `S1C-RICH`** (4 `poet`, 4 `weirdo`) and a "terse textbook one-liner" cluster that is **100% `S1C-SOLO60`** — perfect arm discrimination from style alone, with no labels.
+- Its five best split **3 `S1C-SOLO60` / 2 `S1C-RICH`**; its five worst split **4 `S1C-RICH` / 1 `S1C-SOLO60`**.
+
+#### The caveat that limits all of the above, raised by the reviewer itself
+
+> "a single-clause idea cannot contradict itself"
+
+**Coherence only bites on elaborated ideas.** `S1C-SOLO60` produces one-liners; `S1C-RICH` produces paragraphs. So RICH's monopoly on incoherence flags is **partly an artefact of having enough text to be wrong in**, not purely a quality difference — and any aggregate that pools one-liners with elaborated items washes out the very effect being looked for. This is the sharpest limitation on the section and it came from the instrument, not from us.
+
+#### A second instrument caveat: the two axes are not independent
+
+Per-idea correlation between `originality` and `feasibility` is **r = −0.61** within `S1C-RICH`, **−0.45** within `S1C-SOLO60`, **−0.72** pooled. `assertAxesNotCollapsed` enforces that the axes are separate *fields*; it cannot enforce that they are separate *constructs*. Some of the "originality up, feasibility down" pattern is therefore built into the instrument, and the pooled figure is further inflated by the arm separation itself. The per-arm figures are the ones to read.
+
+#### What this licenses
+
+A reader may now say that the rich panel trades feasibility for originality, that the trade is large and consistent across briefs, and that its ideas fail coherence in a way the solo call's do not — with the length confound stated. A reader may **not** yet say the rich panel is better or worse overall: that is 12 cells, one replicate, two briefs for the blind read, and no contrast was computed.
+
+### Item 12 — The operator's own blind read, and what it found that the metrics could not
+
+The operator read the same 40-idea blind packet (arm and persona stripped) and left free-text notes rather than ratings. Deliberately not a scale: two numeric instruments already scored these ideas, and what neither can supply is the reasoning behind a verdict. The notes were written before the key was seen.
+
+#### A third independent instrument, agreeing
+
+Classifying the operator's notes and joining them to the key:
+
+| operator verdict | `S1C-RICH` | `S1C-SOLO60` |
+|---|---|---|
+| "unique" / "novel" | **5** | **0** |
+| "nonsense" / "doesn't make sense" | **4** | **0** |
+| "good, standard" | 4 | **12** |
+
+**Perfect separation on both tails, from a reader who saw no labels.** The LLM judge, the blind reviewer and the operator are three instruments of different kinds, and all three independently reproduce the same structure — including the double tail: the rich panel owns the uniques *and* the incoherence. The operator's four flags were 2 `poet`, 1 `philosopher`, 1 `weirdo`, again pointing away from the registered `weirdo` suspicion and toward `poet` (item 11).
+
+#### The finding that bears on METHOD, not on the arms
+
+**The operator rated the tontine (`IDEA-16`, `weirdo`) "Unique idea" and did not catch its defect.** Its stated mechanism is arithmetically self-refuting — fixed costs split among *fewer* survivors raise each share, so the claimed cause produces the opposite of the claimed effect. The blind reviewer caught it; a careful human reader who was *specifically looking for this failure mode* did not.
+
+This is registered as a first-class result: **vivid framing buys a pass on incoherence from human spot-check.** It is the precise hazard §5 exists to guard against, observed happening to the study's own operator. Human review alone is therefore **not** a sufficient control for this class, and any future design that leans on operator spot-check as the coherence check should be considered unsound on this evidence.
+
+#### A limit on human spot-check, from the same source
+
+**9 of the operator's 20 `sci-05` notes are "can't evaluate this but sounds cool."** That is the correct answer for domain-technical research proposals, and it bounds what operator review can contribute: on the technical brief its discriminating power is near zero, while on `biz-02` — the brief the operator judged the *weaker* test — the notes are decisive. Human spot-check is domain-bounded and should be deployed where the operator has standing, not uniformly.
+
+#### Brief genericness is real and measurable
+
+The operator's first observation was that `biz-02` is generic and has a bounded answer space. The store confirms it directly, and it had not been looked at before the claim was made:
+
+| brief | `S1C-RICH` collapse | `S1C-SOLO60` collapse |
+|---|---|---|
+| `biz-02` | **13.3%** | **16.7%** |
+| `sci-05` | 3.3% | 1.6% |
+
+`biz-02` collapses **4–10× harder**. Brief genericness is a measurable property of a cell, it varies enormously across the corpus, and nothing in the study currently models it.
+
+#### The dissociation: `distinct_k` and quality are near-orthogonal at the cell level
+
+Comparing the two metrics on the **same twelve cells**:
+
+| brief | `distinct_k` gap (RICH − SOLO60) | originality gap |
+|---|---|---|
+| `biz-02` | **+2** | +3.83 |
+| `biz-07` | **+1** | +3.06 |
+| `prod-03` | **−3** | +3.75 |
+| `prod-07` | **+8** | +3.73 |
+| `sci-05` | **−2** | +2.68 |
+| `sci-08` | **−5** | +2.78 |
+
+**The `distinct_k` gap changes sign three times and averages roughly zero. The originality gap is positive in all six briefs, between +2.68 and +3.83.** On `biz-02` the two arms are nearly identical on `distinct_k` (52 vs 50) and three points apart on originality; on `sci-08` `S1C-SOLO60` *wins* `distinct_k` (61 vs 56) while losing originality by 2.78.
+
+**Twelve competent one-liners and twelve genuinely varied approaches both count as ~50 distinct ideas, because they are ~50 distinct ideas.** `distinct_k` measures how many different things were said, and is constitutionally unable to see how good they were. This is the clearest available evidence that the study's headline metric and the thing the product actually claims are not the same quantity.
+
+**What this does NOT do is revise Appendix M item 9.** These `distinct_k` values are **raw, unrarefied, single-replicate** figures from 6 of 48 briefs; the registered **+1.6728** is a rarefied estimate over 48 briefs × 3 replicates and stands unchanged. The claim here is narrower and about *dissociation*, not magnitude: on the very same cells, the two metrics rank the arms differently, so a `distinct_k` result cannot be read as a quality result in either direction.
+
+#### Provenance
+
+Every observation in this item originated with the operator's read of the packet, not with the analysis. The measurements were run afterwards to test claims the operator had already made — which is the ordering that makes them tests rather than illustrations.
+
 ### Item 10 — The spend ceiling did not bind, again
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.

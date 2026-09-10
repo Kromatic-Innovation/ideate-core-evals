@@ -67,7 +67,7 @@
 
 import { readSiEtAlSlice, sliceToJudgePool } from "./slice.mjs";
 import { validateJudge, recordValidation, meterJudgeCall } from "./gate.mjs";
-import { judgeScoresForAxis, computeJudgeHash } from "./score.mjs";
+import { judgeScoresForAxis, computeJudgeHash, MAX_JUDGE_TOKENS, JUDGE_REQUEST_SHAPE } from "./score.mjs";
 import { assertAxesNotCollapsed } from "./prompt.mjs";
 import { providerOf } from "./matrix.mjs";
 import { JUDGE_VALIDATION_AXIS, SI_ET_AL_EXPERT_SCORE_FIELD } from "./config.mjs";
@@ -287,6 +287,11 @@ export async function runJudgeValidation({
 
   // 5. Gate.
   const result = validateJudge({ judgeScores, expertScores, config });
+  // The instrument that produced these scores, carried into the record because
+  // judgeHash does not cover it (#170). MAX_JUDGE_TOKENS is included alongside
+  // the thinking mode: the two interact, and it was the interaction -- 256
+  // tokens, all of them spent thinking -- that broke the first real run.
+  const requestShape = { maxTokens: MAX_JUDGE_TOKENS, ...JUDGE_REQUEST_SHAPE };
 
   // 6. Record — self-describing: the axis + expert column actually used.
   const judgeHash = computeJudgeHash({ judgeModels: { [providerOf(judgeModel)]: [judgeModel] } });
@@ -297,6 +302,7 @@ export async function runJudgeValidation({
     judgeModel,
     axis,
     expertColumn: expertScoreField,
+    requestShape,
   });
 
   // spendByProvider/hasMissingRate/missingRateModels (issue #63): the same

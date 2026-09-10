@@ -436,3 +436,25 @@ test("runJudgeValidation — a missing timestamp throws rather than substituting
     /timestamp is required/,
   );
 });
+
+// ── #170: the stamp has to survive the COMPOSITION, not just recordValidation ─
+// This test exists because its absence cost a real run. gate.test.mjs already
+// asserted that recordValidation writes requestShape when handed one -- and it
+// passed -- while runJudgeValidation built the shape and never passed it. The
+// first live §5.1 validation record therefore stored `requestShape: null`, and
+// nothing failed. A unit test on the callee is not a test of the wiring.
+test("#170: runJudgeValidation stamps the judge's request shape onto the stored record", async () => {
+  const root = tmpRoot("request-shape");
+  writeValidationFixture(root);
+  const store = makeTempStore("judge-validate-shape-");
+  const provider = mockWithOriginality(EXPERT_BY_INDEX.slice());
+
+  await runJudgeValidation({ store, judgeProvider: provider, judgeModel: JUDGE_MODEL, sliceRoot: root, timestamp: TIMESTAMP });
+
+  const entry = store.list().find((r) => r.armId === "__judge-validation__");
+  assert.ok(entry, "a validation record was written");
+  const shape = store.get(entry.key).result.requestShape;
+  assert.ok(shape, "the record carries a requestShape -- judgeHash cannot, so the record must");
+  assert.deepEqual(shape.thinking, { type: "disabled" }, "...naming the direct-scorer instrument Appendix N item 3 registers");
+  assert.equal(typeof shape.maxTokens, "number", "...and the ceiling it interacts with");
+});
