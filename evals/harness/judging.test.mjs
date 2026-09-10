@@ -21,7 +21,7 @@
 //     -> "an incomplete judging pass ... leaves runSpec() failing"
 // Issue #74 (ordering): "issue #74:" tests.
 
-import { test } from "node:test";
+import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -481,6 +481,14 @@ test("judge cost rows reach recordActualSpend -- real judge spend (not generatio
     // ceiling trip to the ANTHROPIC judge leg's real spend specifically.
     judgeProviders: { anthropic: anthropicJudge },
     corpus: CORPUS,
+    // issue #169 added a mid-flight ceiling gate on JUDGE LEGS too. This test
+    // is about something else -- that a judge leg's ACTUAL spend, once it has
+    // run, counts toward a LATER cell's admission -- so the leg has to be
+    // admitted for the test to say anything. Pricing the gate at $0 disables
+    // it for this fixture only, keeping the pre-#169 arithmetic below exactly
+    // as written. The gate itself has its own dedicated tests further down;
+    // one test, one behaviour.
+    judgeLegPrice: () => ({ usd: 0, byProvider: {} }),
     maxSpendByProviderUsd: { anthropic: ceiling },
     log: silentLog,
   });
@@ -589,6 +597,14 @@ test("Sentry HIGH finding (PR #76 fix round): judge spend also trips the GLOBAL 
     judgeModels: JUDGE_MODELS,
     judgeProviders: { anthropic: anthropicJudge }, // openai deferred, $0 -- isolates the trip to anthropic judge spend
     corpus: corpus3,
+    // issue #169 added a mid-flight ceiling gate on JUDGE LEGS too. This test
+    // is about something else -- that a judge leg's ACTUAL spend, once it has
+    // run, counts toward a LATER cell's admission -- so the leg has to be
+    // admitted for the test to say anything. Pricing the gate at $0 disables
+    // it for this fixture only, keeping the pre-#169 arithmetic below exactly
+    // as written. The gate itself has its own dedicated tests further down;
+    // one test, one behaviour.
+    judgeLegPrice: () => ({ usd: 0, byProvider: {} }),
     maxSpendUsd: ceiling, // GLOBAL ceiling this time, not per-provider
     log: silentLog,
   });
@@ -971,3 +987,248 @@ test("N6: a reused cell whose arm was removed from armsConfig between sessions f
     /unknown arm 'Z'/,
   );
 });
+
+// ── issue #169: the mid-flight ceiling gates JUDGE LEGS, not only cells ──────
+//
+// Judging was the one spend path with no admission control at all. A judge leg
+// was dispatched from judgePoolIfEnabled unconditionally and only recorded
+// afterwards, so a run could stop admitting generation cells at the ceiling
+// and keep spending on judging past it, indefinitely.
+//
+// These tests drive that through runSpec -- the COMPOSITION, not the checker.
+// A unit test on a price comparison would have passed just as happily while
+// the gate was never wired into the dispatch path, which is the exact shape of
+// the "unit test on the callee is not a test of the wiring" failure this repo
+// has already recorded once.
+
+test("issue #169: a judge leg that would cross the GLOBAL ceiling is never dispatched, and is recorded as budget_exceeded", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // Learn the real per-cell generation cost the same way every other ceiling
+  // test in this file does -- MockProvider's token volumes are not either
+  // pricer's estimate, so a hand-computed ceiling would drift.
+  const calibStore = new ResultsStore(tempDir(t));
+  const { summary: calib } = await runSpec(soloSpec, { store: calibStore, armsConfig: soloArms, provider: new MockProvider(), log: silentLog });
+  const genUsd = calib.spendByProvider.anthropic;
+  assert.ok(genUsd > 0);
+
+  const exactPriceGrid = (cells) => ({
+    usd: cells.length * genUsd,
+    breakdown: cells.map((c) => ({ cellKey: c.key, usd: genUsd, byProvider: { anthropic: genUsd } })),
+  });
+
+  const logged = [];
+  // Ceiling = exactly the generation, with nothing left for a judge leg
+  // priced at half a cell. Generation is admitted; the judge leg is not.
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    priceGrid: exactPriceGrid,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    judgeLegPrice: () => ({ usd: genUsd / 2, byProvider: { anthropic: genUsd / 2 } }),
+    maxSpendUsd: genUsd,
+    log: (m) => logged.push(m),
+  });
+
+  assert.equal(summary.completed, 1, "the generation cell itself fit under the ceiling and was admitted");
+  assert.equal(anthropicJudge.calls.length, 0, "the judge was NEVER CALLED -- the gate ran before dispatch, not after");
+  assert.equal(summary.judge.skippedByReason.budget_exceeded, 1, "the anthropic leg is classified budget_exceeded, not deferred or failed");
+  assert.ok(
+    logged.some((m) => m.includes("judge leg SKIPPED (budget_exceeded)")),
+    "the operator is told which judge leg was gated and why",
+  );
+  // Store-absent, exactly like a budget-skipped generation cell: the next
+  // invocation under a higher ceiling must see this leg as unscored.
+  assert.ok(
+    !store.keys().some((k) => k.includes("judge")),
+    "a budget-skipped judge leg writes NOTHING to the store, so it re-plans cleanly",
+  );
+});
+
+test("issue #169: a PER-PROVIDER ceiling gates a judge leg under that provider", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const calibStore = new ResultsStore(tempDir(t));
+  const { summary: calib } = await runSpec(soloSpec, { store: calibStore, armsConfig: soloArms, provider: new MockProvider(), log: silentLog });
+  const genUsd = calib.spendByProvider.anthropic;
+
+  const exactPriceGrid = (cells) => ({
+    usd: cells.length * genUsd,
+    breakdown: cells.map((c) => ({ cellKey: c.key, usd: genUsd, byProvider: { anthropic: genUsd } })),
+  });
+
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    priceGrid: exactPriceGrid,
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    judgeLegPrice: () => ({ usd: genUsd / 2, byProvider: { anthropic: genUsd / 2 } }),
+    maxSpendByProviderUsd: { anthropic: genUsd },
+    log: silentLog,
+  });
+
+  assert.equal(anthropicJudge.calls.length, 0, "the anthropic judge leg was gated by the anthropic ceiling");
+  assert.equal(summary.judge.skippedByReason["budget_exceeded"], 1, "the reason names the tripped provider after the colon");
+});
+
+test("issue #169: a judge leg with headroom IS dispatched -- the gate is a ceiling, not a blanket refusal to judge", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    maxSpendUsd: 1000,
+    log: silentLog,
+  });
+
+  assert.equal(anthropicJudge.calls.length, 1, "ample headroom -- the leg ran");
+  assert.equal(summary.judge.completed, 1);
+});
+
+test("issue #169: with NO ceiling active, judging is untouched -- the gate costs a ceiling-free run nothing", async (t) => {
+  const store = new ResultsStore(tempDir(t));
+  const anthropicJudge = new MockJudgeProvider();
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const soloSpec = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  const { summary } = await runSpec(soloSpec, {
+    store,
+    armsConfig: soloArms,
+    provider: new MockProvider(),
+    judgeModels: JUDGE_MODELS,
+    judgeProviders: { anthropic: anthropicJudge },
+    corpus: CORPUS,
+    // deliberately no maxSpendUsd / maxSpendByProviderUsd, and a judgeLegPrice
+    // that would gate everything if it were ever consulted
+    judgeLegPrice: () => ({ usd: 1e9, byProvider: { anthropic: 1e9 } }),
+    log: silentLog,
+  });
+
+  assert.equal(anthropicJudge.calls.length, 1, "no ceiling means no gate -- judgeLegPrice is never even called");
+  assert.equal(summary.judge.completed, 1);
+});
+
+// ── PR #174 Sentry MEDIUM: the judge gate must not count a cell twice ────────
+//
+// An in-flight RESERVATION stands in for a cost that is not yet known. Once
+// `recordActualSpend` posts the cell's real cost, the projection is superseded
+// by a fact -- but the driver's `finally` (which used to do the releasing)
+// cannot run until `runOneCell` RETURNS, and `judgePoolIfEnabled` is called
+// before that. So the judge-leg check saw this cell's generation cost in
+// `runningTotal` AND its projection in `inFlightTotal`.
+//
+// Live at concurrency 1 -- not a concurrency artefact -- so these run at the
+// default. The ceiling below sits at exactly `g + j`, which is:
+//   correct:  0 + g (actual) + 0 (released) + j  <= g + j  -> ADMITTED
+//   doubled:  0 + g (actual) + g (still held) + j > g + j   -> SKIPPED
+// so the double-counting form fails this test and nothing else distinguishes
+// them. The companion test below drops the ceiling by a hair to prove the
+// gate is still a gate and not simply switched off.
+
+describe("issue #169 / PR #174: a cell is not counted twice against its own judge-leg gate", () => {
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const spec1 = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+
+  // MockProvider's token volumes are not either pricer's estimate, so the
+  // generation cost is learned empirically -- the same calibration technique
+  // every other ceiling test in this file uses.
+  const calibrate = async (t) => {
+    const { summary } = await runSpec(spec1, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      log: silentLog,
+    });
+    const g = summary.spendByProvider.anthropic;
+    assert.ok(g > 0, "sanity: a positive per-cell generation cost");
+    return g;
+  };
+
+  const runAt = async (t, ceiling, g, j) => {
+    const judge = new MockJudgeProvider();
+    const exactGrid = (cells) => ({
+      usd: cells.length * g,
+      breakdown: cells.map((c) => ({ cellKey: c.key, usd: g, byProvider: { anthropic: g } })),
+    });
+    const { summary } = await runSpec(spec1, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: exactGrid,
+      judgeModels: JUDGE_MODELS,
+      judgeProviders: { anthropic: judge },
+      corpus: CORPUS,
+      judgeLegPrice: () => ({ usd: j, byProvider: { anthropic: j } }),
+      maxSpendUsd: ceiling,
+      log: silentLog,
+    });
+    return { judge, summary };
+  };
+
+  test("a judge leg that fits once the cell's settled cost replaces its reservation IS admitted", async (t) => {
+    const g = await calibrate(t);
+    const j = g / 4;
+    const { judge, summary } = await runAt(t, g + j, g, j);
+
+    assert.equal(summary.completed, 1, "sanity: the generation cell itself was admitted");
+    assert.equal(
+      judge.calls.length,
+      1,
+      "the leg fits under `actual g + leg j <= g + j`. Counting the cell's projection on top of its own " +
+        "already-posted actual cost would make this `g + g + j > g + j` and wrongly skip it.",
+    );
+    assert.equal(summary.judge.skippedByReason.budget_exceeded, undefined, "nothing was budget-skipped");
+  });
+
+  test("a hair below that, the same leg is still gated -- the fix did not switch the guard off", async (t) => {
+    const g = await calibrate(t);
+    const j = g / 4;
+    const { judge, summary } = await runAt(t, g + j / 2, g, j);
+
+    assert.equal(summary.completed, 1);
+    assert.equal(judge.calls.length, 0, "actual g + leg j exceeds the ceiling, so the leg is gated");
+    assert.equal(summary.judge.skippedByReason.budget_exceeded, 1);
+  });
+
+  test("the reservation is released on SETTLEMENT, so a later cell is not gated by an earlier cell's stale projection", async (t) => {
+    // The same defect seen from the generation side: if a settled cell's
+    // reservation outlived its actual cost, every subsequent cell's admission
+    // check would carry it too. Three cells, ceiling = 3g exactly.
+    const g = await calibrate(t);
+    const spec3 = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }, { id: "b3" }], replicates: 1, config: CFG };
+    const exactGrid = (cells) => ({
+      usd: cells.length * g,
+      breakdown: cells.map((c) => ({ cellKey: c.key, usd: g, byProvider: { anthropic: g } })),
+    });
+    const { summary } = await runSpec(spec3, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: exactGrid,
+      maxSpendUsd: g * 3,
+      log: silentLog,
+    });
+    assert.equal(summary.completed, 3, "all three fit: each settles to exactly its projection, and none lingers");
+    assert.equal(summary.skipped, 0);
+  });
+});
+

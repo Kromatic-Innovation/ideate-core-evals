@@ -18,6 +18,8 @@ import {
   resolveStoreDir,
   DEFAULT_RESULTS_DIR,
   DEFAULT_CONCURRENT_BATCH_WINDOW_MS,
+  helpLines,
+  parseEnvBalance,
 } from "./run.mjs";
 // The real judge-call writer (issue #108) -- the CLI prune tests below use it
 // rather than hand-built keys, so the fixture cannot drift from the writer.
@@ -1511,4 +1513,179 @@ test("issue #120 AC5 / PREREGISTRATION §11: a second invocation against a DIFFE
 
   // 6. The pilot store is untouched by the confirmatory invocation.
   assert.equal(new ResultsStore(pilotDir).keys().length, planned.length);
+});
+
+// ── issue #169 item 4: --help, and the cumulative semantics written down ─────
+//
+// This CLI had no --help at all. Usage lived in run.mjs's header comment,
+// where an operator running the tool never sees it -- and the ceiling's
+// cumulative semantics lived nowhere at all, which is how `--max-spend 180`
+// got read as "spend at most $180 on this run".
+
+test("issue #169: --help states that the ceiling is CUMULATIVE, not per-invocation", async () => {
+  const lines = [];
+  const out = await main(["--help"], { log: (m) => lines.push(m) });
+  const text = lines.join("\n");
+
+  assert.deepEqual(out, { help: true });
+  assert.match(text, /THE CEILING IS CUMULATIVE, NOT PER-INVOCATION/);
+  assert.match(text, /every prior invocation and every configHash/);
+  assert.match(text, /--results-dir/, "and names the escape hatch for budgeting one invocation in isolation");
+});
+
+test("issue #169: --help documents mid-flight enforcement and the in-flight-cell decision", async () => {
+  const lines = [];
+  await main(["--help"], { log: (m) => lines.push(m) });
+  const text = lines.join("\n");
+
+  assert.match(text, /budget_exceeded/);
+  assert.match(text, /re-plans as `todo`/);
+  assert.match(text, /allowed to COMPLETE/, "the overshoot bound is stated, not left for the operator to discover");
+  assert.match(text, /at most\n?\s*one cell's worth/);
+  assert.match(text, /FLOOR, not an\n?\s*estimate/);
+});
+
+test("issue #169: --help documents that the balance is asserted, never queried", async () => {
+  const lines = [];
+  await main(["--help"], { log: (m) => lines.push(m) });
+  const text = lines.join("\n");
+  assert.match(text, /--account-balance/);
+  assert.match(text, /ASSERTED BY YOU, not queried/);
+});
+
+test("issue #169: --help needs no store, no engine version, and no network", async () => {
+  // Deliberately no deps beyond log: --help must work on a machine with no
+  // node_modules, no results dir, and no API keys.
+  const lines = [];
+  await main(["-h"], { log: (m) => lines.push(m) });
+  assert.ok(lines.length > 10);
+});
+
+// ── issue #169: --account-balance ────────────────────────────────────────────
+
+test("issue #169: --account-balance parses and reaches runSpec as accountBalanceUsd", async () => {
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run", "--max-spend", "180", "--account-balance", "25"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  assert.equal(runSpecFn.calls[0].opts.accountBalanceUsd, 25);
+});
+
+test("issue #169: --account-balance rejects a non-numeric value rather than silently becoming NaN", () => {
+  assert.throws(() => parseArgs(["--account-balance", "lots"]), /--account-balance/);
+});
+
+test("issue #169: no --account-balance and no env var leaves accountBalanceUsd undefined -- 'not asserted', not zero", async () => {
+  const runSpecFn = spyRunSpec();
+  const saved = process.env.IDEATE_ACCOUNT_BALANCE_USD;
+  delete process.env.IDEATE_ACCOUNT_BALANCE_USD;
+  try {
+    await main(["--dry-run", "--max-spend", "180"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  } finally {
+    if (saved !== undefined) process.env.IDEATE_ACCOUNT_BALANCE_USD = saved;
+  }
+  assert.equal(runSpecFn.calls[0].opts.accountBalanceUsd, undefined, "zero would read as 'checked, and you have no money'");
+});
+
+test("issue #169: IDEATE_ACCOUNT_BALANCE_USD reaches runSpec when the flag is absent", async () => {
+  const runSpecFn = spyRunSpec();
+  const saved = process.env.IDEATE_ACCOUNT_BALANCE_USD;
+  process.env.IDEATE_ACCOUNT_BALANCE_USD = "77.5";
+  try {
+    await main(["--dry-run", "--max-spend", "180"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  } finally {
+    if (saved === undefined) delete process.env.IDEATE_ACCOUNT_BALANCE_USD;
+    else process.env.IDEATE_ACCOUNT_BALANCE_USD = saved;
+  }
+  assert.equal(runSpecFn.calls[0].opts.accountBalanceUsd, 77.5);
+});
+
+test("issue #169: the flag WINS over the env var", async () => {
+  const runSpecFn = spyRunSpec();
+  const saved = process.env.IDEATE_ACCOUNT_BALANCE_USD;
+  process.env.IDEATE_ACCOUNT_BALANCE_USD = "77.5";
+  try {
+    await main(["--dry-run", "--max-spend", "180", "--account-balance", "10"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION });
+  } finally {
+    if (saved === undefined) delete process.env.IDEATE_ACCOUNT_BALANCE_USD;
+    else process.env.IDEATE_ACCOUNT_BALANCE_USD = saved;
+  }
+  assert.equal(runSpecFn.calls[0].opts.accountBalanceUsd, 10);
+});
+
+test("issue #169: parseEnvBalance -- blank is 'not asserted', garbage THROWS", () => {
+  assert.equal(parseEnvBalance(undefined), undefined);
+  assert.equal(parseEnvBalance(""), undefined);
+  assert.equal(parseEnvBalance("  "), undefined);
+  assert.equal(parseEnvBalance("180"), 180);
+  assert.equal(parseEnvBalance("0"), 0, "an explicit zero IS an assertion -- the account is empty");
+  // A silently-NaN balance would disable the warning, the same class of bug
+  // as the NaN --max-spend run.mjs's header comment calls out.
+  assert.throws(() => parseEnvBalance("180 USD"), /finite number/);
+});
+
+// ── issue #169: the calibration is actually wired into the projection ────────
+
+test("issue #169: main() fits the price grid to the store when a ceiling is active, and logs the basis", async () => {
+  // The wiring, not the fit: `calibrateFromStore` has its own tests. What is
+  // covered here is that main() calls it at all and hands the result to
+  // runnerPriceGrid -- the exact seam whose absence let a constant table price
+  // a 144-cell re-collect at 2.5x under.
+  const runSpecFn = spyRunSpec();
+  const lines = [];
+  await main(["--dry-run", "--max-spend", "180"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION, log: (m) => lines.push(m) });
+
+  const text = lines.join("\n");
+  assert.match(text, /\[calibration\] per-arm token fit/, "the basis is printed, so the projection is auditable");
+  assert.match(text, /\[calibration\] effort output multipliers/);
+});
+
+test("issue #169: NO ceiling means no calibration pass -- a ceiling-free run does not pay for a whole-store read", async () => {
+  const runSpecFn = spyRunSpec();
+  const lines = [];
+  await main(["--dry-run"], { runSpecFn, store: FAKE_STORE, getEngineVersion: STUB_ENGINE_VERSION, log: (m) => lines.push(m) });
+  assert.equal(lines.filter((m) => m.startsWith("[calibration]")).length, 0);
+});
+
+test("issue #169: main() prints exactly helpLines() -- one source for the help text", async () => {
+  const lines = [];
+  await main(["--help"], { log: (m) => lines.push(m) });
+  assert.deepEqual(lines, helpLines());
+});
+
+test("issue #169: the calibration main() computes is HANDED TO the price grid, not merely logged", async () => {
+  // M30 in the mutation ledger. Logging the basis and actually pricing against
+  // it are two different wirings, and only one of them is the fix: the whole
+  // defect was a projection that ignored what the store already knew. So this
+  // reaches THROUGH main() to the priceGrid it built and prices a cell with it.
+  //
+  // Arm "A" is given absurd measured tokens, far above any structural
+  // estimate, so a grid that consulted the fit and one that did not cannot
+  // produce the same number by accident.
+  const key = "arm=A|brief=b1|rep=0|cfg=zzz";
+  const bodies = new Map();
+  const entries = [];
+  for (let i = 0; i < 5; i++) {
+    const k = `${key}-${i}`;
+    entries.push({ key: k, armId: "A", state: "completed" });
+    bodies.set(k, { costRows: [{ cellKey: k, tokens_by_model: { "claude-sonnet-5": { input_tokens: 1_000_000, output_tokens: 9_000_000 } } }] });
+  }
+  const storeWithHistory = { list: () => entries, get: (k) => bodies.get(k) };
+
+  const runSpecFn = spyRunSpec();
+  await main(["--dry-run", "--max-spend", "180"], { runSpecFn, store: storeWithHistory, getEngineVersion: STUB_ENGINE_VERSION, log: () => {} });
+
+  const { priceGrid } = runSpecFn.calls[0].opts;
+  const armsForPricing = { A: { mode: "solo", slots: [{ persona: "solo", model: "claude-sonnet-5" }] } };
+  const priced = priceGrid([{ key: "c1", armId: "A" }], armsForPricing);
+
+  assert.equal(priced.calibrated, true, "the grid knows arm A was fitted from the store");
+  assert.equal(priced.breakdown[0].calibrated, true);
+  assert.ok(priced.usd > 10, `9M output tokens must price far above the structural estimate, got $${priced.usd}`);
+});
+
+test("issue #169: --help points the operator at the printed worst-case bound, not just at the concept", async () => {
+  const lines = [];
+  await main(["--help"], { log: (m) => lines.push(m) });
+  const text = lines.join("\n");
+  assert.match(text, /worst-case stop=/, "the help shows the actual line the run prints");
+  assert.match(text, /Size against THAT number, not against the ceiling\./);
 });

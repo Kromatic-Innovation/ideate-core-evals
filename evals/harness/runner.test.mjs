@@ -2299,3 +2299,381 @@ describe("foldCostRows -- pricing_regime is part of the fold group key (issue #1
     assert.equal(rows[0].tokens_by_model["claude-haiku-4-5"].input_tokens, 3000);
   });
 });
+
+// ── issue #169: admission compares against the projection's UPPER BOUND ──────
+//
+// The $220 ceiling settled at $222.7198 because the per-cell admission check
+// compared against a projection its own pricer could not stand behind. A cell
+// with no stored history for its arm is priced from a constant table; that
+// number is a floor, and admitting against a floor is how the overshoot
+// happened. `usdHigh` is what the ceiling now compares against.
+//
+// Driven through runSpec, not through the comparison in isolation: a unit test
+// on the arithmetic passes just as happily when nothing reads `usdHigh`.
+
+describe("issue #169: mid-flight admission uses usdHigh, not the point estimate", () => {
+  const gridWith = (usd, usdHigh) => (cells) => ({
+    usd: cells.length * usd,
+    usdHigh: cells.length * usdHigh,
+    calibrated: false,
+    uncalibratedArmIds: ["A"],
+    breakdown: cells.map((c) => ({ cellKey: c.key, usd, usdHigh, calibrated: false, byProvider: { anthropic: usd } })),
+  });
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const spec3 = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }, { id: "b3" }], replicates: 1, config: CFG };
+
+  test("a ceiling that fits three cells at the POINT estimate admits fewer at the upper bound", async (t) => {
+    const store = new ResultsStore(tempDir(t));
+    // Point estimate $1/cell, upper bound $3/cell. A $3 ceiling looks like
+    // room for three cells and is really room for one.
+    const { summary } = await runSpec(spec3, {
+      store,
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: gridWith(1, 3),
+      maxSpendUsd: 3,
+      log: silentLog,
+    });
+    assert.equal(summary.completed, 1, "admitted against $3/cell, not $1/cell");
+    assert.equal(summary.skipped, 2);
+    assert.equal(summary.skippedByReason.budget_exceeded, 2);
+  });
+
+  test("a pricer that reports NO usdHigh admits exactly as it always did -- the field is additive", async (t) => {
+    const store = new ResultsStore(tempDir(t));
+    const legacyGrid = (cells) => ({
+      usd: cells.length,
+      breakdown: cells.map((c) => ({ cellKey: c.key, usd: 1, byProvider: { anthropic: 1 } })),
+    });
+    const { summary } = await runSpec(spec3, {
+      store,
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: legacyGrid,
+      maxSpendUsd: 3,
+      log: silentLog,
+    });
+    assert.equal(summary.completed, 3, "no usdHigh means no upper bound; the pre-#169 comparison stands");
+  });
+
+  test("a PER-PROVIDER ceiling is scaled by the same ratio -- the two guards never disagree about a cell's cost", async (t) => {
+    const store = new ResultsStore(tempDir(t));
+    const { summary } = await runSpec(spec3, {
+      store,
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: gridWith(1, 3),
+      maxSpendByProviderUsd: { anthropic: 3 },
+      log: silentLog,
+    });
+    assert.equal(summary.completed, 1, "the anthropic ceiling saw $3/cell too, not the unscaled $1");
+    assert.equal(summary.skippedByReason.budget_exceeded, 2);
+  });
+
+  test("the pre-flight banner says the projection is a FLOOR and names the uncalibrated arms", async (t) => {
+    const store = new ResultsStore(tempDir(t));
+    const logged = [];
+    await runSpec(spec3, {
+      store,
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: gridWith(1, 3),
+      maxSpendUsd: 1000,
+      log: (m) => logged.push(m),
+    });
+    const banner = logged.find((m) => m.startsWith("[max-spend] ceiling="));
+    assert.match(banner, /a FLOOR, not an estimate/);
+    assert.match(banner, /upper bound \$9\.0000/);
+    assert.match(banner, /too few completed cells to calibrate A/);
+  });
+
+  test("the cumulative semantics are stated on every ceiling-gated run", async (t) => {
+    const store = new ResultsStore(tempDir(t));
+    const logged = [];
+    await runSpec(spec3, {
+      store,
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: gridWith(1, 1),
+      maxSpendUsd: 1000,
+      log: (m) => logged.push(m),
+    });
+    assert.ok(
+      logged.some((m) => m.includes("the ceiling is CUMULATIVE") && m.includes("Headroom left: $1000.0000")),
+      "the operator who read --max-spend as per-invocation is told otherwise, with the number",
+    );
+  });
+});
+
+// ── issue #169: the ceiling checked against ASSERTED funding ─────────────────
+//
+// Failure 1: the first Stage 1c run aborted at $39.4965 against a --max-spend
+// of $180, on a billing refusal. The ceiling was never approached because the
+// account balance was the real limit.
+
+describe("issue #169: [balance] -- a ceiling above the funding is decorative, and now says so at plan time", () => {
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const spec1 = { arms: [{ id: "A" }], briefs: [{ id: "b1" }], replicates: 1, config: CFG };
+  const flatGrid = (cells) => ({ usd: cells.length, breakdown: cells.map((c) => ({ cellKey: c.key, usd: 1, byProvider: { anthropic: 1 } })) });
+
+  const runWith = async (t, extra) => {
+    const logged = [];
+    await runSpec(spec1, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: flatGrid,
+      maxSpendUsd: 180,
+      log: (m) => logged.push(m),
+      ...extra,
+    });
+    return logged.filter((m) => m.startsWith("[balance]"));
+  };
+
+  test("no balance asserted: the run states plainly that it cannot check one, rather than passing silently", async (t) => {
+    const lines = await runWith(t, {});
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /NOT CHECKED/);
+    assert.match(lines[0], /neither Anthropic nor OpenAI exposes a balance an API key can read/);
+  });
+
+  test("headroom above the asserted balance WARNS, and names both numbers", async (t) => {
+    const lines = await runWith(t, { accountBalanceUsd: 25 });
+    assert.match(lines[0], /WARNING/);
+    assert.match(lines[0], /\$180\.0000/);
+    assert.match(lines[0], /\$25\.0000/);
+    assert.match(lines[0], /decorative/);
+  });
+
+  test("headroom inside the asserted balance says --max-spend is the binding limit", async (t) => {
+    const lines = await runWith(t, { accountBalanceUsd: 5000 });
+    assert.doesNotMatch(lines[0], /WARNING/);
+    assert.match(lines[0], /--max-spend, not the balance, is the binding limit/);
+  });
+
+  test("the comparison is against HEADROOM, not the raw ceiling -- a resumed study must not cry wolf", async (t) => {
+    // A store already holding real spend leaves less headroom than the
+    // ceiling. Comparing the ceiling itself would warn on every resumed run
+    // whose ceiling happens to exceed a balance that most of the ceiling is
+    // already paid for.
+    //
+    // The balance is placed STRICTLY BETWEEN the two candidate comparands:
+    //
+    //   headroom (180 - spent)  <  balance (180 - spent/2)  <  ceiling (180)
+    //
+    // so "headroom > balance" is false (correct: no warning) while
+    // "ceiling > balance" is true (a mutant that compares the raw ceiling
+    // warns here and fails this test). A balance equal to the ceiling would
+    // discriminate nothing, since neither comparison would fire.
+    const store = new ResultsStore(tempDir(t));
+    const { summary: first } = await runSpec(spec1, {
+      store,
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: flatGrid,
+      maxSpendUsd: 180,
+      log: silentLog,
+    });
+    const spent = first.cumulativeSpendUsd;
+    assert.ok(spent > 0, "sanity: the store now holds real spend, so headroom is strictly below the ceiling");
+
+    const logged = [];
+    await runSpec(
+      { ...spec1, briefs: [{ id: "b2" }] },
+      {
+        store,
+        armsConfig: soloArms,
+        provider: new MockProvider(),
+        priceGrid: flatGrid,
+        maxSpendUsd: 180,
+        accountBalanceUsd: 180 - spent / 2,
+        log: (m) => logged.push(m),
+      },
+    );
+    const line = logged.find((m) => m.startsWith("[balance]"));
+    assert.doesNotMatch(line, /WARNING/, "the headroom fits inside the balance, even though the raw ceiling does not");
+  });
+
+  test("no ceiling at all: no [balance] line, because there is no ceiling to compare", async (t) => {
+    const logged = [];
+    await runSpec(spec1, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      log: (m) => logged.push(m),
+    });
+    assert.equal(logged.filter((m) => m.startsWith("[balance]")).length, 0);
+  });
+});
+
+// ── issue #169: the worst-case stop is printed at PLAN time ──────────────────
+//
+// The in-flight cell completes rather than being aborted, so the real bound is
+// ceiling + whatever was in flight. #169's complaint is that --max-spend
+// "reads as absolute" and is not; an overshoot discovered only afterwards
+// reproduces that complaint in a new form. The bound is therefore stated
+// before the run, derived from the concurrency in force and the actual cells.
+
+describe("issue #169: [max-spend] worst-case stop", () => {
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const spec4 = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }, { id: "b3" }, { id: "b4" }], replicates: 1, config: CFG };
+  // Deliberately UNEQUAL per-cell prices so "the N most expensive" is
+  // distinguishable from "the first N" or "N x the mean".
+  const laddered = (cells) => {
+    const priceOf = (i) => (i + 1) * 2; // 2, 4, 6, 8
+    return {
+      usd: cells.reduce((a, _c, i) => a + priceOf(i), 0),
+      breakdown: cells.map((c, i) => ({ cellKey: c.key, usd: priceOf(i), byProvider: { anthropic: priceOf(i) } })),
+    };
+  };
+
+  const bannerFrom = async (t, opts) => {
+    const logged = [];
+    await runSpec(spec4, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: laddered,
+      maxSpendUsd: 1000,
+      log: (m) => logged.push(m),
+      ...opts,
+    });
+    return logged.find((m) => m.includes("worst-case stop="));
+  };
+
+  test("at the default concurrency 1 the bound is the ceiling plus the single most expensive planned cell", async (t) => {
+    const line = await bannerFrom(t, {});
+    assert.match(line, /worst-case stop=\$1008\.0000/, "1000 + the $8 cell, not + $2 (the first) and not + $5 (the mean)");
+    assert.match(line, /up to 1 in-flight cell\(s\)/);
+  });
+
+  test("the bound scales with --cell-concurrency, because that many cells can be in flight at once", async (t) => {
+    const line = await bannerFrom(t, { cellConcurrency: 3 });
+    assert.match(line, /worst-case stop=\$1018\.0000/, "1000 + 8 + 6 + 4 -- the THREE most expensive");
+    assert.match(line, /up to 3 in-flight cell\(s\)/);
+  });
+
+  test("the bound is built on usdHigh where the pricer reports one -- a bound built on a floor is not a bound", async (t) => {
+    const withHigh = (cells) => ({
+      usd: cells.length,
+      usdHigh: cells.length * 5,
+      calibrated: false,
+      uncalibratedArmIds: ["A"],
+      breakdown: cells.map((c) => ({ cellKey: c.key, usd: 1, usdHigh: 5, calibrated: false, byProvider: { anthropic: 1 } })),
+    });
+    const line = await bannerFrom(t, { priceGrid: withHigh, cellConcurrency: 2 });
+    assert.match(line, /worst-case stop=\$1010\.0000/, "2 x $5 (usdHigh), never 2 x $1 (the point estimate)");
+  });
+
+  test("the line says WHY the bound exists -- the in-flight cell completes rather than being discarded", async (t) => {
+    const line = await bannerFrom(t, {});
+    assert.match(line, /allowed to COMPLETE/);
+    assert.match(line, /this -- not the ceiling -- is the number to size against/);
+  });
+
+  test("no ceiling means no bound line, since there is nothing to overshoot", async (t) => {
+    const logged = [];
+    await runSpec(spec4, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      log: (m) => logged.push(m),
+    });
+    assert.equal(logged.filter((m) => m.includes("worst-case stop=")).length, 0);
+  });
+});
+
+// ── PR #174 Sentry LOW, taken as a must: the verdict word must agree ─────────
+//
+// `overBudget` was computed on the POINT estimate while admission builds
+// `priceByKey` from `usdHigh ?? usd`. The banner could therefore say
+// "(within budget)" for a run that then skipped cells -- a ceiling readout
+// telling the operator one thing while the run does another, which IS #169's
+// own complaint that --max-spend "reads as absolute" and is not.
+//
+// What the word promises, stated precisely: "priced the way admission will
+// price it, this plan crosses the ceiling." It is not a prediction of actual
+// spend -- mid-flight admission compares REAL settled cost plus one cell's
+// projection, so a run whose cells come in under projection can read "over
+// budget" and still admit everything. The fixtures below therefore pin actual
+// cost TO the projection, so the pre-flight verdict and the mid-flight
+// outcome are comparable at all.
+
+describe("issue #169 / PR #174: the pre-flight verdict is computed on the admission basis", () => {
+  const soloArms = { arms: { A: ARMS_CONFIG.arms.A } };
+  const spec3 = { arms: [{ id: "A" }], briefs: [{ id: "b1" }, { id: "b2" }, { id: "b3" }], replicates: 1, config: CFG };
+
+  // MockProvider's real per-cell cost, learned empirically -- the same
+  // calibration technique every other ceiling test in this file uses. Pinning
+  // the point estimate to it makes projection and actual agree, so a ceiling
+  // can be placed to discriminate the two bases.
+  const calibrate = async (t) => {
+    const { summary } = await runSpec(
+      { ...spec3, briefs: [{ id: "b1" }] },
+      { store: new ResultsStore(tempDir(t)), armsConfig: soloArms, provider: new MockProvider(), log: silentLog },
+    );
+    const g = summary.spendByProvider.anthropic;
+    assert.ok(g > 0);
+    return g;
+  };
+
+  // Point estimate g/cell (== actual), upper bound 3g/cell.
+  const floorGrid = (g) => (cells) => ({
+    usd: cells.length * g,
+    usdHigh: cells.length * 3 * g,
+    calibrated: false,
+    uncalibratedArmIds: ["A"],
+    breakdown: cells.map((c) => ({ cellKey: c.key, usd: g, usdHigh: 3 * g, calibrated: false, byProvider: { anthropic: g } })),
+  });
+
+  const run = async (t, g, ceiling) => {
+    const logged = [];
+    const { summary } = await runSpec(spec3, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: floorGrid(g),
+      maxSpendUsd: ceiling,
+      log: (m) => logged.push(m),
+    });
+    return { summary, banner: logged.find((m) => m.startsWith("[max-spend] ceiling=")) };
+  };
+
+  test("a ceiling above the point total but below the admission total reads OVER BUDGET -- and the run does skip", async (t) => {
+    const g = await calibrate(t);
+    // point total 3g (fits under 4g -- the old basis said "within budget");
+    // admission total 9g (does not). Mid-flight: cells 1 and 2 admitted at
+    // 0+3g and g+3g, cell 3 skipped at 2g+3g > 4g.
+    const { summary, banner } = await run(t, g, 4 * g);
+    assert.match(banner, /over budget -- admission-controlling cells/);
+    assert.doesNotMatch(banner, /within budget/);
+    assert.ok(summary.skipped > 0, "the word describes what actually happened, not merely a different number");
+    assert.match(banner, new RegExp(`projected=\\$${(3 * g).toFixed(4)}`), "the point estimate stays visible next to its range");
+    assert.match(banner, new RegExp(`upper bound \\$${(9 * g).toFixed(4)}`));
+  });
+
+  test("a ceiling above the admission total still reads WITHIN BUDGET, and nothing is skipped", async (t) => {
+    const g = await calibrate(t);
+    const { summary, banner } = await run(t, g, 50 * g);
+    assert.match(banner, /within budget/);
+    assert.equal(summary.skipped, 0);
+  });
+
+  test("with no upper bound reported, the verdict is unchanged -- `usdHigh ?? usd` is purely additive", async (t) => {
+    const logged = [];
+    const legacyGrid = (cells) => ({
+      usd: cells.length,
+      breakdown: cells.map((c) => ({ cellKey: c.key, usd: 1, byProvider: { anthropic: 1 } })),
+    });
+    await runSpec(spec3, {
+      store: new ResultsStore(tempDir(t)),
+      armsConfig: soloArms,
+      provider: new MockProvider(),
+      priceGrid: legacyGrid,
+      maxSpendUsd: 5,
+      log: (m) => logged.push(m),
+    });
+    const banner = logged.find((m) => m.startsWith("[max-spend] ceiling="));
+    assert.match(banner, /within budget/, "a pre-#169 pricer reports no usdHigh, so the verdict reads exactly as it always did");
+  });
+});

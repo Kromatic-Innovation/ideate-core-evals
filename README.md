@@ -26,7 +26,9 @@ See [`docs/PREREGISTRATION.md` §11](docs/PREREGISTRATION.md) for why accumulati
 
 ## Cost
 
-Both providers offer 50% Batch API discounts and evals are latency-insensitive, so the study is batch-first. Projected **~$79** for the full grid; **~$160** with contingency. A `--max-spend` pre-flight prices the planned grid and refuses to start if it would exceed the ceiling.
+Both providers offer 50% Batch API discounts and evals are latency-insensitive, so the study is batch-first. Projected **~$79** for the full grid; **~$160** with contingency.
+
+`--max-spend` prices the planned grid pre-flight as an early warning, and enforces the ceiling **mid-flight** against actual recorded spend — between cell dispatches and before every judge leg. It is **cumulative over the store**, not per-invocation: it counts every prior invocation and every `configHash`. A cell already in flight when the ceiling trips is allowed to complete, so the bound is the ceiling plus whatever was in flight. See **[`docs/spend-ceilings.md`](docs/spend-ceilings.md)** for the full guarantee, why the projection is sometimes reported as a floor rather than an estimate, and `--account-balance`.
 
 **Batch-first buys throughput only if a batch holds more than one request** (issue #148). Cells run one at a time by default, so a **solo** arm submits a Message Batch of exactly one request and then waits out its full queue latency before the next cell is submitted — measured at 2h34m for zero cells on Study 1 Stage 1a. The discount is unaffected (batch pricing is per request, not per batch), but "latency-insensitive" only holds when the queue wait is amortised across many requests. For a grid of solo arms, pass `--cell-concurrency N --batch-window-ms 2000` so several cells' requests land in one batch; the run warns when every planned arm is solo and concurrency is 1.
 

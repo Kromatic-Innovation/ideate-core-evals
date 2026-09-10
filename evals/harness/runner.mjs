@@ -78,7 +78,11 @@ import { assertValidProviderResponse, realizedAgents } from "./provider.mjs";
 // same read-time pricer the ledger already uses for a report, now used to
 // reconstruct spend-to-date from the store's own cost rows before this
 // invocation's admission control runs -- see `spendToDate` below.
-import { providerOf, priceRowByProvider, priceRows, priceRowsByProvider, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
+// priceJudgeLeg (issue #169): the mid-flight ceiling has to price a JUDGE LEG
+// before dispatching it, and it must price it by the same rule the pre-flight
+// projection used -- two copies of that arithmetic is how a ceiling silently
+// stops binding. Imported rather than reimplemented for exactly that reason.
+import { providerOf, priceRowByProvider, priceRows, priceRowsByProvider, priceJudgeLeg, RATE_TABLE as DEFAULT_RATE_TABLE } from "../../lib/price.mjs";
 // runJudgeMatrix/judgeScoresKey (issue #68): judging has a non-test caller
 // here -- runSpec() invokes runJudgeMatrix per completed pool (one generation
 // cell IS a pool -- poolKey === cell.key, see evals/judge/matrix.mjs's own
@@ -1731,6 +1735,23 @@ export async function runSpec(spec, opts) {
     judgeProviders,
     corpus,
     judgeSeed = 1,
+    // judgeLegPrice (issue #169): the injectable seam the mid-flight judge-leg
+    // ceiling prices against, exactly mirroring the `priceGrid` seam the
+    // generation ceiling already uses. Defaults to lib/price.mjs's
+    // `priceJudgeLeg`, the SAME function the pre-flight projection uses, so
+    // production admits and projects a leg at one price. A test injects an
+    // exact pricer for the same reason it injects an exact `priceGrid`: the
+    // MockProvider's token volumes and the real API's differ by construction,
+    // so a ceiling that must land between two known amounts cannot be pinned
+    // against a real-API estimate.
+    judgeLegPrice = (leg) => priceJudgeLeg(leg, rateTable, { batch }),
+    // accountBalanceUsd (issue #169): what the funding account can actually
+    // pay, ASSERTED BY THE OPERATOR. Neither provider exposes a balance an
+    // API key can read -- see evals/run.mjs's --account-balance for the search
+    // that establishes it -- so this is not queried, it is declared. Undefined
+    // means "not asserted", which produces a plain statement to that effect
+    // rather than a silent pass; it never blocks a run.
+    accountBalanceUsd,
     embedder,
     clusterDistanceThreshold,
   } = opts || {};
@@ -1830,12 +1851,121 @@ export async function runSpec(spec, opts) {
   // spend-to-date alone already meets or exceeds the ceiling, the whole
   // grid is skipped immediately (see the per-cell loop, which folds
   // `priorSpend.totalUsd` into every comparison).
-  const overBudget = maxSpendUsd !== undefined && priorSpend.totalUsd + projection.usd > maxSpendUsd;
+  //
+  // The pre-flight is an EARLY WARNING, not the guard (issue #169). The guard
+  // is the per-cell admission check below, which compares ACTUAL accumulated
+  // spend against the ceiling as cells settle. This banner exists so an
+  // operator learns at plan time that a run is going to hit the wall -- which
+  // is why it now prints the projection's upper bound and says out loud when
+  // the point estimate is a FLOOR rather than an estimate. `$41.59` against an
+  // actual `$105.22` was read as precise because nothing said otherwise.
+  //
+  // ── The verdict word is computed on the ADMISSION basis (issue #169, ─────
+  // ── Sentry LOW on PR #174) ──────────────────────────────────────────────
+  // This used to read `priorSpend.totalUsd + projection.usd`, the POINT
+  // estimate, while admission builds `priceByKey` from `usdHigh ?? usd`. So
+  // the banner could print "(within budget)" and the run would then skip
+  // cells the moment `usdHigh` pricing applied.
+  //
+  // Rated LOW as messaging, and taken as a must anyway: a ceiling readout
+  // that tells the operator one thing while the run does another IS #169 --
+  // the issue's own words are that `--max-spend` "reads as absolute" and is
+  // not. Fixing the gate and leaving the banner disagreeing with the gate
+  // closes the defect in code and leaves it open in the operator's
+  // experience. The `rangeNote` below mitigates it; it does not make a wrong
+  // verdict word right.
+  //
+  // The point estimate stays VISIBLE in the line -- it is the honest centre
+  // of the range, and `rangeNote` names the upper bound next to it. Only the
+  // pass/fail word moved onto the binding arithmetic.
+  const admissionBasisUsd = projection.usdHigh ?? projection.usd;
+  const overBudget = maxSpendUsd !== undefined && priorSpend.totalUsd + admissionBasisUsd > maxSpendUsd;
   if (maxSpendUsd !== undefined) {
+    const highUsd = admissionBasisUsd;
+    const uncal = projection.uncalibratedArmIds || [];
+    const rangeNote =
+      highUsd > projection.usd
+        ? ` (a FLOOR, not an estimate -- upper bound $${highUsd.toFixed(4)}` +
+          (uncal.length ? `; the store holds too few completed cells to calibrate ${uncal.join(", ")}` : "") +
+          ")"
+        : "";
     log(
-      `[max-spend] ceiling=$${maxSpendUsd} spent-to-date=$${priorSpend.totalUsd.toFixed(4)} projected=$${projection.usd.toFixed(4)} ` +
+      `[max-spend] ceiling=$${maxSpendUsd} spent-to-date=$${priorSpend.totalUsd.toFixed(4)} projected=$${projection.usd.toFixed(4)}${rangeNote} ` +
         `${overBudget ? "(over budget -- admission-controlling cells)" : "(within budget)"}`,
     );
+    // The ceiling is CUMULATIVE across every prior invocation and configHash
+    // in this store, not per-invocation (issue #64). The operator who filed
+    // #169 read it as per-invocation on the first Stage 1c run. `spent-to-date`
+    // above is that history; this line names what it is.
+    log(
+      `[max-spend] the ceiling is CUMULATIVE: spent-to-date is every prior invocation and every configHash in this store, ` +
+        `not just this invocation. Headroom left: $${(maxSpendUsd - priorSpend.totalUsd).toFixed(4)}.`,
+    );
+
+    // ── The worst-case stop, printed BEFORE the run (issue #169) ──────────
+    // A cell already in flight when the ceiling trips is allowed to complete
+    // (see the admission check below for why: aborting discards work already
+    // paid for and risks a half-written record in an append-only store). So
+    // the real bound is `ceiling + the actual cost of everything in flight`,
+    // not the ceiling exactly.
+    //
+    // #169's whole complaint is that --max-spend "reads as absolute" and is
+    // not. An overshoot the operator can only discover afterwards reproduces
+    // that complaint in a new form, however small and however well documented
+    // elsewhere. So the bound is stated here, at plan time, derived from the
+    // concurrency actually in force and the actual planned cells -- never
+    // left to be inferred from a doc.
+    //
+    // Worst case is the `cellConcurrency` MOST EXPENSIVE planned cells, since
+    // any subset of that size can be the one in flight when the ceiling
+    // trips. Priced at `usdHigh` wherever the pricer reports one, for the
+    // same reason admission uses it: a tier-2 cell's point estimate is a
+    // floor, and a bound built on a floor is not a bound.
+    const inFlightWorstCase = projection.breakdown
+      .map((b) => b.usdHigh ?? b.usd)
+      .sort((a, b) => b - a)
+      .slice(0, Math.max(cellConcurrency, 1))
+      .reduce((a, b) => a + b, 0);
+    log(
+      `[max-spend] worst-case stop=$${(maxSpendUsd + inFlightWorstCase).toFixed(4)} ` +
+        `(ceiling $${Number(maxSpendUsd).toFixed(4)} + up to ${Math.max(cellConcurrency, 1)} in-flight cell(s) at ` +
+        `--cell-concurrency ${Math.max(cellConcurrency, 1)}, worth $${inFlightWorstCase.toFixed(4)}). ` +
+        `A cell already dispatched when the ceiling trips is allowed to COMPLETE rather than be discarded, ` +
+        `so this -- not the ceiling -- is the number to size against.`,
+    );
+
+    // ── Ceiling vs funding (issue #169, failure 1) ────────────────────────
+    // The first Stage 1c run aborted at $39.4965 against a --max-spend of
+    // $180, on an Anthropic billing refusal. The ceiling was never
+    // approached. A ceiling above the money available is decorative, and the
+    // operator learned it mid-run instead of at plan time.
+    //
+    // The number that has to fit inside the balance is the HEADROOM
+    // (ceiling - spent-to-date), not the ceiling: the ceiling is cumulative
+    // and most of it may already be paid for. Comparing the raw ceiling would
+    // cry wolf on every resumed run.
+    const headroomUsd = maxSpendUsd - priorSpend.totalUsd;
+    if (accountBalanceUsd === undefined) {
+      log(
+        "[balance] account balance NOT CHECKED -- neither Anthropic nor OpenAI exposes a balance an API key can read, " +
+          "so the harness cannot query one and does not pretend to. Pass --account-balance <usd> (or set " +
+          "IDEATE_ACCOUNT_BALANCE_USD) to have this ceiling checked against your funding at plan time instead of " +
+          "discovering the gap as a mid-run billing refusal.",
+      );
+    } else if (headroomUsd > accountBalanceUsd) {
+      log(
+        `[balance] WARNING: this ceiling's remaining headroom ($${headroomUsd.toFixed(4)}) exceeds the asserted account ` +
+          `balance ($${Number(accountBalanceUsd).toFixed(4)}). The ceiling is decorative above $${Number(accountBalanceUsd).toFixed(4)}: ` +
+          `the real limit is the balance, and the run will stop on a provider billing refusal rather than on --max-spend. ` +
+          `Balance is operator-asserted, not queried.`,
+      );
+    } else {
+      log(
+        `[balance] ceiling headroom $${headroomUsd.toFixed(4)} fits inside the asserted account balance ` +
+          `$${Number(accountBalanceUsd).toFixed(4)} -- --max-spend, not the balance, is the binding limit. ` +
+          `Balance is operator-asserted, not queried.`,
+      );
+    }
   }
 
   // ── --max-spend-<provider>: the SAME fail-closed pre-flight, priced PER
@@ -1941,7 +2071,41 @@ export async function runSpec(spec, opts) {
   // computed, above) so it fires whenever EITHER ceiling depends on
   // per-row pricing. A run with NO ceiling at all has nothing to gate, and
   // priceRowByProvider's $0-and-continue default remains correct for it.
-  function recordActualSpend(costRows) {
+  //
+  // ── `settledCellKey` (issue #169, Sentry MEDIUM on PR #174) ──────────────
+  // An in-flight RESERVATION exists for exactly one reason: this cell's cost
+  // is not yet known, so the ceiling holds its PROJECTION against the budget
+  // in the meantime. The moment `recordActualSpend` posts the cell's real
+  // cost into `runningTotal`, that projection is superseded by a fact -- and
+  // holding both counts the cell twice against its own ceiling.
+  //
+  // That double-count was live, at concurrency 1, on exactly one path:
+  // `recordActualSpend(costRows)` for a completed cell runs INSIDE
+  // `runOneCell`, and `judgePoolIfEnabled` is called immediately after it --
+  // while the driver's `finally` (which is what used to do the releasing)
+  // has not run, because `runOneCell` has not returned. So the judge-leg
+  // ceiling check saw this cell's generation cost in `runningTotal` AND its
+  // projection in `inFlightTotal`, and gated legs it should have admitted.
+  //
+  // Over-restrictive, so it could never overspend -- but judge legs are the
+  // gap this whole change exists to close, and a gate that trips early means
+  // pools the operator expected to be judged silently are not. It also made
+  // the plan-time `worst-case stop` line wrong, since the bound and the gate
+  // stopped describing the same arithmetic.
+  //
+  // Fixed HERE rather than by moving `judgePoolIfEnabled` after the driver's
+  // release, deliberately. Moving the call would change WHEN a pool is judged
+  // relative to the next cell's admission -- judging is per-cell precisely so
+  // a per-provider ceiling stays responsive to judge spend for the NEXT cell
+  // (issue #68) -- and would leave the invariant itself ("a reservation may
+  // outlive the fact that replaces it") intact for the next caller to trip
+  // over. Releasing on settlement states the invariant instead: a reservation
+  // lives exactly as long as the cost is unknown.
+  //
+  // `releaseInFlight` is idempotent, so the driver's `finally` remains the
+  // correct catch-all for every path that never settles (a throw, a payment
+  // abort, a budget skip) and simply no-ops for a cell released here.
+  function recordActualSpend(costRows, settledCellKey) {
     for (const row of costRows) {
       const { byProvider, hasMissingRate, missingRateModels, excludedNonProviderUsd } = priceRowByProvider(row, rateTable, { batch });
       if (anyCeilingActive && hasMissingRate) {
@@ -1975,6 +2139,10 @@ export async function runSpec(spec, opts) {
       // total-dollars backstop, not scoped to any one provider.
       runningTotal += rowTotalUsd;
     }
+    // The projection this cell was admitted on is now superseded by the fact
+    // just posted above. Release it, or the cell is counted twice against its
+    // own ceiling for the rest of `runOneCell` -- see this function's header.
+    if (settledCellKey !== undefined) releaseInFlight(settledCellKey);
   }
 
   // ── Judging (issue #68) ──────────────────────────────────────────────────
@@ -2147,6 +2315,74 @@ export async function runSpec(spec, opts) {
     }
     if (alreadyJudged.size === rows.length) return; // every leg already scored in a prior session
 
+    // ── Mid-flight ceiling for JUDGE LEGS (issue #169) ─────────────────────
+    // Until this block, judging was the one spend path with NO admission
+    // control at all. Generation cells have been gated per-cell since #51/#62
+    // and gated against ACTUAL accumulated spend since PR #76 -- but a judge
+    // leg was dispatched here unconditionally and only recorded afterwards,
+    // through the same `recordActualSpend` the ceiling reads. A run could
+    // therefore stop admitting generation cells at the ceiling and keep
+    // spending on judging past it, indefinitely. Judge spend is also the
+    // dominant OpenAI cost driver (docs/PREREGISTRATION.md §12), so this was
+    // the largest unguarded surface in the harness.
+    //
+    // Priced with the REAL candidate count (`candidates.length`), not the
+    // plan-time estimate -- the pool is in hand by the time this runs, so the
+    // gate uses a fact where the projection could only use a guess.
+    //
+    // Shape matches the generation check exactly: everything ACTUALLY spent
+    // (prior invocations + this run) plus everything reserved in flight, plus
+    // THIS leg's projection. A leg that would cross the ceiling is recorded as
+    // a classified `budget_exceeded` skip on `judgeAccount` and never sent --
+    // store-absent, so the next invocation re-plans it, exactly like a
+    // budget-skipped generation cell.
+    // `budgetSkipped` mirrors `alreadyJudged`: a provider whose leg reached a
+    // terminal state HERE must be excluded from every accounting loop after
+    // `runJudgeMatrix` below, or `judgeAccount.skip`/`.complete`/`.fail` lands
+    // on an already-terminal leg and throws "already terminal; refusing to
+    // overwrite". Same one-terminal-state-per-leg gate the paymentSkipped
+    // partition documents further down.
+    const budgetSkipped = new Set();
+    if (anyCeilingActive) {
+      for (const row of rows) {
+        const providerName = row.judge_provider;
+        if (!providersToCall[providerName]) continue;
+        const { usd: legUsd, byProvider: legByProvider } = judgeLegPrice({
+          model: row.judge_model,
+          provider: providerName,
+          candidateCount: candidates.length,
+          poolKey: cell.key,
+        });
+        let tripped = null;
+        if (maxSpendByProviderUsd) {
+          for (const [provider, projected] of Object.entries(legByProvider)) {
+            if (!(provider in maxSpendByProviderUsd) || !(projected > 0)) continue;
+            const already = (priorSpend.byProvider[provider] || 0) + (runningTotalByProvider[provider] || 0) + (inFlightByProvider[provider] || 0);
+            if (already + projected > maxSpendByProviderUsd[provider]) {
+              tripped = provider;
+              break;
+            }
+          }
+        }
+        if (tripped || (maxSpendUsd !== undefined && priorSpend.totalUsd + runningTotal + inFlightTotal + legUsd > maxSpendUsd)) {
+          delete providersToCall[providerName];
+          budgetSkipped.add(providerName);
+          judgeAccount.skip(judgeLegKey(cell.key, providerName), tripped ? `budget_exceeded:${tripped}` : "budget_exceeded");
+          log(
+            `[max-spend] judge leg SKIPPED (budget_exceeded${tripped ? `:${tripped}` : ""}): pool '${cell.key}' ` +
+              `judge=${row.judge_model} projected=$${legUsd.toFixed(4)} ` +
+              `spent-so-far=$${(priorSpend.totalUsd + runningTotal).toFixed(4)}` +
+              (maxSpendUsd !== undefined ? ` ceiling=$${maxSpendUsd}` : ""),
+          );
+        }
+      }
+      // Every leg of this pool is now terminal (already scored, or budget
+      // skipped) -- there is nothing left for runJudgeMatrix to do, and
+      // calling it would only re-derive `deferred` rows the loops below would
+      // then have to filter back out again.
+      if (rows.every((r) => alreadyJudged.has(r.judge_provider) || budgetSkipped.has(r.judge_provider))) return;
+    }
+
     const timestamp = new Date().toISOString();
     // providersToCall omits any provider not wired (opts.judgeProviders) --
     // runJudgeMatrix records that leg as `deferred`, never throws for it
@@ -2189,11 +2425,11 @@ export async function runSpec(spec, opts) {
     // the array) dedupes for free, so a duplicated entry cannot double-skip.
     const paymentSkippedLegs = new Map();
     for (const p of paymentSkipped || []) {
-      if (alreadyJudged.has(p.judge_provider)) continue;
+      if (alreadyJudged.has(p.judge_provider) || budgetSkipped.has(p.judge_provider)) continue;
       paymentSkippedLegs.set(judgeLegKey(p.poolKey, p.judge_provider), p.reason);
     }
     for (const r of results) {
-      if (alreadyJudged.has(r.judge_provider)) continue;
+      if (alreadyJudged.has(r.judge_provider) || budgetSkipped.has(r.judge_provider)) continue;
       const legKey = judgeLegKey(r.poolKey, r.judge_provider);
       if (paymentSkippedLegs.has(legKey)) continue; // terminal below, as a skip
       if (r.state === "completed") judgeAccount.complete(legKey, { scores: r.scores });
@@ -2209,7 +2445,7 @@ export async function runSpec(spec, opts) {
       judgeAccount.skip(legKey, reason);
     }
     for (const d of deferred) {
-      if (alreadyJudged.has(d.judge_provider)) continue;
+      if (alreadyJudged.has(d.judge_provider) || budgetSkipped.has(d.judge_provider)) continue;
       const legKey = judgeLegKey(d.poolKey, d.judge_provider);
       // A deferred leg (no provider wired for it) is a legitimate, terminal
       // outcome -- `skip()`, never `fail()`: FAILURE_KINDS has no entry that
@@ -2339,11 +2575,39 @@ export async function runSpec(spec, opts) {
   // `budget_exceeded` skip below already uses, for the same reason.
   let paymentAborted = null;
 
-  const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usd]));
+  // ── What the mid-flight ceiling admits against (issue #169) ───────────────
+  // `usdHigh`, not `usd`. A cell priced from the STRUCTURAL estimate (no
+  // stored cells for its arm) carries a projection its own pricer declares to
+  // be a floor -- lib/price.mjs's UNCALIBRATED_HIGH_FACTOR, set to the 2.53x
+  // miss actually observed on the Stage 1c re-collect. Admitting against a
+  // known floor is exactly how a $220 ceiling settled at $222.7198. A cell
+  // priced from real stored cells for its own arm has `usdHigh === usd`, so a
+  // resumed study -- the common case -- admits against the measurement, not
+  // against a 2.5x pad.
+  //
+  // `?? b.usd` keeps every pricer that predates this field (interimPriceGrid,
+  // and any injected test pricer) admitting exactly as it did before.
+  //
+  // The direction of the remaining error is deliberate: over-projecting stops
+  // the run EARLY, and a `budget_exceeded` skip is store-absent and re-plans
+  // as `todo` on the next invocation (see the skip below). Under-projecting
+  // spends money that cannot be un-spent. Only one of those is recoverable.
+  const priceByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.usdHigh ?? b.usd]));
   // Projected per-provider cost for each todo cell, split slot-by-slot (see
   // the pre-flight block above) -- used to decide, BEFORE a cell runs,
   // whether admitting it would cross a provider's ceiling.
-  const providerByKey = new Map(projection.breakdown.map((b) => [b.cellKey, b.byProvider || {}]));
+  // Scaled by the SAME usdHigh/usd ratio the global check uses (issue #169) --
+  // otherwise the global ceiling would admit against the upper bound while
+  // every per-provider ceiling admitted against the point estimate, and the
+  // two guards would disagree about what this cell is about to cost.
+  const providerByKey = new Map(
+    projection.breakdown.map((b) => {
+      const byProvider = b.byProvider || {};
+      const ratio = b.usdHigh !== undefined && b.usd > 0 ? b.usdHigh / b.usd : 1;
+      if (ratio === 1) return [b.cellKey, byProvider];
+      return [b.cellKey, Object.fromEntries(Object.entries(byProvider).map(([p, usd]) => [p, usd * ratio]))];
+    }),
+  );
 
   // ── In-flight reservations (issue #148) ────────────────────────────────────
   // The admission check below is "everything ACTUALLY spent so far, plus this
@@ -2623,7 +2887,7 @@ export async function runSpec(spec, opts) {
         // for, and this cell is still being re-planned, so its replies must
         // survive or the next invocation buys them again.
         if (resumeEnabled) persistBatchResumeState(store, cell, response.resume, pricingLever, log);
-        recordActualSpend(genCostRows);
+        recordActualSpend(genCostRows, cell.key);
         return; // no metrics, no store.put, no judging -- this pool is discarded
       }
 
@@ -2676,7 +2940,7 @@ export async function runSpec(spec, opts) {
         // never lost and never double-counted against a later successful
         // retry (each attempt gets a new, non-colliding key).
         recordMetricsAttemptFailure(store, { cell, costRows, detail: metrics.detail, timestamp });
-        recordActualSpend(costRows);
+        recordActualSpend(costRows, cell.key);
         // Skipped, not failed: RunAccount.skip() is a legitimate terminal
         // state for THIS invocation's reconcile() (every planned cell must
         // still reach exactly one terminal state -- this cell is not
@@ -2728,7 +2992,7 @@ export async function runSpec(spec, opts) {
         accounting: { state: "completed" },
         costRows,
       });
-      recordActualSpend(costRows);
+      recordActualSpend(costRows, cell.key);
       // issue #68 -- judge this pool now, per cell, so a per-provider
       // ceiling stays responsive to judge spend for the NEXT cell's
       // admission decision (see the per-cell loop's projected-vs-actual
@@ -2838,7 +3102,7 @@ export async function runSpec(spec, opts) {
           costRows,
         });
       }
-      recordActualSpend(costRows);
+      recordActualSpend(costRows, cell.key);
       // No candidates on a failed generation cell -- nothing to judge.
     }
   };
