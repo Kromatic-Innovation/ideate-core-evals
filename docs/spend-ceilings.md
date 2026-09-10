@@ -114,6 +114,14 @@ one-factor screening arms (`S1-ELOW` 0.55x, `S1-C0` 1.00x, `S1-EMAX` 6.16x —
 same model, same N, 24 cells each). Better than the effort-blind constant it
 replaces, but still an estimate.
 
+The multiplier scales **output tokens only** — effort buys reasoning, not a
+longer prompt, and the measurement bears that out (input held flat at ~362
+tokens across all three levels). So a *cell's* total cost ratio is always
+**below** the multiplier, by whatever share of that cell is input: a solo cell
+at 2,500 in / 1,500 out prices `max` at ~4.9x `high`, not 6.16x. If the
+`[calibration]` line says `max=6.16x` and a per-cell comparison says 4.87x,
+both are right.
+
 A projection containing any tier-2 cell is reported as a **FLOOR, not an
 estimate**, with an upper bound and the arms it could not calibrate:
 
