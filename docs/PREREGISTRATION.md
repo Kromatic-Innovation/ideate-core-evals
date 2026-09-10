@@ -2162,6 +2162,74 @@ S1c-1's SE is estimated from a single-σ fit pooling all three arms, including `
 
 The concern that motivated the check — that floor effects at 15.8 would compress that arm's variance and *deflate* the pooled SE — is **falsified**: per-arm variance is RICH 9.41, SOLO60 12.69, **SOLO6X10 32.91**, so pooling it *inflated* the SE by ~30%. **The registered three-arm figure is the conservative one**, and it remains the primary result; the two-arm fit was not pre-specified and is recorded here only so the check cannot be re-run selectively later.
 
+---
+
+## Appendix N — Amendments (dated 2026-09-09)
+
+Registers the §5.1 judge-validation run (#16) **before it is run**, and registers a separate, explicitly non-confirmatory quality read of the Stage 1c pools. Appendix L item 4 and Appendix M item 9 both name the unrun judge gate as the binding constraint on every claim this study makes; this appendix is the attempt to unbind it, and it registers in advance what happens in both branches.
+
+### Item 1 — What was already settled, and what is actually left
+
+Issue #16's own history records two blockers that are **no longer live**, and this item states that plainly so the run is not re-litigated against a stale reading of the issue:
+
+1. **The axis↔column mapping is registered.** Appendix A item 7 registers the judge's **`originality`** axis against the Si et al. **`overall_score`** column. The 2026-08-02 kickback described this as an unregistered methodology decision; it was registered afterwards. That kickback also described the judge as emitting *four* axes — it emits **two**, `originality` and `feasibility` (`prompt.mjs` `JUDGE_AXES`). Both statements in that comment are stale.
+2. **The slice join is repaired.** The kickback recorded `readSiEtAlSlice()` failing closed with *"99 idea file(s) did not resolve to an idea_id"*. Verified on `develop` at `cbb74a7`: the join is total — **98 ideas, 228 reviews**, `nearMisses: 0`, with `AI_Rerank` carried as a named exclusion (49 files, issue #35).
+
+The remaining scope of #16 is therefore exactly its fourth checklist item: **run the validation and record the record.** Nothing about the instrument is changed by this appendix.
+
+### Item 2 — The answer key is under-powered, and this is registered before the verdict
+
+`evals/judge/reproduce-si-et-al.mjs` was run against the real slice. It reproduces the committed #47 figure **bit-for-bit** (only the timestamp differs), so this is a verification, not a new measurement — but the figure has never been carried into the gate's own registration, and it governs how the verdict may be read:
+
+| Quantity | Value |
+|---|---|
+| Human–human balanced accuracy, our 98-idea slice | **0.5534** |
+| Bootstrap 95% CI (2000 draws, resampling ideas) | **[0.4483, 0.6702]** |
+| Registered floor (Appendix A item 4) | 0.561 |
+| Chance | 0.500 |
+
+**The CI does not exclude chance.** The expert answer key, measured against itself at n=98, cannot be distinguished from a coin flip. The registered 0.561 floor sits inside the CI and is therefore not contradicted — but a `pass`/`drop` verdict computed at n=98 carries roughly ±0.11 of bootstrap uncertainty, so a judge at 0.60 and a judge at 0.50 land in the same interval.
+
+**Registered consequence:** the verdict is reported **with this CI beside it**, and is described as **power-limited by the answer key, not only by the judge**. This is registered now, before the verdict is known, precisely so it cannot be deployed selectively as an excuse for a `drop` or waved away on a `pass`.
+
+### Item 3 — Comparators, registered before the run
+
+Appendix A item 4 registers **53.3%** as the "best LLM evaluator" comparator. That figure is Si et al.'s Claude-3.5 **Pairwise** ranker. This study's judge is a **direct, score-only** scorer, whose shape-matched comparator is Claude-3.5 **Direct** at **51.7%**. Registering only the pairwise figure invites a comparison against a differently-shaped evaluator.
+
+**Both are registered as comparators**, with 51.7% named as the shape-matched one. Neither is a floor; the floor remains 56.1%.
+
+**A construction difference is registered alongside them:** Si et al. threshold LLM evaluators at their **median** score, whereas `balancedAccuracyTopBottom` ranks the labelled set and splits top-k/bottom-k. These are not the same computation, and any comparison drawn against 51.7% or 53.3% must say so.
+
+### Item 4 — Run parameters, fixed before the first judge call
+
+- **Axis:** `originality` (Appendix A item 7)
+- **Expert column:** `overall_score` (Appendix A item 7)
+- **Metric / construction:** `balanced-accuracy` / `si-et-al-2024/split-half-top-bottom-25pct-balanced-accuracy` (Appendix A item 4)
+- **Floor:** `0.561`
+- **Slice:** Human + AI, n = 98; `AI_Rerank` excluded and carried in the record's `exclusions`
+- **Store:** a **dedicated** store, not `results-study1c`
+
+The store choice is load-bearing rather than cosmetic. `recordValidation` writes its record under `cfg: <judgeHash>`. `results-study1c`'s configHash tally is what `resolveS1cArmHashes` reads, and it throws when it finds more than one non-pre-#168 hash — so writing the validation record into that store would **break the Stage 1c analysis merged as #168**. The validation record goes elsewhere.
+
+**No sweep.** The judge is run at the registered mapping only. A judge-vs-column or judge-vs-axis sweep would select the gate on its own outcome; Appendix A item 7 closed the question and this appendix does not reopen it.
+
+### Item 5 — A construct tension, disclosed and NOT acted on
+
+The Si et al. release carries a **`novelty_score`** column. On construct grounds it is a closer match to the judge's `originality` axis than `overall_score` is.
+
+**The registered mapping stands.** The 56.1% floor is human–human agreement on `overall_score` and on no other column; validating against `novelty_score` would require a second floor and a second amendment. This is recorded as a **limitation of the registered gate**, not as a proposed change — and it is recorded *after* item 2's 0.5534 was already known, which is exactly the circumstance in which switching columns would be selecting on the outcome.
+
+### Item 6 — The Stage 1c quality read is DESCRIPTIVE and non-confirmatory
+
+The question the study actually needs answered — whether the rich panel's extra distinct ideas are *better* ideas, and whether `weirdo` buys distinctness with incoherence — is registered here as a **separate, explicitly non-confirmatory** exercise, run **outside** the §5.1 gate.
+
+- It scores already-stored Stage 1c candidate texts. No cells are re-collected.
+- Scores are written to a **sidecar keyed by cellKey**, never back into `results-study1c` under a new `configHash`. `judgeHash` is a `CONFIG_FIELDS` entry, so writing judge output in-store would restate every cell's identity and strand the 431 cells already collected.
+- It is run **regardless of the gate's verdict**, and every artifact it produces is labelled descriptive. Per §5.4 a `drop` verdict removes idea-level metrics from *the study's confirmatory claims*; it does not forbid looking at the ideas and saying what is there.
+- **It is a look, not a test.** A small stratified pilot has no power for an arm contrast, and no p-value is computed from it.
+
+Registering this in advance is what stops a `drop` verdict from silently deleting the user-facing answer, and stops a descriptive read from being promoted to a confirmatory one after the fact.
+
 ### Item 10 — The spend ceiling did not bind, again
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.
