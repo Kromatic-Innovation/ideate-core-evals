@@ -126,11 +126,17 @@ function parseArgs(argv) {
     // buildRegisteredFamily() gives); it does not need re-pairing. See
     // contrasts.mjs's "ARM SUBSETS AND THE REGISTERED FAMILY" header.
     else if (a === "--panel-arms") args.panelArms = argv[++i].split(",");
-    // H2/H4's registered default is delta=0 (buildRegisteredFamily()) -- this
-    // flag exists ONLY to register an explicit margin later (§B2's pilot),
-    // and doing so is recorded as a deviation from the current registration
-    // (see contrasts.mjs's `deltaDeviatesFromRegistration`), never silently
-    // absorbed as if it were always the registered test.
+    // H2/H4's registered default is now REGISTERED_H2_H4_DELTA (2.7976),
+    // per docs/PREREGISTRATION.md Appendix R (issue #179), superseding the
+    // delta=0 default this comment used to describe. Leaving `args.delta`
+    // undefined when this flag is not passed (see the `delta: undefined`
+    // initializer above) is what lets buildRegisteredFamily() apply the
+    // REGISTERED default on its own -- this flag exists to register a
+    // DIFFERENT explicit margin, and doing so is recorded as a deviation
+    // from the current registration (see contrasts.mjs's
+    // `deltaDeviatesFromRegistration`), never silently absorbed as if it
+    // were always the registered test. Passing exactly the registered value
+    // is NOT a deviation -- see buildRegisteredFamily()'s jsdoc.
     else if (a === "--delta") args.delta = Number(argv[++i]);
     // Rarefaction (issue #73, docs/PREREGISTRATION.md Appendix C): H1's
     // registered estimand needs the SAME clusterDistanceThreshold distinct_k
