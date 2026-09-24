@@ -649,3 +649,24 @@ test("#97: familyEstimability() reports the loss WITHOUT feeding it back into th
   const holm = holmBonferroni(results.map((r) => r.p), { familySize: registeredFamilySlotCount(family) });
   assert.equal(holm.length, 5);
 });
+
+// H4 carries the SAME registered delta as H2 (Appendix R item 3: one number
+// serves both). Covered separately because buildRegisteredFamily() builds the
+// two entries independently -- a change that wired the registered default into
+// only one of them would pass every H2 test above.
+test("buildRegisteredFamily: H4 uses the same REGISTERED_H2_H4_DELTA default as H2, and an explicit 0 is a deviation there too", () => {
+  const fit = diagonalFit([10, 1, 2, 3, 4, 5], [0.1, 0.25, 0.25, 0.25, 0.25, 0.25]);
+
+  const defaultFamily = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E"] });
+  const h4Default = evaluateSpec(defaultFamily[3], fit);
+  assert.equal(h4Default.id, "H4", "family[3] must be H4 -- this test's premise");
+  assert.equal(h4Default.delta, REGISTERED_H2_H4_DELTA);
+  assert.equal(h4Default.deltaDeviatesFromRegistration, false);
+  assert.match(h4Default.description, /registered default/);
+
+  const zeroFamily = buildRegisteredFamily({ referenceArm: "A", panelArms: ["B", "D", "E"], delta: 0 });
+  const h4Zero = evaluateSpec(zeroFamily[3], fit);
+  assert.equal(h4Zero.delta, 0);
+  assert.equal(h4Zero.deltaDeviatesFromRegistration, true);
+  assert.match(h4Zero.description, /DEVIATES from registration/);
+});

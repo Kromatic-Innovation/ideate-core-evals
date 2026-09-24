@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { renderReport } from "./report.mjs";
+import { REGISTERED_H2_H4_DELTA } from "./contrasts.mjs";
 
 function baseInput() {
   return {
@@ -211,4 +212,45 @@ test("renderReport: an unimplemented H1 (rarefied lane unavailable) renders its 
   const md = renderReport(input);
   assert.match(md, /no per-cell pools present/);
   assert.doesNotMatch(md, /judge-score frame not wired/);
+});
+
+// ── Appendix R (issue #179): the "DEVIATES from registration" rendering ───
+// AC7 names report.mjs's rendering explicitly. The renderer keys entirely off
+// `deltaDeviatesFromRegistration`, so what these two tests pin is that the
+// flag reaches the rendered row at all -- a silently dropped deviation note
+// would make a deviating run read as the registered analysis in the artifact,
+// which is the exact failure Appendix B item 5 and Appendix R both exist to
+// prevent.
+
+function h2Row(delta, deviates) {
+  return {
+    id: "H2",
+    description: `E >= D (one-sided, delta=${delta}${deviates ? ", DEVIATES from registration" : " -- registered default"})`,
+    kind: "one-sided-margin",
+    oneSided: true,
+    estimate: 1.0,
+    ci: [0.2, 1.8],
+    p: 0.01,
+    holmP: 0.02,
+    supported: true,
+    delta,
+    deltaDeviatesFromRegistration: deviates,
+  };
+}
+
+test("renderReport: an H2 row carrying a REGISTERED delta renders NO deviation note (Appendix R)", () => {
+  const input = baseInput();
+  input.registeredResults = [h2Row(REGISTERED_H2_H4_DELTA, false)];
+  input.holmAdjusted = [0.02];
+  const md = renderReport(input);
+  assert.doesNotMatch(md, /DEVIATES from registration\)/, "a registered-delta run must not be annotated as a deviation by the renderer");
+  assert.match(md, /registered default/);
+});
+
+test("renderReport: an H2 row carrying a NON-registered delta renders the deviation note with the delta value", () => {
+  const input = baseInput();
+  input.registeredResults = [h2Row(0, true)];
+  input.holmAdjusted = [0.02];
+  const md = renderReport(input);
+  assert.match(md, /\(delta=0, DEVIATES from registration\)/, "the renderer must surface both the deviating delta and that it deviates");
 });
