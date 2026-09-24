@@ -2420,7 +2420,6 @@ Every observation in this item originated with the operator's read of the packet
 
 Final cumulative spend was **$222.7198** against a `--max-spend` of **$220**. `--max-spend` is evaluated against a *projection* before cells are dispatched, not enforced mid-flight, so it overshoots when the projection is low — and `interimPriceGrid` has no model of `effort` (Appendix L item 5), which is exactly the condition this arm runs under. Combined with Appendix K's finding that the ceiling sat above the account balance, **the ceiling has now failed to bind twice for two different reasons.** Filed as **#169** rather than fixed here; no result in item 9 depends on it. For the record, the pre-flight projection for the 144-cell re-collect was **$41.59** against an actual **$105.22** — a 2.5× underestimate, concentrated in exactly the max-effort condition where a ceiling most needs to work.
 
-
 ## Appendix O — Amendments (dated 2026-09-10)
 
 Two amendments, neither of which retracts a registered result. **Items 1–5** resolve **#165** (§3.3, the universal `temperature` strip) — the issue's central claim does not hold for the contrast it is about, and what replaces it is a **tighter** bound on `S1b-1` than the caveat the issue asked for. **Items 6–8** record that **#170**'s hash gap is **CLOSED** (merged as `7f3f359`, PR #173) and supersede, by dated cross-reference, the two statements in [Appendix N](#appendix-n--amendments-dated-2026-09-09) item 8 that the merge made false.
@@ -2644,84 +2643,31 @@ What changed is **how much a future run is permitted to spend and how honestly i
 
 ## Appendix Q — Amendments (dated 2026-09-24)
 
-Per the amendment rule at the top of this document — nothing above is edited
-in place. This appendix registers the status of the crowdsourced human-anchor
-rating panel scoped and costed in `docs/human-anchor-panel.md` (issue #52),
-**pre-data**: no panel has run, no pool has been rated, and no result exists
-for either item below to be fitted to. It also registers the §10 limitation
-that stands while that remains true. **Nothing in §6 is changed by either
-item below**, and no cell, contrast, or verdict already reported depends on
-anything in this appendix.
+Per the amendment rule at the top of this document — nothing above is edited in place. This appendix registers the status of the crowdsourced human-anchor rating panel scoped and costed in `docs/human-anchor-panel.md` (issue #52), **pre-data**: no panel has run, no pool has been rated, and no result exists for either item below to be fitted to. It also registers the §10 limitation that stands while that remains true. **Nothing in §6 is changed by either item below**, and no cell, contrast, or verdict already reported depends on anything in this appendix.
 
 ### Item 1 — §6.3: the human-anchor panel's result is registered as EXPLORATORY
 
-**What's registered.** [Appendix B](#appendix-b--amendments-dated-2026-09-01)
-**Item 14** already registered issue #52's panel as running after the
-confirmatory grid and as **exploratory, not confirmatory** — not part of the
-registered H1–H5 family, not Holm-corrected, reported in §6.3 with
-Benjamini–Hochberg correction. That registration is dated 2026-09-01, is
-**unchanged by this item**, and this item does not re-register the same
-decision a second time. What this item adds is the reporting mechanics and
-the interpretive rule issue #52's own acceptance criteria call for, which
-Item 14 did not spell out.
+**What's registered.** [Appendix B](#appendix-b--amendments-dated-2026-09-01) **Item 14** already registered issue #52's panel as running after the confirmatory grid and as **exploratory, not confirmatory** — not part of the registered H1–H5 family, not Holm-corrected, reported in §6.3 with Benjamini–Hochberg correction. That registration is dated 2026-09-01, is **unchanged by this item**, and this item does not re-register the same decision a second time. What this item adds is the reporting mechanics and the interpretive rule issue #52's own acceptance criteria call for, which Item 14 did not spell out.
 
-**Why registering this now, rather than after seeing the panel's result, is
-the whole point.** Per §11's own table ("Exploration ... labeled exploratory
-... reported in a separate section with BH correction"), an exploratory
-label costs nothing to apply in advance and is not legitimate to apply after
-the fact. Deciding confirmatory-vs-exploratory status *after* seeing whether
-the human counts agree with `distinct_k` would be exactly the optional-stopping
-hazard §11 exists to rule out, wearing an exploratory label instead of a
-confirmatory one — the hazard is the same regardless of which label the
-after-the-fact decision reaches for.
+**Why registering this now, rather than after seeing the panel's result, is the whole point.** Per §11's own table ("Exploration ... labeled exploratory ... reported in a separate section with BH correction"), an exploratory label costs nothing to apply in advance and is not legitimate to apply after the fact. Deciding confirmatory-vs-exploratory status *after* seeing whether the human counts agree with `distinct_k` would be exactly the optional-stopping hazard §11 exists to rule out, wearing an exploratory label instead of a confirmatory one — the hazard is the same regardless of which label the after-the-fact decision reaches for.
 
 **The consequences, stated concretely:**
 
-- The panel's correlation (human distinct-count vs. `distinct_k`) and its
-  inter-rater agreement statistic are reported in §6.3, the exploratory
-  section, **BH-corrected if any significance test is run over them.**
-- They are **never folded into the Holm-corrected confirmatory family.**
-  That family is m = 5 (H1–H5), registered in §6.2 and confirmed by
-  [Appendix B](#appendix-b--amendments-dated-2026-09-01) **Item 6** ("§6.2:
-  the Holm family is 5 hypotheses, not 6 — H3 is an intersection-union
-  test"). The panel adds no sixth hypothesis and no sixth Holm slot; **the
-  family size does not change.**
-- **An agreement result, however strong, does not retroactively validate
-  `distinct_k` as a confirmatory instrument.** Validating an instrument
-  after using it to produce the confirmatory results it is supposed to
-  validate would be circular, and would launder an exploratory finding into
-  confirmatory backing it never earned.
-- **A disagreement does not invalidate a registered contrast.** H1–H5 are
-  tested on `distinct_k` as pre-registered regardless of what the panel
-  finds. A disagreement between the panel and `distinct_k` is evidence about
-  `distinct_k`'s **construct validity** — reported as exactly that, in §6.3,
-  never as grounds to discard or re-run an already-registered confirmatory
-  result.
+- The panel's correlation (human distinct-count vs. `distinct_k`) and its inter-rater agreement statistic are reported in §6.3, the exploratory section, **BH-corrected if any significance test is run over them.**
+- They are **never folded into the Holm-corrected confirmatory family.** That family is m = 5 (H1–H5), registered in §6.2 and confirmed by [Appendix B](#appendix-b--amendments-dated-2026-09-01) **Item 6** ("§6.2: the Holm family is 5 hypotheses, not 6 — H3 is an intersection-union test"). The panel adds no sixth hypothesis and no sixth Holm slot; **the family size does not change.**
+- **An agreement result, however strong, does not retroactively validate `distinct_k` as a confirmatory instrument.** Validating an instrument after using it to produce the confirmatory results it is supposed to validate would be circular, and would launder an exploratory finding into confirmatory backing it never earned.
+- **A disagreement does not invalidate a registered contrast.** H1–H5 are tested on `distinct_k` as pre-registered regardless of what the panel finds. A disagreement between the panel and `distinct_k` is evidence about `distinct_k`'s **construct validity** — reported as exactly that, in §6.3, never as grounds to discard or re-run an already-registered confirmatory result.
 
 ### Item 2 — §10: the threats-to-validity row that stands until the panel runs
 
-**Registered content** (not added to §10's table in place — see the
-forward-pointer blockquote placed immediately after §10's existing
-2026-09-01 amendment note, which points here):
+**Registered content** (not added to §10's table in place — see the forward-pointer blockquote placed immediately after §10's existing 2026-09-01 amendment note, which points here):
 
 | Threat | Mitigation | Residual |
 | --- | --- | --- |
 | No human evaluates the study's own outputs — every reported number is embedding-derived or LLM-derived | `distinct_k` validated against NoveltyBench's definition and DAT ordering; judge calibrated against Si et al. | Real, and not closed by either: the Si et al. key calibrates the JUDGE on multi-page research proposals, and says nothing about whether pool-level clustering matches human judgement on this study's own briefs |
 
-**The registered consequence.** This row stands, and is reported in §10,
-**unless and until** the panel scoped in `docs/human-anchor-panel.md` runs —
-it is **not conditional on the operator's go/no-go decision**, because it is
-true today regardless of which way that decision goes. If the operator
-declines to run the panel (`docs/human-anchor-panel.md` §6's no-go fallback),
-this row is permanent. If the panel runs, this row is superseded by a future
-dated appendix reporting what it found — an amendment this document does not
-pre-write, because pre-writing a result before the data exists is exactly
-what §11 and Item 1 above refuse.
+**The registered consequence.** This row stands, and is reported in §10, **unless and until** the panel scoped in `docs/human-anchor-panel.md` runs — it is **not conditional on the operator's go/no-go decision**, because it is true today regardless of which way that decision goes. If the operator declines to run the panel (`docs/human-anchor-panel.md` §6's no-go fallback), this row is permanent. If the panel runs, this row is superseded by a future dated appendix reporting what it found — an amendment this document does not pre-write, because pre-writing a result before the data exists is exactly what §11 and Item 1 above refuse.
 
 ### Item 3 — What this appendix does NOT do
 
-This appendix does not commit spend, does not authorise a data collection,
-and does not register a hypothesis. The go/no-go recommendation for the
-panel is the operator's to make and is recorded in
-`docs/human-anchor-panel.md` §6, not here. No cell, contrast, or verdict
-depends on anything in Items 1 or 2 above.
+This appendix does not commit spend, does not authorise a data collection, and does not register a hypothesis. The go/no-go recommendation for the panel is the operator's to make and is recorded in `docs/human-anchor-panel.md` §6, not here. No cell, contrast, or verdict depends on anything in Items 1 or 2 above.
