@@ -629,6 +629,8 @@ This entry does not independently re-verify #53's provider-call trace (reported 
 
 **Why this mattered in practice.** With no δ passed, H2 and H4 previously fell into an unregistered two-sided Wald-vs-zero branch, which then contaminated the shared Holm family and drove every other hypothesis's verdict. Measured against the corrected one-sided δ = 0 test, H4's contaminating p-value was roughly 7× smaller than its correct value. This entry does not re-derive that measurement; it is reported from the #60 review pass and reproducible against that PR's diff.
 
+> _Amended 2026-09-24 by [Appendix R](#appendix-r--amendments-dated-2026-09-24) (issue #179). The margin this item said would need "a separate, dated amendment, made explicitly" has now been made: **δ = 2.7976**, derived as `sqrt(σ²_ba)` at the ~60-idea pool basis ([Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5), the basis matching H2's and H4's own rarefaction target per [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 4's scope bound. This item's text above is unchanged and still correctly describes the registration as it stood on 2026-09-01 — nothing in Appendix B is edited in place, and nothing in Appendix R edits it either._
+
 ### Item 6 — §6.2: the Holm family is 5 hypotheses, not 6 — H3 is an intersection-union test (issue #44)
 
 **What changed.** Nothing in §6.2's text. §6.2 already states **"5 registered hypotheses"**, and that is correct as written. This entry records the reasoning so a future reviewer does not "fix" it back to 6, which an earlier (reverted) review pass had proposed.
@@ -2671,3 +2673,108 @@ Per the amendment rule at the top of this document — nothing above is edited i
 ### Item 3 — What this appendix does NOT do
 
 This appendix does not commit spend, does not authorise a data collection, and does not register a hypothesis. The go/no-go recommendation for the panel is the operator's to make and is recorded in `docs/human-anchor-panel.md` §6, not here. No cell, contrast, or verdict depends on anything in Items 1 or 2 above.
+
+---
+
+## Appendix R — Amendments (dated 2026-09-24)
+
+Per the amendment rule at the top of this document — nothing above is edited in place. This is the "separate, dated amendment, made explicitly" that [Appendix B](#appendix-b--amendments-dated-2026-09-01) item 5 said a numeric non-inferiority margin for H2 and H4 would require: item 5 registered the one-sided δ = 0 test and stated in as many words that "no pilot-derived margin is registered here or implied by the existing text," and that a margin, if one were ever wanted, is this kind of entry. This appendix registers exactly that, and lands before any Study 2 (issue #131) cell exists — #131 is wired `blocked_by` issue #179 (the issue this appendix discharges) for precisely that ordering. One naming note: the issue that requested this registration described the target as "the next letter after Appendix P," written before [Appendix Q](#appendix-q--amendments-dated-2026-09-24) landed earlier the same day (PR #180, issue #52); **R**, not Q, is the next unused letter, and this appendix uses it. Nothing in §6 (hypotheses and analysis plan) is changed by any entry below — H1, H3, H5 and the Holm family size (m = 5, [Appendix B](#appendix-b--amendments-dated-2026-09-01) item 6) are untouched, and this appendix commits no Study 2 design decision, sizing, or cost projection.
+
+### Item 1 — §6.1/§6.2: the basis is Appendix J's ~60 pair, per Appendix G item 4's scope bound
+
+**The question is which of the two registered `σ²_ba` figures H2 and H4 are sized on.** H2 is `E ≥ D` and H4 is `B ≥ D` (§6.1). Arms B, D and E are each registered in `arms.config.json` as `mode: "panel"` with no per-arm geometry override, so all three inherit the file's default `panel` block verbatim — `{size: 5, ideasPerAgent: 6, maxRounds: 2}` — read directly from `arms.config.json` rather than assumed. Arm A's own `purpose` string in that same file states the pool-size consequence explicitly: round 2 **appends** to round 1's candidates rather than replacing them, so "a panel arm's real pool is ~60 (size x ideasPerAgent x maxRounds), not 30" — the same reading [Appendix C](#appendix-c--amendments-dated-2026-09-01) item 1 already registered for Arm A's own comparison to the panel. [Appendix C](#appendix-c--amendments-dated-2026-09-01) item 2's rarefaction rule rarefies every pool in a contrast to the minimum pool size present on either side. Both sides of H2 (E, D) and both sides of H4 (B, D) are ~60-idea panel pools, so both contrasts' rarefaction target is ~60, not ~30.
+
+**[Appendix G](#appendix-g--amendments-dated-2026-09-08) item 4 registers the scope bound that makes this choice load-bearing rather than incidental**: "Any design whose rarefaction target is not ~30 requires its own variance basis, estimated at that pool size, registered as its own dated amendment." H2/H4's ~60 target therefore rules out [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 1's `σ²_ba = 1.2088` / `σ²_e = 5.1181` (the ~30-idea matched-N=30 basis) as the basis for this margin — that pair is registered for arm-A-versus-panel contrasts, not panel-versus-panel ones. The basis used here is **[Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's measured ~60-scale pair**: `σ²_ba = 7.8266` (MEASURED, three arms directly fitted at the ~60 scale, superseding a transported 2.3562 that [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5 found wrong by 3.3× "in the direction that flattered the design") and `σ²_e = 3.6348` (MEASURED, but **rarefied at 45**, not 60 — [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's own stated caveat, repeated here rather than dropped: the re-run's truncated pools dragged the common rarefaction floor from 60 down to 45 across every arm in that contrast, per [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's own text).
+
+**One caveat inherited from [Appendix C](#appendix-c--amendments-dated-2026-09-01) item 1, carried rather than dropped: ≈60 is a *traced upper bound*, not an observation.** That item states it plainly — round 2 is only *prompted* for new ideas and the pool is deduped by normalized text, so "the true observed panel pool size may be well under 60" — which is exactly why [Appendix C](#appendix-c--amendments-dated-2026-09-01) item 2 registers rarefaction as a rule ("the minimum pool size actually present") and never as a number. Two consequences for this margin, and neither is a reason to choose the other basis. First, what decides the basis here is the *scale* the contrast sits at, not a precise pool count: both sides of H2 and H4 are panel arms of identical geometry, so the contrast sits at the panel scale and not at Arm A's ~30 solo scale, whatever the achieved floor turns out to be. Second, [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's basis is itself measured under exactly this shortfall — its `σ²_e` is the rarefied-at-45 residual — so the registered pair is, if anything, the closer match to a panel floor that lands under 60 than to a hypothetical clean 60. If the grid's own achieved floor were ever to land far enough below the panel scale to make the ~60 basis the wrong one, [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 4 governs that case too, and it would be a further dated amendment — not a silent reinterpretation of this one.
+
+### Item 2 — Study 2 (issue #131): its rarefaction target is NOT YET on record, and this margin is not derived from it
+
+**Investigated, not assumed.** Study 2 (issue #131) holds N at "Study 1's best solo configuration" and rarefies to the minimum pool size across its six solo conditions — so whatever that configuration turns out to be decides Study 2's own target pool scale, independently of the grid. A search of this checkout for that configuration — `docs/PREREGISTRATION.md` and every `docs/status-2026-09-0*.md` file, [Appendix L](#appendix-l--amendments-dated-2026-09-09), [Appendix M](#appendix-m--amendments-dated-2026-09-09) and [Appendix N](#appendix-n--amendments-dated-2026-09-09) (Study 1, Stages 1b and 1c), and every `data/` and `results*` directory in the repository — finds no "best configuration" or "best solo" designation anywhere. `data/` contains only `study1-stage1a/`; the only `results*` directory is `results-pilot/`. No `results-study1b*` or `results-study1c*` store is committed, and no document names a winning stance/strategy/effort combination. Stage 1a's one-factor-at-a-time screening (the design that could in principle produce such a combination) has run, but nothing in this checkout reports its outcome as a selected "best" configuration; Stage 1b and Stage 1c, as registered, answer a different question (whether a differentiated panel clears one call), not this one. **Study 1's best solo configuration is therefore not yet on record, and Study 2's own rarefaction target cannot be determined from anything committed here** — it is downstream of a Study 1 result that does not exist yet.
+
+**The margin registered in this appendix is therefore registered for the A–H grid's H2 and H4 contrasts, not for Study 2.** Their rarefaction target is determined by the grid's own construction (~60, per Item 1 above) and does not depend on Study 2's design at all. This is the second of the two options issue #179's acceptance criteria contemplated: the margin is registered for the grid, and Study 2 reports its own tier contrasts against it, rather than the margin being derived from Study 2's (currently undetermined) target.
+
+**The condition under which Study 2 may use this margin, stated so a future amendment does not have to rediscover it:** only if Study 2's own achieved rarefaction floor lands at the ~60 scale. If it does not — for example if Study 1's best configuration turns out to be N=30 — then per [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 4, Study 2 needs **its own variance basis, estimated at that pool size, registered as its own dated amendment**. This appendix does not license transporting `σ²_ba = 7.8266` to a design at a different scale; that refusal is made explicitly and in advance, naming [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's own transport failure (the 2.3562 figure, wrong by 3.3×) as the precedent this appendix declines to repeat in either direction.
+
+**Study 2's target is in part an outcome, not a design parameter, and that too is already registered.** [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 8 registers, for Stage 1b's re-run, that "the rarefaction floor is data-determined... it is a result, not a parameter." The same logic applies to Study 2: its six solo conditions' achieved floor is something Study 2 will report, not something this appendix — or any appendix written before Study 2's first cell — can pin in advance.
+
+### Item 3 — §6.1/§6.2: the registered margin, one δ for both H2 and H4, derived step by step
+
+**One δ serves both H2 and H4.** Both are panel-versus-arm-D contrasts, both rarefy at the same ~60 scale (Item 1), both are sized on the same registered design and the same variance basis, so the same derivation returns the same number — registering two different values for H2 and H4 would assert a distinction the design does not contain. `evals/analysis/contrasts.mjs` already shares a single `opts.delta` between the two (`buildRegisteredFamily()`'s `h2Pair`/`h4Pair` handling), so one registered number keeps the code and this registration in agreement.
+
+**The derivation.** δ := `sqrt(σ²_ba)` at the registered ~60 basis = `sqrt(7.8266)` = **2.7976** rarefied distinct ideas (4 d.p., matching this document's convention for these figures).
+
+**Why this quantity, in the response's own units.** `σ²_ba` is the brief × arm interaction variance — the variance of a given arm's effect *across briefs*. Its square root is the standard deviation, in `distinct_k`'s own units, with which one arm's advantage over another moves from one brief to the next. A mean deficit smaller than that SD is smaller than the brief-to-brief wobble in the very quantity being compared: on a substantial share of briefs the cheaper arm is actually *ahead*, so a configuration recommendation — the reason this study exists — cannot turn on a difference that size. A deficit of 2.7976 rarefied distinct ideas on a ~60-idea pool is ≈4.7% of the pool; that is the smallest deficit this margin declines to rule out, and everything larger the test must still reject.
+
+**The conservative choice, disclosed rather than left implicit.** Under the R0 model (§6.2) each arm carries its own `brief:arm` term, so a two-arm contrast's own brief-level variance is `2·σ²_ba` — exactly why §3.4's registered SE formula carries a leading factor of 2. The contrast's own brief-level SD is therefore `sqrt(2 × 7.8266)` = **3.9564**, not 2.7976. Registering the **per-arm** SD (2.7976) rather than the **contrast** SD (3.9564) is the conservative of the two available readings: a smaller δ is a *stronger* non-inferiority claim, harder to support, not easier — and it is chosen deliberately, disclosed here so a reader can see a choice was made rather than defaulted. A future amendment that wants the more permissive (contrast-SD) reading has to make that case explicitly, on the record, rather than inherit this one by silence.
+
+**Resolvability context, reported and NOT targeted.** [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 2 is emphatic that "the MDE is reported, not targeted... inventing one here to justify a design would be the move §5.1 explicitly refuses," and δ above was derived from `σ²_ba` alone, not from any power figure. The following is context only. On §3.4's unchanged formula `SE(B,R) = sqrt(2·(σ²_ba/B + σ²_e/(B·R)))`, at the grid's registered design B = 24 briefs, R = 2 replicates ([Appendix G](#appendix-g--amendments-dated-2026-09-08) item 2's "Registered design") on the ~60 basis: `SE = sqrt(2·(7.8266/24 + 3.6348/48))` = **0.8965**. At a true difference of exactly zero, the one-sided margin test (H0: difference ≤ −δ) rejects with probability `Φ(δ/SE − z)`: at the registered one-sided α = 0.025 (z = 1.959964) that is `Φ(3.1207 − 1.959964)` = `Φ(1.1607)` ≈ **0.8771**; at Holm's worst-case per-slot α = 0.005 over the registered m = 5 family (z = 2.575829) it is `Φ(0.5448)` ≈ **0.7071**. Both figures are computed by `evals/analysis/non-inferiority-margin.mjs` (Item 8) and are reported as context on the registered design, never as a target δ was chosen to hit.
+
+### Item 4 — Two reproduction checks, in the spirit of Appendix G item 2's own two checks
+
+**These make the derivation auditable rather than asserted.** Both are computed by `evals/analysis/non-inferiority-margin.mjs` (Item 8's full output) against the SE formula already registered in §3.4:
+
+1. **On the ~60 basis, the formula reproduces [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's own table**: 0.8965 at B=24/R=2 (the table prints 0.897), 0.6339 at B=48/R=2 (the table prints 0.634), 0.6137 at B=48/R=3 (the table prints 0.614). **PASS** on all three, at a tolerance of two decimal places — the same standard [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 5 itself applies ("returns... to the two decimals that table prints"). One discrepancy is disclosed rather than smoothed over: the B=24/R=2 cell computes 0.8965 against the table's printed 0.897, a genuine difference in the third decimal that the neighboring two cells (which reproduce their printed third decimal exactly) do not share. This is smaller than what the printed 4-decimal-place variance components can resolve and is reported as a minor, disclosed discrepancy in the published table rather than corrected in place, per this document's append-only discipline — no contrast, verdict, or registered figure depends on the third decimal of this context-only SE.
+2. **On the ~30 basis, the formula reproduces [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 2's registered-design row**: 0.5603 at B=24/R=2 against the table's printed 0.56. **PASS.**
+
+The formula being applied here is therefore the one already registered in both appendices, not a new one wearing its name.
+
+### Item 5 — Counter-example: the choice of basis is load-bearing, not cosmetic
+
+Deriving δ the same way from the *other* registered basis gives a materially different margin: `sqrt(σ²_ba)` at the ~30 basis ([Appendix G](#appendix-g--amendments-dated-2026-09-08) item 1, `σ²_ba = 1.2088`) is **1.0995**, against **2.7976** at the ~60 basis registered here — a factor of **2.5445×**. Concretely: an observed deficit of −2.00 rarefied distinct ideas would be **inside** the registered ~60-basis margin (non-inferior, since −2.00 > −2.7976) and **outside** the transported ~30-basis one (inferior, since −2.00 < −1.0995) — the same data, opposite verdicts, decided entirely by which basis was used. The direction is stated honestly because it differs from [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's own case: transporting the ~30 figure up to a ~60 contrast would register a margin **2.5445× too tight**, making H2 and H4 harder to support — the opposite direction from [Appendix J](#appendix-j--amendments-dated-2026-09-09) item 5's transport, which flattered the design by understating `σ²_ba`. Same failure, opposite sign; a margin transported across scales is wrong either way, and the sign of the error is not something a reader gets to assume.
+
+### Item 6 — Which conditions this margin applies to
+
+**H2 and H4 as registered in §6.1 are contrasts over the A–H grid's arms E/D and B/D.** Study 2's six conditions are solo, tier-matched cells — a different design entirely, decoupled from panel process (issue #131). This margin is a property of the grid's own H2/H4 contrasts; per Item 2 above, Study 2 does not yet have a determined rarefaction target to inherit it, and if that target later turns out not to be ~60, Study 2 registers its own basis rather than borrowing this one. Where Study 2's tier contrasts are reported against a margin at all, they are reported against *this* one only if Study 2's own achieved floor lands at ~60; otherwise Study 2's own dated amendment governs.
+
+### Item 7 — Code consequence
+
+`evals/analysis/contrasts.mjs` now exports `REGISTERED_H2_H4_DELTA = 2.7976`, cited to this appendix, and `buildRegisteredFamily()`'s δ logic changes semantics accordingly: a caller who names no δ, or who names exactly `REGISTERED_H2_H4_DELTA`, gets `deltaDeviatesFromRegistration: false` — both read as *the* registered test. Any other explicit value — **including 0**, which was the registered default before this appendix — reports `deltaDeviatesFromRegistration: true`. `evals/analysis/report.mjs`'s "DEVIATES from registration" rendering is unchanged and follows automatically, since it keys entirely off that flag. `evals/analysis/analysis.mjs`, the one production caller of `buildRegisteredFamily()` outside the test suite, forwards its own `--delta` CLI flag verbatim (`undefined` when the flag is absent) and needed no behavioural change — a run with no `--delta` flag now silently and correctly picks up the registered margin instead of the old δ = 0.
+
+### Item 8 — Reproduction
+
+The derivation above is reproducible from committed constants by one command, in the pattern [Appendix G](#appendix-g--amendments-dated-2026-09-08) item 5 registered for `evals/analysis/variance-components.mjs`. This script does **not** re-fit `σ²_ba` at any scale — re-estimation is out of scope for issue #179, and the sidecar venv a re-fit would need is not committed — it consumes the two registered variance-component pairs above and derives everything else from them.
+
+```
+node evals/analysis/non-inferiority-margin.mjs
+```
+
+Actual output, pasted verbatim:
+
+```
+=== Non-inferiority margin delta for H2 (E>=D) / H4 (B>=D) -- docs/PREREGISTRATION.md Appendix R (issue #179) ===
+
+Registered variance-component bases:
+  ~30-idea pool (Appendix G item 1, MEASURED, matched N=30, n=144): sigma^2_ba=1.2088  sigma^2_e=5.1181
+  ~60-idea pool (Appendix J item 5, MEASURED, 3 arms at ~60):        sigma^2_ba=7.8266  sigma^2_e=3.6348 (sigma^2_e rarefied at 45)
+
+H2/H4 are panel-vs-panel contrasts (E vs D, B vs D); B, D, E all inherit the default panel geometry
+(size:5, ideasPerAgent:6, maxRounds:2; arms.config.json) with round 2 APPENDING to round 1 (arm A's own
+purpose string) -- so both contrasts' rarefaction target (Appendix C item 2: minimum pool size present)
+is ~60, and Appendix G item 4's scope bound makes the ~60 basis (Appendix J item 5) the registered one.
+
+SE formula (docs/PREREGISTRATION.md §3.4, unchanged): SE(B,R) = sqrt(2*(sigma^2_ba/B + sigma^2_e/(B*R)))
+
+Reproduction checks (formula applied here reproduces the already-registered tables):
+  PASS  ~60 basis, B=24 R=2 (Appendix J item 5): computed 0.8965 vs registered 0.897 (tolerance 0.005)
+  PASS  ~60 basis, B=48 R=2 (Appendix J item 5): computed 0.6339 vs registered 0.634 (tolerance 0.005)
+  PASS  ~60 basis, B=48 R=3 (Appendix J item 5): computed 0.6137 vs registered 0.614 (tolerance 0.005)
+  PASS  ~30 basis, B=24 R=2 (Appendix G item 2): computed 0.5603 vs registered 0.56 (tolerance 0.005)
+
+Derived margin delta := sqrt(sigma^2_ba), per-arm brief-to-brief SD (the CONSERVATIVE reading -- see contrastSD()):
+  delta at ~60 basis (REGISTERED for H2/H4): sqrt(7.8266) = 2.7976
+  delta at ~30 basis (counter-example only):  sqrt(1.2088) = 1.0995
+  ratio (~60 delta / ~30 delta):               2.5445x
+  contrast SD at ~60 (sqrt(2*sigma^2_ba), the LESS conservative reading, NOT registered): 3.9564
+
+Counter-example: an observed deficit of -2.00 rarefied distinct ideas --
+  under the registered ~60-basis delta (2.7976): inside (non-inferior)
+  under the transported ~30-basis delta (1.0995): outside (inferior)
+  Same data, opposite verdicts -- the choice of basis is load-bearing, not cosmetic.
+
+Resolvability context at the registered design (B=24, R=2, ~60 basis) -- REPORTED, NOT TARGETED
+(Appendix G item 2: "the MDE is reported, not targeted" -- delta above was NOT chosen to hit either figure below):
+  SE = sqrt(2*(7.8266/24 + 3.6348/48)) = 0.8965
+  power at true difference = 0, one-sided alpha=0.025 (z=1.959964): Phi(3.1207 - 1.959964) = Phi(1.1607) = 0.8771 (~88%)
+  power at true difference = 0, Holm worst-case per-slot alpha=0.005 (z=2.575829): Phi(0.5448) = 0.7071 (~71%)
+```

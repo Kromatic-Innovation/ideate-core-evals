@@ -20,17 +20,32 @@
 //     SEPARATE, exploratory contrast — BH-corrected, never folded into the
 //     Holm-corrected registered family.
 // H2: E >= D. docs/PREREGISTRATION.md §6.1/§6.2 registers a DIRECTION only —
-//     no numeric margin appears anywhere in the registration. The faithful
-//     reading is the one-sided delta=0 test (H0: E - D <= 0), structurally
-//     identical to H3's IUT sub-tests. delta=0 is therefore the REGISTERED
-//     DEFAULT here. A caller may still pass an explicit delta (a margin may
-//     be registered later via the pilot per §B2), but that is a DEVIATION
-//     from the current registration, not the registered test itself — it is
-//     recorded on the result as `deltaDeviatesFromRegistration: true` rather
-//     than silently absorbed. (Previously this was framed as
-//     "non-inferiority" with no default, which meant the delta=0 test never
-//     actually ran; every real invocation fell through to a two-sided
-//     Wald-vs-zero p that was never registered. See #46 QA re-review.)
+//     no numeric margin appears in §6.1/§6.2 itself. **Superseded by
+//     Appendix R** (issue #179, dated 2026-09-24): the historical reasoning
+//     below is kept, not deleted, because it was the faithful reading of
+//     the registration AS IT STOOD on 2026-09-01 and explains why delta=0
+//     was ever the default.
+//
+//     Historical (2026-09-01, Appendix B item 5): with no numeric margin
+//     registered anywhere, the faithful reading was the one-sided delta=0
+//     test (H0: E - D <= 0), structurally identical to H3's IUT sub-tests,
+//     and delta=0 was the REGISTERED DEFAULT. A caller-supplied non-zero
+//     delta was recorded as `deltaDeviatesFromRegistration: true` rather
+//     than silently absorbed. (Before that, "non-inferiority" had no
+//     default at all, so the delta=0 test never actually ran; every real
+//     invocation fell through to a two-sided Wald-vs-zero p that was never
+//     registered. See #46 QA re-review.)
+//
+//     Current (2026-09-24, Appendix R): a numeric margin IS now registered
+//     — REGISTERED_H2_H4_DELTA = 2.7976, derived from sqrt(sigma^2_ba) at
+//     the ~60-idea pool basis (Appendix J item 5), the basis matching H2's
+//     (and H4's) rarefaction target per Appendix G item 4's scope bound.
+//     REGISTERED_H2_H4_DELTA is now the REGISTERED DEFAULT: a caller who
+//     names no delta gets it, a caller who explicitly passes exactly that
+//     value gets `deltaDeviatesFromRegistration: false` (it IS the
+//     registered test), and any OTHER explicit value — including 0, which
+//     used to be the free default — is a DEVIATION and is flagged as one.
+//     See buildRegisteredFamily()'s delta logic and its own inline comment.
 // H3: G > max(D, H) is NOT one linear contrast, but it IS a single
 //     registered hypothesis (docs/PREREGISTRATION.md:223: "5 registered
 //     hypotheses ... Holm-Bonferroni on the registered set"). Modeled as an
@@ -42,7 +57,12 @@
 //     adjustment and legitimately consumes exactly ONE Holm slot, with
 //     p = max(p_G-D, p_G-H). Do not re-split this into two slots; see
 //     buildRegisteredFamily()'s H3 entry and registeredFamilySlotCount().
-// H4: same delta=0-default one-sided treatment as H2, for B >= D.
+// H4: same one-sided margin treatment as H2, for B >= D — same
+//     REGISTERED_H2_H4_DELTA default per Appendix R, for the same reason:
+//     both are panel-vs-D contrasts at the same ~60 rarefaction scale, sized
+//     on the same registered design and the same variance basis, so one
+//     number serves both rather than two numbers implying a distinction the
+//     design does not contain.
 //
 // ── ARM SUBSETS AND THE REGISTERED FAMILY (issue #97) ────────────────────
 // The registered family names arms D, E, G, H (H2: E vs D, H3: G vs D/H,
@@ -170,6 +190,27 @@ export const REGISTERED_H1_ARM_SETS = {
 
 /** The key `buildRegisteredFamily()` uses when a caller names none. */
 export const DEFAULT_H1_ARM_SET = "prereg-2026-08-01";
+
+/**
+ * The registered non-inferiority margin for H2 (E >= D) and H4 (B >= D),
+ * per docs/PREREGISTRATION.md Appendix R (issue #179), superseding Appendix
+ * B item 5's delta=0 default (see the H2/H4 header comment above and
+ * buildRegisteredFamily()'s jsdoc for the superseded reasoning, kept rather
+ * than deleted).
+ *
+ * Derivation: sqrt(sigma^2_ba) at the ~60-idea pool basis (Appendix J item
+ * 5, sigma^2_ba = 7.8266, MEASURED across three arms) -- H2 and H4 are both
+ * panel-vs-panel contrasts whose rarefaction target (Appendix C item 2) is
+ * ~60, per Appendix G item 4's scope bound. Reproduced by
+ * evals/analysis/non-inferiority-margin.mjs; this constant and that
+ * script's derived value are pinned together by
+ * non-inferiority-margin.test.mjs's drift-guard test.
+ *
+ * A later re-estimate of sigma^2_ba changes this constant only alongside a
+ * new dated appendix -- exactly the discipline REGISTERED_H1_ARM_SETS above
+ * already applies to H1's arm set.
+ */
+export const REGISTERED_H2_H4_DELTA = 2.7976;
 
 /**
  * Structural validation of one REGISTERED_H1_ARM_SETS entry (issue #145).
@@ -392,10 +433,16 @@ function zQuantile(p) {
  *   @param {[string,string]} [opts.h2Pair=["E","D"]]
  *   @param {[string,string]} [opts.h4Pair=["B","D"]]
  *   @param {[string,string]} [opts.h3TargetVsBest=["G","D","H"]]  [challenger, ...bestOf]
- *   @param {number} [opts.delta=0]         H2/H4 margin. The registration
- *     (§6.1/§6.2) supplies no numeric margin, so 0 is the REGISTERED
- *     default — passing an explicit value is a deviation from that
- *     registration, recorded on the H2/H4 results as
+ *   @param {number} [opts.delta=REGISTERED_H2_H4_DELTA]  H2/H4 margin.
+ *     Superseded 2026-09-24 by docs/PREREGISTRATION.md Appendix R (issue
+ *     #179): the registered default is now `REGISTERED_H2_H4_DELTA`
+ *     (2.7976, derived from sigma^2_ba at the ~60-idea basis), not 0.
+ *     Omitting this option, or passing exactly `REGISTERED_H2_H4_DELTA`,
+ *     both report `deltaDeviatesFromRegistration: false` — either IS the
+ *     registered test. Passing any OTHER value — including 0, the prior
+ *     default (§6.1/§6.2 registered no numeric margin before Appendix R;
+ *     see the module header's H2 comment for that history) — is a
+ *     deviation, recorded on the H2/H4 results as
  *     `deltaDeviatesFromRegistration: true`.
  *   @param {string[]} [opts.availableArms]  issue #97. The arm ids this run
  *     can actually estimate, defaulting to `[referenceArm, ...panelArms]` --
@@ -431,8 +478,17 @@ export function buildRegisteredFamily(opts = {}) {
   const [h2Challenger, h2Baseline] = opts.h2Pair || ["E", "D"];
   const [h4Challenger, h4Baseline] = opts.h4Pair || ["B", "D"];
   const [h3Challenger, ...h3Baselines] = opts.h3TargetVsBest || ["G", "D", "H"];
-  const deltaDeviatesFromRegistration = opts.delta !== undefined && opts.delta !== null;
-  const delta = deltaDeviatesFromRegistration ? opts.delta : 0;
+  // docs/PREREGISTRATION.md Appendix R (issue #179): the registered default
+  // is no longer delta=0 -- it is REGISTERED_H2_H4_DELTA. A caller who names
+  // no delta gets the registered margin; a caller who explicitly passes
+  // EXACTLY the registered margin is asking for the registered test, not
+  // deviating from it; any other explicit value -- including 0, which used
+  // to be silently absorbed as "the default" -- IS a deviation and is
+  // flagged as one. (0 stopped being free the moment a non-zero margin
+  // became the registration: running the old delta=0 test today is itself
+  // now a deviation from what is registered.)
+  const delta = opts.delta === undefined || opts.delta === null ? REGISTERED_H2_H4_DELTA : opts.delta;
+  const deltaDeviatesFromRegistration = delta !== REGISTERED_H2_H4_DELTA;
 
   // ── H1's registered arm set (issue #145) ──────────────────────────────
   const h1ArmSetKey = opts.h1ArmSet || DEFAULT_H1_ARM_SET;
