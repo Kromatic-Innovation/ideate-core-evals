@@ -413,6 +413,8 @@ Per-run estimate ≈ 16k input / 9k output tokens (5 agents × 2 rounds, pool-sh
 
 > _Amended 2026-09-01 ([Appendix C](#appendix-c--amendments-dated-2026-09-01), item 7). "DAT replication as validity check" (row: "Embedding model shapes diversity metric") is real but weaker than the phrasing implies — reported, not verified against a committed artifact in this repo: the DAT ordering is a three-point check that holds one time in six under a null; over 3,000 seeds, a semantics-free SHA-512-of-text embedder cleared it 16.4% of the time (null 16.7%) and cleared all three negative controls together 1.9% of the time (reproducible witness: seed 97) — i.e. Phase 0 rejects a semantics-free embedder roughly five times in six on the ordering alone. See the appendix item for the full construction._
 
+> _Amended 2026-09-24 by [Appendix Q](#appendix-q--amendments-dated-2026-09-24), item 2. A new threats-to-validity row is registered — "No human evaluates the study's own outputs — every reported number is embedding-derived or LLM-derived" — standing until the crowdsourced human-anchor panel scoped in `docs/human-anchor-panel.md` (issue #52) actually runs. Not added to the table above, per this document's append-only discipline; see the appendix for the row's full text and why it stands regardless of the operator's go/no-go decision._
+
 ---
 
 ## 11. Additive accumulation — and the statistical hazard it creates
@@ -2637,3 +2639,89 @@ Stated last and explicitly, as [Appendix O](#appendix-o--amendments-dated-2026-0
 `configHash` covers `harnessVersion` / `engineSha` / `promptHash` / `judgeHash` / `embedderId` / `armsConfigHash` / `corpusHash` / `clusterDistanceThreshold`. **`engineSha` is checked separately and explicitly**, because `evals/run.mjs` *is* in the diff and a source-derived engine hash would have re-keyed the whole store: it resolves to `ideate-core@${engineVersion}` — the **resolved `ideate-core` dependency version**, not a hash over harness source — and the merge changes no dependency (`package.json` is absent from the diff). **No hashed input moved. No stored cell is re-keyed. No Stage 1a, Stage 1b or Stage 1c result depends on anything in this appendix**, including the registered contrasts `S1b-1`, `S1c-1` and `S1c-2`, [Appendix M](#appendix-m--amendments-dated-2026-09-09) item 9's **+1.6728**, and [Appendix N](#appendix-n--amendments-dated-2026-09-09) item 9's passing §5.1 verdict.
 
 What changed is **how much a future run is permitted to spend and how honestly it says so beforehand** — an instrument-safety property, not a measurement.
+
+---
+
+## Appendix Q — Amendments (dated 2026-09-24)
+
+Per the amendment rule at the top of this document — nothing above is edited
+in place. This appendix registers the status of the crowdsourced human-anchor
+rating panel scoped and costed in `docs/human-anchor-panel.md` (issue #52),
+**pre-data**: no panel has run, no pool has been rated, and no result exists
+for either item below to be fitted to. It also registers the §10 limitation
+that stands while that remains true. **Nothing in §6 is changed by either
+item below**, and no cell, contrast, or verdict already reported depends on
+anything in this appendix.
+
+### Item 1 — §6.3: the human-anchor panel's result is registered as EXPLORATORY
+
+**What's registered.** [Appendix B](#appendix-b--amendments-dated-2026-09-01)
+**Item 14** already registered issue #52's panel as running after the
+confirmatory grid and as **exploratory, not confirmatory** — not part of the
+registered H1–H5 family, not Holm-corrected, reported in §6.3 with
+Benjamini–Hochberg correction. That registration is dated 2026-09-01, is
+**unchanged by this item**, and this item does not re-register the same
+decision a second time. What this item adds is the reporting mechanics and
+the interpretive rule issue #52's own acceptance criteria call for, which
+Item 14 did not spell out.
+
+**Why registering this now, rather than after seeing the panel's result, is
+the whole point.** Per §11's own table ("Exploration ... labeled exploratory
+... reported in a separate section with BH correction"), an exploratory
+label costs nothing to apply in advance and is not legitimate to apply after
+the fact. Deciding confirmatory-vs-exploratory status *after* seeing whether
+the human counts agree with `distinct_k` would be exactly the optional-stopping
+hazard §11 exists to rule out, wearing an exploratory label instead of a
+confirmatory one — the hazard is the same regardless of which label the
+after-the-fact decision reaches for.
+
+**The consequences, stated concretely:**
+
+- The panel's correlation (human distinct-count vs. `distinct_k`) and its
+  inter-rater agreement statistic are reported in §6.3, the exploratory
+  section, **BH-corrected if any significance test is run over them.**
+- They are **never folded into the Holm-corrected confirmatory family.**
+  That family is m = 5 (H1–H5), registered in §6.2 and confirmed by
+  [Appendix B](#appendix-b--amendments-dated-2026-09-01) **Item 6** ("§6.2:
+  the Holm family is 5 hypotheses, not 6 — H3 is an intersection-union
+  test"). The panel adds no sixth hypothesis and no sixth Holm slot; **the
+  family size does not change.**
+- **An agreement result, however strong, does not retroactively validate
+  `distinct_k` as a confirmatory instrument.** Validating an instrument
+  after using it to produce the confirmatory results it is supposed to
+  validate would be circular, and would launder an exploratory finding into
+  confirmatory backing it never earned.
+- **A disagreement does not invalidate a registered contrast.** H1–H5 are
+  tested on `distinct_k` as pre-registered regardless of what the panel
+  finds. A disagreement between the panel and `distinct_k` is evidence about
+  `distinct_k`'s **construct validity** — reported as exactly that, in §6.3,
+  never as grounds to discard or re-run an already-registered confirmatory
+  result.
+
+### Item 2 — §10: the threats-to-validity row that stands until the panel runs
+
+**Registered content** (not added to §10's table in place — see the
+forward-pointer blockquote placed immediately after §10's existing
+2026-09-01 amendment note, which points here):
+
+| Threat | Mitigation | Residual |
+| --- | --- | --- |
+| No human evaluates the study's own outputs — every reported number is embedding-derived or LLM-derived | `distinct_k` validated against NoveltyBench's definition and DAT ordering; judge calibrated against Si et al. | Real, and not closed by either: the Si et al. key calibrates the JUDGE on multi-page research proposals, and says nothing about whether pool-level clustering matches human judgement on this study's own briefs |
+
+**The registered consequence.** This row stands, and is reported in §10,
+**unless and until** the panel scoped in `docs/human-anchor-panel.md` runs —
+it is **not conditional on the operator's go/no-go decision**, because it is
+true today regardless of which way that decision goes. If the operator
+declines to run the panel (`docs/human-anchor-panel.md` §6's no-go fallback),
+this row is permanent. If the panel runs, this row is superseded by a future
+dated appendix reporting what it found — an amendment this document does not
+pre-write, because pre-writing a result before the data exists is exactly
+what §11 and Item 1 above refuse.
+
+### Item 3 — What this appendix does NOT do
+
+This appendix does not commit spend, does not authorise a data collection,
+and does not register a hypothesis. The go/no-go recommendation for the
+panel is the operator's to make and is recorded in
+`docs/human-anchor-panel.md` §6, not here. No cell, contrast, or verdict
+depends on anything in Items 1 or 2 above.
