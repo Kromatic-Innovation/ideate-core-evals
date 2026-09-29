@@ -31,6 +31,7 @@ import { buildRarefiedFrame } from "./rarefiedFrame.mjs";
 import { evaluateContrast, armCoefficientName, contrastVector } from "./contrasts.mjs";
 import { runLadder, makeSidecarRunner } from "./fit.mjs";
 import { holmBonferroni } from "./multiplicity.mjs";
+import { paretoFrontier, costDiversityRatioByArm, seedFromString } from "./pareto.mjs";
 import { VOYAGE_CLUSTER_DISTANCE_THRESHOLD } from "../metrics/voyage-calibration.mjs";
 
 /** The registered arms. Constants here, not reads of arms.config.json, for the
@@ -62,6 +63,104 @@ export function buildS1bSpecs(coefficientNames, referenceArm) {
   });
 }
 
+// ── The registered headline metric: distinct_k per dollar (#182) ───────────
+//
+// §4.1 registers distinct_k/cost as "The headline metric. Answers the question
+// actually asked." (docs/PREREGISTRATION.md:165), and Appendix C item 3
+// registers its BASIS as "full-pool, self-correcting" (:823) -- never the
+// rarefied frame the contrasts are fit on. §6.3 registers the companion
+// output: "not report a single best model -- the output is a cost/diversity
+// Pareto frontier". B6 registers the CI method (cluster bootstrap over
+// briefs) and that the lane is always labelled descriptive.
+//
+// Deliberately mirrors stage1c.mjs's computeS1cCostLane near-verbatim -- the
+// same convention these two files already follow for buildS1bSpecs, the family
+// constants and the whole print flow. Stage 1b has its own arm set and its own
+// selection (a single configHash, resolved by resolveStoreConfigHash, with no
+// per-arm hash rule); a shared helper would have to be parameterised on both
+// stages' selection rules for no reader benefit.
+
+/**
+ * The §6.3 Pareto frontier and the §4.1 distinct_k-per-dollar ratio (with B6's
+ * cluster-bootstrap CI) per arm, over Stage 1b's FULL-POOL frame.
+ *
+ * Exported so the tests exercise it on synthetic frames with no results store
+ * (the real stores are gitignored and absent from a build worktree).
+ *
+ * @param {ReturnType<typeof buildFrame>} frame
+ *   Stage 1b's full-pool, post-selection frame. A rarefied frame is refused,
+ *   not silently accepted -- see the Appendix C item 3 guard below.
+ * @param {object} [opts]
+ *   @param {number} [opts.seed]  bootstrap PRNG seed; defaults to one derived
+ *     from the frame's configHash set, never wall-clock (#46 QA SHOULD).
+ *   Remaining keys are forwarded to costDiversityRatio (iterations,
+ *   confidenceLevel).
+ * @returns {{
+ *   basis: "full-pool", seed: number,
+ *   paretoPoints: ReturnType<typeof paretoFrontier>,
+ *   costRatioByArm: ReturnType<typeof costDiversityRatioByArm>,
+ * }}
+ */
+export function computeS1bCostLane(frame, opts = {}) {
+  // Appendix C item 3: the ratio is registered on the full-pool,
+  // self-correcting basis. Handing this the rarefied frame would silently
+  // report a DIFFERENT estimand under the headline metric's name, and nothing
+  // downstream could tell -- both frames are structurally identical. Refuse
+  // instead. `rarefied`/`responseFullPool` are buildRarefiedFrame's own
+  // markers (rarefiedFrame.mjs), so this recognises the real thing rather
+  // than a naming convention.
+  if (frame.rarefied || (Array.isArray(frame.rows) && frame.rows.some((r) => r.responseFullPool !== undefined))) {
+    throw new Error(
+      "computeS1bCostLane: refusing a RAREFIED frame. distinct_k per dollar is registered on the " +
+        '"full-pool, self-correcting" basis (docs/PREREGISTRATION.md Appendix C item 3, §4.1) -- pass the ' +
+        "full-pool frame, not buildRarefiedFrame()'s output.",
+    );
+  }
+  if (!Array.isArray(frame.rows) || frame.rows.length === 0) {
+    throw new Error("computeS1bCostLane: frame.rows is empty -- there is no cost lane to compute");
+  }
+  const seed = opts.seed ?? seedFromString((frame.configHashes ?? [frame.configHash ?? ""]).join(","));
+  const summaries = summarizeByArm(frame);
+  const paretoPoints = paretoFrontier(
+    summaries.map((a) => ({ armId: a.armId, meanCostUsd: a.meanCostUsd, meanResponse: a.meanResponse })),
+  );
+  const costRatioByArm = costDiversityRatioByArm(frame, { ...opts, seed });
+  return { basis: "full-pool", seed, paretoPoints, costRatioByArm };
+}
+
+/**
+ * The two lane sections as lines of text. PURE and exported for the reason
+ * report.mjs's renderers are: a printer that only ever reaches a terminal is a
+ * printer no test can check, and the CLI is the one surface this issue
+ * delivers (a formatting slip here is invisible until someone runs it against
+ * the real store, which is gitignored).
+ *
+ * @param {ReturnType<typeof computeS1bCostLane>} lane
+ * @returns {string[]}
+ */
+export function formatCostLane(lane) {
+  const lines = [];
+  lines.push("");
+  lines.push("=== cost/diversity Pareto frontier (§6.3, full-pool basis) ===");
+  for (const p of lane.paretoPoints) {
+    lines.push(
+      `  ${p.armId.padEnd(14)} mean cost=$${p.meanCostUsd.toFixed(4)}  mean distinct_k=${p.meanResponse.toFixed(3)}` +
+        `  on frontier: ${p.onFrontier ? "yes" : "no"}`,
+    );
+  }
+  lines.push("");
+  lines.push("=== distinct_k per dollar (the §4.1 headline metric; DESCRIPTIVE per amendment B6) ===");
+  lines.push(`  basis: ${lane.basis} (Appendix C item 3), cluster-bootstrap CI over briefs, seed ${lane.seed}`);
+  for (const [armId, r] of Object.entries(lane.costRatioByArm)) {
+    lines.push(
+      `  ${armId.padEnd(14)} ratio=${r.ratio.toFixed(3)}  ` +
+        `${(r.confidenceLevel * 100).toFixed(0)}% CI [${r.ciLower.toFixed(3)}, ${r.ciUpper.toFixed(3)}]` +
+        `  (${r.iterations} bootstrap iterations over briefs)`,
+    );
+  }
+  return lines;
+}
+
 async function main(argv) {
   let resultsDir = "results-study1b-r2";
   for (let i = 0; i < argv.length; i++) {
@@ -86,6 +185,10 @@ async function main(argv) {
   for (const s of summarizeByArm(frame)) {
     console.log(`  ${s.armId.padEnd(14)} n=${String(s.n).padEnd(4)} mean=${s.meanResponse.toFixed(3)}  mean cost=$${s.meanCostUsd.toFixed(4)}`);
   }
+
+  // #182: the registered headline metric, on the FULL-POOL frame -- before
+  // rarefaction, which the contrasts below use instead.
+  for (const line of formatCostLane(computeS1bCostLane(frame))) console.log(line);
 
   const armIds = [S1B_REFERENCE_ARM, S1B_PANEL_ARM, S1B_APRIME_ARM];
   const rarefied = buildRarefiedFrame(frame, {
