@@ -60,16 +60,16 @@ All contrasts are on rarefied `distinct_k` (App. C items 2–5), brief as a rand
 | **1c** | `S1C-RICH − S1C-SOLO60` | **+1.67 [0.31, 3.03]** | **0.0158** | `status-2026-09-09c.md` |
 | 1c | `S1C-RICH − S1C-SOLO6X10` (ten blind identical calls) | +30.21 [28.85, 31.57] | <0.0001 | same |
 
-**Cost lane** (descriptive by registration, App. B item 9; mean generation cost per cell):
+**Cost lane** (descriptive by registration, App. B item 9). Mean cost is generation cost per cell. Distinct ideas per dollar is `distinct_k` ÷ mean cost, on each basis. The full-pool column reproduces the figures the brief reports (~1168 and ~256, `status-2026-09-09b.md`). The rarefied column uses the registered estimand and was computed for this report.
 
-| Stage | Arm | Rarefied `distinct_k` | Mean cost/cell | Distinct ideas per dollar (as reported) |
-| --- | --- | --- | --- | --- |
-| 1b re-run | `S1B-SOLO60` | 44.57 | $0.0456 | ~1168 |
-| 1b re-run | `S1B-PANEL` | 42.50 | $0.1920 | ~256 |
-| 1b re-run | `S1B-APRIME` | 25.35 | $0.1504 | — |
-| 1c | `S1C-SOLO60` | 44.37 | $0.0430 | — |
-| 1c | `S1C-RICH` | 46.03 | $0.6178 | — |
-| 1c | `S1C-SOLO6X10` | 15.83 | $0.0915 | — |
+| Stage | Arm | Rarefied `distinct_k` | Full-pool `distinct_k` | Mean cost/cell | Distinct/$ (full pool) | Distinct/$ (rarefied) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1b re-run | `S1B-SOLO60` | 44.57 | 53.25 | $0.0456 | 1168 | 977 |
+| 1b re-run | `S1B-PANEL` | 42.50 | 49.16 | $0.1920 | 256 | 221 |
+| 1b re-run | `S1B-APRIME` | 25.35 | 27.94 | $0.1504 | 186 | 169 |
+| 1c | `S1C-SOLO60` | 44.37 | 53.16 | $0.0430 | 1236 | 1032 |
+| 1c | `S1C-RICH` | 46.03 | 54.16 | $0.6178 | 88 | 74 |
+| 1c | `S1C-SOLO6X10` | 15.83 | 17.20 | $0.0915 | 188 | 173 |
 
 The rich panel costs **14.4×** the solo call for **+3.8%** rarefied distinct ideas (`status-2026-09-09c.md`).
 
